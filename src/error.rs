@@ -180,8 +180,7 @@ invalid_errors! {
 
 /// An error returned when parsing an invalid SIP header field value.
 ///
-/// Unlike the other errors in this module, its `Display` output says what
-/// was wrong with the value.
+/// Its `Display` output says what was wrong with the value.
 ///
 /// The error deliberately does not keep the rejected value. Header values can
 /// carry credentials, such as `Authorization`, and an error is easy to log by
@@ -243,6 +242,72 @@ impl From<InvalidHeaderValue> for Error {
         Error { inner: ErrorKind::HeaderValue(err) }
     }
 }
+
+/// An error returned when parsing an invalid SIP message from bytes.
+///
+/// Its `Display` output says which part of the message was wrong. Like
+/// [`InvalidHeaderValue`], it does not keep any of the rejected bytes.
+///
+/// It does not convert into [`Error`], which is for building messages.
+pub struct InvalidMessage {
+    kind: InvalidMessageKind,
+}
+
+/// What made a message invalid.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InvalidMessageKind {
+    /// `siparse` rejected the head. `TooManyHeaders` never appears here.
+    Head(siparse::ErrorKind),
+    TooManyHeaders,
+    IncompleteHead,
+    StatusCode,
+    ContentLength,
+    TruncatedBody,
+}
+
+impl InvalidMessage {
+    pub(crate) const fn new(kind: InvalidMessageKind) -> InvalidMessage {
+        InvalidMessage { kind }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn kind(&self) -> InvalidMessageKind {
+        self.kind
+    }
+}
+
+impl fmt::Debug for InvalidMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InvalidMessage").field("kind", &self.kind).finish()
+    }
+}
+
+impl fmt::Display for InvalidMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.kind {
+            InvalidMessageKind::Head(kind) => fmt::Display::fmt(&kind, f),
+            InvalidMessageKind::TooManyHeaders => write!(
+                f,
+                "more than {} header fields in SIP message",
+                crate::parse::MAX_HEADERS
+            ),
+            InvalidMessageKind::IncompleteHead => {
+                f.write_str("incomplete SIP message head")
+            }
+            InvalidMessageKind::StatusCode => {
+                f.write_str("SIP status code out of range")
+            }
+            InvalidMessageKind::ContentLength => {
+                f.write_str("invalid Content-Length in SIP message")
+            }
+            InvalidMessageKind::TruncatedBody => {
+                f.write_str("SIP message body shorter than Content-Length")
+            }
+        }
+    }
+}
+
+impl error::Error for InvalidMessage {}
 
 #[cfg(test)]
 mod tests {

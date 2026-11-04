@@ -6,8 +6,10 @@ This module defines [`Response`] and its [`Parts`].
 
 use std::fmt;
 
+use bytes::Bytes;
+
 use crate::{
-    error::Error,
+    error::{Error, InvalidMessage},
     extensions::Extensions,
     header::{HeaderMap, HeaderName, HeaderValue},
     reason::ReasonPhrase,
@@ -97,6 +99,49 @@ impl Response<()> {
     /// Creates a [`Builder`] for a response.
     pub fn builder() -> Builder {
         Builder::new()
+    }
+}
+
+impl Response<Bytes> {
+    /// Parses a response from the bytes of one complete message, copying
+    /// them.
+    ///
+    /// This is [`Response::from_shared`] on a copy of `src`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidMessage`] in the same cases as
+    /// [`Response::from_shared`].
+    pub fn from_bytes(src: &[u8]) -> Result<Response<Bytes>, InvalidMessage> {
+        Response::from_shared(Bytes::copy_from_slice(src))
+    }
+
+    /// Parses a response from the bytes of one complete message without
+    /// copying them.
+    ///
+    /// This works like [`Request::from_shared`](crate::Request::from_shared).
+    /// The reason phrase is kept as received, even when it is empty.
+    ///
+    /// ```
+    /// use bytes::Bytes;
+    /// use signa::{Response, StatusCode};
+    ///
+    /// let response = Response::from_shared(Bytes::from_static(
+    ///     b"SIP/2.0 486 Busy Here\r\nContent-Length: 0\r\n\r\n",
+    /// ))?;
+    ///
+    /// assert_eq!(response.status(), StatusCode::BUSY_HERE);
+    /// assert_eq!(response.reason().unwrap().as_str(), "Busy Here");
+    /// # Ok::<(), signa::error::InvalidMessage>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidMessage`] in the same cases as
+    /// [`Request::from_shared`](crate::Request::from_shared), and also if the
+    /// status code is outside `100..=699`.
+    pub fn from_shared(src: Bytes) -> Result<Response<Bytes>, InvalidMessage> {
+        crate::parse::response(src)
     }
 }
 
@@ -194,7 +239,7 @@ impl<T: fmt::Debug> fmt::Debug for Response<T> {
 }
 
 impl Parts {
-    fn new(status: StatusCode) -> Parts {
+    pub(crate) fn new(status: StatusCode) -> Parts {
         Parts {
             status,
             reason: None,

@@ -152,8 +152,9 @@ impl HeaderValue {
     ///
     /// Construction validates UTF-8, so this always succeeds.
     pub fn as_str(&self) -> &str {
-        // SAFETY: `from_static` takes a `str`, and every other constructor
-        // checks the bytes with `validate`, which rejects invalid UTF-8.
+        // SAFETY: `from_static` and `from_parsed` take a `str`, and every
+        // other constructor checks the bytes with `validate`, which rejects
+        // invalid UTF-8.
         unsafe { str::from_utf8_unchecked(self.as_ref()) }
     }
 
@@ -336,6 +337,23 @@ impl TryFrom<&str> for HeaderValue {
 
     fn try_from(value: &str) -> Result<HeaderValue, InvalidHeaderValue> {
         HeaderValue::from_str(value)
+    }
+}
+
+impl HeaderValue {
+    /// Creates a `HeaderValue` from a value that `siparse` parsed out of
+    /// `src`, without copying or checking it again.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `value` does not lie within `src`.
+    pub(crate) fn from_parsed(src: &Bytes, value: &str) -> HeaderValue {
+        debug_assert!(validate(value.as_bytes()).is_ok());
+
+        HeaderValue {
+            raw: src.slice_ref(value.as_bytes()),
+            is_sensitive: false,
+        }
     }
 }
 

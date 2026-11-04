@@ -18,7 +18,9 @@ WORK IN PROGRESS.
 pub mod error;
 mod extensions;
 pub mod header;
+mod message;
 mod method;
+mod parse;
 mod reason;
 pub mod request;
 pub mod response;
@@ -32,6 +34,7 @@ pub use self::{
     error::Error,
     extensions::Extensions,
     header::{HeaderMap, HeaderName, HeaderValue},
+    message::Message,
     method::Method,
     reason::ReasonPhrase,
     request::Request,
