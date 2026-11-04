@@ -33,10 +33,11 @@ extension method and preserves its original casing.
 */
 
 use std::{
-    error::Error,
     fmt,
     str::{self, FromStr},
 };
+
+use crate::error::InvalidMethod;
 
 use self::{
     extension::{AllocatedExtension, InlineExtension},
@@ -55,11 +56,6 @@ use self::{
 /// and extension methods preserve their original casing.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Method(Repr);
-
-/// An error returned when parsing an invalid SIP method.
-pub struct InvalidMethod {
-    _priv: (),
-}
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum Repr {
@@ -303,12 +299,6 @@ impl FromStr for Method {
     }
 }
 
-impl InvalidMethod {
-    fn new() -> InvalidMethod {
-        InvalidMethod { _priv: () }
-    }
-}
-
 impl Known {
     fn as_str(&self) -> &str {
         match self {
@@ -329,20 +319,6 @@ impl Known {
         }
     }
 }
-
-impl fmt::Debug for InvalidMethod {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("InvalidMethod").finish()
-    }
-}
-
-impl fmt::Display for InvalidMethod {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("invalid SIP method")
-    }
-}
-
-impl Error for InvalidMethod {}
 
 mod extension {
     use super::*;

@@ -4,11 +4,11 @@ SIP request URI types.
 This module defines [`Uri`], the target of a SIP request.
 */
 
-use std::{error::Error, fmt, str::FromStr};
+use std::{fmt, str::FromStr};
 
 use bytes::Bytes;
 
-use crate::util::ByteStr;
+use crate::{error::InvalidUri, util::ByteStr};
 
 // TODO: Add structured access before transport work in 0.2.0, which needs
 // the host, port, `transport`, `maddr`, and `sips` scheme to pick a target
@@ -57,7 +57,7 @@ use crate::util::ByteStr;
 /// assert_eq!(uri.as_str(), "sip:bob@biloxi.example.com;transport=tcp");
 ///
 /// assert!("sip:bob@biloxi.example.com bad".parse::<Uri>().is_err());
-/// # Ok::<(), signa::InvalidUri>(())
+/// # Ok::<(), signa::error::InvalidUri>(())
 /// ```
 ///
 /// [`siparse`]: https://docs.rs/siparse
@@ -65,11 +65,6 @@ use crate::util::ByteStr;
 /// [RFC 3261 section 19.1.4]: https://www.rfc-editor.org/rfc/rfc3261#section-19.1.4
 #[derive(Clone)]
 pub struct Uri(ByteStr);
-
-/// An error returned when parsing an invalid SIP request URI.
-pub struct InvalidUri {
-    _priv: (),
-}
 
 impl Uri {
     /// Creates a `Uri` from a static string without copying it.
@@ -103,7 +98,7 @@ impl Uri {
     /// the accepted URI character classes.
     pub fn from_bytes(src: &[u8]) -> Result<Uri, InvalidUri> {
         if !is_valid(src) {
-            return Err(InvalidUri { _priv: () });
+            return Err(InvalidUri::new());
         }
 
         // SAFETY: `is_valid` only accepts ASCII bytes.
@@ -159,20 +154,6 @@ impl FromStr for Uri {
         Uri::from_bytes(src.as_bytes())
     }
 }
-
-impl fmt::Debug for InvalidUri {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("InvalidUri").finish()
-    }
-}
-
-impl fmt::Display for InvalidUri {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("invalid SIP request URI")
-    }
-}
-
-impl Error for InvalidUri {}
 
 // TODO: Switch to `siparse`'s public request URI check once it exists, so
 // the character classes live in one place. It is planned together with the

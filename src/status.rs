@@ -5,11 +5,12 @@ This module defines [`StatusCode`], a value type for SIP response codes.
 */
 
 use std::{
-    error::Error,
     fmt,
     num::NonZeroU16,
     str::{self, FromStr},
 };
+
+use crate::error::InvalidStatusCode;
 
 /// A SIP response status code.
 ///
@@ -30,11 +31,6 @@ use std::{
 /// existing callers.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StatusCode(NonZeroU16);
-
-/// An error returned when parsing an invalid SIP status code.
-pub struct InvalidStatusCode {
-    _priv: (),
-}
 
 impl StatusCode {
     /// Converts a `u16` to a `StatusCode`.
@@ -102,7 +98,7 @@ impl StatusCode {
     ///
     /// assert_eq!(StatusCode::RINGING.canonical_reason(), Some("Ringing"));
     /// assert_eq!(StatusCode::from_u16(299)?.canonical_reason(), None);
-    /// # Ok::<(), signa::InvalidStatusCode>(())
+    /// # Ok::<(), signa::error::InvalidStatusCode>(())
     /// ```
     ///
     /// [RFC 3261 section 7.2]: https://www.rfc-editor.org/rfc/rfc3261#section-7.2
@@ -213,26 +209,6 @@ impl FromStr for StatusCode {
         TryFrom::try_from(src)
     }
 }
-
-impl InvalidStatusCode {
-    const fn new() -> InvalidStatusCode {
-        InvalidStatusCode { _priv: () }
-    }
-}
-
-impl fmt::Debug for InvalidStatusCode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("InvalidStatusCode").finish()
-    }
-}
-
-impl fmt::Display for InvalidStatusCode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("invalid SIP status code")
-    }
-}
-
-impl Error for InvalidStatusCode {}
 
 // Adapted from the `status_codes!` macro in the `http` crate.
 // Each row also carries the reason phrase from the IANA registry, so the
