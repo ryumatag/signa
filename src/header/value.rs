@@ -346,6 +346,14 @@ impl FromStr for HeaderValue {
     }
 }
 
+impl TryFrom<&[u8]> for HeaderValue {
+    type Error = InvalidHeaderValue;
+
+    fn try_from(value: &[u8]) -> Result<HeaderValue, InvalidHeaderValue> {
+        HeaderValue::from_bytes(value)
+    }
+}
+
 impl TryFrom<&str> for HeaderValue {
     type Error = InvalidHeaderValue;
 
