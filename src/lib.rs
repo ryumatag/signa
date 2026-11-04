@@ -15,6 +15,7 @@ WORK IN PROGRESS.
 )]
 #![warn(missing_docs, missing_debug_implementations)]
 
+mod extensions;
 pub mod header;
 mod method;
 mod status;
@@ -24,6 +25,7 @@ mod version;
 
 #[doc(inline)]
 pub use self::{
+    extensions::Extensions,
     header::{
         HeaderMap, HeaderName, HeaderValue, InvalidHeaderName,
         InvalidHeaderValue,
