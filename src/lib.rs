@@ -23,6 +23,7 @@ mod version;
 
 #[doc(inline)]
 pub use self::{
+    header::{HeaderName, HeaderValue, InvalidHeaderName, InvalidHeaderValue},
     method::{InvalidMethod, Method},
     status::{InvalidStatusCode, StatusCode},
     version::Version,
