@@ -2,7 +2,7 @@
 A SIP message that is either a request or a response.
 */
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
 use crate::{error::InvalidMessage, request::Request, response::Response};
 
@@ -62,5 +62,27 @@ impl Message<Bytes> {
     /// matches the start-line.
     pub fn from_shared(src: Bytes) -> Result<Message<Bytes>, InvalidMessage> {
         crate::parse::message(src)
+    }
+}
+
+impl<T: AsRef<[u8]>> Message<T> {
+    /// Writes the message to the end of `dst`.
+    ///
+    /// This is [`Request::encode`] or [`Response::encode`], whichever the
+    /// message holds.
+    pub fn encode(&self, dst: &mut BytesMut) {
+        match self {
+            Message::Request(request) => request.encode(dst),
+            Message::Response(response) => response.encode(dst),
+        }
+    }
+
+    /// Returns the message as bytes.
+    ///
+    /// This is [`Message::encode`] into a new buffer.
+    pub fn to_bytes(&self) -> Bytes {
+        let mut dst = BytesMut::new();
+        self.encode(&mut dst);
+        dst.freeze()
     }
 }

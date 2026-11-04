@@ -6,7 +6,7 @@ This module defines [`Request`] and its [`Parts`].
 
 use std::fmt;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
 use crate::{
     error::{Error, InvalidMessage},
@@ -154,6 +154,56 @@ impl Request<Bytes> {
     /// * the body is shorter than `Content-Length`.
     pub fn from_shared(src: Bytes) -> Result<Request<Bytes>, InvalidMessage> {
         crate::parse::request(src)
+    }
+}
+
+impl<T: AsRef<[u8]>> Request<T> {
+    /// Writes the request to the end of `dst` as one complete message.
+    ///
+    /// Header fields are written in the order of [`Request::headers`], with
+    /// their values as stored, folds included. Standard names take their
+    /// long form, such as `Call-ID`, and other names stay lowercase.
+    ///
+    /// The `Content-Length` field always comes from the body, after the
+    /// other fields. Any `Content-Length` in the headers is skipped, so the
+    /// two cannot disagree.
+    ///
+    /// A request built without a body has a `()` body, which this cannot
+    /// write. Give it an empty `Bytes` instead.
+    ///
+    /// ```
+    /// use bytes::{Bytes, BytesMut};
+    /// use signa::Request;
+    ///
+    /// let request = Request::builder()
+    ///     .method("OPTIONS")
+    ///     .uri("sip:carol@chicago.example.com")
+    ///     .header("Call-ID", "a84b4c76e66710")
+    ///     .body(Bytes::new())?;
+    ///
+    /// let mut dst = BytesMut::new();
+    /// request.encode(&mut dst);
+    ///
+    /// assert_eq!(
+    ///     dst,
+    ///     &b"OPTIONS sip:carol@chicago.example.com SIP/2.0\r\n\
+    ///        Call-ID: a84b4c76e66710\r\n\
+    ///        Content-Length: 0\r\n\
+    ///        \r\n"[..]
+    /// );
+    /// # Ok::<(), signa::Error>(())
+    /// ```
+    pub fn encode(&self, dst: &mut BytesMut) {
+        crate::encode::request(self, dst);
+    }
+
+    /// Returns the request as the bytes of one complete message.
+    ///
+    /// This is [`Request::encode`] into a new buffer.
+    pub fn to_bytes(&self) -> Bytes {
+        let mut dst = BytesMut::new();
+        self.encode(&mut dst);
+        dst.freeze()
     }
 }
 
