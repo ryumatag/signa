@@ -1,0 +1,15 @@
+[package]
+name = "signa"
+version = "0.0.1"
+authors = ["Ryuma Taguchi <ryumatag@gmail.com>"]
+description = "WIP"
+repository = "https://github.com/ryumatag/signa"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+edition = "2021"
+include = [
+  "/src/**/*.rs",
+  "/README.md",
+  "LICENSE-APACHE",
+  "LICENSE-MIT",
+]
