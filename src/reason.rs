@@ -168,6 +168,24 @@ impl str::FromStr for ReasonPhrase {
     }
 }
 
+impl ReasonPhrase {
+    /// Creates a `ReasonPhrase` from a reason phrase that `siparse` parsed
+    /// out of `src`, without copying or checking it again.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `reason` does not lie within `src`.
+    pub(crate) fn from_parsed(src: &Bytes, reason: &str) -> ReasonPhrase {
+        debug_assert!(check_bytes(reason.as_bytes()));
+
+        // SAFETY: The slice holds the same bytes as `reason`, which is a
+        // `str`.
+        ReasonPhrase(unsafe {
+            ByteStr::from_utf8_unchecked(src.slice_ref(reason.as_bytes()))
+        })
+    }
+}
+
 // TODO: Switch to `siparse`'s public reason phrase check once it exists, so
 // the grammar lives in one place. It is planned together with the other shared
 // checks before signa 0.1.0.

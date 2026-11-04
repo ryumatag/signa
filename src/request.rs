@@ -6,8 +6,10 @@ This module defines [`Request`] and its [`Parts`].
 
 use std::fmt;
 
+use bytes::Bytes;
+
 use crate::{
-    error::Error,
+    error::{Error, InvalidMessage},
     extensions::Extensions,
     header::{HeaderMap, HeaderName, HeaderValue},
     method::Method,
@@ -95,6 +97,63 @@ impl Request<()> {
     /// Creates a [`Builder`] for a request.
     pub fn builder() -> Builder {
         Builder::new()
+    }
+}
+
+impl Request<Bytes> {
+    /// Parses a request from the bytes of one complete message, copying them.
+    ///
+    /// This is [`Request::from_shared`] on a copy of `src`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidMessage`] in the same cases as
+    /// [`Request::from_shared`].
+    pub fn from_bytes(src: &[u8]) -> Result<Request<Bytes>, InvalidMessage> {
+        Request::from_shared(Bytes::copy_from_slice(src))
+    }
+
+    /// Parses a request from the bytes of one complete message without
+    /// copying them.
+    ///
+    /// The Request-URI, the header values, and the body share `src`. Only
+    /// header names are copied, when they are not standard names, because
+    /// [`HeaderName`] normalizes them.
+    ///
+    /// `src` must hold the whole message, such as one UDP datagram. This
+    /// does not frame messages on a stream. The body is the rest of `src`
+    /// after the head, cut to `Content-Length` if the message has one. Bytes
+    /// after that are dropped, as RFC 3261 section 18.3 says for datagrams.
+    ///
+    /// ```
+    /// use bytes::Bytes;
+    /// use signa::{header::CALL_ID, Method, Request};
+    ///
+    /// let request = Request::from_shared(Bytes::from_static(
+    ///     b"MESSAGE sip:bob@biloxi.example.com SIP/2.0\r\n\
+    ///       Call-ID: a84b4c76e66710\r\n\
+    ///       Content-Length: 5\r\n\
+    ///       \r\n\
+    ///       hello",
+    /// ))?;
+    ///
+    /// assert_eq!(request.method(), Method::MESSAGE);
+    /// assert_eq!(request.headers().get(CALL_ID).unwrap(), "a84b4c76e66710");
+    /// assert_eq!(request.body(), "hello");
+    /// # Ok::<(), signa::error::InvalidMessage>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidMessage`] if:
+    ///
+    /// * the head is invalid or ends before its empty line;
+    /// * the head has more than 100 header fields;
+    /// * `Content-Length` is not a number, or appears more than once with
+    ///   different values;
+    /// * the body is shorter than `Content-Length`.
+    pub fn from_shared(src: Bytes) -> Result<Request<Bytes>, InvalidMessage> {
+        crate::parse::request(src)
     }
 }
 
@@ -205,7 +264,7 @@ impl<T: fmt::Debug> fmt::Debug for Request<T> {
 }
 
 impl Parts {
-    fn new(method: Method, uri: Uri) -> Parts {
+    pub(crate) fn new(method: Method, uri: Uri) -> Parts {
         Parts {
             method,
             uri,

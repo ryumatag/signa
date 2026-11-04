@@ -155,6 +155,23 @@ impl FromStr for Uri {
     }
 }
 
+impl Uri {
+    /// Creates a `Uri` from a Request-URI that `siparse` parsed out of `src`,
+    /// without copying or checking it again.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `uri` does not lie within `src`.
+    pub(crate) fn from_parsed(src: &Bytes, uri: &str) -> Uri {
+        debug_assert!(is_valid(uri.as_bytes()));
+
+        // SAFETY: The slice holds the same bytes as `uri`, which is a `str`.
+        Uri(unsafe {
+            ByteStr::from_utf8_unchecked(src.slice_ref(uri.as_bytes()))
+        })
+    }
+}
+
 // TODO: Switch to `siparse`'s public request URI check once it exists, so
 // the character classes live in one place. It is planned together with the
 // other shared checks before signa 0.1.0.
