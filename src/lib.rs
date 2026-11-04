@@ -31,12 +31,15 @@ mod version;
 pub use self::{
     error::Error,
     extensions::Extensions,
-    header::{HeaderMap, HeaderName, HeaderValue},
-    method::Method,
-    reason::ReasonPhrase,
+    header::{
+        HeaderMap, HeaderName, HeaderValue, InvalidHeaderName,
+        InvalidHeaderValue,
+    },
+    method::{InvalidMethod, Method},
+    reason::{InvalidReasonPhrase, ReasonPhrase},
     request::Request,
     response::Response,
-    status::StatusCode,
-    uri::Uri,
+    status::{InvalidStatusCode, StatusCode},
+    uri::{InvalidUri, Uri},
     version::Version,
 };
