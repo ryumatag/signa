@@ -1,12 +1,11 @@
 use std::{
-    error::Error,
     fmt,
     str::{self, FromStr},
 };
 
 use bytes::{BufMut, Bytes, BytesMut};
 
-use crate::util::ByteStr;
+use crate::{error::InvalidHeaderName, util::ByteStr};
 
 /// A SIP header field name.
 ///
@@ -16,11 +15,6 @@ use crate::util::ByteStr;
 /// lowercase.
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct HeaderName(Repr);
-
-/// An error returned when parsing an invalid SIP header field name.
-pub struct InvalidHeaderName {
-    _priv: (),
-}
 
 #[derive(Clone, Eq, Hash, PartialEq)]
 enum Repr {
@@ -872,26 +866,6 @@ impl FromStr for HeaderName {
         HeaderName::try_from(src)
     }
 }
-
-impl InvalidHeaderName {
-    const fn new() -> InvalidHeaderName {
-        InvalidHeaderName { _priv: () }
-    }
-}
-
-impl fmt::Debug for InvalidHeaderName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("InvalidHeaderName").finish()
-    }
-}
-
-impl fmt::Display for InvalidHeaderName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("invalid SIP header name")
-    }
-}
-
-impl Error for InvalidHeaderName {}
 
 // Stack scratch buffer size for validate-and-lowercase. It must hold the
 // longest standard header name, currently `p-charging-function-addresses` at

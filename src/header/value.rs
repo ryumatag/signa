@@ -9,6 +9,8 @@ use std::{
 
 use bytes::Bytes;
 
+use crate::error::{InvalidHeaderValue, InvalidHeaderValueKind};
+
 /// A generic SIP header field value as defined by RFC 3261.
 ///
 /// This type models the generic `header-value` production from RFC 3261,
@@ -39,18 +41,6 @@ use bytes::Bytes;
 pub struct HeaderValue {
     raw: Bytes,
     is_sensitive: bool,
-}
-
-/// Represents an invalid header field value.
-///
-/// This is an error returned when constructing a [`HeaderValue`] from bytes
-/// or text. Its `Display` output says what was wrong with the value.
-///
-/// The error deliberately does not keep the rejected value. Header values can
-/// carry credentials, such as `Authorization`, and an error is easy to log by
-/// accident. Not keeping the value also avoids allocating on the error path.
-pub struct InvalidHeaderValue {
-    kind: InvalidHeaderValueKind,
 }
 
 impl HeaderValue {
@@ -361,51 +351,6 @@ impl TryFrom<&str> for HeaderValue {
         HeaderValue::from_str(value)
     }
 }
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum InvalidHeaderValueKind {
-    Byte(u8),
-    BareCr,
-    BareLf,
-    MissingWspAfterCrLf,
-    Utf8(str::Utf8Error),
-}
-
-impl InvalidHeaderValue {
-    const fn new(kind: InvalidHeaderValueKind) -> InvalidHeaderValue {
-        InvalidHeaderValue { kind }
-    }
-}
-
-impl fmt::Debug for InvalidHeaderValue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("InvalidHeaderValue").field("kind", &self.kind).finish()
-    }
-}
-
-impl fmt::Display for InvalidHeaderValue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.kind {
-            InvalidHeaderValueKind::Byte(byte) => {
-                write!(f, "invalid byte 0x{byte:02X} in SIP header value")
-            }
-            InvalidHeaderValueKind::BareCr => {
-                f.write_str("bare CR in SIP header value")
-            }
-            InvalidHeaderValueKind::BareLf => {
-                f.write_str("bare LF in SIP header value")
-            }
-            InvalidHeaderValueKind::MissingWspAfterCrLf => f.write_str(
-                "missing SP or HTAB after CRLF in SIP header value",
-            ),
-            InvalidHeaderValueKind::Utf8(_) => {
-                f.write_str("invalid UTF-8 in SIP header value")
-            }
-        }
-    }
-}
-
-impl std::error::Error for InvalidHeaderValue {}
 
 /// Validates the generic SIP `header-value` grammar, including UTF-8.
 fn validate(src: &[u8]) -> Result<(), InvalidHeaderValue> {

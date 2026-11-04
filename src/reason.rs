@@ -5,11 +5,11 @@ This module defines [`ReasonPhrase`], the text after the status code in a
 status-line.
 */
 
-use std::{error::Error, fmt, str};
+use std::{fmt, str};
 
 use bytes::Bytes;
 
-use crate::util::ByteStr;
+use crate::{error::InvalidReasonPhrase, util::ByteStr};
 
 /// The reason phrase of a SIP status-line.
 ///
@@ -44,18 +44,13 @@ use crate::util::ByteStr;
 ///
 /// assert!("Say \"hi\"".parse::<ReasonPhrase>().is_err());
 /// assert!("Say %22hi%22".parse::<ReasonPhrase>().is_ok());
-/// # Ok::<(), signa::InvalidReasonPhrase>(())
+/// # Ok::<(), signa::error::InvalidReasonPhrase>(())
 /// ```
 ///
 /// [`siparse`]: https://docs.rs/siparse
 /// [RFC 3261 section 25.1]: https://www.rfc-editor.org/rfc/rfc3261#section-25.1
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct ReasonPhrase(ByteStr);
-
-/// An error returned when parsing an invalid SIP reason phrase.
-pub struct InvalidReasonPhrase {
-    _priv: (),
-}
 
 impl ReasonPhrase {
     /// Creates a `ReasonPhrase` from a static string without copying it.
@@ -92,7 +87,7 @@ impl ReasonPhrase {
         src: &[u8],
     ) -> Result<ReasonPhrase, InvalidReasonPhrase> {
         if !check_bytes(src) || str::from_utf8(src).is_err() {
-            return Err(InvalidReasonPhrase { _priv: () });
+            return Err(InvalidReasonPhrase::new());
         }
 
         // SAFETY: `str::from_utf8` just accepted `src`.
@@ -172,20 +167,6 @@ impl str::FromStr for ReasonPhrase {
         ReasonPhrase::from_bytes(src.as_bytes())
     }
 }
-
-impl fmt::Debug for InvalidReasonPhrase {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("InvalidReasonPhrase").finish()
-    }
-}
-
-impl fmt::Display for InvalidReasonPhrase {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("invalid SIP reason phrase")
-    }
-}
-
-impl Error for InvalidReasonPhrase {}
 
 // TODO: Switch to `siparse`'s public reason phrase check once it exists, so
 // the grammar lives in one place. It is planned together with the other shared

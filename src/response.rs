@@ -447,14 +447,14 @@ mod tests {
             .status(StatusCode::OK)
             .body(())
             .unwrap_err();
-        assert!(err.is::<crate::status::InvalidStatusCode>());
+        assert!(err.is::<crate::error::InvalidStatusCode>());
 
         let err = Response::builder()
             .status(200)
             .reason("<bad>")
             .body(())
             .unwrap_err();
-        assert!(err.is::<crate::reason::InvalidReasonPhrase>());
+        assert!(err.is::<crate::error::InvalidReasonPhrase>());
     }
 
     #[test]

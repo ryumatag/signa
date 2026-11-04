@@ -15,7 +15,7 @@ WORK IN PROGRESS.
 )]
 #![warn(missing_docs, missing_debug_implementations)]
 
-mod error;
+pub mod error;
 mod extensions;
 pub mod header;
 mod method;
@@ -31,15 +31,12 @@ mod version;
 pub use self::{
     error::Error,
     extensions::Extensions,
-    header::{
-        HeaderMap, HeaderName, HeaderValue, InvalidHeaderName,
-        InvalidHeaderValue,
-    },
-    method::{InvalidMethod, Method},
-    reason::{InvalidReasonPhrase, ReasonPhrase},
+    header::{HeaderMap, HeaderName, HeaderValue},
+    method::Method,
+    reason::ReasonPhrase,
     request::Request,
     response::Response,
-    status::{InvalidStatusCode, StatusCode},
-    uri::{InvalidUri, Uri},
+    status::StatusCode,
+    uri::Uri,
     version::Version,
 };

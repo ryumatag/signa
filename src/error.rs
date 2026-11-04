@@ -1,20 +1,18 @@
 /*!
-The general error type.
+Error types.
+
+Each conversion into a SIP message part has its own error, such as
+[`InvalidMethod`] for [`Method`]. They all convert into [`Error`], which
+builders and other code that takes several kinds of input report.
+
+[`Method`]: crate::Method
 */
 
-use std::{convert::Infallible, error, fmt};
-
-use crate::{
-    header::{InvalidHeaderName, InvalidHeaderValue},
-    method::InvalidMethod,
-    reason::InvalidReasonPhrase,
-    status::InvalidStatusCode,
-    uri::InvalidUri,
-};
+use std::{convert::Infallible, error, fmt, str};
 
 /// A general error for building SIP messages.
 ///
-/// The more specific errors in this crate, such as [`InvalidMethod`], all
+/// The more specific errors in this module, such as [`InvalidMethod`], all
 /// convert into this one, so builders and other code that takes several
 /// kinds of input can report any of them through `?`.
 ///
@@ -22,7 +20,7 @@ use crate::{
 /// its type.
 ///
 /// ```
-/// use signa::{InvalidMethod, Request};
+/// use signa::{error::InvalidMethod, Request};
 ///
 /// let err = Request::builder()
 ///     .method("IN VITE")
@@ -50,7 +48,7 @@ enum ErrorKind {
 ///
 /// This is not public. Callers can tell it apart from the other kinds
 /// because [`Error::is`] matches none of the public error types.
-pub(crate) struct Missing(&'static str);
+struct Missing(&'static str);
 
 impl Error {
     /// Returns `true` if the underlying error has type `T`.
@@ -99,27 +97,6 @@ impl error::Error for Error {
     }
 }
 
-macro_rules! from_errors {
-    ($($kind:ident($ty:ty),)+) => {
-        $(
-            impl From<$ty> for Error {
-                fn from(err: $ty) -> Error {
-                    Error { inner: ErrorKind::$kind(err) }
-                }
-            }
-        )+
-    };
-}
-
-from_errors! {
-    Method(InvalidMethod),
-    Uri(InvalidUri),
-    StatusCode(InvalidStatusCode),
-    ReasonPhrase(InvalidReasonPhrase),
-    HeaderName(InvalidHeaderName),
-    HeaderValue(InvalidHeaderValue),
-}
-
 // Builders accept values that are already of the target type, whose
 // `TryFrom` error is `Infallible`.
 impl From<Infallible> for Error {
@@ -141,6 +118,133 @@ impl fmt::Display for Missing {
 }
 
 impl error::Error for Missing {}
+
+// Defines an error that only says the input was invalid, along with its
+// conversion into `Error`.
+macro_rules! invalid_errors {
+    ($(
+        $(#[$attr:meta])*
+        $name:ident => $kind:ident, $message:literal;
+    )+) => {
+        $(
+            $(#[$attr])*
+            pub struct $name {
+                _priv: (),
+            }
+
+            impl $name {
+                pub(crate) const fn new() -> $name {
+                    $name { _priv: () }
+                }
+            }
+
+            impl fmt::Debug for $name {
+                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.debug_struct(stringify!($name)).finish()
+                }
+            }
+
+            impl fmt::Display for $name {
+                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str($message)
+                }
+            }
+
+            impl error::Error for $name {}
+
+            impl From<$name> for Error {
+                fn from(err: $name) -> Error {
+                    Error { inner: ErrorKind::$kind(err) }
+                }
+            }
+        )+
+    };
+}
+
+invalid_errors! {
+    /// An error returned when parsing an invalid SIP method.
+    InvalidMethod => Method, "invalid SIP method";
+
+    /// An error returned when parsing an invalid SIP request URI.
+    InvalidUri => Uri, "invalid SIP request URI";
+
+    /// An error returned when parsing an invalid SIP status code.
+    InvalidStatusCode => StatusCode, "invalid SIP status code";
+
+    /// An error returned when parsing an invalid SIP reason phrase.
+    InvalidReasonPhrase => ReasonPhrase, "invalid SIP reason phrase";
+
+    /// An error returned when parsing an invalid SIP header field name.
+    InvalidHeaderName => HeaderName, "invalid SIP header name";
+}
+
+/// Represents an invalid header field value.
+///
+/// This is an error returned when constructing a [`HeaderValue`] from bytes
+/// or text. Its `Display` output says what was wrong with the value.
+///
+/// The error deliberately does not keep the rejected value. Header values can
+/// carry credentials, such as `Authorization`, and an error is easy to log by
+/// accident. Not keeping the value also avoids allocating on the error path.
+///
+/// [`HeaderValue`]: crate::HeaderValue
+pub struct InvalidHeaderValue {
+    kind: InvalidHeaderValueKind,
+}
+
+/// What made a header value invalid.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InvalidHeaderValueKind {
+    Byte(u8),
+    BareCr,
+    BareLf,
+    MissingWspAfterCrLf,
+    Utf8(str::Utf8Error),
+}
+
+impl InvalidHeaderValue {
+    pub(crate) const fn new(
+        kind: InvalidHeaderValueKind,
+    ) -> InvalidHeaderValue {
+        InvalidHeaderValue { kind }
+    }
+}
+
+impl fmt::Debug for InvalidHeaderValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InvalidHeaderValue").field("kind", &self.kind).finish()
+    }
+}
+
+impl fmt::Display for InvalidHeaderValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.kind {
+            InvalidHeaderValueKind::Byte(byte) => {
+                write!(f, "invalid byte 0x{byte:02X} in SIP header value")
+            }
+            InvalidHeaderValueKind::BareCr => {
+                f.write_str("bare CR in SIP header value")
+            }
+            InvalidHeaderValueKind::BareLf => {
+                f.write_str("bare LF in SIP header value")
+            }
+            InvalidHeaderValueKind::MissingWspAfterCrLf => f.write_str(
+                "missing SP or HTAB after CRLF in SIP header value",
+            ),
+            InvalidHeaderValueKind::Utf8(_) => {
+                f.write_str("invalid UTF-8 in SIP header value")
+            }
+        }
+    }
+}
+
+impl error::Error for InvalidHeaderValue {}
+
+impl From<InvalidHeaderValue> for Error {
+    fn from(err: InvalidHeaderValue) -> Error {
+        Error { inner: ErrorKind::HeaderValue(err) }
+    }
+}
 
 #[cfg(test)]
 mod tests {

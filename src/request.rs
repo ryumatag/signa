@@ -478,7 +478,7 @@ mod tests {
         assert!(builder.method_ref().is_none());
         assert!(builder.headers_mut().is_none());
         let err = builder.body(()).unwrap_err();
-        assert!(err.is::<crate::uri::InvalidUri>());
+        assert!(err.is::<crate::error::InvalidUri>());
     }
 
     #[test]
@@ -489,7 +489,7 @@ mod tests {
             .header("Subject", "bare\nlf")
             .body(())
             .unwrap_err();
-        assert!(err.is::<crate::header::InvalidHeaderValue>());
+        assert!(err.is::<crate::error::InvalidHeaderValue>());
     }
 
     #[test]
