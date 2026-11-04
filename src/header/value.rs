@@ -1,5 +1,4 @@
 use std::{
-    any::Any,
     cmp::Ordering,
     fmt,
     hash::{Hash, Hasher},
@@ -115,46 +114,32 @@ impl HeaderValue {
         })
     }
 
-    /// Attempts to create a new `HeaderValue` from an arbitrary byte buffer
-    /// while performing zero-copy when possible.
+    /// Attempts to create a new `HeaderValue` from shared bytes without
+    /// copying them.
+    ///
+    /// This accepts the same bytes as [`HeaderValue::from_bytes`]. The value
+    /// keeps a reference to `src`, so a value taken from a larger buffer
+    /// keeps the whole buffer alive. A `Vec<u8>` or `String` converts into
+    /// `Bytes` without copying.
+    ///
+    /// ```
+    /// use bytes::Bytes;
+    /// use signa::HeaderValue;
+    ///
+    /// let value = HeaderValue::from_shared(Bytes::from(String::from(
+    ///     "<sip:alice@atlanta.example.com>;tag=1928301774",
+    /// )))?;
+    ///
+    /// assert_eq!(value, "<sip:alice@atlanta.example.com>;tag=1928301774");
+    /// # Ok::<(), signa::error::InvalidHeaderValue>(())
+    /// ```
     ///
     /// # Errors
     ///
-    /// Returns [`InvalidHeaderValue`] when `src` is not a valid generic SIP
-    /// header field value.
-    pub fn from_maybe_shared<T>(
-        src: T,
-    ) -> Result<HeaderValue, InvalidHeaderValue>
-    where
-        T: AsRef<[u8]> + 'static,
-    {
-        let mut slot = Some(src);
-
-        if let Some(bytes) =
-            (&mut slot as &mut dyn Any).downcast_mut::<Option<Bytes>>()
-        {
-            return HeaderValue::from_shared(
-                bytes
-                    .take()
-                    // OK because `slot` was initialized with `Some(src)`, and
-                    // this branch has exclusive access to the same
-                    // `Option<Bytes>`. No earlier code can have taken the
-                    // value out of it.
-                    .unwrap(),
-            );
-        }
-
-        HeaderValue::from_bytes(
-            // OK because `slot` was initialized with `Some(src)`, and the
-            // `Bytes` downcast branch above is the only code path that can
-            // replace it with `None`. Reaching this branch therefore
-            // guarantees the value is still present.
-            slot.unwrap().as_ref(),
-        )
-    }
-
-    fn from_shared(src: Bytes) -> Result<HeaderValue, InvalidHeaderValue> {
-        validate(src.as_ref())?;
+    /// Returns [`InvalidHeaderValue`] if `src` contains a byte or sequence
+    /// that [`HeaderValue::from_bytes`] rejects.
+    pub fn from_shared(src: Bytes) -> Result<HeaderValue, InvalidHeaderValue> {
+        validate(&src)?;
         Ok(HeaderValue { raw: src, is_sensitive: false })
     }
 
@@ -633,11 +618,11 @@ mod tests {
     }
 
     #[test]
-    fn from_maybe_shared_reuses_bytes_when_possible() {
+    fn from_shared_does_not_copy() {
         let bytes = Bytes::from_static(b"text/plain");
         let expected = bytes.as_ptr();
 
-        let value = HeaderValue::from_maybe_shared(bytes).unwrap();
+        let value = HeaderValue::from_shared(bytes).unwrap();
 
         assert_eq!(value.as_bytes().as_ptr(), expected);
     }
