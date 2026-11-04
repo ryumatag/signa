@@ -15,20 +15,6 @@ WORK IN PROGRESS.
 )]
 #![warn(missing_docs, missing_debug_implementations)]
 
-pub mod error;
-mod extensions;
-pub mod header;
-mod message;
-mod method;
-mod parse;
-mod reason;
-pub mod request;
-pub mod response;
-mod status;
-mod uri;
-mod util;
-mod version;
-
 #[doc(inline)]
 pub use self::{
     error::Error,
@@ -43,3 +29,18 @@ pub use self::{
     uri::Uri,
     version::Version,
 };
+
+mod encode;
+pub mod error;
+mod extensions;
+pub mod header;
+mod message;
+mod method;
+mod parse;
+mod reason;
+pub mod request;
+pub mod response;
+mod status;
+mod uri;
+mod util;
+mod version;

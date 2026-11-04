@@ -6,7 +6,7 @@ This module defines [`Response`] and its [`Parts`].
 
 use std::fmt;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
 use crate::{
     error::{Error, InvalidMessage},
@@ -142,6 +142,42 @@ impl Response<Bytes> {
     /// status code is outside `100..=699`.
     pub fn from_shared(src: Bytes) -> Result<Response<Bytes>, InvalidMessage> {
         crate::parse::response(src)
+    }
+}
+
+impl<T: AsRef<[u8]>> Response<T> {
+    /// Writes the response to the end of `dst` as one complete message.
+    ///
+    /// This works like [`Request::encode`](crate::Request::encode). A
+    /// response without a [`ReasonPhrase`] uses
+    /// [`StatusCode::canonical_reason`], or an empty reason phrase if its
+    /// code has none.
+    ///
+    /// ```
+    /// use bytes::Bytes;
+    /// use signa::{Response, StatusCode};
+    ///
+    /// let response = Response::builder()
+    ///     .status(StatusCode::RINGING)
+    ///     .body(Bytes::new())?;
+    ///
+    /// assert_eq!(
+    ///     response.to_bytes(),
+    ///     &b"SIP/2.0 180 Ringing\r\nContent-Length: 0\r\n\r\n"[..]
+    /// );
+    /// # Ok::<(), signa::Error>(())
+    /// ```
+    pub fn encode(&self, dst: &mut BytesMut) {
+        crate::encode::response(self, dst);
+    }
+
+    /// Returns the response as the bytes of one complete message.
+    ///
+    /// This is [`Response::encode`] into a new buffer.
+    pub fn to_bytes(&self) -> Bytes {
+        let mut dst = BytesMut::new();
+        self.encode(&mut dst);
+        dst.freeze()
     }
 }
 
