@@ -18,6 +18,7 @@ WORK IN PROGRESS.
 pub mod header;
 mod method;
 mod status;
+mod uri;
 mod util;
 mod version;
 
@@ -29,5 +30,6 @@ pub use self::{
     },
     method::{InvalidMethod, Method},
     status::{InvalidStatusCode, StatusCode},
+    uri::{InvalidUri, Uri},
     version::Version,
 };
