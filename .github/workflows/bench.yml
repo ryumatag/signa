@@ -1,0 +1,79 @@
+name: bench
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+# A newer push to the same branch makes an in-flight comparison stale.
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Compares the whole-message benchmarks against the commit this change
+  # builds on. Shared runners are noisy, so the result is informational and
+  # never fails the job. Clippy and the benchmark assertions run in `ci`.
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # The per-value benchmarks take a few nanoseconds each, where runner
+      # noise outweighs most changes. Compare them locally instead.
+      FILTER: ^(parse|encode)/
+      BASE_SHA: >-
+        ${{ github.event.pull_request.base.sha || github.event.before }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - name: Install critcmp
+        run: cargo install --locked critcmp
+      # `bench/target` is ignored by Git, so the saved baseline survives
+      # the checkouts below.
+      - name: Benchmark the base commit
+        id: base
+        run: |
+          # A push that creates the branch has no previous commit, and an
+          # old base may predate the benchmark crate.
+          if ! git cat-file -e "$BASE_SHA:bench/Cargo.toml" 2>/dev/null; then
+            echo "No benchmarks at base commit $BASE_SHA. Skipping."
+            exit 0
+          fi
+          git checkout --detach "$BASE_SHA"
+          (cd bench && cargo bench -- "$FILTER" --save-baseline base)
+          git checkout --detach "$GITHUB_SHA"
+          echo "ran=true" >> "$GITHUB_OUTPUT"
+      - name: Benchmark the head commit
+        if: steps.base.outputs.ran == 'true'
+        working-directory: bench
+        run: cargo bench -- "$FILTER" --save-baseline head
+      - name: Compare
+        if: steps.base.outputs.ran == 'true'
+        working-directory: bench
+        # `-t 5` alone prints nothing useful when no benchmark moved by 5%
+        # or more, so print the full table first. The summary shows the
+        # same tables on the run page.
+        run: |
+          {
+            echo "## Benchmarks against $BASE_SHA"
+            echo
+            echo '```'
+            critcmp base head
+            echo '```'
+            echo
+            echo "Changes of 5% or more:"
+            echo
+            echo '```'
+            critcmp -t 5 base head || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
