@@ -11,20 +11,31 @@ use bytes::Bytes;
 
 use crate::error::{InvalidHeaderValue, InvalidHeaderValueKind};
 
-/// A generic SIP header field value as defined by RFC 3261.
+/// A SIP header field value.
 ///
-/// This type models the generic `header-value` production from RFC 3261,
-/// Section 25.1:
+/// One type holds the value of every header field, so it cannot check a
+/// value against the grammar of its field. It accepts the same bytes as
+/// [`siparse`], which cover every field's grammar in RFC 3261 section 25.1.
+/// The generic `header-value` production allows no ASCII controls besides
+/// `HTAB` in folds and whitespace:
 ///
 /// ```text
 /// header-value = *(TEXT-UTF8char / UTF8-CONT / LWS)
 /// ```
 ///
-/// This type intentionally validates only the *generic* header field value
-/// grammar. It does not attempt to enforce the grammar or semantics of
-/// specific header fields such as `Subject`, `From`, `To`, `Warning`,
-/// `Contact`, and so on. Those checks belong in higher-level typed header
-/// parsers.
+/// But the `quoted-string` and `comment` productions in fields such as
+/// `From`, `Contact`, and `Authorization` also allow a `quoted-pair`, which
+/// can escape any ASCII control except `CR` and `LF`:
+///
+/// ```text
+/// quoted-pair = "\" (%x00-09 / %x0B-0C / %x0E-7F)
+/// ```
+///
+/// So this type also accepts such a control right after an odd run of
+/// backslashes, in any field. Checking that it sits in a quoted string or
+/// comment that the field allows is left to typed header parsers, along with
+/// the rest of each field's grammar. Matching `siparse` means that any value
+/// received in a parsed head can be built here too.
 ///
 /// The value is stored exactly as given, including folds (`CRLF` followed by
 /// `SP` or `HTAB`) and leading or trailing whitespace. This matches what
@@ -74,36 +85,27 @@ impl HeaderValue {
 
     /// Attempts to create a new `HeaderValue` from raw bytes.
     ///
-    /// Validation follows RFC 3261's generic `header-value` production:
+    /// This accepts:
     ///
-    /// ```text
-    /// header-value = *(TEXT-UTF8char / UTF8-CONT / LWS)
-    /// ```
+    /// * printable ASCII (`0x20..=0x7E`) and `HTAB`;
+    /// * folds of the form `CRLF 1*(SP / HTAB)`;
+    /// * other ASCII controls and `DEL`, except `CR` and `LF`, right after an
+    ///   odd run of backslashes, as in a `quoted-pair`;
+    /// * modern UTF-8.
     ///
-    /// More concretely, this constructor accepts:
+    /// It rejects:
     ///
-    /// * visible ASCII octets in `0x21..=0x7E` except where otherwise rejected
-    ///   below;
-    /// * `SP` and `HTAB` as linear whitespace;
-    /// * folded linear whitespace of the form `CRLF 1*(SP / HTAB)`;
-    /// * non-ASCII octets that participate in a well-formed UTF-8 sequence.
-    ///
-    /// This constructor rejects:
-    ///
-    /// * bare `CR` or bare `LF`;
-    /// * `CRLF` not followed by at least one `SP` or `HTAB`;
-    /// * `NUL` and other control octets except `HTAB`, `CR`, and `LF` where
-    ///   `CRLF 1*(SP / HTAB)` forms a valid fold;
-    /// * `DEL` (`0x7F`);
-    /// * `0xFE` and `0xFF`;
-    /// * any byte sequence that is not valid UTF-8.
+    /// * bare `CR` or bare `LF`, even after a backslash;
+    /// * `CRLF` not followed by `SP` or `HTAB`;
+    /// * any other ASCII control or `DEL`;
+    /// * bytes that are not valid UTF-8.
     ///
     /// The bytes are stored as given, folds included.
     ///
     /// # Errors
     ///
-    /// Returns [`InvalidHeaderValue`] when `src` is not a valid generic SIP
-    /// header field value.
+    /// Returns [`InvalidHeaderValue`] if `src` contains a byte or sequence
+    /// that this rejects.
     pub fn from_bytes(src: &[u8]) -> Result<HeaderValue, InvalidHeaderValue> {
         validate(src)?;
 
@@ -352,7 +354,7 @@ impl TryFrom<&str> for HeaderValue {
     }
 }
 
-/// Validates the generic SIP `header-value` grammar, including UTF-8.
+/// Validates a header field value, including UTF-8.
 fn validate(src: &[u8]) -> Result<(), InvalidHeaderValue> {
     if let Err(kind) = check_bytes(src) {
         return Err(InvalidHeaderValue::new(kind));
@@ -367,15 +369,26 @@ fn validate(src: &[u8]) -> Result<(), InvalidHeaderValue> {
     Ok(())
 }
 
-/// Checks the byte-level rules of the generic SIP `header-value` grammar.
+// TODO: Switch to `siparse`'s public header value check once it exists, so
+// the rules live in one place. It is planned together with the other shared
+// checks before signa 0.1.0.
+//
+/// Checks the byte-level rules of a header field value.
 ///
 /// This leaves UTF-8 validation to the caller so that it can run in `const`
 /// contexts, where the input is a `str` that is already valid UTF-8.
 const fn check_bytes(src: &[u8]) -> Result<(), InvalidHeaderValueKind> {
     let mut i = 0;
+    // Whether the bytes just before `i` end in an odd run of backslashes.
+    // A pair consumes its backslash, so `\\` escapes nothing.
+    let mut escaped = false;
 
     while i < src.len() {
-        match src[i] {
+        let byte = src[i];
+        let was_escaped = escaped;
+        escaped = byte == b'\\' && !was_escaped;
+
+        match byte {
             b'\r' => {
                 if i + 1 >= src.len() || src[i + 1] != b'\n' {
                     return Err(InvalidHeaderValueKind::BareCr);
@@ -389,13 +402,23 @@ const fn check_bytes(src: &[u8]) -> Result<(), InvalidHeaderValueKind> {
 
             b'\n' => return Err(InvalidHeaderValueKind::BareLf),
 
-            byte @ (b'\0'..=b'\x08'
+            b'\0'..=b'\x08'
+            | b'\x0B'
+            | b'\x0C'
+            | b'\x0E'..=b'\x1F'
+            | b'\x7F'
+                if was_escaped =>
+            {
+                i += 1;
+            }
+
+            b'\0'..=b'\x08'
             | b'\x0B'
             | b'\x0C'
             | b'\x0E'..=b'\x1F'
             | b'\x7F'
             | b'\xFE'
-            | b'\xFF') => return Err(InvalidHeaderValueKind::Byte(byte)),
+            | b'\xFF' => return Err(InvalidHeaderValueKind::Byte(byte)),
 
             _ => i += 1,
         }
@@ -513,6 +536,100 @@ mod tests {
 
         let err = HeaderValue::from_bytes(&[0x7f]).unwrap_err();
         assert_eq!(err.to_string(), "invalid byte 0x7F in SIP header value");
+    }
+
+    #[test]
+    fn from_bytes_accepts_controls_after_an_odd_backslash_run() {
+        let value = HeaderValue::from_bytes(
+            b"\"Bob\\\x01\" <sip:bob@biloxi.example.com>",
+        )
+        .unwrap();
+        assert_eq!(
+            value.as_bytes(),
+            b"\"Bob\\\x01\" <sip:bob@biloxi.example.com>"
+        );
+
+        HeaderValue::from_bytes(b"a\\\\\\\x7f").unwrap();
+
+        let err = HeaderValue::from_bytes(b"a\\\\\x01").unwrap_err();
+        assert_eq!(err.to_string(), "invalid byte 0x01 in SIP header value");
+
+        // A pair consumes the control too, so it cannot escape what follows.
+        let err = HeaderValue::from_bytes(b"a\\\x01\x01").unwrap_err();
+        assert_eq!(err.to_string(), "invalid byte 0x01 in SIP header value");
+    }
+
+    #[test]
+    fn backslash_does_not_escape_cr_or_lf() {
+        let err = HeaderValue::from_bytes(b"a\\\rb").unwrap_err();
+        assert_eq!(err.to_string(), "bare CR in SIP header value");
+
+        let err = HeaderValue::from_bytes(b"a\\\nb").unwrap_err();
+        assert_eq!(err.to_string(), "bare LF in SIP header value");
+
+        HeaderValue::from_bytes(b"a\\\r\n b").unwrap();
+    }
+
+    #[test]
+    fn from_static_accepts_escaped_controls() {
+        const VALUE: HeaderValue = HeaderValue::from_static("\"a\\\x00\"");
+
+        assert_eq!(VALUE.as_bytes(), b"\"a\\\x00\"");
+    }
+
+    /// Returns whether `siparse` accepts `value` as a header field value.
+    fn siparse_accepts(value: &[u8]) -> bool {
+        let mut head =
+            b"OPTIONS sip:carol@chicago.example.com SIP/2.0\r\nX: ".to_vec();
+        head.extend_from_slice(value);
+        head.extend_from_slice(b"\r\n\r\n");
+
+        let mut headers = siparse::HeaderBuf::<1>::new();
+        let mut request = siparse::RequestHead::new(&mut headers);
+        matches!(request.parse(&head), Ok(siparse::Status::Complete(_)))
+    }
+
+    // Any value that `siparse` accepts in a header row must be accepted here,
+    // and the reverse, so received heads can be rebuilt. Each value starts
+    // and ends with a visible character because `siparse` strips leading
+    // whitespace as part of the separator.
+    #[test]
+    fn agrees_with_siparse_for_every_byte_and_backslash_run() {
+        for byte in 0..=255u8 {
+            for backslashes in 0..=4 {
+                let mut value = vec![b'a'];
+                value.resize(1 + backslashes, b'\\');
+                value.extend([byte, b'z']);
+                assert_eq!(
+                    HeaderValue::from_bytes(&value).is_ok(),
+                    siparse_accepts(&value),
+                    "{value:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn agrees_with_siparse_on_folds_and_utf8() {
+        for value in [
+            &b"a\r\n b"[..],
+            b"a\r\n\tb",
+            b"a\\\r\n b",
+            b"a\\\x00\r\n \\\x00b",
+            b"a\r\nb",
+            b"a\rb",
+            "a\\é".as_bytes(),
+            "話し中".as_bytes(),
+            b"a\\\xc3",
+            b"a\\\xff",
+            b"\xed\xa0\x80",
+        ] {
+            assert_eq!(
+                HeaderValue::from_bytes(value).is_ok(),
+                siparse_accepts(value),
+                "{value:?}"
+            );
+        }
     }
 
     #[test]
