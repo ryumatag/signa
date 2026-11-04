@@ -178,16 +178,14 @@ invalid_errors! {
     InvalidHeaderName => HeaderName, "invalid SIP header name";
 }
 
-/// Represents an invalid header field value.
+/// An error returned when parsing an invalid SIP header field value.
 ///
-/// This is an error returned when constructing a [`HeaderValue`] from bytes
-/// or text. Its `Display` output says what was wrong with the value.
+/// Unlike the other errors in this module, its `Display` output says what
+/// was wrong with the value.
 ///
 /// The error deliberately does not keep the rejected value. Header values can
 /// carry credentials, such as `Authorization`, and an error is easy to log by
 /// accident. Not keeping the value also avoids allocating on the error path.
-///
-/// [`HeaderValue`]: crate::HeaderValue
 pub struct InvalidHeaderValue {
     kind: InvalidHeaderValueKind,
 }
