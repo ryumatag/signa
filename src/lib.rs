@@ -18,6 +18,7 @@ WORK IN PROGRESS.
 mod extensions;
 pub mod header;
 mod method;
+mod reason;
 mod status;
 mod uri;
 mod util;
@@ -31,6 +32,7 @@ pub use self::{
         InvalidHeaderValue,
     },
     method::{InvalidMethod, Method},
+    reason::{InvalidReasonPhrase, ReasonPhrase},
     status::{InvalidStatusCode, StatusCode},
     uri::{InvalidUri, Uri},
     version::Version,
