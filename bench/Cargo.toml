@@ -1,0 +1,26 @@
+[package]
+publish = false
+name = "signa-bench"
+version = "0.0.1"
+authors = ["Ryuma Taguchi <ryumatag@gmail.com>"]
+description = "Criterion benchmark suite for the signa crate."
+license = "MIT OR Apache-2.0"
+edition = "2021"
+
+[workspace]
+
+[[bench]]
+name = "signa-bench"
+harness = false
+path = "src/bench.rs"
+
+[dependencies]
+bytes = "1.12.1"
+criterion = { version = "0.8.2", default-features = false }
+signa = { path = ".." }
+
+[profile.release]
+debug = true
+
+[profile.bench]
+debug = true
