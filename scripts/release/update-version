@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=common.sh
+source "$(dirname -- "$0")/common.sh"
+[[ $# == 1 ]] || die "Usage: $(basename "$0") <version>"
+version="$1"
+validate_version "$version"
+
+# I avoid sed -i because its syntax differs between macOS and Linux.
+# Only replace the [package] version so dependency versions stay untouched.
+manifest_tmp="$(mktemp Cargo.toml.XXXXXX)"
+trap 'rm -f -- "$manifest_tmp"' EXIT
+awk -v version="$version" '
+  /^\[/ { package = ($0 == "[package]") }
+  package && /^version = "/ {
+    $0 = "version = \"" version "\""
+    count++
+  }
+  { print }
+  END { if (count != 1) exit 1 }
+' Cargo.toml > "$manifest_tmp"
+cat "$manifest_tmp" > Cargo.toml
+
+printf 'Updated signa to %s\n' "$version"

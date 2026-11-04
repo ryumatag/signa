@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=common.sh
+source "$(dirname -- "$0")/common.sh"
+[[ $# == 0 ]] || die "Usage: $(basename "$0")"
+require_clean
+
+version="$(current_version)"
+validate_version "$version"
+
+# Make sure HEAD matches origin/main before pushing the release tag.
+# GitHub Actions handles the crates.io upload through Trusted Publishing.
+git fetch origin refs/heads/main:refs/remotes/origin/main
+[[ "$(git rev-parse HEAD)" == "$(git rev-parse refs/remotes/origin/main)" ]] \
+  || die 'HEAD must match origin/main. Merge and update the checkout first.'
+
+if git show-ref --verify --quiet "refs/tags/$version"; then
+  # If the push failed last time, reuse the tag as long as it's annotated
+  # and still points to this commit.
+  [[ "$(git cat-file -t "refs/tags/$version")" == tag ]] \
+    || die "tag $version must be annotated"
+  [[ "$(git rev-parse "refs/tags/$version^{commit}")" == "$(git rev-parse HEAD)" ]] \
+    || die "tag $version points to a different commit"
+else
+  git tag -s "$version" -m "$version"
+fi
+git push origin "refs/tags/$version"
+printf 'Pushed %s. Follow the publish workflow on GitHub Actions.\n' "$version"
