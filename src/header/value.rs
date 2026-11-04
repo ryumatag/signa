@@ -44,13 +44,13 @@ pub struct HeaderValue {
 /// Represents an invalid header field value.
 ///
 /// This is an error returned when constructing a [`HeaderValue`] from bytes
-/// or text.
+/// or text. Its `Display` output says what was wrong with the value.
 ///
-/// The original rejected octets are retained for diagnostics.
+/// The error deliberately does not keep the rejected value. Header values can
+/// carry credentials, such as `Authorization`, and an error is easy to log by
+/// accident. Not keeping the value also avoids allocating on the error path.
 pub struct InvalidHeaderValue {
-    raw: Bytes,
     kind: InvalidHeaderValueKind,
-    _priv: (),
 }
 
 impl HeaderValue {
@@ -255,7 +255,7 @@ impl fmt::Debug for HeaderValue {
         if self.is_sensitive {
             return f.write_str("\"<sensitive>\"");
         }
-        fmt::Debug::fmt(bstr::BStr::new(self.as_ref()), f)
+        fmt::Debug::fmt(self.as_str(), f)
     }
 }
 
@@ -364,29 +364,14 @@ enum InvalidHeaderValueKind {
 }
 
 impl InvalidHeaderValue {
-    fn new(raw: &[u8], kind: InvalidHeaderValueKind) -> InvalidHeaderValue {
-        InvalidHeaderValue {
-            raw: Bytes::copy_from_slice(raw),
-            kind,
-            _priv: (),
-        }
-    }
-
-    /// Returns the rejected raw bytes.
-    pub fn as_bytes(&self) -> &[u8] {
-        self.as_ref()
-    }
-}
-
-impl AsRef<[u8]> for InvalidHeaderValue {
-    fn as_ref(&self) -> &[u8] {
-        self.raw.as_ref()
+    const fn new(kind: InvalidHeaderValueKind) -> InvalidHeaderValue {
+        InvalidHeaderValue { kind }
     }
 }
 
 impl fmt::Debug for InvalidHeaderValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(bstr::BStr::new(self.as_ref()), f)
+        f.debug_struct("InvalidHeaderValue").field("kind", &self.kind).finish()
     }
 }
 
@@ -417,14 +402,13 @@ impl std::error::Error for InvalidHeaderValue {}
 /// Validates the generic SIP `header-value` grammar, including UTF-8.
 fn validate(src: &[u8]) -> Result<(), InvalidHeaderValue> {
     if let Err(kind) = check_bytes(src) {
-        return Err(InvalidHeaderValue::new(src, kind));
+        return Err(InvalidHeaderValue::new(kind));
     }
 
     if let Err(err) = str::from_utf8(src) {
-        return Err(InvalidHeaderValue::new(
-            src,
-            InvalidHeaderValueKind::Utf8(err),
-        ));
+        return Err(InvalidHeaderValue::new(InvalidHeaderValueKind::Utf8(
+            err,
+        )));
     }
 
     Ok(())
@@ -636,6 +620,21 @@ mod tests {
         let err = HeaderValue::from_bytes(b"\r").unwrap_err();
 
         assert_eq!(err.to_string(), "bare CR in SIP header value");
-        assert_eq!(format!("{err:?}"), "\"\\r\"");
+        assert_eq!(format!("{err:?}"), "InvalidHeaderValue { kind: BareCr }");
+    }
+
+    #[test]
+    fn invalid_header_value_does_not_reveal_the_value() {
+        let err = HeaderValue::from_bytes(b"Digest response=\"s3cr3t\"\0")
+            .unwrap_err();
+
+        assert!(!format!("{err:?}").contains("s3cr3t"));
+        assert!(!err.to_string().contains("s3cr3t"));
+    }
+
+    #[test]
+    fn debug_escapes_folds() {
+        let value = HeaderValue::from_static("a\r\n b");
+        assert_eq!(format!("{value:?}"), "\"a\\r\\n b\"");
     }
 }
