@@ -3,10 +3,11 @@ use std::{
     cmp::Ordering,
     fmt,
     hash::{Hash, Hasher},
+    iter::FusedIterator,
     str::{self, FromStr},
 };
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 
 /// A generic SIP header field value as defined by RFC 3261.
 ///
@@ -23,23 +24,17 @@ use bytes::{Bytes, BytesMut};
 /// `Contact`, and so on. Those checks belong in higher-level typed header
 /// parsers.
 ///
-/// In particular, this type:
+/// The value is stored exactly as given, including folds (`CRLF` followed by
+/// `SP` or `HTAB`) and leading or trailing whitespace. This matches what
+/// [`siparse`] returns for a parsed head, so a received value can be kept as
+/// it arrived without copying or rewriting it. [`HeaderValue::lines`] splits
+/// the value at its folds for consumers that need the unfolded text.
 ///
-/// * validates the generic byte-level `header-value` grammar;
-/// * accepts valid folded linear whitespace (`LWS`);
-/// * rejects invalid UTF-8 byte sequences;
-/// * unfolds any folded `LWS` to a single `SP` during construction;
-/// * always stores an unfolded, interpretation-ready generic header value;
-/// * preserves leading and trailing whitespace exactly as provided.
+/// I keep folds instead of unfolding at construction because unfolding has to
+/// allocate. That would rule out a `const` [`HeaderValue::from_static`] and
+/// zero-copy construction from a received buffer.
 ///
-/// Folded `LWS` is message syntax, not part of the stored semantic value.
-/// Accordingly, constructors accept `CRLF 1*(SP / HTAB)` but normalize it to a
-/// single `SP` before storing the value. The stored bytes are therefore always
-/// valid UTF-8 and always unfolded according to RFC 3261's generic
-/// `header-value` interpretation rules.
-///
-/// This layer does not trim or otherwise normalize leading or trailing
-/// whitespace, and it does not perform any field-specific parsing.
+/// [`siparse`]: https://docs.rs/siparse
 #[derive(Clone)]
 pub struct HeaderValue {
     raw: Bytes,
@@ -61,28 +56,30 @@ pub struct InvalidHeaderValue {
 impl HeaderValue {
     /// Creates a new `HeaderValue` from a static string.
     ///
-    /// The input must satisfy RFC 3261's generic `header-value` grammar.
-    /// Because the input is a Rust `&'static str`, it is already valid UTF-8;
-    /// this function only checks the SIP byte-level constraints.
+    /// The input must satisfy the same rules as [`HeaderValue::from_bytes`].
+    /// A `&'static str` is already valid UTF-8, so only the byte-level rules
+    /// are checked. This makes the function usable in `const` contexts.
     ///
-    /// Valid folded `LWS` is accepted, but any `CRLF 1*(SP / HTAB)` sequence is
-    /// normalized to a single `SP` before storage. Leading and trailing
-    /// whitespace are otherwise preserved as provided.
+    /// ```
+    /// use signa::HeaderValue;
+    ///
+    /// const APPLICATION_SDP: HeaderValue =
+    ///     HeaderValue::from_static("application/sdp");
+    ///
+    /// assert_eq!(APPLICATION_SDP, "application/sdp");
+    /// ```
     ///
     /// # Panics
     ///
     /// Panics if `src` contains bytes that are illegal in a generic SIP
-    /// header field value.
-    pub fn from_static(src: &'static str) -> HeaderValue {
+    /// header field value. In a `const` context this is a compile error.
+    pub const fn from_static(src: &'static str) -> HeaderValue {
         let bytes = src.as_bytes();
-        let Ok(first_fold) = validate(bytes) else {
+        if check_bytes(bytes).is_err() {
             panic!("invalid SIP header field value");
-        };
-
-        HeaderValue {
-            raw: unfold(Bytes::from_static(bytes), first_fold),
-            is_sensitive: false,
         }
+
+        HeaderValue { raw: Bytes::from_static(bytes), is_sensitive: false }
     }
 
     /// Attempts to create a new `HeaderValue` from raw bytes.
@@ -111,19 +108,17 @@ impl HeaderValue {
     /// * `0xFE` and `0xFF`;
     /// * any byte sequence that is not valid UTF-8.
     ///
-    /// Valid folded `LWS` is accepted, but any `CRLF 1*(SP / HTAB)` sequence
-    /// is normalized to a single `SP` before storage. Leading and trailing
-    /// whitespace are otherwise preserved as provided.
+    /// The bytes are stored as given, folds included.
     ///
     /// # Errors
     ///
     /// Returns [`InvalidHeaderValue`] when `src` is not a valid generic SIP
     /// header field value.
     pub fn from_bytes(src: &[u8]) -> Result<HeaderValue, InvalidHeaderValue> {
-        let first_fold = validate(src)?;
+        validate(src)?;
 
         Ok(HeaderValue {
-            raw: unfold(Bytes::copy_from_slice(src), first_fold),
+            raw: Bytes::copy_from_slice(src),
             is_sensitive: false,
         })
     }
@@ -167,26 +162,48 @@ impl HeaderValue {
     }
 
     fn from_shared(src: Bytes) -> Result<HeaderValue, InvalidHeaderValue> {
-        let first_fold = validate(src.as_ref())?;
-        Ok(HeaderValue { raw: unfold(src, first_fold), is_sensitive: false })
+        validate(src.as_ref())?;
+        Ok(HeaderValue { raw: src, is_sensitive: false })
     }
 
-    /// Returns the normalized bytes stored by this header field value.
-    ///
-    /// The returned bytes are always valid UTF-8 and always unfolded.
+    /// Returns the value as bytes, folds included.
     pub fn as_bytes(&self) -> &[u8] {
         self.as_ref()
     }
 
-    /// Returns the normalized textual representation of this header field
-    /// value.
+    /// Returns the value as a string slice, folds included.
     ///
-    /// Because construction validates UTF-8 and unfolds folded `LWS`, this
-    /// always succeeds and returns the stored unfolded representation.
+    /// Construction validates UTF-8, so this always succeeds.
     pub fn as_str(&self) -> &str {
-        // SAFETY: Every constructor validates UTF-8, and unfolding only
-        // replaces ASCII bytes with `SP`.
+        // SAFETY: `from_static` takes a `str`, and every other constructor
+        // checks the bytes with `validate`, which rejects invalid UTF-8.
         unsafe { str::from_utf8_unchecked(self.as_ref()) }
+    }
+
+    /// Returns the lines of the value, split at each fold.
+    ///
+    /// Each item is the text between two folds, without the `CRLF` and the
+    /// whitespace that starts the next line. [RFC 3261 section 7.3.1] treats
+    /// a fold as a single `SP`, so joining the items with one `SP` gives the
+    /// unfolded value. A value without folds yields itself as its only line.
+    ///
+    /// ```
+    /// use signa::HeaderValue;
+    ///
+    /// let subject = HeaderValue::from_static(
+    ///     "I know you're there,\r\n   pick up the phone",
+    /// );
+    ///
+    /// let lines: Vec<&str> = subject.lines().collect();
+    /// assert_eq!(lines, ["I know you're there,", "pick up the phone"]);
+    /// ```
+    ///
+    /// [RFC 3261 section 7.3.1]: https://www.rfc-editor.org/rfc/rfc3261#section-7.3.1
+    pub fn lines(&self) -> ValueLines<'_> {
+        // `siparse` already splits a value at its folds, and its `Header` can
+        // be built by hand, so this reuses that instead of a second copy.
+        let header = siparse::Header { name: "", value: self.as_str() };
+        ValueLines(header.value_lines())
     }
 
     /// Returns the length of this header field value in bytes.
@@ -209,6 +226,23 @@ impl HeaderValue {
         self.is_sensitive = yes;
     }
 }
+
+/// An iterator over the lines of a folded [`HeaderValue`].
+///
+/// This is created by [`HeaderValue::lines`].
+#[derive(Clone, Debug)]
+pub struct ValueLines<'a>(siparse::ValueLines<'a>);
+
+impl<'a> Iterator for ValueLines<'a> {
+    type Item = &'a str;
+
+    #[inline]
+    fn next(&mut self) -> Option<&'a str> {
+        self.0.next()
+    }
+}
+
+impl FusedIterator for ValueLines<'_> {}
 
 impl AsRef<[u8]> for HeaderValue {
     fn as_ref(&self) -> &[u8] {
@@ -380,66 +414,10 @@ impl fmt::Display for InvalidHeaderValue {
 
 impl std::error::Error for InvalidHeaderValue {}
 
-/// Validates the generic SIP `header-value` grammar.
-///
-/// On success, returns the byte index of the first folded `LWS` sequence, if
-/// any.
-fn validate(src: &[u8]) -> Result<Option<usize>, InvalidHeaderValue> {
-    let mut first_fold = None;
-    let mut i = 0;
-
-    while i < src.len() {
-        match src[i] {
-            b'\r' => {
-                if first_fold.is_none() {
-                    first_fold = Some(i);
-                }
-
-                if i + 2 >= src.len()
-                    || src[i + 1] != b'\n'
-                    || !is_wsp(src[i + 2])
-                {
-                    return Err(InvalidHeaderValue::new(
-                        src,
-                        if i + 1 >= src.len() || src[i + 1] != b'\n' {
-                            InvalidHeaderValueKind::BareCr
-                        } else {
-                            InvalidHeaderValueKind::MissingWspAfterCrLf
-                        },
-                    ));
-                }
-
-                i += 3;
-
-                while i < src.len() && is_wsp(src[i]) {
-                    i += 1;
-                }
-            }
-
-            b'\n' => {
-                return Err(InvalidHeaderValue::new(
-                    src,
-                    InvalidHeaderValueKind::BareLf,
-                ));
-            }
-
-            b'\0'..=b'\x08'
-            | b'\x0B'
-            | b'\x0C'
-            | b'\x0E'..=b'\x1F'
-            | b'\x7F'
-            | b'\xFE'
-            | b'\xFF' => {
-                return Err(InvalidHeaderValue::new(
-                    src,
-                    InvalidHeaderValueKind::Byte(src[i]),
-                ));
-            }
-
-            _ => {
-                i += 1;
-            }
-        }
+/// Validates the generic SIP `header-value` grammar, including UTF-8.
+fn validate(src: &[u8]) -> Result<(), InvalidHeaderValue> {
+    if let Err(kind) = check_bytes(src) {
+        return Err(InvalidHeaderValue::new(src, kind));
     }
 
     if let Err(err) = str::from_utf8(src) {
@@ -449,47 +427,44 @@ fn validate(src: &[u8]) -> Result<Option<usize>, InvalidHeaderValue> {
         ));
     }
 
-    Ok(first_fold)
+    Ok(())
 }
 
-fn unfold(mut src: Bytes, first_fold: Option<usize>) -> Bytes {
-    use bytes::{Buf, BufMut};
+/// Checks the byte-level rules of the generic SIP `header-value` grammar.
+///
+/// This leaves UTF-8 validation to the caller so that it can run in `const`
+/// contexts, where the input is a `str` that is already valid UTF-8.
+const fn check_bytes(src: &[u8]) -> Result<(), InvalidHeaderValueKind> {
+    let mut i = 0;
 
-    let Some(i) = first_fold else { return src };
-    let mut unfolded = BytesMut::with_capacity(src.len());
-
-    unfolded.extend_from_slice(&src[..i]);
-    src.advance(i);
-
-    while src.has_remaining() {
-        let b = src.get_u8();
-
-        if b == b'\r' {
-            if cfg!(debug_assertions) {
-                let chunk = src.chunk();
-
-                assert!(chunk.len() >= 2);
-                assert_eq!(chunk[0], b'\n');
-                assert!(is_wsp(chunk[1]));
-            }
-
-            unfolded.put_u8(b' ');
-
-            src.advance(2);
-
-            while let Some(&byte) = src.chunk().first() {
-                if !is_wsp(byte) {
-                    break;
+    while i < src.len() {
+        match src[i] {
+            b'\r' => {
+                if i + 1 >= src.len() || src[i + 1] != b'\n' {
+                    return Err(InvalidHeaderValueKind::BareCr);
+                }
+                if i + 2 >= src.len() || !is_wsp(src[i + 2]) {
+                    return Err(InvalidHeaderValueKind::MissingWspAfterCrLf);
                 }
 
-                src.advance(1);
+                i += 3;
             }
-        } else {
-            unfolded.put_u8(b);
+
+            b'\n' => return Err(InvalidHeaderValueKind::BareLf),
+
+            byte @ (b'\0'..=b'\x08'
+            | b'\x0B'
+            | b'\x0C'
+            | b'\x0E'..=b'\x1F'
+            | b'\x7F'
+            | b'\xFE'
+            | b'\xFF') => return Err(InvalidHeaderValueKind::Byte(byte)),
+
+            _ => i += 1,
         }
     }
 
-    unfolded.freeze()
+    Ok(())
 }
 
 const fn is_wsp(byte: u8) -> bool {
@@ -512,28 +487,43 @@ mod tests {
     }
 
     #[test]
-    fn from_bytes_unfolds_folded_lws_to_single_space() {
+    fn from_bytes_keeps_folds() {
         let value = HeaderValue::from_bytes(b"folded\r\n\t value").unwrap();
 
-        assert_eq!(value.as_bytes(), b"folded value");
-        assert_eq!(value.as_str(), "folded value");
+        assert_eq!(value.as_bytes(), b"folded\r\n\t value");
+        assert_eq!(value.as_str(), "folded\r\n\t value");
     }
 
     #[test]
-    fn from_static_unfolds_folded_lws_to_single_space() {
-        let value = HeaderValue::from_static("folded\r\n more");
+    fn from_static_keeps_folds() {
+        const VALUE: HeaderValue = HeaderValue::from_static("folded\r\n more");
 
-        assert_eq!(value.as_bytes(), b"folded more");
-        assert_eq!(value.as_str(), "folded more");
+        assert_eq!(VALUE.as_str(), "folded\r\n more");
     }
 
     #[test]
-    fn from_bytes_unfolds_multiple_folded_segments() {
+    #[should_panic(expected = "invalid SIP header field value")]
+    fn from_static_rejects_invalid_values() {
+        let _ = HeaderValue::from_static("bare\nlf");
+    }
+
+    #[test]
+    fn lines_split_at_folds() {
         let value =
-            HeaderValue::from_bytes(b"value\r\n more\r\n\tparts").unwrap();
+            HeaderValue::from_bytes(b"value \r\n more\r\n\t parts").unwrap();
 
-        assert_eq!(value.as_bytes(), b"value more parts");
-        assert_eq!(value.as_str(), "value more parts");
+        // Whitespace before a fold stays at the end of its line.
+        let lines: Vec<&str> = value.lines().collect();
+        assert_eq!(lines, ["value ", "more", "parts"]);
+    }
+
+    #[test]
+    fn lines_of_unfolded_values() {
+        let value = HeaderValue::from_static("no folds");
+        assert_eq!(value.lines().collect::<Vec<_>>(), ["no folds"]);
+
+        let empty = HeaderValue::from_static("");
+        assert_eq!(empty.lines().collect::<Vec<_>>(), [""]);
     }
 
     #[test]
@@ -545,11 +535,11 @@ mod tests {
     }
 
     #[test]
-    fn from_bytes_accepts_fold_that_normalizes_to_trailing_space() {
+    fn from_bytes_accepts_trailing_fold() {
         let value = HeaderValue::from_bytes(b"value\r\n ").unwrap();
 
-        assert_eq!(value.as_bytes(), b"value ");
-        assert_eq!(value.as_str(), "value ");
+        assert_eq!(value.as_bytes(), b"value\r\n ");
+        assert_eq!(value.lines().collect::<Vec<_>>(), ["value", ""]);
     }
 
     #[test]

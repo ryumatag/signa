@@ -7,5 +7,5 @@ mod value;
 
 pub use self::{
     name::{konst::*, HeaderName, InvalidHeaderName},
-    value::{HeaderValue, InvalidHeaderValue},
+    value::{HeaderValue, InvalidHeaderValue, ValueLines},
 };
