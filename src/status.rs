@@ -182,6 +182,14 @@ impl From<StatusCode> for u16 {
     }
 }
 
+impl TryFrom<u16> for StatusCode {
+    type Error = InvalidStatusCode;
+
+    fn try_from(src: u16) -> Result<Self, Self::Error> {
+        StatusCode::from_u16(src)
+    }
+}
+
 impl TryFrom<&[u8]> for StatusCode {
     type Error = InvalidStatusCode;
 

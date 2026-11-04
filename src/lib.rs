@@ -15,10 +15,13 @@ WORK IN PROGRESS.
 )]
 #![warn(missing_docs, missing_debug_implementations)]
 
+mod error;
 mod extensions;
 pub mod header;
 mod method;
 mod reason;
+pub mod request;
+pub mod response;
 mod status;
 mod uri;
 mod util;
@@ -26,6 +29,7 @@ mod version;
 
 #[doc(inline)]
 pub use self::{
+    error::Error,
     extensions::Extensions,
     header::{
         HeaderMap, HeaderName, HeaderValue, InvalidHeaderName,
@@ -33,6 +37,8 @@ pub use self::{
     },
     method::{InvalidMethod, Method},
     reason::{InvalidReasonPhrase, ReasonPhrase},
+    request::Request,
+    response::Response,
     status::{InvalidStatusCode, StatusCode},
     uri::{InvalidUri, Uri},
     version::Version,
