@@ -41,6 +41,20 @@ jobs:
       - name: Test
         run: cargo test --verbose
 
+  # Runs every benchmark once and checks its assertions, so a change that
+  # breaks a benchmark fails here instead of in a later comparison.
+  test-bench:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - name: Run benchmark tests
+        run: cargo bench --manifest-path bench/Cargo.toml -- --test
+
   clippy:
     runs-on: ubuntu-latest
     steps:
@@ -54,6 +68,7 @@ jobs:
       - name: Run clippy
         run: |
           cargo clippy --all-targets -- -D warnings
+          cargo clippy --manifest-path bench/Cargo.toml --all-targets -- -D warnings
 
   rustfmt:
     name: rustfmt
@@ -69,6 +84,7 @@ jobs:
       - name: Check formatting
         run: |
           cargo fmt -- --check
+          cargo fmt --manifest-path bench/Cargo.toml -- --check
 
   rustdoc:
     runs-on: ubuntu-latest
