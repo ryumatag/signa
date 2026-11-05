@@ -11,11 +11,15 @@ pub use self::as_header_name::AsHeaderName;
 /// A name may appear in several rows. [`HeaderMap::get_all`] returns their
 /// values in order, which matters for fields such as `Via` and `Route`.
 ///
+/// # Order
+///
 /// [RFC 3261 section 7.3.1] only gives meaning to the relative order of rows
 /// with the same name. I still keep the order across names because a message
 /// that is forwarded or logged should look like the one received, and because
 /// the RFC recommends putting fields that proxies need, such as `Via` and
 /// `Route`, near the top.
+///
+/// # Lookups
 ///
 /// Lookups scan the rows, so they take time linear in the number of rows.
 /// A SIP head has few rows, and comparing two standard header names is a
@@ -25,6 +29,8 @@ pub use self::as_header_name::AsHeaderName;
 ///
 /// Header names compare as [`HeaderName`] does. Lookups are therefore
 /// case-insensitive, and a compact form such as `v` finds `Via` rows.
+///
+/// # Example
 ///
 /// ```
 /// use signa::header::{HeaderMap, HeaderValue, CALL_ID, VIA};
@@ -38,6 +44,8 @@ pub use self::as_header_name::AsHeaderName;
 /// assert_eq!(vias, ["SIP/2.0/UDP a.example.com", "SIP/2.0/UDP b.example.com"]);
 /// assert_eq!(headers.get("call-id").unwrap(), "a84b4c76e66710");
 /// ```
+///
+/// # Equality
 ///
 /// `HeaderMap` does not implement `PartialEq`. Exact row order is stricter
 /// than SIP's notion of equivalent headers, while comparing per name would
@@ -165,6 +173,8 @@ impl HeaderMap {
     /// new row is added at the end, as [`HeaderMap::append`] does, since
     /// SIP gives no meaning to the order across names. Returns `true` if
     /// rows with `name` already existed.
+    ///
+    /// # Example
     ///
     /// ```
     /// use signa::header::{HeaderMap, HeaderValue, MAX_FORWARDS, VIA};

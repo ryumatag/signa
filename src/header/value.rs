@@ -13,6 +13,8 @@ use crate::error::InvalidHeaderValue;
 
 /// A SIP header field value.
 ///
+/// # Accepted bytes
+///
 /// One type holds the value of every header field, so it cannot check a value
 /// against the grammar of its field. It accepts the same bytes as [siparse],
 /// which cover every field's grammar in RFC 3261 section 25.1. The generic
@@ -36,6 +38,8 @@ use crate::error::InvalidHeaderValue;
 /// comment that the field allows is left to typed header parsers, along with
 /// the rest of each field's grammar. Matching siparse means that any value
 /// received in a parsed head can be built here too.
+///
+/// # Storage
 ///
 /// The value is stored exactly as given, including folds (`CRLF` followed by
 /// `SP` or `HTAB`) and leading or trailing whitespace. This matches what

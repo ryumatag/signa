@@ -52,6 +52,8 @@ impl Hasher for IdHasher {
 /// this to pass along data that is not part of the message itself, such as
 /// where it was received from.
 ///
+/// # Example
+///
 /// ```
 /// use signa::Extensions;
 ///

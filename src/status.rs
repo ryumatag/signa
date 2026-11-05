@@ -17,6 +17,8 @@ use crate::error::InvalidStatusCode;
 /// This type stores only the numeric status code. The reason phrase from a SIP
 /// status line is not part of this type.
 ///
+/// # Range
+///
 /// This implementation currently supports SIP response codes in the range
 /// `100..=699`. The first digit determines the response class.
 ///

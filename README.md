@@ -12,45 +12,58 @@ A fast and correct low-level SIP library in Rust.
 
 <br>
 
-signa aims to do for SIP roughly what `hyper` does for HTTP. It will carry
-messages over UDP and TCP, run the RFC 3261 transactions, and hand requests to
-application code through a Tower `Service`. Its design draws heavily on the
-[`http`] and [`hyper`] crates.
+signa does for SIP roughly what `hyper` does for HTTP. It carries messages over
+UDP and TCP, runs the RFC 3261 transactions, and hands requests to application
+code through a Tower `Service`. Its design draws heavily on the [`http`] and
+[`hyper`] crates.
 
-The current release provides the message layer. It has request and response
-types modeled on the `http` crate, parses one complete message from bytes with
-[siparse], and encodes messages back to bytes. It does not frame streams, do
-I/O, or run transactions yet. Those are planned for the next releases.
+The current release has request and response types modeled on the `http` crate,
+parsing with [siparse] and encoding, and an endpoint that carries messages over
+UDP and TCP, runs the non-INVITE transactions, and serves requests through a
+Tower `Service`. Its client sends requests to one next hop and is a `Service`
+too. INVITE, ACK, and CANCEL transactions are planned for the next release, and
+TLS, next-hop selection, and graceful shutdown are later work. The
+[crate docs] say what is covered in detail.
 
 [`http`]: https://docs.rs/http
 [`hyper`]: https://docs.rs/hyper
 [siparse]: https://docs.rs/siparse
+[crate docs]: https://docs.rs/signa
 
 ### Example
 
+A UAS that answers every request with a 200:
+
 ```rust
+use std::convert::Infallible;
+
 use bytes::Bytes;
-use signa::{header::CALL_ID, Message, Method};
+use signa::{endpoint::Endpoint, Request, Response, StatusCode};
 
-let datagram = Bytes::from_static(
-    b"OPTIONS sip:carol@chicago.example.com SIP/2.0\r\n\
-      Via: SIP/2.0/UDP pc33.atlanta.example.com;branch=z9hG4bKhjhs8ass877\r\n\
-      Call-ID: a84b4c76e66710\r\n\
-      Content-Length: 0\r\n\
-      \r\n",
-);
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    let endpoint = Endpoint::builder()
+        .udp("0.0.0.0:5060".parse().unwrap())
+        .tcp("0.0.0.0:5060".parse().unwrap())
+        .serve(tower::service_fn(|request: Request<Bytes>| async move {
+            // The response carries the header fields the endpoint routes
+            // it by, copied from the request.
+            let response = Response::reply_to(&request)
+                .status(StatusCode::OK)
+                .body(Bytes::new())
+                .expect("the status is set");
+            Ok::<_, Infallible>(response)
+        }))?;
 
-let Message::Request(request) = Message::from_shared(datagram)? else {
-    return Ok(());
-};
-assert_eq!(request.method(), Method::OPTIONS);
-assert_eq!(request.headers().get(CALL_ID).unwrap(), "a84b4c76e66710");
-
-// Encoding writes the start-line and header values as stored. Header
-// names come out in their long form, and `Content-Length` is computed
-// from the body.
-assert!(request.to_bytes().starts_with(b"OPTIONS sip:carol@"));
+    // The endpoint runs as long as a handle to it exists.
+    std::future::pending::<()>().await;
+    drop(endpoint);
+    Ok(())
+}
 ```
+
+`examples/options.rs` has both sides, a server and a client that sends it an
+`OPTIONS` over UDP and over TCP.
 
 ### License
 

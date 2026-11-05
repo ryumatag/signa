@@ -1,12 +1,10 @@
 /*!
-signa is a fast and correct low-level SIP library. It aims to do for SIP
-roughly what `hyper` does for HTTP. It will carry messages over UDP and TCP,
-run the RFC 3261 transactions, and hand requests to application code through a
-[Tower] `Service`. Its design draws heavily on the [`http`] and [`hyper`]
-crates.
+signa is a fast and correct low-level SIP library.
 
-This release provides the message layer that the rest will build on. It does
-not do any I/O yet.
+It does for SIP roughly what `hyper` does for HTTP. It carries messages over
+UDP and TCP, runs the RFC 3261 transactions, and hands requests to application
+code through a [Tower] `Service`. Its design draws heavily on the [`http`] and
+[`hyper`] crates.
 
 # What this release covers
 
@@ -21,30 +19,45 @@ not do any I/O yet.
   stored. Header names come out in their long form, and `Content-Length` is
   always computed from the body. A response without a reason phrase gets the
   standard one for its code.
+* An `Endpoint` that carries messages over UDP and TCP, splits TCP streams into
+  messages by `Content-Length` and answers RFC 5626 keepalives, runs the
+  non-INVITE client and server transactions of RFC 3261 section 17 as updated
+  by RFC 4320, and hands each request to a Tower `Service`. Its `Client` sends
+  requests to one next hop and is a `Service` too, so Tower middleware fits on
+  both sides. Both live in the `endpoint` module.
 
 # What it does not cover yet
 
-Parsing takes exactly one message, such as one UDP datagram. Nothing here
-splits a TCP stream into messages, sends or receives anything, or runs
-transactions. I plan stream framing, UDP and TCP I/O, non-INVITE transactions,
-and the `Service` boundary for 0.2.0, and INVITE, ACK, and CANCEL transactions
-for 0.3.0.
+* INVITE, ACK, and CANCEL transactions, and with them provisional responses
+  other than the 100 the endpoint sends itself. An INVITE gets a 501 and a
+  CANCEL a 481. They are planned for 0.3.0, with RFC 6026.
+* Choosing a next hop. RFC 3263 resolution, and the structured view of a
+  [`Uri`] it needs, belong to a layer above, which holds one `Client` per hop.
+* TLS, and anything that would make `sips:` mean what it says.
+* Graceful shutdown. Dropping the last handle to an endpoint stops it at once.
+* Dialogs, registration, proxying, and the rest of what an application does
+  with messages. Those belong in crates built on signa.
 
-The `tokio` feature, on by default, pulls in tokio for the [`endpoint`], which
-carries messages over UDP and TCP, runs non-INVITE transactions, and serves
-requests through a Tower `Service`. With `default-features = false` only the
-message layer is built.
+# Features
 
-# Example
+The `tokio` feature, on by default, pulls in tokio for the `endpoint` module.
+With `default-features = false` only the message layer is built, and the
+examples below that use the endpoint are left out of these docs.
 
-A UAS answering an `OPTIONS` request received in a datagram:
+# Examples
+*/
+// The endpoint examples exist only with the `tokio` feature, since the
+// doctests would not compile without it.
+#![cfg_attr(feature = "tokio", doc = include_str!("doc/endpoint_examples.md"))]
+/*!
+### The message layer alone
+
+Parsing a datagram and answering it, without the endpoint. This is what the
+endpoint does inside.
 
 ```
 use bytes::Bytes;
-use signa::{
-    header::{CALL_ID, CSEQ, FROM, TO, VIA},
-    Message, Method, Response, StatusCode,
-};
+use signa::{Message, Method, Response, StatusCode};
 
 let datagram = Bytes::from_static(
     b"OPTIONS sip:carol@chicago.example.com SIP/2.0\r\n\
@@ -63,15 +76,10 @@ let Message::Request(request) = Message::from_shared(datagram)? else {
 };
 assert_eq!(request.method(), Method::OPTIONS);
 
-// A response copies these fields from the request (RFC 3261 section 8.2.6.2).
 // A real UAS would also add a tag to `To`.
-let mut response = Response::builder().status(StatusCode::OK);
-for name in [VIA, FROM, TO, CALL_ID, CSEQ] {
-    for value in request.headers().get_all(&name) {
-        response = response.header(name.clone(), value.clone());
-    }
-}
-let response = response.body(Bytes::new())?;
+let response = Response::reply_to(&request)
+    .status(StatusCode::OK)
+    .body(Bytes::new())?;
 
 let bytes = response.to_bytes();
 assert!(bytes.starts_with(b"SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP pc33"));
