@@ -38,16 +38,19 @@ use tokio::{
 };
 use tower_service::Service;
 
-use super::{Error, Flow, Timers, Transport};
 use crate::{
+    endpoint::error::Error,
     header::{via::Via, HeaderValue, CSEQ, VIA},
-    response::reply_headers,
+    message::Message,
+    method::Method,
+    request::Request,
+    response::{reply_headers, Response},
+    status::StatusCode,
     transaction::{
         bare_response, ClientEvent, ClientKey, ClientTransaction, ServerKey,
-        ServerTransaction,
+        ServerTransaction, Timers,
     },
-    transport::{tcp, udp},
-    Message, Method, Request, Response, StatusCode,
+    transport::{tcp, udp, Flow, Transport},
 };
 
 /// The most bytes of a request that go over UDP. RFC 3261 section 18.1.1
@@ -152,9 +155,19 @@ struct Route {
 enum TcpState {
     #[default]
     Closed,
-    /// A connect task is running. These requests go out when it is done.
-    Connecting(Vec<(Request<Bytes>, Responder)>),
+    /// A connect task is running. These go out when it is done.
+    Connecting(Vec<Pending>),
     Open(Flow, tcp::Writer),
+}
+
+/// Something waiting for a TCP connection to open.
+enum Pending {
+    /// A client's request, which starts a transaction once it can be sent.
+    Request(Request<Bytes>, Responder),
+    /// An encoded response whose request came on a connection that has closed
+    /// since. It goes to `sent-by` on a new connection
+    /// (RFC 3261 section 18.2.2).
+    Response(Bytes),
 }
 
 /// A heap entry. Earlier deadlines come out first.
@@ -420,10 +433,11 @@ where
                 };
                 let before = entry.tx.deadline();
                 if let Some(trying) = entry.tx.on_timeout(now) {
-                    if send_on(self.udp.as_mut(), &entry.link, &trying)
-                        .is_err()
-                    {
-                        entry.tx.on_transport_error();
+                    let link = entry.link.clone();
+                    if self.send_reply(&link, &trying).is_err() {
+                        if let Some(entry) = self.servers.get_mut(&key) {
+                            entry.tx.on_transport_error();
+                        }
                     }
                 }
                 self.settle_server(key, before);
@@ -524,42 +538,81 @@ where
                 );
             }
             Transport::Tcp => {
-                let route = self.routes.entry(next_hop).or_default();
-                match &mut route.tcp {
-                    TcpState::Open(flow, writer) if !writer.is_closed() => {
-                        let link =
-                            Link { flow: *flow, writer: Some(writer.clone()) };
-                        self.start_client(request, link, respond);
-                    }
-                    TcpState::Connecting(pending) => {
-                        pending.push((request, respond));
-                    }
-                    // Closed, or open once and gone since. Open a new
-                    // connection and send once it is up.
-                    TcpState::Closed | TcpState::Open(..) => {
-                        route.tcp =
-                            TcpState::Connecting(vec![(request, respond)]);
-                        let config = self.config.tcp;
-                        let inbound = self.tcp_tx.clone();
-                        let internal = self.internal_tx.clone();
-                        tokio::spawn(async move {
-                            let result =
-                                tcp::connect(next_hop, &config, &inbound)
-                                    .await;
-                            let _ = internal.send(Command::Connected {
-                                remote: next_hop,
-                                result,
-                            });
-                        });
-                    }
-                }
+                self.send_over_tcp(
+                    next_hop,
+                    Pending::Request(request, respond),
+                );
             }
         }
     }
 
+    /// Sends `pending` to `remote` over the connection the driver has to it,
+    /// or over one it opens now.
+    fn send_over_tcp(&mut self, remote: SocketAddr, pending: Pending) {
+        let route = self.routes.entry(remote).or_default();
+        match &mut route.tcp {
+            TcpState::Open(flow, writer) if !writer.is_closed() => {
+                let (flow, writer) = (*flow, writer.clone());
+                self.deliver(pending, flow, writer);
+            }
+            TcpState::Connecting(waiting) => waiting.push(pending),
+            // Closed, or open once and gone since. Open a new connection
+            // and send once it is up.
+            TcpState::Closed | TcpState::Open(..) => {
+                route.tcp = TcpState::Connecting(vec![pending]);
+                let config = self.config.tcp;
+                let inbound = self.tcp_tx.clone();
+                let internal = self.internal_tx.clone();
+                tokio::spawn(async move {
+                    let result = tcp::connect(remote, &config, &inbound).await;
+                    let _ =
+                        internal.send(Command::Connected { remote, result });
+                });
+            }
+        }
+    }
+
+    /// Sends `pending` on an open connection.
+    fn deliver(&mut self, pending: Pending, flow: Flow, writer: tcp::Writer) {
+        match pending {
+            Pending::Request(request, respond) => {
+                let link = Link { flow, writer: Some(writer) };
+                self.start_client(request, link, respond);
+            }
+            // A response that cannot be queued is lost. The connection is full
+            // or gone again, and a server transaction over TCP has nothing to
+            // retransmit it with.
+            Pending::Response(bytes) => {
+                let _ = writer.send(bytes);
+            }
+        }
+    }
+
+    /// Sends a response, or anything else that goes the way a response does,
+    /// along `link`.
+    ///
+    /// When the request's TCP connection has closed since, the response goes
+    /// to `sent-by` on a new connection, as RFC 3261 section 18.2.2 says a
+    /// server SHOULD. The target is in `link` already, see [`reply_flow`].
+    /// If that connection cannot be opened the response is lost. The RFC then
+    /// asks for RFC 3263 to find another address, which is out of scope.
+    fn send_reply(&mut self, link: &Link, bytes: &Bytes) -> io::Result<()> {
+        match send_on(self.udp.as_mut(), link, bytes) {
+            Err(err)
+                if err.kind() == io::ErrorKind::BrokenPipe
+                    && link.writer.is_some() =>
+            {
+                let target = link.flow.remote;
+                self.send_over_tcp(target, Pending::Response(bytes.clone()));
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
     /// The address the UDP socket sends to `remote` from, which goes into the
-    /// `Via`. It is the socket's own unless that is a wildcard, in which
-    /// case the kernel's route to `remote` says, found once per next hop.
+    /// `Via`. It is the socket's own unless that is a wildcard, in which case
+    /// the kernel's route to `remote` says, found once per next hop.
     fn udp_source(&mut self, remote: SocketAddr) -> io::Result<IpAddr> {
         let bound = self
             .udp
@@ -635,15 +688,21 @@ where
         match result {
             Ok((flow, writer)) => {
                 route.tcp = TcpState::Open(flow, writer.clone());
-                for (request, respond) in pending {
-                    let link = Link { flow, writer: Some(writer.clone()) };
-                    self.start_client(request, link, respond);
+                for pending in pending {
+                    self.deliver(pending, flow, writer.clone());
                 }
             }
             Err(err) => {
-                for (_, respond) in pending {
-                    let err = io::Error::new(err.kind(), err.to_string());
-                    let _ = respond.send(Err(Error::transport(err)));
+                for pending in pending {
+                    match pending {
+                        Pending::Request(_, respond) => {
+                            let err =
+                                io::Error::new(err.kind(), err.to_string());
+                            let _ = respond.send(Err(Error::transport(err)));
+                        }
+                        // See `send_reply`.
+                        Pending::Response(_) => {}
+                    }
                 }
             }
         }
@@ -774,7 +833,7 @@ where
     ) {
         let response =
             bare_response(&reply_headers(request.headers()), status);
-        let _ = send_on(self.udp.as_mut(), link, &response);
+        let _ = self.send_reply(link, &response);
     }
 
     /// Takes what the service answered. `None` when it failed.
@@ -797,24 +856,18 @@ where
                     ),
                 };
                 let before = entry.tx.deadline();
-                // TODO: Open a connection to `sent-by` when the one the
-                // request came on has closed, which RFC 3261 section 18.2.2
-                // says a server SHOULD do. For now the response is lost
-                // with the connection.
-                if entry.tx.on_response(status, bytes.clone(), now())
-                    && send_on(self.udp.as_mut(), &entry.link, &bytes).is_err()
-                {
-                    entry.tx.on_transport_error();
+                let send = entry.tx.on_response(status, bytes.clone(), now());
+                let link = entry.link.clone();
+                if send && self.send_reply(&link, &bytes).is_err() {
+                    if let Some(entry) = self.servers.get_mut(&key) {
+                        entry.tx.on_transport_error();
+                    }
                 }
                 self.settle_server(key, before);
             }
             Slot::Stateless(link) => {
                 if let Some(response) = response {
-                    let _ = send_on(
-                        self.udp.as_mut(),
-                        &link,
-                        &response.to_bytes(),
-                    );
+                    let _ = self.send_reply(&link, &response.to_bytes());
                 }
             }
         }
@@ -952,19 +1005,20 @@ fn sent_by_is(via: &Via<'_>, local: SocketAddr) -> bool {
 /// Where a response to a request received on `flow` with the top `via` goes
 /// (RFC 3261 section 18.2.2, RFC 3581 section 4).
 ///
-/// Over TCP it goes back on the connection. Over UDP it goes to the address
-/// the request came from, which is what `received` would say, since the
-/// endpoint adds that parameter whenever `sent-by` says otherwise. The port is
-/// the source port with `rport`, and the `sent-by` port without it. Nothing
-/// here trusts a `received` the request came with, so a request cannot have
-/// its response sent to a third party.
+/// It goes to the address the request came from, which is what `received`
+/// would say, since the endpoint adds that parameter whenever `sent-by` says
+/// otherwise. Nothing here trusts a `received` the request came with, so a
+/// request cannot have its response sent to a third party.
+///
+/// Over UDP the port is the source port with `rport`, and the `sent-by` port
+/// without it. Over TCP the response goes back on the connection, and the
+/// flow's remote address is where a new connection goes when that one has
+/// closed. That is the `sent-by` port, since RFC 3581 applies `rport` to
+/// unreliable transports only.
 fn reply_flow(via: &Via<'_>, flow: &Flow) -> Flow {
-    if flow.transport.is_reliable() {
-        return *flow;
-    }
     let port = match via.rport {
-        Some(_) => flow.remote.port(),
-        None => via.port.unwrap_or(DEFAULT_PORT),
+        Some(_) if !flow.transport.is_reliable() => flow.remote.port(),
+        _ => via.port.unwrap_or(DEFAULT_PORT),
     };
 
     Flow { remote: SocketAddr::new(flow.remote.ip(), port), ..*flow }
