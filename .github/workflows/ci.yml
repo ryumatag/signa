@@ -86,6 +86,18 @@ jobs:
           cargo fmt -- --check
           cargo fmt --manifest-path bench/Cargo.toml -- --check
 
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.65"
+      - name: Build
+        run: cargo build --verbose
+
   rustdoc:
     runs-on: ubuntu-latest
     env:

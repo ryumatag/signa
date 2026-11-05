@@ -184,7 +184,8 @@ fn content_length(
     for value in headers.get_all(CONTENT_LENGTH) {
         let this = parse_content_length(value)
             .ok_or(InvalidMessage::new(InvalidMessageKind::ContentLength))?;
-        if len.is_some_and(|len| len != this) {
+        // MSRV(1.70): Write this as `len.is_some_and(|len| len != this)`.
+        if matches!(len, Some(len) if len != this) {
             return Err(InvalidMessage::new(
                 InvalidMessageKind::ContentLength,
             ));

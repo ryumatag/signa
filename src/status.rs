@@ -75,13 +75,11 @@ impl StatusCode {
     pub fn as_str(&self) -> &str {
         let offset = (self.0.get() - MIN_CODE) as usize * 3;
 
-        const { assert!(CODE_DIGITS.len() == CODE_COUNT * 3) }
-
         // SAFETY: `StatusCode` guarantees `MIN_CODE..=MAX_CODE` (enforced by
         // every constructor). The offset therefore ranges from 0 to
-        // `(MAX_CODE - MIN_CODE) * 3`, and the inline const above statically
-        // verifies the array is large enough. Every byte in `CODE_DIGITS` is
-        // an ASCII digit, so the slice is valid UTF-8.
+        // `(MAX_CODE - MIN_CODE) * 3`, and the type of `CODE_DIGITS` makes it
+        // `CODE_COUNT * 3` bytes long, so the slice is in bounds. Every byte
+        // in `CODE_DIGITS` is an ASCII digit, so the slice is valid UTF-8.
         unsafe { str::from_utf8_unchecked(&CODE_DIGITS[offset..offset + 3]) }
     }
 
