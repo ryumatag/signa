@@ -354,6 +354,12 @@ impl HeaderValue {
     /// # Panics
     ///
     /// Panics if `value` does not lie within `src`.
+    /// Returns the value's bytes as the shared buffer they live in, so a
+    /// part of the value can be kept without copying it.
+    pub(crate) fn as_shared(&self) -> &Bytes {
+        &self.raw
+    }
+
     pub(crate) fn from_parsed(src: &Bytes, value: &str) -> HeaderValue {
         debug_assert!(check::header_value(value.as_bytes()).is_ok());
 
