@@ -1,6 +1,7 @@
 use criterion::{Bencher, Criterion, Throughput};
 
 mod encode;
+mod frame;
 mod header_name;
 mod header_value;
 mod message;
@@ -23,6 +24,8 @@ criterion::criterion_group! {
         // Whole messages. Judge changes by these.
         message::parse,
         encode::encode,
+        // The stream decoder, through the `__bench` feature.
+        frame::stream,
         // One value at a time. These cover the checks that will move to
         // siparse, so they show what the switch changes for each type.
         header_name::from_bytes,

@@ -1,9 +1,11 @@
 /*!
-Conversion from the bytes of one complete SIP message.
+Conversion from the bytes of a SIP message.
 
 siparse parses the head. This module turns its output into a `Request` or
 `Response` whose parts share the input `Bytes` instead of copying it, and picks
-out the body.
+out the body. The public `from_shared` functions take one complete message,
+such as a datagram. The stream decoder in `frame` parses the head on its own
+through [`head`] and supplies the body once it has arrived.
 */
 
 use bytes::Bytes;
@@ -51,6 +53,9 @@ pub(crate) fn response(src: Bytes) -> Result<Response<Bytes>, InvalidMessage> {
     Ok(Response::from_parts(parts, body))
 }
 
+// This repeats `head` instead of calling it, because building the message
+// from a `Head` moved through `Status` measured about ~5% slower on
+// `parse/message/typical`.
 pub(crate) fn message(src: Bytes) -> Result<Message<Bytes>, InvalidMessage> {
     let mut rows = HeaderBuf::<MAX_HEADERS>::new();
     let mut head = AnyHead::new(&mut rows);
@@ -70,6 +75,62 @@ pub(crate) fn message(src: Bytes) -> Result<Message<Bytes>, InvalidMessage> {
     }
 }
 
+/// The parts of a request or response whose head has been parsed, before its
+/// body is known.
+#[derive(Debug)]
+pub(crate) enum Head {
+    Request(request::Parts),
+    Response(response::Parts),
+}
+
+impl Head {
+    pub(crate) fn headers(&self) -> &HeaderMap {
+        match self {
+            Head::Request(parts) => &parts.headers,
+            Head::Response(parts) => &parts.headers,
+        }
+    }
+
+    pub(crate) fn into_message(self, body: Bytes) -> Message<Bytes> {
+        match self {
+            Head::Request(parts) => {
+                Message::Request(Request::from_parts(parts, body))
+            }
+            Head::Response(parts) => {
+                Message::Response(Response::from_parts(parts, body))
+            }
+        }
+    }
+}
+
+/// Parses the head at the start of `src` into the parts of a request or
+/// response, deciding which from the start-line.
+///
+/// On `Complete`, the parts share `src`, and the offset is where the head
+/// ends, so the body starts there. `Partial` means `src` ends before the head
+/// does.
+pub(crate) fn head(
+    src: &Bytes,
+) -> Result<Status<(Head, usize)>, InvalidMessage> {
+    let mut rows = HeaderBuf::<MAX_HEADERS>::new();
+    let mut head = AnyHead::new(&mut rows);
+    let head_end = match head.parse(src) {
+        Ok(Status::Complete(head_end)) => head_end,
+        Ok(Status::Partial) => return Ok(Status::Partial),
+        Err(err) => return Err(head_error(err)),
+    };
+
+    let head = match head.start_line.expect(COMPLETE) {
+        StartLine::Request(line) => {
+            Head::Request(request_parts(src, &line, head.headers)?)
+        }
+        StartLine::Status(line) => {
+            Head::Response(response_parts(src, &line, head.headers)?)
+        }
+    };
+    Ok(Status::Complete((head, head_end)))
+}
+
 // siparse fills every start-line field before it reports a complete head.
 const COMPLETE: &str = "a complete head has every start-line field";
 
@@ -81,15 +142,22 @@ const COMPLETE: &str = "a complete head has every start-line field";
 fn head_end(
     result: Result<Status<usize>, siparse::Error>,
 ) -> Result<usize, InvalidMessage> {
-    let kind = match result {
-        Ok(Status::Complete(head_end)) => return Ok(head_end),
-        Ok(Status::Partial) => InvalidMessageKind::IncompleteHead,
-        Err(err) if err.kind() == ErrorKind::TooManyHeaders => {
-            InvalidMessageKind::TooManyHeaders
+    match result {
+        Ok(Status::Complete(head_end)) => Ok(head_end),
+        Ok(Status::Partial) => {
+            Err(InvalidMessage::new(InvalidMessageKind::IncompleteHead))
         }
-        Err(err) => InvalidMessageKind::Head(err.kind()),
+        Err(err) => Err(head_error(err)),
+    }
+}
+
+fn head_error(err: siparse::Error) -> InvalidMessage {
+    let kind = if err.kind() == ErrorKind::TooManyHeaders {
+        InvalidMessageKind::TooManyHeaders
+    } else {
+        InvalidMessageKind::Head(err.kind())
     };
-    Err(InvalidMessage::new(kind))
+    InvalidMessage::new(kind)
 }
 
 fn request_parts(
@@ -176,7 +244,7 @@ fn body(
 /// The field is `1*DIGIT` (RFC 3261 section 20.14). A repeated field is
 /// accepted only if every copy has the same value, because a message with two
 /// different lengths has no single body.
-fn content_length(
+pub(crate) fn content_length(
     headers: &HeaderMap,
 ) -> Result<Option<usize>, InvalidMessage> {
     let mut len = None;
