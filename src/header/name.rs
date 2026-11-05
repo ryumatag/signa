@@ -3,7 +3,7 @@ use std::{
     str::{self, FromStr},
 };
 
-use bytes::{BufMut, Bytes, BytesMut};
+use siparse::check;
 
 use crate::{error::InvalidHeaderName, util::ByteStr};
 
@@ -59,10 +59,10 @@ macro_rules! standard_headers {
         // relies on every standard name fitting in its scratch buffer.
         const _: () = {
             $(
-                assert!(is_token($canonical));
+                assert!(check::header_name_const($canonical).is_ok());
                 assert!(eq_lowercase_bytes($canonical, $lower));
                 assert!($lower.len() <= SCRATCH_BUF_SIZE);
-                $(assert!(is_token($compact));)?
+                $(assert!(check::header_name_const($compact).is_ok());)?
             )+
         };
 
@@ -716,7 +716,7 @@ impl HeaderName {
     pub const fn from_static(src: &'static str) -> HeaderName {
         let bytes = src.as_bytes();
 
-        if !is_token(bytes) {
+        if check::header_name_const(bytes).is_err() {
             panic!("invalid SIP header field name");
         }
 
@@ -730,7 +730,7 @@ impl HeaderName {
         // lowercase form that `from_bytes` would produce.
         let mut i = 0;
         while i < bytes.len() {
-            if HEADER_NAME_CHARS[bytes[i] as usize] != bytes[i] {
+            if bytes[i].to_ascii_lowercase() != bytes[i] {
                 panic!(
                     "custom SIP header field names in from_static() must \
                      already be lowercase"
@@ -747,56 +747,33 @@ impl HeaderName {
     /// Standard header names and compact forms are recognized
     /// case-insensitively. Custom header names are normalized to lowercase.
     pub fn from_bytes(src: &[u8]) -> Result<HeaderName, InvalidHeaderName> {
-        if src.is_empty() {
-            return Err(InvalidHeaderName::new());
+        // Every standard name and compact form is a valid `token`, so a match
+        // needs no separate check. Most names in practice are standard.
+        if let Some(standard) = StandardHeader::from_any_case(src) {
+            return Ok(HeaderName(Repr::Standard(standard)));
         }
 
-        // Validate and lowercase in one pass on the stack. The lowercased
-        // buffer is fed directly into the standard-header match.
-        let mut buf = [0u8; SCRATCH_BUF_SIZE];
+        let name =
+            check::header_name(src).map_err(|_| InvalidHeaderName::new())?;
+        Ok(HeaderName::custom(name))
+    }
 
-        if src.len() <= SCRATCH_BUF_SIZE {
-            for (i, &b) in src.iter().enumerate() {
-                let c = HEADER_NAME_CHARS[b as usize];
+    /// Creates a `HeaderName` from a name that `siparse` parsed, without
+    /// checking it again.
+    pub(crate) fn from_parsed(name: &str) -> HeaderName {
+        debug_assert!(check::header_name(name.as_bytes()).is_ok());
 
-                if c == 0 {
-                    return Err(InvalidHeaderName::new());
-                }
-
-                buf[i] = c;
-            }
-
-            let lowered = &buf[..src.len()];
-
-            if let Some(standard) = StandardHeader::from_bytes(lowered) {
-                return Ok(HeaderName(Repr::Standard(standard)));
-            }
-
-            // SAFETY: Every byte in `lowered` came from `HEADER_NAME_CHARS`,
-            // which only maps to ASCII token bytes.
-            Ok(HeaderName(Repr::Custom(Custom(unsafe {
-                ByteStr::from_utf8_unchecked(Bytes::copy_from_slice(lowered))
-            }))))
-        } else {
-            // Inputs longer than `SCRATCH_BUF_SIZE` cannot be standard
-            // headers. Validate, lowercase, and allocate in one pass.
-            let mut buf = BytesMut::with_capacity(src.len());
-
-            for &b in src.iter() {
-                let c = HEADER_NAME_CHARS[b as usize];
-
-                if c == 0 {
-                    return Err(InvalidHeaderName::new());
-                }
-
-                buf.put_u8(c);
-            }
-
-            // SAFETY: As above, every byte in `buf` is an ASCII token byte.
-            Ok(HeaderName(Repr::Custom(Custom(unsafe {
-                ByteStr::from_utf8_unchecked(buf.freeze())
-            }))))
+        match StandardHeader::from_any_case(name.as_bytes()) {
+            Some(standard) => HeaderName(Repr::Standard(standard)),
+            None => HeaderName::custom(name),
         }
+    }
+
+    /// Returns a custom name for a `token`, lowercased.
+    fn custom(token: &str) -> HeaderName {
+        HeaderName(Repr::Custom(Custom(ByteStr::from(
+            token.to_ascii_lowercase(),
+        ))))
     }
 
     /// Returns the canonical SIP header field name.
@@ -867,65 +844,34 @@ impl FromStr for HeaderName {
     }
 }
 
-// Stack scratch buffer size for validate-and-lowercase. It must hold the
-// longest standard header name, currently `p-charging-function-addresses` at
-// 29 bytes, which `standard_headers!` checks at compile time. The rest is
-// headroom so typical custom names avoid a second pass.
-const SCRATCH_BUF_SIZE: usize = 64;
-
-// RFC 3261 Section 25.1:
-//
-// ```
-// token = 1*(alphanum / "-" / "." / "!" / "%" / "*"
-//         / "_" / "+" / "`" / "'" / "~")
-// ```
-//
-// Each entry maps a byte to its lowercase equivalent if valid, or 0 if the
-// byte is not a valid SIP token character.
-#[rustfmt::skip]
-const HEADER_NAME_CHARS: [u8; 256] = {
-    let mut table = [0; 256];
-    let mut i = 0;
-
-    while i < 256 {
-        table[i] = match i as u8 {
-            b'A'..=b'Z' => (i as u8) + 32,
-            b'a'..=b'z'
-                | b'0'..=b'9'
-                | b'-'
-                | b'.'
-                | b'!'
-                | b'%'
-                | b'*'
-                | b'_'
-                | b'+'
-                | b'`'
-                | b'\''
-                | b'~' => i as u8,
-            _ => 0,
-        };
-        i += 1;
-    }
-
-    table
-};
-
-/// Returns `true` if `src` is a non-empty SIP `token`.
-const fn is_token(src: &[u8]) -> bool {
-    if src.is_empty() {
-        return false;
-    }
-
-    let mut i = 0;
-    while i < src.len() {
-        if HEADER_NAME_CHARS[src[i] as usize] == 0 {
-            return false;
+impl StandardHeader {
+    /// Finds the standard header that `src` names, in any letter case.
+    ///
+    /// This lowercases on the stack and then takes the single jump table in
+    /// `from_bytes`, which is faster than comparing each name in turn as
+    /// `from_bytes_case_insensitive` does for `const` contexts.
+    fn from_any_case(src: &[u8]) -> Option<StandardHeader> {
+        if src.len() > SCRATCH_BUF_SIZE {
+            return None;
         }
-        i += 1;
+        // Copy and lowercase in one loop. `copy_from_slice` followed by
+        // `make_ascii_lowercase` made whole-message parsing a few percent
+        // slower in the benchmarks, since names are short and the copy
+        // became a `memcpy` call.
+        let mut buf = [0u8; SCRATCH_BUF_SIZE];
+        let lowered = &mut buf[..src.len()];
+        for (dst, &b) in lowered.iter_mut().zip(src) {
+            *dst = b.to_ascii_lowercase();
+        }
+        StandardHeader::from_bytes(lowered)
     }
-
-    true
 }
+
+// Stack scratch buffer size for lowercasing. It must hold the longest
+// standard header name, currently `p-charging-function-addresses` at 29
+// bytes, which `standard_headers!` checks at compile time. Longer names
+// cannot be standard.
+const SCRATCH_BUF_SIZE: usize = 64;
 
 const fn eq_lowercase_bytes(src: &[u8], expected: &[u8]) -> bool {
     if src.len() != expected.len() {
@@ -934,7 +880,7 @@ const fn eq_lowercase_bytes(src: &[u8], expected: &[u8]) -> bool {
 
     let mut i = 0;
     while i < src.len() {
-        if HEADER_NAME_CHARS[src[i] as usize] != expected[i] {
+        if src[i].to_ascii_lowercase() != expected[i] {
             return false;
         }
         i += 1;

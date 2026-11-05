@@ -5,9 +5,10 @@ This module defines [`ReasonPhrase`], the text after the status code in a
 status-line.
 */
 
-use std::{fmt, str};
+use std::{fmt, str::FromStr};
 
 use bytes::Bytes;
+use siparse::check;
 
 use crate::{error::InvalidReasonPhrase, util::ByteStr};
 
@@ -55,8 +56,7 @@ pub struct ReasonPhrase(ByteStr);
 impl ReasonPhrase {
     /// Creates a `ReasonPhrase` from a static string without copying it.
     ///
-    /// A `&'static str` is already valid UTF-8, so only the ASCII rules are
-    /// checked. This makes the function usable in `const` contexts.
+    /// This is usable in `const` contexts.
     ///
     /// ```
     /// use signa::ReasonPhrase;
@@ -70,7 +70,7 @@ impl ReasonPhrase {
     /// Panics if `src` is not a valid reason phrase. In a `const` context this
     /// is a compile error.
     pub const fn from_static(src: &'static str) -> ReasonPhrase {
-        if !check_bytes(src.as_bytes()) {
+        if check::reason_phrase_const(src.as_bytes()).is_err() {
             panic!("invalid SIP reason phrase");
         }
 
@@ -86,14 +86,9 @@ impl ReasonPhrase {
     pub fn from_bytes(
         src: &[u8],
     ) -> Result<ReasonPhrase, InvalidReasonPhrase> {
-        if !check_bytes(src) || str::from_utf8(src).is_err() {
-            return Err(InvalidReasonPhrase::new());
-        }
-
-        // SAFETY: `str::from_utf8` just accepted `src`.
-        Ok(ReasonPhrase(unsafe {
-            ByteStr::from_utf8_unchecked(Bytes::copy_from_slice(src))
-        }))
+        let reason = check::reason_phrase(src)
+            .map_err(|_| InvalidReasonPhrase::new())?;
+        Ok(ReasonPhrase(ByteStr::from(reason)))
     }
 
     /// Returns the reason phrase as a string slice.
@@ -160,7 +155,7 @@ impl TryFrom<&str> for ReasonPhrase {
     }
 }
 
-impl str::FromStr for ReasonPhrase {
+impl FromStr for ReasonPhrase {
     type Err = InvalidReasonPhrase;
 
     fn from_str(src: &str) -> Result<ReasonPhrase, InvalidReasonPhrase> {
@@ -176,7 +171,7 @@ impl ReasonPhrase {
     ///
     /// Panics if `reason` does not lie within `src`.
     pub(crate) fn from_parsed(src: &Bytes, reason: &str) -> ReasonPhrase {
-        debug_assert!(check_bytes(reason.as_bytes()));
+        debug_assert!(check::reason_phrase(reason.as_bytes()).is_ok());
 
         // SAFETY: The slice holds the same bytes as `reason`, which is a
         // `str`.
@@ -185,83 +180,6 @@ impl ReasonPhrase {
         })
     }
 }
-
-// TODO: Switch to `siparse`'s public reason phrase check once it exists, so
-// the grammar lives in one place. It is planned together with the other shared
-// checks before signa 0.1.0.
-//
-/// Checks the ASCII rules of the reason phrase grammar.
-///
-/// Non-ASCII bytes pass here. The caller checks them as UTF-8, which a
-/// `&'static str` already is, so this can run in `const` contexts.
-const fn check_bytes(src: &[u8]) -> bool {
-    let mut i = 0;
-
-    while i < src.len() {
-        let byte = src[i];
-
-        if byte == b'%' {
-            if i + 2 >= src.len()
-                || !is_hex_digit(src[i + 1])
-                || !is_hex_digit(src[i + 2])
-            {
-                return false;
-            }
-            i += 3;
-        } else if byte >= 0x80 || REASON_PHRASE_CHARS[byte as usize] {
-            i += 1;
-        } else {
-            return false;
-        }
-    }
-
-    true
-}
-
-const fn is_hex_digit(byte: u8) -> bool {
-    byte.is_ascii_hexdigit()
-}
-
-// The same ASCII set as `siparse`'s reason phrase check. RFC 3261 `reserved`
-// and `unreserved` characters, `SP`, and `HTAB`. `%` is handled separately
-// because it starts an escape.
-const REASON_PHRASE_CHARS: [bool; 128] = {
-    let mut table = [false; 128];
-    let mut i = 0;
-
-    while i < 128 {
-        table[i] = matches!(
-            i as u8,
-            b'A'..=b'Z'
-                | b'a'..=b'z'
-                | b'0'..=b'9'
-                | b';'
-                | b'/'
-                | b'?'
-                | b':'
-                | b'@'
-                | b'&'
-                | b'='
-                | b'+'
-                | b'$'
-                | b','
-                | b'-'
-                | b'_'
-                | b'.'
-                | b'!'
-                | b'~'
-                | b'*'
-                | b'\''
-                | b'('
-                | b')'
-                | b' '
-                | b'\t'
-        );
-        i += 1;
-    }
-
-    table
-};
 
 #[cfg(test)]
 mod tests {

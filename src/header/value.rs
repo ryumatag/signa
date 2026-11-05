@@ -7,8 +7,9 @@ use std::{
 };
 
 use bytes::Bytes;
+use siparse::check;
 
-use crate::error::{InvalidHeaderValue, InvalidHeaderValueKind};
+use crate::error::InvalidHeaderValue;
 
 /// A SIP header field value.
 ///
@@ -75,7 +76,7 @@ impl HeaderValue {
     /// header field value. In a `const` context this is a compile error.
     pub const fn from_static(src: &'static str) -> HeaderValue {
         let bytes = src.as_bytes();
-        if check_bytes(bytes).is_err() {
+        if check::header_value_const(bytes).is_err() {
             panic!("invalid SIP header field value");
         }
 
@@ -99,7 +100,8 @@ impl HeaderValue {
     /// * any other ASCII control or `DEL`;
     /// * bytes that are not valid UTF-8.
     ///
-    /// The bytes are stored as given, folds included.
+    /// The check is `siparse`'s [`check::header_value`]. The bytes are stored
+    /// as given, folds included.
     ///
     /// # Errors
     ///
@@ -312,13 +314,12 @@ impl FromStr for HeaderValue {
 
     /// Attempts to create a new `HeaderValue` from a string slice.
     ///
-    /// This validates the resulting octets against RFC 3261's generic
-    /// `header-value` production.
+    /// This accepts the same bytes as [`HeaderValue::from_bytes`].
     ///
     /// # Errors
     ///
-    /// Returns [`InvalidHeaderValue`] when `src` is not a valid generic SIP
-    /// header field value.
+    /// Returns [`InvalidHeaderValue`] if `src` contains a byte or sequence
+    /// that [`HeaderValue::from_bytes`] rejects.
     fn from_str(src: &str) -> Result<HeaderValue, InvalidHeaderValue> {
         HeaderValue::from_bytes(src.as_bytes())
     }
@@ -348,7 +349,7 @@ impl HeaderValue {
     ///
     /// Panics if `value` does not lie within `src`.
     pub(crate) fn from_parsed(src: &Bytes, value: &str) -> HeaderValue {
-        debug_assert!(validate(value.as_bytes()).is_ok());
+        debug_assert!(check::header_value(value.as_bytes()).is_ok());
 
         HeaderValue {
             raw: src.slice_ref(value.as_bytes()),
@@ -357,81 +358,21 @@ impl HeaderValue {
     }
 }
 
-/// Validates a header field value, including UTF-8.
+/// Checks a header field value with `siparse`.
 fn validate(src: &[u8]) -> Result<(), InvalidHeaderValue> {
-    if let Err(kind) = check_bytes(src) {
-        return Err(InvalidHeaderValue::new(kind));
+    match check::header_value(src) {
+        Ok(_) => Ok(()),
+        Err(err) => Err(invalid(src, err)),
     }
-
-    if let Err(err) = str::from_utf8(src) {
-        return Err(InvalidHeaderValue::new(InvalidHeaderValueKind::Utf8(
-            err,
-        )));
-    }
-
-    Ok(())
 }
 
-// TODO: Switch to `siparse`'s public header value check once it exists, so
-// the rules live in one place. It is planned together with the other shared
-// checks before signa 0.1.0.
-//
-/// Checks the byte-level rules of a header field value.
-///
-/// This leaves UTF-8 validation to the caller so that it can run in `const`
-/// contexts, where the input is a `str` that is already valid UTF-8.
-const fn check_bytes(src: &[u8]) -> Result<(), InvalidHeaderValueKind> {
-    let mut i = 0;
-    // Whether the bytes just before `i` end in an odd run of backslashes.
-    // A pair consumes its backslash, so `\\` escapes nothing.
-    let mut escaped = false;
-
-    while i < src.len() {
-        let byte = src[i];
-        let was_escaped = escaped;
-        escaped = byte == b'\\' && !was_escaped;
-
-        match byte {
-            b'\r' => {
-                if i + 1 >= src.len() || src[i + 1] != b'\n' {
-                    return Err(InvalidHeaderValueKind::BareCr);
-                }
-                if i + 2 >= src.len() || !is_wsp(src[i + 2]) {
-                    return Err(InvalidHeaderValueKind::MissingWspAfterCrLf);
-                }
-
-                i += 3;
-            }
-
-            b'\n' => return Err(InvalidHeaderValueKind::BareLf),
-
-            b'\0'..=b'\x08'
-            | b'\x0B'
-            | b'\x0C'
-            | b'\x0E'..=b'\x1F'
-            | b'\x7F'
-                if was_escaped =>
-            {
-                i += 1;
-            }
-
-            b'\0'..=b'\x08'
-            | b'\x0B'
-            | b'\x0C'
-            | b'\x0E'..=b'\x1F'
-            | b'\x7F'
-            | b'\xFE'
-            | b'\xFF' => return Err(InvalidHeaderValueKind::Byte(byte)),
-
-            _ => i += 1,
-        }
-    }
-
-    Ok(())
-}
-
-const fn is_wsp(byte: u8) -> bool {
-    matches!(byte, b' ' | b'\t')
+// Finding where the value went wrong scans it again, so it stays off the
+// path of a valid value.
+#[cold]
+fn invalid(src: &[u8], err: siparse::Error) -> InvalidHeaderValue {
+    let offset = check::header_value_error_offset(src)
+        .expect("`check::header_value` rejected the value");
+    InvalidHeaderValue::new(err.kind(), offset)
 }
 
 #[cfg(test)]
@@ -507,38 +448,30 @@ mod tests {
 
     #[test]
     fn from_bytes_rejects_invalid_fold() {
+        // The offset points at what follows a `CRLF` that does not fold, or
+        // past the end.
         let err = HeaderValue::from_bytes(b"folded\r\nvalue").unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "missing SP or HTAB after CRLF in SIP header value"
-        );
+        assert_eq!(err.to_string(), "invalid SIP header value at byte 8");
 
         let err = HeaderValue::from_bytes(b"folded\r\n").unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "missing SP or HTAB after CRLF in SIP header value"
-        );
+        assert_eq!(err.to_string(), "invalid SIP header value at byte 8");
 
         let err = HeaderValue::from_bytes(b"folded\rvalue").unwrap_err();
-        assert_eq!(err.to_string(), "bare CR in SIP header value");
+        assert_eq!(err.to_string(), "CR not followed by LF at byte 6");
     }
 
     #[test]
     fn from_bytes_rejects_cr_lf_and_other_controls() {
         let err = HeaderValue::from_bytes(b"hello\r").unwrap_err();
-        assert_eq!(err.to_string(), "bare CR in SIP header value");
+        assert_eq!(err.to_string(), "CR not followed by LF at byte 5");
 
         let err = HeaderValue::from_bytes(b"hello\n").unwrap_err();
-        assert_eq!(err.to_string(), "bare LF in SIP header value");
+        assert_eq!(err.to_string(), "LF not preceded by CR at byte 5");
 
-        let err = HeaderValue::from_bytes(b"\0").unwrap_err();
-        assert_eq!(err.to_string(), "invalid byte 0x00 in SIP header value");
-
-        let err = HeaderValue::from_bytes(&[0x1f]).unwrap_err();
-        assert_eq!(err.to_string(), "invalid byte 0x1F in SIP header value");
-
-        let err = HeaderValue::from_bytes(&[0x7f]).unwrap_err();
-        assert_eq!(err.to_string(), "invalid byte 0x7F in SIP header value");
+        for control in [0x00, 0x1f, 0x7f] {
+            let err = HeaderValue::from_bytes(&[b'a', control]).unwrap_err();
+            assert_eq!(err.to_string(), "invalid SIP header value at byte 1");
+        }
     }
 
     #[test]
@@ -555,20 +488,20 @@ mod tests {
         HeaderValue::from_bytes(b"a\\\\\\\x7f").unwrap();
 
         let err = HeaderValue::from_bytes(b"a\\\\\x01").unwrap_err();
-        assert_eq!(err.to_string(), "invalid byte 0x01 in SIP header value");
+        assert_eq!(err.to_string(), "invalid SIP header value at byte 3");
 
         // A pair consumes the control too, so it cannot escape what follows.
         let err = HeaderValue::from_bytes(b"a\\\x01\x01").unwrap_err();
-        assert_eq!(err.to_string(), "invalid byte 0x01 in SIP header value");
+        assert_eq!(err.to_string(), "invalid SIP header value at byte 3");
     }
 
     #[test]
     fn backslash_does_not_escape_cr_or_lf() {
         let err = HeaderValue::from_bytes(b"a\\\rb").unwrap_err();
-        assert_eq!(err.to_string(), "bare CR in SIP header value");
+        assert_eq!(err.to_string(), "CR not followed by LF at byte 2");
 
         let err = HeaderValue::from_bytes(b"a\\\nb").unwrap_err();
-        assert_eq!(err.to_string(), "bare LF in SIP header value");
+        assert_eq!(err.to_string(), "LF not preceded by CR at byte 2");
 
         HeaderValue::from_bytes(b"a\\\r\n b").unwrap();
     }
@@ -648,10 +581,11 @@ mod tests {
     #[test]
     fn from_bytes_rejects_invalid_utf8() {
         let err = HeaderValue::from_bytes(b"\x80").unwrap_err();
-        assert_eq!(err.to_string(), "invalid UTF-8 in SIP header value");
+        assert_eq!(err.to_string(), "invalid SIP header value at byte 0");
 
-        let err = HeaderValue::from_bytes(b"\xc3\x28").unwrap_err();
-        assert_eq!(err.to_string(), "invalid UTF-8 in SIP header value");
+        // The offset points at the byte that does not continue the sequence.
+        let err = HeaderValue::from_bytes(b"caf\xc3\x28").unwrap_err();
+        assert_eq!(err.to_string(), "invalid SIP header value at byte 4");
     }
 
     #[test]
@@ -692,8 +626,11 @@ mod tests {
     fn invalid_header_value_error_text() {
         let err = HeaderValue::from_bytes(b"\r").unwrap_err();
 
-        assert_eq!(err.to_string(), "bare CR in SIP header value");
-        assert_eq!(format!("{err:?}"), "InvalidHeaderValue { kind: BareCr }");
+        assert_eq!(err.to_string(), "CR not followed by LF at byte 0");
+        assert_eq!(
+            format!("{err:?}"),
+            "InvalidHeaderValue { kind: BareCr, offset: 0 }"
+        );
     }
 
     #[test]
