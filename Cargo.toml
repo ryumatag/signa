@@ -25,4 +25,4 @@ __bench = []
 
 [dependencies]
 bytes = { version = "1.12.1", default-features = false, features = ["std"] }
-siparse = "0.3.4"
+siparse = "0.4.0"
