@@ -122,7 +122,7 @@ jobs:
         with:
           toolchain: stable
       - name: Build docs
-        run: cargo doc --no-deps --verbose
+        run: cargo doc --all-features --verbose
 
   # signa's own `unsafe` is `from_utf8_unchecked` on bytes a check has
   # accepted, which Miri cannot verify. The tests still drive siparse's

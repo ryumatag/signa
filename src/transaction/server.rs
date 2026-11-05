@@ -33,9 +33,9 @@ use crate::{
 /// same time anyway. The transaction user therefore has no reason to send
 /// anything but the final response.
 ///
-/// [`ServerKey`](super::ServerKey)
-/// [`deadline`](ServerTransaction::deadline)
-/// [`is_terminated`](ServerTransaction::is_terminated)
+/// [`ServerKey`]: super::ServerKey
+/// [`deadline`]: ServerTransaction::deadline
+/// [`is_terminated`]: ServerTransaction::is_terminated
 #[derive(Debug)]
 pub struct ServerTransaction {
     timers: Timers,
