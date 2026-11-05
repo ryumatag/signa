@@ -19,12 +19,11 @@ use crate::{response::Response, transaction::Timers};
 /// Over an unreliable transport the request is retransmitted on Timer E, which
 /// starts at T1 and doubles up to T2. Timer F ends the transaction without a
 /// response after 64 T1. After the final response the transaction stays in
-/// [`Completed`] for Timer K, which is T4, to absorb retransmissions of that
+/// `Completed` for Timer K, which is T4, to absorb retransmissions of that
 /// response. A reliable transport has no retransmissions and ends the
 /// transaction with the final response.
 ///
 /// [`ClientKey`]: super::ClientKey
-/// [`Completed`]: State::Completed
 /// [`deadline`]: ClientTransaction::deadline
 /// [`is_terminated`]: ClientTransaction::is_terminated
 #[derive(Debug)]
