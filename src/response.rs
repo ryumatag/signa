@@ -11,8 +11,11 @@ use bytes::{Bytes, BytesMut};
 use crate::{
     error::{Error, InvalidMessage},
     extensions::Extensions,
-    header::{HeaderMap, HeaderName, HeaderValue},
+    header::{
+        HeaderMap, HeaderName, HeaderValue, CALL_ID, CSEQ, FROM, TO, VIA,
+    },
     reason::ReasonPhrase,
+    request::Request,
     status::StatusCode,
     version::Version,
 };
@@ -100,6 +103,67 @@ impl Response<()> {
     pub fn builder() -> Builder {
         Builder::new()
     }
+
+    /// Creates a [`Builder`] for a response to `request`, with the header
+    /// fields every response has to carry copied from it.
+    ///
+    /// RFC 3261 section 8.2.6.2 requires `Via`, `From`, `To`, `Call-ID`, and
+    /// `CSeq` to be copied from the request. The endpoint routes the response
+    /// by the `Via`, and it answers a response without one with a 500 instead
+    /// of sending it, so this is the way to start a response in a service.
+    /// Adding a tag to `To` where the request has none is left to the caller,
+    /// since it belongs to the dialog layer.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bytes::Bytes;
+    /// use signa::{header::{CSEQ, TO, VIA}, Request, Response, StatusCode};
+    ///
+    /// let request = Request::from_bytes(
+    ///     b"OPTIONS sip:carol@chicago.example.com SIP/2.0\r\n\
+    ///       Via: SIP/2.0/UDP pc33.atlanta.example.com;branch=z9hG4bKhjhs8ass877\r\n\
+    ///       Max-Forwards: 70\r\n\
+    ///       To: <sip:carol@chicago.example.com>\r\n\
+    ///       From: Alice <sip:alice@atlanta.example.com>;tag=1928301774\r\n\
+    ///       Call-ID: a84b4c76e66710\r\n\
+    ///       CSeq: 63104 OPTIONS\r\n\
+    ///       Content-Length: 0\r\n\
+    ///       \r\n",
+    /// )?;
+    ///
+    /// let response = Response::reply_to(&request)
+    ///     .status(StatusCode::OK)
+    ///     .header("Allow", "INVITE, ACK, CANCEL, OPTIONS, BYE")
+    ///     .body(Bytes::new())?;
+    ///
+    /// assert_eq!(response.headers().get(VIA), request.headers().get(VIA));
+    /// assert_eq!(response.headers().get(TO), request.headers().get(TO));
+    /// assert_eq!(response.headers().get(CSEQ).unwrap(), "63104 OPTIONS");
+    /// assert!(!response.headers().contains_key("Max-Forwards"));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn reply_to<T>(request: &Request<T>) -> Builder {
+        let head = Head {
+            headers: reply_headers(request.headers()),
+            ..Head::default()
+        };
+
+        Builder { inner: Ok(head) }
+    }
+}
+
+/// Copies the header fields that every response carries from the headers of a
+/// request (RFC 3261 section 8.2.6.2), in the order the request has them.
+pub(crate) fn reply_headers(request: &HeaderMap) -> HeaderMap {
+    let mut headers = HeaderMap::with_capacity(request.len().min(8));
+    for (name, value) in request.iter() {
+        if [&VIA, &FROM, &TO, &CALL_ID, &CSEQ].contains(&name) {
+            headers.append(name.clone(), value.clone());
+        }
+    }
+
+    headers
 }
 
 impl Response<Bytes> {

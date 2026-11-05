@@ -35,6 +35,9 @@ pub struct Via<'a> {
     /// The `rport` parameter. `Some(None)` is `rport` without a value, by
     /// which a client asks for the port (RFC 3581 section 4).
     pub rport: Option<Option<u16>>,
+    /// The offset in the value just past a valueless `rport`, where the server
+    /// puts `=port`. `None` when there is no such parameter.
+    pub rport_at: Option<usize>,
     /// The `maddr` parameter.
     pub maddr: Option<&'a str>,
     /// The `ttl` parameter.
@@ -48,9 +51,9 @@ pub struct Via<'a> {
 impl<'a> Via<'a> {
     /// Parses the first `via-parm` of `value`.
     ///
-    /// When `value` is the first `Via` row of a message, this is its
-    /// topmost `Via`. Returns `None` if the parm does not match the grammar
-    /// in RFC 3261 section 25.1, with the `rport` parameter from RFC 3581.
+    /// When `value` is the first `Via` row of a message, this is its topmost
+    /// `Via`. Returns `None` if the parm does not match the grammar in
+    /// RFC 3261 section 25.1, with the `rport` parameter from RFC 3581.
     ///
     /// A parameter that appears twice keeps its first value. The protocol
     /// name and version in `sent-protocol` are not checked beyond being
@@ -78,6 +81,7 @@ impl<'a> Via<'a> {
             branch: None,
             received: None,
             rport: None,
+            rport_at: None,
             maddr: None,
             ttl: None,
             end: 0,
@@ -96,7 +100,11 @@ impl<'a> Via<'a> {
                 break;
             }
             let next = scan::sws(next.strip_prefix(';')?);
+            let asked = via.rport.is_none();
             rest = via.param(next)?;
+            if asked && via.rport == Some(None) {
+                via.rport_at = Some(src.len() - rest.len());
+            }
         }
         via.end = src.len() - rest.len();
 
@@ -209,6 +217,7 @@ mod tests {
                 branch: Some("z9hG4bK776asdhds"),
                 received: None,
                 rport: None,
+                rport_at: None,
                 maddr: None,
                 ttl: None,
                 end: VALUE.len(),
@@ -230,6 +239,7 @@ mod tests {
                 branch: Some("z9hG4bKa"),
                 received: Some("192.0.2.207"),
                 rport: Some(Some(49154)),
+                rport_at: None,
                 maddr: Some("224.2.0.1"),
                 ttl: Some(16),
                 end: VALUE.len(),
@@ -239,9 +249,10 @@ mod tests {
 
     #[test]
     fn rport_without_a_value_asks_for_one() {
-        let via =
-            top!("SIP/2.0/UDP a.example.com;rport;branch=z9hG4bKa").unwrap();
+        const VALUE: &str = "SIP/2.0/UDP a.example.com;rport;branch=z9hG4bKa";
+        let via = top!(VALUE).unwrap();
         assert_eq!(via.rport, Some(None));
+        assert_eq!(&VALUE[via.rport_at.unwrap()..], ";branch=z9hG4bKa");
         assert_eq!(via.branch, Some("z9hG4bKa"));
         let via = top!("SIP/2.0/UDP a.example.com;rport").unwrap();
         assert_eq!(via.rport, Some(None));

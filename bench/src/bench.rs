@@ -1,6 +1,7 @@
 use criterion::{Bencher, Criterion, Throughput};
 
 mod encode;
+mod endpoint;
 mod frame;
 mod header_map;
 mod header_name;
@@ -28,16 +29,19 @@ criterion::criterion_group! {
         // Whole messages. Judge changes by these.
         message::parse,
         encode::encode,
-        // The stream decoder and the protocol layer's header parsers,
-        // through the `__bench` feature.
+        // The stream decoder and the protocol layer's header parsers, through
+        // the `__bench` feature.
         frame::stream,
         via::parse,
         header_map::prepend,
         transaction::non_invite,
-        // Loopback round trips through the transports, on a
-        // current-thread runtime. These include the syscalls.
+        // Loopback round trips through the transports, on a current-thread
+        // runtime. These include the syscalls.
         transport::udp,
         transport::tcp,
+        // The same round trips between two endpoints, which adds the
+        // transactions, the service, and the message layer on both sides.
+        endpoint::round_trip,
         // One value at a time. These cover the checks that will move to
         // siparse, so they show what the switch changes for each type.
         header_name::from_bytes,

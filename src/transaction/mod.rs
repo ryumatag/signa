@@ -21,17 +21,18 @@ The server machine applies all four, so the transaction user only ever supplies
 a final response.
 */
 
-mod client;
-mod key;
-mod server;
-
 use std::time::Duration;
 
+pub(crate) use self::server::bare_response;
 pub use self::{
     client::{ClientEvent, ClientTransaction},
     key::{ClientKey, ServerKey},
     server::ServerTransaction,
 };
+
+mod client;
+mod key;
+mod server;
 
 /// The timer values of RFC 3261 section 17.1.2.2.
 ///

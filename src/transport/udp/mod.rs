@@ -22,8 +22,10 @@ way back.
 */
 
 use std::{
+    future::poll_fn,
     io,
     net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6},
+    task::{ready, Context, Poll},
 };
 
 use bytes::{Bytes, BytesMut};
@@ -103,17 +105,39 @@ impl Socket {
     /// chunk alive, so a message that lives long holds the other datagrams
     /// read into the same chunk with it. Pass the same buffer to every call to
     /// get that sharing.
+    ///
+    /// The endpoint polls with [`Socket::poll_recv`] from its own loop. This
+    /// waits, for the tests and the benchmarks.
+    #[cfg_attr(not(any(test, feature = "__bench")), allow(dead_code))]
     pub async fn recv(&self, buf: &mut BytesMut) -> io::Result<(Bytes, Flow)> {
+        poll_fn(|cx| self.poll_recv(cx, buf)).await
+    }
+
+    /// Polls for one datagram. See [`Socket::recv`].
+    pub fn poll_recv(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &mut BytesMut,
+    ) -> Poll<io::Result<(Bytes, Flow)>> {
         buf.clear();
         // A chunk at a time, not a datagram at a time. `reserve` reuses the
         // allocation when no datagram from it is alive any more.
         if buf.capacity() < MAX_DATAGRAM {
             buf.reserve(CHUNK);
         }
-        let received = self
-            .inner
-            .async_io(Interest::READABLE, || sys::recv(&self.inner, buf))
-            .await?;
+        let received = loop {
+            ready!(self.inner.poll_recv_ready(cx))?;
+            // `try_io` clears the readiness on `WouldBlock`, so the next
+            // round waits for the reactor again.
+            match self
+                .inner
+                .try_io(Interest::READABLE, || sys::recv(&self.inner, buf))
+            {
+                Ok(received) => break received,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+                Err(err) => return Poll::Ready(Err(err)),
+            }
+        };
         let datagram = buf.split_to(received.len).freeze();
 
         // A dual-stack socket reports IPv4 peers as mapped IPv6 addresses.
@@ -126,7 +150,7 @@ impl Socket {
         };
         let flow = Flow { transport: Transport::Udp, local, remote };
 
-        Ok((datagram, flow))
+        Poll::Ready(Ok((datagram, flow)))
     }
 
     /// Sends `data` to the remote address of `flow`, from its local address
@@ -134,7 +158,56 @@ impl Socket {
     ///
     /// The local address only matters on a socket bound to a wildcard address.
     /// A socket bound to one address always sends from it.
+    ///
+    /// The endpoint uses [`Socket::try_send`], since it must not wait on one
+    /// flow. This waits, for the tests and the benchmarks.
+    #[cfg_attr(not(any(test, feature = "__bench")), allow(dead_code))]
     pub async fn send(&self, data: &[u8], flow: &Flow) -> io::Result<()> {
+        let (remote, source) = self.addresses(flow);
+        let sent = self
+            .inner
+            .async_io(Interest::WRITABLE, || {
+                sys::send(&self.inner, data, remote, source)
+            })
+            .await?;
+        // A datagram goes out whole or not at all, so a short count cannot
+        // happen. This guards the platform layer, not the kernel.
+        debug_assert_eq!(sent, data.len());
+
+        Ok(())
+    }
+
+    /// Polls for the socket to be writable, which [`Socket::try_send`] needs
+    /// before it can send anything.
+    pub fn poll_send_ready(
+        &self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.inner.poll_send_ready(cx)
+    }
+
+    /// Sends `data` as [`Socket::send`] does, without waiting.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`io::ErrorKind::WouldBlock`] when the socket's send buffer
+    /// is full, or when the reactor has not yet seen the socket writable,
+    /// which is so until [`Socket::poll_send_ready`] has been polled once. The
+    /// endpoint queues the datagram and sends it when the socket is writable,
+    /// rather than wait on one flow.
+    pub fn try_send(&self, data: &[u8], flow: &Flow) -> io::Result<()> {
+        let (remote, source) = self.addresses(flow);
+        let sent = self.inner.try_io(Interest::WRITABLE, || {
+            sys::send(&self.inner, data, remote, source)
+        })?;
+        debug_assert_eq!(sent, data.len());
+
+        Ok(())
+    }
+
+    /// The destination and the source to give the platform layer for a send on
+    /// `flow`.
+    fn addresses(&self, flow: &Flow) -> (SocketAddr, Option<IpAddr>) {
         // A socket bound to IPv6 reaches IPv4 peers through mapped addresses.
         // The other way around cannot work, and the kernel reports it.
         let remote = match (self.local, flow.remote) {
@@ -156,17 +229,8 @@ impl Socket {
             }
             _ => None,
         };
-        let sent = self
-            .inner
-            .async_io(Interest::WRITABLE, || {
-                sys::send(&self.inner, data, remote, source)
-            })
-            .await?;
-        // A datagram goes out whole or not at all, so a short count cannot
-        // happen. This guards the platform layer, not the kernel.
-        debug_assert_eq!(sent, data.len());
 
-        Ok(())
+        (remote, source)
     }
 }
 
@@ -189,6 +253,12 @@ mod tests {
 
     const LOCALHOST: SocketAddr =
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+    // Only the tests on the platforms with `PKTINFO` bind to a wildcard.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple"
+    ))]
     const UNSPECIFIED: SocketAddr =
         SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
     const LOCALHOST_V6: SocketAddr =

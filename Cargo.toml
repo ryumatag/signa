@@ -19,9 +19,9 @@ include = [
 
 [features]
 default = ["tokio"]
-# The transports, and later the endpoint, run on tokio. Without this feature
-# only the message layer is built.
-tokio = ["dep:tokio", "dep:libc"]
+# The transports and the endpoint run on tokio. Without this feature only the
+# message layer is built.
+tokio = ["dep:tokio", "dep:libc", "dep:tower-service", "dep:foldhash"]
 # Exposes crate internals to the benchmark crate in `bench/`. Unstable, with no
 # semver guarantee. Not for use outside this repository.
 __bench = []
@@ -30,6 +30,10 @@ __bench = []
 bytes = { version = "1.12.1", default-features = false, features = ["std"] }
 siparse = "0.4.0"
 tokio = { version = "1.47", default-features = false, features = ["io-util", "net", "rt", "sync", "time"], optional = true }
+tower-service = { version = "0.3.3", optional = true }
+# Keys the transaction tables. Branches come from the network, so the hasher
+# must be seeded, and it must be fast, since every message is looked up.
+foldhash = { version = "0.2", optional = true }
 
 # `recvmsg` and `sendmsg` with the `PKTINFO` control messages, which tokio does
 # not expose.
@@ -38,3 +42,4 @@ libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.47", features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.5", features = ["limit", "util"] }

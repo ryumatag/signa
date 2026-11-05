@@ -30,9 +30,10 @@ transactions. I plan stream framing, UDP and TCP I/O, non-INVITE transactions,
 and the `Service` boundary for 0.2.0, and INVITE, ACK, and CANCEL transactions
 for 0.3.0.
 
-The `tokio` feature, on by default, pulls in tokio for the I/O that 0.2.0 is
-building up. Nothing public depends on it yet. With `default-features = false`
-only the message layer is built.
+The `tokio` feature, on by default, pulls in tokio for the [`endpoint`], which
+carries messages over UDP and TCP, runs non-INVITE transactions, and serves
+requests through a Tower `Service`. With `default-features = false` only the
+message layer is built.
 
 # Example
 
@@ -128,6 +129,8 @@ pub use self::{
 };
 
 mod encode;
+#[cfg(feature = "tokio")]
+pub mod endpoint;
 pub mod error;
 mod extensions;
 // Everything `pub` in `frame` exists for the `__bench` feature, which
@@ -145,26 +148,19 @@ mod reason;
 pub mod request;
 pub mod response;
 mod status;
-// Crate-private until the endpoint drives the transactions. `pub` items exist
-// for the `__bench` feature, as in `frame`.
-//
-// TODO: Drop `dead_code` and `unused_imports` once the endpoint uses the
-// transactions.
+// The machines are crate-private, driven by the endpoint. `pub` items exist
+// for the `__bench` feature, as in `frame`. Without `tokio` nothing drives
+// them, so the module is dead.
+#[cfg_attr(not(feature = "__bench"), allow(unreachable_pub))]
 #[cfg_attr(
-    not(feature = "__bench"),
-    allow(unreachable_pub, dead_code, unused_imports)
+    not(any(feature = "__bench", feature = "tokio")),
+    allow(dead_code, unused_imports)
 )]
 mod transaction;
-// The transports run on tokio. Crate-private until the endpoint drives them,
+// The transports run on tokio and are crate-private, driven by the endpoint,
 // with `pub` items for the `__bench` feature, as in `frame`.
-//
-// TODO: Drop `dead_code` and `unused_imports` once the endpoint uses the
-// transports.
 #[cfg(feature = "tokio")]
-#[cfg_attr(
-    not(feature = "__bench"),
-    allow(unreachable_pub, dead_code, unused_imports)
-)]
+#[cfg_attr(not(feature = "__bench"), allow(unreachable_pub))]
 mod transport;
 mod uri;
 mod util;

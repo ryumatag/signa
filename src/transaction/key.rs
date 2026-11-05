@@ -35,16 +35,31 @@ pub struct ServerKey {
 impl ServerKey {
     /// Returns the key of `request`, or `None` if its top `Via` is missing,
     /// unreadable, or has no RFC 3261 branch.
+    ///
+    /// The endpoint has parsed the `Via` already when it needs the key, so it
+    /// uses [`ServerKey::new`]. This is for tests and benchmarks.
+    #[cfg_attr(not(any(test, feature = "__bench")), allow(dead_code))]
     pub fn from_request(request: &Request<Bytes>) -> Option<ServerKey> {
         let value = request.headers().get(VIA)?;
         let via = Via::top(value)?;
-        let branch = branch(value, &via)?;
+
+        ServerKey::new(value, &via, request.method())
+    }
+
+    /// Returns the key for a request whose top `Via` the caller has parsed
+    /// from `value` already, or `None` if it has no RFC 3261 branch.
+    pub fn new(
+        value: &HeaderValue,
+        via: &Via<'_>,
+        method: &Method,
+    ) -> Option<ServerKey> {
+        let branch = branch(value, via)?;
 
         Some(ServerKey {
             branch,
             host: value.as_shared().slice_ref(via.host.as_bytes()),
             port: via.port,
-            method: request.method().clone(),
+            method: method.clone(),
         })
     }
 }

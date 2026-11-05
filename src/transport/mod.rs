@@ -12,7 +12,7 @@ a trait can be extracted once a transport outside signa exists to validate it,
 such as one on a raw socket that carries Ethernet-level data.
 */
 
-use std::net::SocketAddr;
+use std::{fmt, net::SocketAddr};
 
 pub mod tcp;
 pub mod udp;
@@ -26,12 +26,36 @@ pub enum Transport {
     Tcp,
 }
 
+impl Transport {
+    /// Returns `true` if the transport delivers what is sent, so that
+    /// transactions need not retransmit over it (RFC 3261 section 17).
+    pub fn is_reliable(self) -> bool {
+        match self {
+            Transport::Udp => false,
+            Transport::Tcp => true,
+        }
+    }
+}
+
+impl fmt::Display for Transport {
+    /// The name as it appears in a `Via` (RFC 3261 section 20.42).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Transport::Udp => "UDP",
+            Transport::Tcp => "TCP",
+        })
+    }
+}
+
 /// A transport-layer association, which RFC 5626 section 3 calls a flow: the
 /// transport, and the address and port of both ends.
 ///
 /// A flow says where a message came from and where its answer goes. Over UDP
 /// the local address is the one the datagram was received on, which matters on
 /// a socket bound to a wildcard address. Over TCP it is the connection's own.
+///
+/// The endpoint puts the flow a request arrived on into the request's
+/// extensions, so a service can see where it came from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct Flow {
     /// The protocol.

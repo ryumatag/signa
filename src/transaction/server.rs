@@ -8,8 +8,9 @@ use bytes::Bytes;
 
 use super::Timers;
 use crate::{
-    header::{HeaderMap, CALL_ID, CSEQ, FROM, TO, VIA},
-    response, Request, Response, StatusCode,
+    header::HeaderMap,
+    response::{self, reply_headers},
+    Request, Response, StatusCode,
 };
 
 /// A non-INVITE server transaction.
@@ -89,9 +90,16 @@ impl ServerTransaction {
         ServerTransaction {
             timers,
             reliable,
-            headers: response_headers(request.headers()),
+            headers: reply_headers(request.headers()),
             state: State::Trying { trying: now + timers.trying_after() },
         }
+    }
+
+    /// The header fields a response to the request has to carry, as the
+    /// request had them. The caller builds a response of its own from them,
+    /// such as a 500 when the transaction user gave it nothing usable.
+    pub fn headers(&self) -> &HeaderMap {
+        &self.headers
     }
 
     /// Returns when the caller should call [`on_timeout`] next, or `None` when
@@ -118,7 +126,7 @@ impl ServerTransaction {
     pub fn on_timeout(&mut self, now: Instant) -> Option<Bytes> {
         match &self.state {
             State::Trying { trying } if *trying <= now => {
-                let response = trying_response(&self.headers);
+                let response = bare_response(&self.headers, TRYING);
                 self.state = State::Proceeding { response: response.clone() };
 
                 Some(response)
@@ -196,22 +204,10 @@ impl ServerTransaction {
     }
 }
 
-/// Copies the header fields that every response carries from the request
-/// (RFC 3261 section 8.2.6.2).
-fn response_headers(request: &HeaderMap) -> HeaderMap {
-    let mut headers = HeaderMap::with_capacity(5);
-    for name in [VIA, FROM, TO, CALL_ID, CSEQ] {
-        for value in request.get_all(&name) {
-            headers.append(name.clone(), value.clone());
-        }
-    }
-
-    headers
-}
-
-/// Encodes a `100 Trying` with `headers`.
-fn trying_response(headers: &HeaderMap) -> Bytes {
-    let mut parts = response::Parts::new(TRYING);
+/// Encodes a response with `status`, `headers`, and no body. This is what the
+/// transaction layer sends on its own, such as the 100 and the 500.
+pub(crate) fn bare_response(headers: &HeaderMap, status: StatusCode) -> Bytes {
+    let mut parts = response::Parts::new(status);
     parts.headers = headers.clone();
 
     Response::from_parts(parts, Bytes::new()).to_bytes()
@@ -275,8 +271,8 @@ mod tests {
             [
                 ("Via", "SIP/2.0/UDP proxy.example.com;branch=z9hG4bKnashds8"),
                 ("Via", "SIP/2.0/UDP pc33.atlanta.example.com;branch=z9hG4bKhjhs8ass877"),
-                ("From", "Alice <sip:alice@atlanta.example.com>;tag=1928301774"),
                 ("To", "<sip:carol@chicago.example.com>"),
+                ("From", "Alice <sip:alice@atlanta.example.com>;tag=1928301774"),
                 ("Call-ID", "a84b4c76e66710"),
                 ("CSeq", "63104 OPTIONS"),
                 ("Content-Length", "0"),
