@@ -2,12 +2,14 @@ use criterion::{Bencher, Criterion, Throughput};
 
 mod encode;
 mod frame;
+mod header_map;
 mod header_name;
 mod header_value;
 mod message;
 mod method;
 mod reason;
 mod uri;
+mod via;
 
 // I `assert_eq!` on every benchmark iteration. For the argument behind
 // this choice, see the linked jiff issue comment.
@@ -24,8 +26,11 @@ criterion::criterion_group! {
         // Whole messages. Judge changes by these.
         message::parse,
         encode::encode,
-        // The stream decoder, through the `__bench` feature.
+        // The stream decoder and the protocol layer's header parsers,
+        // through the `__bench` feature.
         frame::stream,
+        via::parse,
+        header_map::prepend,
         // One value at a time. These cover the checks that will move to
         // siparse, so they show what the switch changes for each type.
         header_name::from_bytes,

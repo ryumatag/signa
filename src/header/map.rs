@@ -1,6 +1,6 @@
 use std::{borrow::Cow, fmt, iter::FusedIterator, slice, vec};
 
-use super::{HeaderName, HeaderValue};
+use super::{name::HeaderName, value::HeaderValue};
 
 pub use self::as_header_name::AsHeaderName;
 
@@ -156,6 +156,41 @@ impl HeaderMap {
         let existed = self.position(&name).is_some();
         self.rows.push((name, value));
         existed
+    }
+
+    /// Adds a row with `name` and `value` before existing rows with `name`.
+    ///
+    /// This is how a sender adds its own `Via`, which [RFC 3261 section
+    /// 8.1.1.7] puts above those already present. If no row has `name`, the
+    /// new row is added at the end, as [`HeaderMap::append`] does, since
+    /// SIP gives no meaning to the order across names. Returns `true` if
+    /// rows with `name` already existed.
+    ///
+    /// ```
+    /// use signa::header::{HeaderMap, HeaderValue, MAX_FORWARDS, VIA};
+    ///
+    /// let mut headers = HeaderMap::new();
+    /// headers.append(MAX_FORWARDS, HeaderValue::from_static("70"));
+    /// headers.append(VIA, HeaderValue::from_static("SIP/2.0/UDP b.example.com"));
+    /// headers.prepend(VIA, HeaderValue::from_static("SIP/2.0/UDP a.example.com"));
+    ///
+    /// let vias: Vec<_> = headers.get_all(VIA).collect();
+    /// assert_eq!(vias, ["SIP/2.0/UDP a.example.com", "SIP/2.0/UDP b.example.com"]);
+    /// assert_eq!(headers.iter().next().unwrap().0, &MAX_FORWARDS);
+    /// ```
+    ///
+    /// [RFC 3261 section 8.1.1.7]: https://www.rfc-editor.org/rfc/rfc3261#section-8.1.1.7
+    pub fn prepend(&mut self, name: HeaderName, value: HeaderValue) -> bool {
+        match self.position(&name) {
+            Some(first) => {
+                self.rows.insert(first, (name, value));
+                true
+            }
+            None => {
+                self.rows.push((name, value));
+                false
+            }
+        }
     }
 
     /// Removes every row with `name` and returns the first removed value.
@@ -386,7 +421,7 @@ mod as_header_name {
 #[cfg(test)]
 mod tests {
     use super::{
-        super::{CALL_ID, CONTACT, TO, VIA},
+        super::{CALL_ID, CONTACT, CSEQ, TO, VIA},
         *,
     };
 
@@ -440,6 +475,29 @@ mod tests {
 
         assert!(map.insert(CALL_ID, value("f")).is_none());
         assert_eq!(rows(&map).last(), Some(&("Call-ID", "f")));
+    }
+
+    #[test]
+    fn prepend_goes_before_rows_of_the_same_name() {
+        let mut headers = HeaderMap::new();
+        assert!(!headers.prepend(VIA, value("c")));
+        headers.append(CALL_ID, value("id"));
+        headers.append(VIA, value("d"));
+        assert!(headers.prepend(VIA, value("b")));
+        assert!(headers.prepend(VIA, value("a")));
+        assert!(!headers.prepend(CSEQ, value("1 INVITE")));
+
+        assert_eq!(
+            rows(&headers),
+            [
+                ("Via", "a"),
+                ("Via", "b"),
+                ("Via", "c"),
+                ("Call-ID", "id"),
+                ("Via", "d"),
+                ("CSeq", "1 INVITE"),
+            ]
+        );
     }
 
     #[test]
