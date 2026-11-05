@@ -11,11 +11,11 @@ pub use self::as_header_name::AsHeaderName;
 /// A name may appear in several rows. [`HeaderMap::get_all`] returns their
 /// values in order, which matters for fields such as `Via` and `Route`.
 ///
-/// [RFC 3261 section 7.3.1] only gives meaning to the relative order of
-/// rows with the same name. I still keep the order across names because a
-/// message that is forwarded or logged should look like the one received,
-/// and because the RFC recommends putting fields that proxies need, such
-/// as `Via` and `Route`, near the top.
+/// [RFC 3261 section 7.3.1] only gives meaning to the relative order of rows
+/// with the same name. I still keep the order across names because a message
+/// that is forwarded or logged should look like the one received, and because
+/// the RFC recommends putting fields that proxies need, such as `Via` and
+/// `Route`, near the top.
 ///
 /// Lookups scan the rows, so they take time linear in the number of rows.
 /// A SIP head has few rows, and comparing two standard header names is a
@@ -121,10 +121,9 @@ impl HeaderMap {
 
     /// Sets `name` to the single value `value`.
     ///
-    /// If rows with `name` exist, `value` replaces the first of them in
-    /// place and the others are removed. The first previous value is
-    /// returned. Otherwise a new row is added at the end and this returns
-    /// `None`.
+    /// If rows with `name` exist, `value` replaces the first of them in place
+    /// and the others are removed. The first previous value is returned.
+    /// Otherwise a new row is added at the end and this returns `None`.
     pub fn insert(
         &mut self,
         name: HeaderName,
@@ -151,8 +150,8 @@ impl HeaderMap {
 
     /// Adds a row with `name` and `value` at the end.
     ///
-    /// Existing rows with `name` are kept, and the new value comes after
-    /// them. Returns `true` if rows with `name` already existed.
+    /// Existing rows with `name` are kept, and the new value comes after them.
+    /// Returns `true` if rows with `name` already existed.
     pub fn append(&mut self, name: HeaderName, value: HeaderValue) -> bool {
         let existed = self.position(&name).is_some();
         self.rows.push((name, value));
@@ -326,7 +325,7 @@ mod as_header_name {
     /// is not a valid header name matches no rows. Looking up a custom
     /// (non-standard) name by string allocates to normalize it.
     ///
-    /// This trait is sealed and cannot be implemented outside of `signa`.
+    /// This trait is sealed and cannot be implemented outside of signa.
     pub trait AsHeaderName: Sealed {}
 
     // The conversion lives on this hidden supertrait rather than on

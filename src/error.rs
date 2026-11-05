@@ -13,8 +13,8 @@ use std::{convert::Infallible, error, fmt};
 /// A general error for building SIP messages.
 ///
 /// The more specific errors in this module, such as [`InvalidMethod`], all
-/// convert into this one, so builders and other code that takes several
-/// kinds of input can report any of them through `?`.
+/// convert into this one, so builders and other code that takes several kinds
+/// of input can report any of them through `?`.
 ///
 /// [`Error::get_ref`] returns the underlying error, and [`Error::is`] checks
 /// its type.
@@ -46,8 +46,8 @@ enum ErrorKind {
 
 /// A required part was never given to a builder.
 ///
-/// This is not public. Callers can tell it apart from the other kinds
-/// because [`Error::is`] matches none of the public error types.
+/// This is not public. Callers can tell it apart from the other kinds because
+/// [`Error::is`] matches none of the public error types.
 struct Missing(&'static str);
 
 impl Error {
@@ -97,8 +97,8 @@ impl error::Error for Error {
     }
 }
 
-// Builders accept values that are already of the target type, whose
-// `TryFrom` error is `Infallible`.
+// Builders accept values that are already of the target type, whose `TryFrom`
+// error is `Infallible`.
 impl From<Infallible> for Error {
     fn from(err: Infallible) -> Error {
         match err {}
@@ -180,13 +180,13 @@ invalid_errors! {
 
 /// An error returned when parsing an invalid SIP header field value.
 ///
-/// Its `Display` output says what was wrong with the value and at which
-/// byte, counting from 0, as in `CR not followed by LF at byte 6`.
+/// Its `Display` output says what was wrong with the value and at which byte,
+/// counting from 0, as in `CR not followed by LF at byte 6`.
 ///
-/// The error deliberately does not keep the rejected value, not even the
-/// byte at fault. Header values can carry credentials, such as
-/// `Authorization`, and an error is easy to log by accident. Not keeping the
-/// value also avoids allocating on the error path.
+/// The error deliberately does not keep the rejected value, not even the byte
+/// at fault. Header values can carry credentials, such as `Authorization`, and
+/// an error is easy to log by accident. Not keeping the value also avoids
+/// allocating on the error path.
 pub struct InvalidHeaderValue {
     kind: siparse::ErrorKind,
     offset: usize,
@@ -212,8 +212,8 @@ impl fmt::Debug for InvalidHeaderValue {
 
 impl fmt::Display for InvalidHeaderValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // `siparse` describes the kind, such as "invalid SIP header value"
-        // or "CR not followed by LF".
+        // siparse describes the kind, such as "invalid SIP header value" or
+        // "CR not followed by LF".
         write!(f, "{} at byte {}", self.kind, self.offset)
     }
 }
@@ -239,7 +239,7 @@ pub struct InvalidMessage {
 /// What made a message invalid.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InvalidMessageKind {
-    /// `siparse` rejected the head. `TooManyHeaders` never appears here.
+    /// siparse rejected the head. `TooManyHeaders` never appears here.
     Head(siparse::ErrorKind),
     TooManyHeaders,
     IncompleteHead,

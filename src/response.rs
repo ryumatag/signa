@@ -19,8 +19,8 @@ use crate::{
 
 /// A SIP response: a status-line, header fields, and a body.
 ///
-/// The body type `T` is generic. A response read from the wire has a
-/// `Bytes` body, and higher layers can turn it into a typed body with
+/// The body type `T` is generic. A response read from the wire has a `Bytes`
+/// body, and higher layers can turn it into a typed body with
 /// [`Response::map`].
 ///
 /// The reason phrase is optional. A response read from the wire keeps the
@@ -43,9 +43,9 @@ use crate::{
 /// # Ok::<(), signa::Error>(())
 /// ```
 ///
-/// The builder is the only way to create a response from scratch. A
-/// response can also be taken apart with [`Response::into_parts`] and put
-/// back together with [`Response::from_parts`].
+/// The builder is the only way to create a response from scratch. A response
+/// can also be taken apart with [`Response::into_parts`] and put back together
+/// with [`Response::from_parts`].
 #[derive(Clone)]
 pub struct Response<T> {
     head: Parts,
@@ -85,8 +85,8 @@ pub struct Builder {
     inner: Result<Head, Error>,
 }
 
-// What a `Builder` has collected so far. The status starts out unset
-// because, unlike HTTP's 200, no status makes sense as a default.
+// What a `Builder` has collected so far. The status starts out unset because,
+// unlike HTTP's 200, no status makes sense as a default.
 #[derive(Debug, Default)]
 struct Head {
     status: Option<StatusCode>,
@@ -122,6 +122,8 @@ impl Response<Bytes> {
     /// This works like [`Request::from_shared`](crate::Request::from_shared).
     /// The reason phrase is kept as received, even when it is empty.
     ///
+    /// # Example
+    ///
     /// ```
     /// use bytes::Bytes;
     /// use signa::{Response, StatusCode};
@@ -138,8 +140,10 @@ impl Response<Bytes> {
     /// # Errors
     ///
     /// Returns [`InvalidMessage`] in the same cases as
-    /// [`Request::from_shared`](crate::Request::from_shared), and also if the
-    /// status code is outside `100..=699`.
+    /// [`Request::from_shared`], and also if the status code is outside
+    /// `100..=699`.
+    ///
+    /// [`Request::from_shared`]: crate::Request::from_shared
     pub fn from_shared(src: Bytes) -> Result<Response<Bytes>, InvalidMessage> {
         crate::parse::response(src)
     }
@@ -152,6 +156,8 @@ impl<T: AsRef<[u8]>> Response<T> {
     /// response without a [`ReasonPhrase`] uses
     /// [`StatusCode::canonical_reason`], or an empty reason phrase if its
     /// code has none.
+    ///
+    /// # Example
     ///
     /// ```
     /// use bytes::Bytes;
@@ -408,8 +414,8 @@ impl Builder {
     ///
     /// # Errors
     ///
-    /// Returns the first error from an earlier call, or an error if the
-    /// status was never set.
+    /// Returns the first error from an earlier call, or an error if the status
+    /// was never set.
     pub fn body<T>(self, body: T) -> Result<Response<T>, Error> {
         let head = self.inner?;
         let status = head.status.ok_or_else(|| Error::missing("status"))?;

@@ -1,9 +1,9 @@
 /*!
 Conversion from the bytes of one complete SIP message.
 
-`siparse` parses the head. This module turns its output into a `Request` or
-`Response` whose parts share the input `Bytes` instead of copying it, and
-picks out the body.
+siparse parses the head. This module turns its output into a `Request` or
+`Response` whose parts share the input `Bytes` instead of copying it, and picks
+out the body.
 */
 
 use bytes::Bytes;
@@ -70,11 +70,11 @@ pub(crate) fn message(src: Bytes) -> Result<Message<Bytes>, InvalidMessage> {
     }
 }
 
-// `siparse` fills every start-line field before it reports a complete head.
+// siparse fills every start-line field before it reports a complete head.
 const COMPLETE: &str = "a complete head has every start-line field";
 
-/// Returns where the head ends, or the error for a head that is invalid or
-/// cut short.
+/// Returns where the head ends, or the error for a head that is invalid or cut
+/// short.
 ///
 /// The input is one complete message, so a partial head is an error rather
 /// than a request for more bytes.
@@ -111,8 +111,8 @@ fn response_parts(
     line: &StatusLine<'_>,
     rows: &[Header<'_>],
 ) -> Result<response::Parts, InvalidMessage> {
-    // `siparse` accepts any three digits. `StatusCode` only takes the
-    // classes RFC 3261 defines.
+    // siparse accepts any three digits. `StatusCode` only takes the classes
+    // RFC 3261 defines.
     let status =
         StatusCode::from_bytes(line.status_code.expect(COMPLETE).as_bytes())
             .map_err(|_| InvalidMessage::new(InvalidMessageKind::StatusCode))?;
@@ -141,7 +141,7 @@ fn headers(
     Ok(headers)
 }
 
-// `Method` uses `siparse`'s own check, so it never rejects a parsed method.
+// `Method` uses siparse's own check, so it never rejects a parsed method.
 // If that ever changed, this reports the method as invalid instead of
 // panicking on untrusted input.
 fn drifted(kind: ErrorKind) -> InvalidMessage {
@@ -152,8 +152,8 @@ fn drifted(kind: ErrorKind) -> InvalidMessage {
 ///
 /// Without `Content-Length`, the body is the rest of the input. With it, the
 /// body is that many bytes, and anything after them is dropped, as RFC 3261
-/// section 18.3 says for datagrams. A `Content-Length` larger than the rest
-/// is an error, since the input is the whole message.
+/// section 18.3 says for datagrams. A `Content-Length` larger than the rest is
+/// an error, since the input is the whole message.
 fn body(
     src: &Bytes,
     head_end: usize,
@@ -174,8 +174,8 @@ fn body(
 /// Returns the value of `Content-Length`, or `None` if there is none.
 ///
 /// The field is `1*DIGIT` (RFC 3261 section 20.14). A repeated field is
-/// accepted only if every copy has the same value, because a message with
-/// two different lengths has no single body.
+/// accepted only if every copy has the same value, because a message with two
+/// different lengths has no single body.
 fn content_length(
     headers: &HeaderMap,
 ) -> Result<Option<usize>, InvalidMessage> {
@@ -197,11 +197,11 @@ fn content_length(
 }
 
 fn parse_content_length(value: &HeaderValue) -> Option<usize> {
-    // `siparse` keeps trailing whitespace, including a trailing fold.
+    // siparse keeps trailing whitespace, including a trailing fold.
     let digits = value.as_str().trim_end_matches([' ', '\t', '\r', '\n']);
 
-    // `usize::from_str` also takes a leading `+`, which the grammar does
-    // not. It still rejects a value too large for `usize`.
+    // `usize::from_str` also takes a leading `+`, which the grammar does not.
+    // It still rejects a value too large for `usize`.
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }

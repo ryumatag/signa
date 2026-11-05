@@ -75,8 +75,8 @@ macro_rules! standard_headers {
 
         impl StandardHeader {
             // Matches against pre-lowercased input. Long-form names and
-            // compact forms are unified in a single match so the compiler
-            // can emit one optimized jump table.
+            // compact forms are unified in a single match so the compiler can
+            // emit one optimized jump table.
             const fn from_bytes(src: &[u8]) -> Option<StandardHeader> {
                 match src {
                     $(
@@ -701,9 +701,8 @@ standard_headers! {
 impl HeaderName {
     /// Creates a new `HeaderName` from a static string.
     ///
-    /// This constructor is intended for compile-time constants.
-    /// Standard SIP header names and compact forms are recognized without
-    /// allocation.
+    /// This constructor is intended for compile-time constants. Standard SIP
+    /// header names and compact forms are recognized without allocation.
     ///
     /// Custom header names must already be lowercase-normalized. Unlike
     /// [`HeaderName::from_bytes`], this constructor does not allocate in order
@@ -758,7 +757,7 @@ impl HeaderName {
         Ok(HeaderName::custom(name))
     }
 
-    /// Creates a `HeaderName` from a name that `siparse` parsed, without
+    /// Creates a `HeaderName` from a name that siparse parsed, without
     /// checking it again.
     pub(crate) fn from_parsed(name: &str) -> HeaderName {
         debug_assert!(check::header_name(name.as_bytes()).is_ok());
@@ -856,8 +855,8 @@ impl StandardHeader {
         }
         // Copy and lowercase in one loop. `copy_from_slice` followed by
         // `make_ascii_lowercase` made whole-message parsing a few percent
-        // slower in the benchmarks, since names are short and the copy
-        // became a `memcpy` call.
+        // slower in the benchmarks, since names are short and the copy became
+        // a `memcpy` call.
         let mut buf = [0u8; SCRATCH_BUF_SIZE];
         let lowered = &mut buf[..src.len()];
         for (dst, &b) in lowered.iter_mut().zip(src) {
@@ -868,9 +867,9 @@ impl StandardHeader {
 }
 
 // Stack scratch buffer size for lowercasing. It must hold the longest
-// standard header name, currently `p-charging-function-addresses` at 29
-// bytes, which `standard_headers!` checks at compile time. Longer names
-// cannot be standard.
+// standard header name, currently `p-charging-function-addresses` at 29 bytes,
+// which `standard_headers!` checks at compile time. Longer names cannot be
+// standard.
 const SCRATCH_BUF_SIZE: usize = 64;
 
 const fn eq_lowercase_bytes(src: &[u8], expected: &[u8]) -> bool {

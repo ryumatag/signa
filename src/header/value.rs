@@ -13,19 +13,19 @@ use crate::error::InvalidHeaderValue;
 
 /// A SIP header field value.
 ///
-/// One type holds the value of every header field, so it cannot check a
-/// value against the grammar of its field. It accepts the same bytes as
-/// [`siparse`], which cover every field's grammar in RFC 3261 section 25.1.
-/// The generic `header-value` production allows no ASCII controls besides
-/// `HTAB` in folds and whitespace:
+/// One type holds the value of every header field, so it cannot check a value
+/// against the grammar of its field. It accepts the same bytes as [siparse],
+/// which cover every field's grammar in RFC 3261 section 25.1. The generic
+/// `header-value` production allows no ASCII controls besides `HTAB` in folds
+/// and whitespace:
 ///
 /// ```text
 /// header-value = *(TEXT-UTF8char / UTF8-CONT / LWS)
 /// ```
 ///
-/// But the `quoted-string` and `comment` productions in fields such as
-/// `From`, `Contact`, and `Authorization` also allow a `quoted-pair`, which
-/// can escape any ASCII control except `CR` and `LF`:
+/// But the `quoted-string` and `comment` productions in fields such as `From`,
+/// `Contact`, and `Authorization` also allow a `quoted-pair`, which can escape
+/// any ASCII control except `CR` and `LF`:
 ///
 /// ```text
 /// quoted-pair = "\" (%x00-09 / %x0B-0C / %x0E-7F)
@@ -34,20 +34,20 @@ use crate::error::InvalidHeaderValue;
 /// So this type also accepts such a control right after an odd run of
 /// backslashes, in any field. Checking that it sits in a quoted string or
 /// comment that the field allows is left to typed header parsers, along with
-/// the rest of each field's grammar. Matching `siparse` means that any value
+/// the rest of each field's grammar. Matching siparse means that any value
 /// received in a parsed head can be built here too.
 ///
 /// The value is stored exactly as given, including folds (`CRLF` followed by
 /// `SP` or `HTAB`) and leading or trailing whitespace. This matches what
-/// [`siparse`] returns for a parsed head, so a received value can be kept as
-/// it arrived without copying or rewriting it. [`HeaderValue::lines`] splits
-/// the value at its folds for consumers that need the unfolded text.
+/// [siparse] returns for a parsed head, so a received value can be kept as it
+/// arrived without copying or rewriting it. [`HeaderValue::lines`] splits the
+/// value at its folds for consumers that need the unfolded text.
 ///
 /// I keep folds instead of unfolding at construction because unfolding has to
 /// allocate. That would rule out a `const` [`HeaderValue::from_static`] and
 /// zero-copy construction from a received buffer.
 ///
-/// [`siparse`]: https://docs.rs/siparse
+/// [siparse]: https://docs.rs/siparse
 #[derive(Clone)]
 pub struct HeaderValue {
     raw: Bytes,
@@ -61,6 +61,8 @@ impl HeaderValue {
     /// A `&'static str` is already valid UTF-8, so only the byte-level rules
     /// are checked. This makes the function usable in `const` contexts.
     ///
+    /// # Example
+    ///
     /// ```
     /// use signa::HeaderValue;
     ///
@@ -72,8 +74,8 @@ impl HeaderValue {
     ///
     /// # Panics
     ///
-    /// Panics if `src` contains bytes that are illegal in a generic SIP
-    /// header field value. In a `const` context this is a compile error.
+    /// Panics if `src` contains bytes that are illegal in a generic SIP header
+    /// field value. In a `const` context this is a compile error.
     pub const fn from_static(src: &'static str) -> HeaderValue {
         let bytes = src.as_bytes();
         if check::header_value_const(bytes).is_err() {
@@ -100,7 +102,7 @@ impl HeaderValue {
     /// * any other ASCII control or `DEL`;
     /// * bytes that are not valid UTF-8.
     ///
-    /// The check is `siparse`'s [`check::header_value`]. The bytes are stored
+    /// The check is siparse's [`check::header_value`]. The bytes are stored
     /// as given, folds included.
     ///
     /// # Errors
@@ -120,9 +122,11 @@ impl HeaderValue {
     /// copying them.
     ///
     /// This accepts the same bytes as [`HeaderValue::from_bytes`]. The value
-    /// keeps a reference to `src`, so a value taken from a larger buffer
-    /// keeps the whole buffer alive. A `Vec<u8>` or `String` converts into
-    /// `Bytes` without copying.
+    /// keeps a reference to `src`, so a value taken from a larger buffer keeps
+    /// the whole buffer alive. A `Vec<u8>` or `String` converts into `Bytes`
+    /// without copying.
+    ///
+    /// # Example
     ///
     /// ```
     /// use bytes::Bytes;
@@ -167,6 +171,8 @@ impl HeaderValue {
     /// a fold as a single `SP`, so joining the items with one `SP` gives the
     /// unfolded value. A value without folds yields itself as its only line.
     ///
+    /// # Example
+    ///
     /// ```
     /// use signa::HeaderValue;
     ///
@@ -180,8 +186,8 @@ impl HeaderValue {
     ///
     /// [RFC 3261 section 7.3.1]: https://www.rfc-editor.org/rfc/rfc3261#section-7.3.1
     pub fn lines(&self) -> ValueLines<'_> {
-        // `siparse` already splits a value at its folds, and its `Header` can
-        // be built by hand, so this reuses that instead of a second copy.
+        // siparse already splits a value at its folds, and its `Header` can be
+        // built by hand, so this reuses that instead of a second copy.
         let header = siparse::Header { name: "", value: self.as_str() };
         ValueLines(header.value_lines())
     }
@@ -342,8 +348,8 @@ impl TryFrom<&str> for HeaderValue {
 }
 
 impl HeaderValue {
-    /// Creates a `HeaderValue` from a value that `siparse` parsed out of
-    /// `src`, without copying or checking it again.
+    /// Creates a `HeaderValue` from a value that siparse parsed out of `src`,
+    /// without copying or checking it again.
     ///
     /// # Panics
     ///
@@ -358,7 +364,7 @@ impl HeaderValue {
     }
 }
 
-/// Checks a header field value with `siparse`.
+/// Checks a header field value with siparse.
 fn validate(src: &[u8]) -> Result<(), InvalidHeaderValue> {
     match check::header_value(src) {
         Ok(_) => Ok(()),
@@ -366,8 +372,8 @@ fn validate(src: &[u8]) -> Result<(), InvalidHeaderValue> {
     }
 }
 
-// Finding where the value went wrong scans it again, so it stays off the
-// path of a valid value.
+// Finding where the value went wrong scans it again, so it stays off the path
+// of a valid value.
 #[cold]
 fn invalid(src: &[u8], err: siparse::Error) -> InvalidHeaderValue {
     let offset = check::header_value_error_offset(src)
@@ -513,7 +519,7 @@ mod tests {
         assert_eq!(VALUE.as_bytes(), b"\"a\\\x00\"");
     }
 
-    /// Returns whether `siparse` accepts `value` as a header field value.
+    /// Returns whether siparse accepts `value` as a header field value.
     fn siparse_accepts(value: &[u8]) -> bool {
         let mut head =
             b"OPTIONS sip:carol@chicago.example.com SIP/2.0\r\nX: ".to_vec();
@@ -525,9 +531,9 @@ mod tests {
         matches!(request.parse(&head), Ok(siparse::Status::Complete(_)))
     }
 
-    // Any value that `siparse` accepts in a header row must be accepted here,
+    // Any value that siparse accepts in a header row must be accepted here,
     // and the reverse, so received heads can be rebuilt. Each value starts
-    // and ends with a visible character because `siparse` strips leading
+    // and ends with a visible character because siparse strips leading
     // whitespace as part of the separator.
     #[test]
     fn agrees_with_siparse_for_every_byte_and_backslash_run() {

@@ -1,8 +1,8 @@
 /*!
 Conversion from messages to the bytes of one complete SIP message.
 
-Every part of a message was checked when it was built or parsed, so writing
-it out cannot fail.
+Every part of a message was checked when it was built or parsed, so writing it
+out cannot fail.
 */
 
 use bytes::{BufMut, BytesMut};

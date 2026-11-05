@@ -2,10 +2,12 @@
 name = "signa"
 version = "0.0.1"
 authors = ["Ryuma Taguchi <ryumatag@gmail.com>"]
-description = "WIP"
+description = "A fast and correct low-level SIP library"
 repository = "https://github.com/ryumatag/signa"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
+keywords = ["sip", "rfc3261", "voip", "telephony"]
+categories = ["network-programming"]
 edition = "2021"
 rust-version = "1.65"
 include = [

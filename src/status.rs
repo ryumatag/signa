@@ -83,13 +83,14 @@ impl StatusCode {
         unsafe { str::from_utf8_unchecked(&CODE_DIGITS[offset..offset + 3]) }
     }
 
-    /// Returns the reason phrase registered for this code with IANA, if
-    /// any.
+    /// Returns the reason phrase registered for this code with IANA, if any.
     ///
     /// This is meant as a default when building a status-line. The reason
     /// phrase is for humans, and [RFC 3261 section 7.2] does not require a
     /// receiver to read it, so any text may be sent instead. Codes that are
     /// valid but not registered return `None`.
+    ///
+    /// # Example
     ///
     /// ```
     /// use signa::StatusCode;
@@ -107,8 +108,8 @@ impl StatusCode {
     /// Returns `true` if this is a final response, that is, not `1xx`.
     ///
     /// [RFC 3261 section 7.2] splits responses into provisional (`1xx`) and
-    /// final (`2xx` to `6xx`). A request can receive any number of
-    /// provisional responses before its final one.
+    /// final (`2xx` to `6xx`). A request can receive any number of provisional
+    /// responses before its final one.
     ///
     /// [RFC 3261 section 7.2]: https://www.rfc-editor.org/rfc/rfc3261#section-7.2
     pub const fn is_final(&self) -> bool {
@@ -208,9 +209,9 @@ impl FromStr for StatusCode {
     }
 }
 
-// Adapted from the `status_codes!` macro in the `http` crate.
-// Each row also carries the reason phrase from the IANA registry, so the
-// constants and `canonical_reason` come from one table and cannot drift.
+// Adapted from the `status_codes!` macro in the `http` crate. Each row also
+// carries the reason phrase from the IANA registry, so the constants and
+// `canonical_reason` come from one table and cannot drift.
 macro_rules! status_codes {
     (
         $(
