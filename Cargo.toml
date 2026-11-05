@@ -1,6 +1,6 @@
 [package]
 name = "signa"
-version = "0.0.1"
+version = "0.1.0"
 authors = ["Ryuma Taguchi <ryumatag@gmail.com>"]
 description = "A fast and correct low-level SIP library"
 repository = "https://github.com/ryumatag/signa"
