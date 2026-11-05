@@ -126,6 +126,12 @@ pub use self::{
 mod encode;
 pub mod error;
 mod extensions;
+// Everything `pub` in `frame` exists for the `__bench` feature, which
+// re-exports it. Without the feature nothing reaches it, which
+// `unreachable_pub` would otherwise flag.
+// TODO: Drop `dead_code` once the TCP transport uses the decoder.
+#[cfg_attr(not(feature = "__bench"), allow(unreachable_pub, dead_code))]
+mod frame;
 pub mod header;
 mod message;
 mod method;
@@ -137,3 +143,14 @@ mod status;
 mod uri;
 mod util;
 mod version;
+
+/// Entry points for the `signa-bench` crate, behind the `__bench` feature.
+///
+/// Nothing here is part of the public API, and the feature can change or go
+/// away in any release.
+#[cfg(feature = "__bench")]
+#[doc(hidden)]
+pub mod bench {
+    #[doc(hidden)]
+    pub use crate::frame::{DecodeError, Decoder, Frame, Limits, Role};
+}

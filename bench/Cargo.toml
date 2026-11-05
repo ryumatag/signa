@@ -17,7 +17,7 @@ path = "src/bench.rs"
 [dependencies]
 bytes = "1.12.1"
 criterion = { version = "0.8.2", default-features = false }
-signa = { path = ".." }
+signa = { path = "..", features = ["__bench"] }
 
 [profile.release]
 debug = true

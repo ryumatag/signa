@@ -17,6 +17,12 @@ include = [
   "LICENSE-MIT",
 ]
 
+[features]
+default = []
+# Exposes crate internals to the benchmark crate in `bench/`. Unstable, with
+# no semver guarantee. Not for use outside this repository.
+__bench = []
+
 [dependencies]
 bytes = { version = "1.12.1", default-features = false, features = ["std"] }
-siparse = "0.3.3"
+siparse = "0.3.4"
