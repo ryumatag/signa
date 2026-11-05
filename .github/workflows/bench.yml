@@ -18,20 +18,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Compares the whole-message benchmarks against a base commit. Shared runners
-  # are noisy, so the result is informational and never fails the job. Clippy
-  # and the benchmark assertions run in `ci`.
+  # Compares every benchmark against a base commit. Shared runners are noisy,
+  # so the result is informational and never fails the job. Clippy and the
+  # benchmark assertions run in `ci`.
   #
   # One runner is enough. Nothing in signa depends on the CPU, and the
   # delimiter scans that do live in siparse, whose own benchmark CI runs them
   # on each target.
+  #
+  # Base and head run on the same runner in the same job, so what matters is
+  # the difference, not the absolute numbers. The per-value benchmarks take a
+  # few nanoseconds each and show a few percent of jitter here, which the
+  # threshold in the summary hides. The loopback round trips are the ones to
+  # read on Linux, since the local numbers come from macOS.
   compare:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      # The per-value benchmarks take a few nanoseconds each, where runner
-      # noise outweighs most changes. Compare them locally instead.
-      FILTER: ^(parse|encode|frame)/
+      # Everything. Narrow this to a group, such as `^(parse|encode)/`, when
+      # the run gets too long for the timeout.
+      FILTER: ''
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
