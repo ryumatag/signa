@@ -40,7 +40,7 @@ use tokio::{
 use crate::{
     frame::{Decoder, Frame, Limits, Role},
     message::Message,
-    transport::{Flow, Transport}
+    transport::{Flow, Transport},
 };
 
 /// How much to reserve before each read. A head is a few KiB at most, so this

@@ -1,4 +1,4 @@
-/!*
+/*!
 Plain `recv_from` and `send_to` for the platforms without `PKTINFO`
 support in signa, Windows among them.
 
