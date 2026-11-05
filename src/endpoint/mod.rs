@@ -36,10 +36,24 @@ Timer F, and resolves the future with the final response or an [`Error`].
 Over TCP the endpoint opens a connection to the next hop on the first
 request and keeps it for the next ones.
 
+# Shutdown
+
+[`Endpoint::shutdown`] stops the endpoint once what it has in hand is done, or
+at a deadline. From the call on, a new request gets a stateless 503 and a new
+request through a [`Client`] fails with [`Error::is_closed`]. The endpoint goes
+on answering the requests the service has, sending the final responses, and
+waiting for the responses to its own requests. Once none of that is left, or at
+the deadline, it stops. Stopping closes the sockets and every TCP connection,
+drops the transactions that only linger to absorb retransmissions, and fails
+whatever was still waiting with [`Error::is_closed`].
+
+Dropping the last `Endpoint` and `Client` stops the endpoint at once, without
+the grace.
+
 # Example
 
 ```no_run
-use std::convert::Infallible;
+use std::time::Duration;
 
 use bytes::Bytes;
 use signa::{
@@ -71,6 +85,9 @@ let request = Request::builder()
     .body(Bytes::new())?;
 let response = client.call(request).await?;
 assert_eq!(response.status(), StatusCode::OK);
+
+// Stop taking requests, and give the ones in hand up to ten seconds.
+endpoint.shutdown(Duration::from_secs(10)).await;
 # Ok(())
 # }
 ```
@@ -81,24 +98,20 @@ assert_eq!(response.status(), StatusCode::OK);
 use std::{fmt, io, net::SocketAddr, time::Duration};
 
 use bytes::Bytes;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tower_service::Service;
 
 use self::driver::{Command, Config, Driver, TCP_INBOUND};
 use crate::{
+    request::Request,
+    response::Response,
     transport::{tcp, udp},
-    Request, Response,
 };
-
-mod client;
-mod driver;
-mod error;
-#[cfg(test)]
-mod tests;
 
 pub use self::{
     client::{Client, ResponseFuture},
     error::Error,
+    shutdown::Shutdown,
 };
 pub use crate::{
     frame::Limits,
@@ -106,12 +119,19 @@ pub use crate::{
     transport::{Flow, Transport},
 };
 
+mod client;
+mod driver;
+mod error;
+mod shutdown;
+#[cfg(test)]
+mod tests;
+
 /// A handle to a running endpoint.
 ///
-/// The endpoint runs in a task of its own as long as an `Endpoint` or a
-/// [`Client`] of it exists. When the last one is dropped it stops, closes
-/// its sockets and connections, and drops its transactions. There is no
-/// graceful shutdown yet.
+/// The endpoint runs in a task of its own as long as an `Endpoint`, a
+/// [`Client`] of it, or a [`Shutdown`] exists. When the last one is dropped it
+/// stops at once, closes its sockets and connections, and drops its
+/// transactions. [`Endpoint::shutdown`] stops it with a grace period instead.
 ///
 /// See the [module docs](self) for what it does.
 #[derive(Clone)]
@@ -149,6 +169,40 @@ impl Endpoint {
     ) -> Client {
         Client::new(self.commands.clone(), transport, next_hop)
     }
+
+    /// Stops the endpoint once what it has in hand is done, or after
+    /// `timeout`, and returns a future that resolves when it has stopped.
+    ///
+    /// From this call on, the endpoint answers a new request with a 503 and
+    /// fails a new request through a [`Client`] with [`Error::is_closed`].
+    /// It waits for the requests the service has, the responses to its own
+    /// requests, and the connections it is opening, then stops. At `timeout`
+    /// it stops regardless, and whatever still waits fails with
+    /// [`Error::is_closed`]. See the [module docs](self#shutdown).
+    ///
+    /// Other handles to the endpoint go on working until it stops, and calling
+    /// this on more than one of them is fine. The earliest deadline wins.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    ///
+    /// # use signa::endpoint::Endpoint;
+    /// # async fn run(endpoint: Endpoint) {
+    /// // Say on SIGTERM. Nothing waits past 30 seconds, which is just
+    /// // short of Timer F with the default T1.
+    /// endpoint.shutdown(Duration::from_secs(30)).await;
+    /// # }
+    /// ```
+    pub fn shutdown(self, timeout: Duration) -> Shutdown {
+        let (done, wait) = oneshot::channel();
+        // A send that fails means the endpoint has stopped already, and the
+        // dropped `done` resolves the future at once.
+        let _ = self.commands.send(Command::Shutdown { timeout, done });
+
+        Shutdown::new(self.commands, wait)
+    }
 }
 
 impl fmt::Debug for Endpoint {
@@ -171,7 +225,16 @@ impl fmt::Debug for Endpoint {
 /// # use bytes::Bytes;
 /// # use signa::{Request, Response};
 ///
-/// # fn service() -> impl tower_service::Service<Request<Bytes>, Response = Response<Bytes>, Future = std::future::Ready<Result<Response<Bytes>, std::convert::Infallible>>> + Send + 'static { tower::service_fn(|_| unreachable!()) }
+/// # fn service() -> impl tower_service::Service<
+/// #     Request<Bytes>,
+/// #     Response = Response<Bytes>,
+/// #     Future = std::future::Ready<
+/// #         Result<Response<Bytes>, std::convert::Infallible>,
+/// #     >,
+/// # > + Send
+/// #        + 'static {
+/// #     tower::service_fn(|_| unreachable!())
+/// # }
 /// # fn main() -> std::io::Result<()> {
 /// # let rt = tokio::runtime::Runtime::new()?;
 /// # let _guard = rt.enter();
@@ -214,9 +277,9 @@ impl Builder {
     /// Binds a UDP socket to `addr`.
     ///
     /// On Linux, Android, and Apple platforms a socket bound to a wildcard
-    /// address answers each request from the address it came to. Elsewhere
-    /// the kernel picks the source address, so bind to one address there
-    /// when the host has several.
+    /// address answers each request from the address it came to. Elsewhere the
+    /// kernel picks the source address, so bind to one address there when the
+    /// host has several.
     pub fn udp(mut self, addr: SocketAddr) -> Builder {
         self.udp = Some(addr);
         self
@@ -235,17 +298,19 @@ impl Builder {
         self
     }
 
-    /// Sets how large the head and the body of a message received over TCP
-    /// may be. A larger one closes the connection. The default allows
-    /// 64 KiB and 1 MiB.
+    /// Sets how large the head and the body of a message received over TCP may
+    /// be.
+    ///
+    /// A larger one closes the connection. The default allows 64 KiB and
+    /// 1 MiB.
     pub fn limits(mut self, limits: Limits) -> Builder {
         self.config.tcp.limits = limits;
         self
     }
 
-    /// Sets how long a TCP connection may go without receiving anything
-    /// before it is closed. The default is five minutes, which outlasts the
-    /// RFC 5626 keepalive interval.
+    /// Sets how long a TCP connection may go without receiving anything before
+    /// it is closed. The default is five minutes, which outlasts the RFC 5626
+    /// keepalive interval.
     pub fn idle_timeout(mut self, timeout: Duration) -> Builder {
         self.config.tcp.idle_timeout = timeout;
         self
@@ -258,9 +323,8 @@ impl Builder {
         self
     }
 
-    /// Sets how many requests may wait for the service or be in its hands
-    /// at once. A request beyond that gets a stateless 503. The default is
-    /// 1024.
+    /// Sets how many requests may wait for the service or be in its hands at
+    /// once. A request beyond that gets a stateless 503. The default is 1024.
     pub fn max_pending_requests(mut self, limit: usize) -> Builder {
         self.config.max_pending_requests = limit;
         self
@@ -270,9 +334,9 @@ impl Builder {
     /// beyond that fails with [`Error::is_busy`]. The default is 4096.
     ///
     /// Over UDP a transaction stays open for Timer K, which is T4 or 5 s,
-    /// after its final response, to absorb retransmissions of it. So the
-    /// limit bounds the requests of the last five seconds, not the ones
-    /// still waiting for an answer.
+    /// after its final response, to absorb retransmissions of it. So the limit
+    /// bounds the requests of the last five seconds, not the ones still
+    /// waiting for an answer.
     pub fn max_client_transactions(mut self, limit: usize) -> Builder {
         self.config.max_client_transactions = limit;
         self
@@ -281,8 +345,8 @@ impl Builder {
     /// Binds the sockets, starts the endpoint with `service` answering its
     /// requests, and returns a handle to it.
     ///
-    /// Must be called from within a tokio runtime, since the endpoint runs
-    /// as a task on it.
+    /// Must be called from within a tokio runtime, since the endpoint runs as
+    /// a task on it.
     ///
     /// # Errors
     ///

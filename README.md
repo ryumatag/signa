@@ -21,9 +21,9 @@ The current release has request and response types modeled on the `http` crate,
 parsing with [siparse] and encoding, and an endpoint that carries messages over
 UDP and TCP, runs the non-INVITE transactions, and serves requests through a
 Tower `Service`. Its client sends requests to one next hop and is a `Service`
-too. INVITE, ACK, and CANCEL transactions are planned for the next release, and
-TLS, next-hop selection, and graceful shutdown are later work. The
-[crate docs] say what is covered in detail.
+too, and the endpoint shuts down gracefully. INVITE, ACK, and CANCEL
+transactions are planned for the next release, and TLS and next-hop selection
+are later work. The [crate docs] say what is covered in detail.
 
 [`http`]: https://docs.rs/http
 [`hyper`]: https://docs.rs/hyper

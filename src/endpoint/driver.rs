@@ -13,6 +13,13 @@ The timers are one heap of deadlines, with one `Sleep` set to the earliest.
 A transaction whose deadline moves gets a new entry, and an entry whose
 transaction has moved on is harmless, because a transaction fires nothing
 before its time. So nothing is ever removed from the heap except by popping.
+
+A shutdown is a deadline on the heap too. From the command on, the driver
+answers new requests with a 503 and refuses new sends, and it stops as soon as
+nothing is open any more, or at the deadline. Stopping is dropping the driver.
+That drops the transactions, answers the client futures with a closed error,
+and closes the sockets. The TCP readers see their channel close and end their
+connections.
 */
 
 use std::{
@@ -20,6 +27,7 @@ use std::{
     collections::{
         hash_map::RandomState as StdRandomState, BinaryHeap, HashMap, VecDeque,
     },
+    convert::Infallible,
     fmt::Write as _,
     future::{poll_fn, Future},
     hash::{BuildHasher, Hasher},
@@ -27,7 +35,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
     task::{Context, Poll},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use bytes::{Bytes, BytesMut};
@@ -107,6 +115,10 @@ pub(super) enum Command {
     Respond { slot: Slot, response: Option<Response<Bytes>> },
     /// A connection the driver asked for is open, or could not be opened.
     Connected { remote: SocketAddr, result: io::Result<(Flow, tcp::Writer)> },
+    /// An `Endpoint` asks the driver to stop once nothing is open, or after
+    /// `timeout`. `done` is dropped when it has, which is all the handle waits
+    /// for.
+    Shutdown { timeout: Duration, done: oneshot::Sender<Infallible> },
 }
 
 /// Where the response to a request handed to the service goes.
@@ -179,6 +191,8 @@ struct Timer {
 enum Key {
     Server(ServerKey),
     Client(ClientKey),
+    /// The shutdown deadline. The driver stops when it fires.
+    Shutdown,
 }
 
 impl PartialEq for Timer {
@@ -212,8 +226,8 @@ struct Branches {
 
 impl Branches {
     fn new() -> Branches {
-        // The standard library seeds its hasher randomly. Hashing nothing
-        // with a fresh one gives 64 random bits without another dependency.
+        // The standard library seeds its hasher randomly. Hashing nothing with
+        // a fresh one gives 64 random bits without another dependency.
         let mut seed = StdRandomState::new().build_hasher().finish();
         let mut prefix = String::from("z9hG4bK");
         for _ in 0..10 {
@@ -265,6 +279,13 @@ pub(super) struct Driver<S> {
     queue: VecDeque<(Slot, Request<Bytes>)>,
     /// Requests the service has taken and not answered.
     pending: usize,
+    /// Client transactions without a final response or an error yet.
+    unanswered: usize,
+    /// Set by the first shutdown command. New requests get a 503 from then on,
+    /// and the driver stops once `is_drained` says so.
+    shutting_down: bool,
+    /// The handles waiting for the driver to stop, which is when these drop.
+    shutdown_done: Vec<oneshot::Sender<Infallible>>,
     branches: Branches,
 }
 
@@ -301,6 +322,9 @@ where
             sleep: Box::pin(tokio::time::sleep(std::time::Duration::ZERO)),
             queue: VecDeque::new(),
             pending: 0,
+            unanswered: 0,
+            shutting_down: false,
+            shutdown_done: Vec::new(),
             branches: Branches::new(),
         }
     }
@@ -308,6 +332,7 @@ where
     pub(super) async fn run(mut self) {
         loop {
             match poll_fn(|cx| self.poll_event(cx)).await {
+                Event::Timer(Key::Shutdown) => return,
                 Event::Timer(key) => self.on_timer(key),
                 Event::Command(command) => self.on_command(command),
                 Event::Inbound(inbound) => {
@@ -332,6 +357,10 @@ where
         }
     }
 
+    /// Polls every source in turn and returns the first event.
+    ///
+    /// The shutdown check comes last, once every source is pending, so that it
+    /// sees the tables after everything that arrived has been handled.
     fn poll_event(&mut self, cx: &mut Context<'_>) -> Poll<Event> {
         if let Some(timer) = self.timers.peek() {
             let at = tokio::time::Instant::from_std(timer.at);
@@ -347,6 +376,7 @@ where
         if let Poll::Ready(Some(command)) = self.internal.poll_recv(cx) {
             return Poll::Ready(Event::Command(command));
         }
+
         match self.commands.poll_recv(cx) {
             Poll::Ready(Some(command)) => {
                 return Poll::Ready(Event::Command(command))
@@ -354,10 +384,12 @@ where
             Poll::Ready(None) => return Poll::Ready(Event::Stop),
             Poll::Pending => {}
         }
+
         // The driver holds a sender, so the channel never ends.
         if let Poll::Ready(Some(inbound)) = self.tcp.poll_recv(cx) {
             return Poll::Ready(Event::Inbound(inbound));
         }
+
         if let Some(udp) = &mut self.udp {
             udp.poll_flush(cx);
             match udp.socket.poll_recv(cx, &mut udp.buf) {
@@ -374,7 +406,30 @@ where
 
         self.poll_dispatch(cx);
 
+        if self.shutting_down && self.is_drained() {
+            return Poll::Ready(Event::Stop);
+        }
+
         Poll::Pending
+    }
+
+    /// Returns `true` when nothing is left that a shutdown waits for.
+    ///
+    /// That is a request waiting for the service or in its hands, a client
+    /// transaction waiting for its final response, a connection being opened,
+    /// which carries a request or a response, and a datagram waiting for the
+    /// UDP socket. A transaction that only lingers to absorb retransmissions
+    /// is not waited for, since whatever it would answer goes unanswered once
+    /// the endpoint is gone anyway.
+    fn is_drained(&self) -> bool {
+        self.queue.is_empty()
+            && self.pending == 0
+            && self.unanswered == 0
+            && self.udp.as_ref().map_or(true, |udp| udp.backlog.is_empty())
+            && !self
+                .routes
+                .values()
+                .any(|route| matches!(route.tcp, TcpState::Connecting(_)))
     }
 
     /// Hands waiting requests to the service as long as it is ready.
@@ -421,6 +476,15 @@ where
             Command::Connected { remote, result } => {
                 self.on_connected(remote, result);
             }
+            Command::Shutdown { timeout, done } => {
+                self.shutting_down = true;
+                self.shutdown_done.push(done);
+                // The earliest deadline wins when several handles ask. A
+                // timeout too long for the clock means no deadline.
+                if let Some(at) = now().checked_add(timeout) {
+                    self.timers.push(Timer { at, key: Key::Shutdown });
+                }
+            }
         }
     }
 
@@ -447,33 +511,44 @@ where
                     return;
                 };
                 let before = entry.tx.deadline();
-                match entry.tx.on_timeout(now) {
+                let answered = match entry.tx.on_timeout(now) {
                     ClientEvent::Retransmit(request) => {
-                        if let Err(err) =
-                            send_on(self.udp.as_mut(), &entry.link, &request)
+                        match send_on(self.udp.as_mut(), &entry.link, &request)
                         {
-                            entry.tx.on_transport_error();
-                            entry.fail(Error::transport(err));
+                            Ok(()) => false,
+                            Err(err) => {
+                                entry.tx.on_transport_error();
+                                entry.answer(Err(Error::transport(err)))
+                            }
                         }
                     }
-                    ClientEvent::Timeout => entry.fail(Error::timeout()),
+                    ClientEvent::Timeout => {
+                        entry.answer(Err(Error::timeout()))
+                    }
                     ClientEvent::None
                     | ClientEvent::Provisional(_)
-                    | ClientEvent::Final(_) => {}
+                    | ClientEvent::Final(_) => false,
+                };
+
+                if answered {
+                    self.unanswered -= 1;
                 }
+
                 self.settle_client(key, before);
             }
+            Key::Shutdown => unreachable!("handled by the loop"),
         }
     }
 
-    /// Drops a server transaction that is over, or schedules its next
-    /// deadline when it moved.
+    /// Drops a server transaction that is over, or schedules its next deadline
+    /// when it moved.
     fn settle_server(&mut self, key: ServerKey, before: Option<Instant>) {
         let Some(entry) = self.servers.get(&key) else { return };
         if entry.tx.is_terminated() {
             self.servers.remove(&key);
             return;
         }
+
         let after = entry.tx.deadline();
         if after != before {
             if let Some(at) = after {
@@ -488,6 +563,7 @@ where
             self.clients.remove(&key);
             return;
         }
+
         let after = entry.tx.deadline();
         if after != before {
             if let Some(at) = after {
@@ -503,6 +579,11 @@ where
         next_hop: SocketAddr,
         respond: Responder,
     ) {
+        if self.shutting_down {
+            let _ = respond.send(Err(Error::closed()));
+            return;
+        }
+
         if !request.headers().contains_key(CSEQ) {
             let _ = respond.send(Err(Error::missing(CSEQ)));
             return;
@@ -624,10 +705,12 @@ where
         if !bound.is_unspecified() {
             return Ok(bound);
         }
+
         let route = self.routes.entry(remote).or_default();
         if let Some(source) = route.udp_source {
             return Ok(source);
         }
+
         let source = source_toward(remote)?;
         route.udp_source = Some(source);
 
@@ -657,6 +740,7 @@ where
             let _ = respond.send(Err(Error::too_large(bytes.len())));
             return;
         }
+
         if let Err(err) = send_on(self.udp.as_mut(), &link, &bytes) {
             let _ = respond.send(Err(Error::transport(err)));
             return;
@@ -670,6 +754,7 @@ where
         }
         let entry = ClientEntry { tx, link, respond: Some(respond) };
         self.clients.insert(key, entry);
+        self.unanswered += 1;
     }
 
     fn on_connected(
@@ -685,6 +770,7 @@ where
                 return;
             }
         };
+
         match result {
             Ok((flow, writer)) => {
                 route.tcp = TcpState::Open(flow, writer.clone());
@@ -732,8 +818,8 @@ where
         let before = entry.tx.deadline();
         match entry.tx.on_response(response, now()) {
             ClientEvent::Final(response) => {
-                if let Some(respond) = entry.respond.take() {
-                    let _ = respond.send(Ok(response));
+                if entry.answer(Ok(response)) {
+                    self.unanswered -= 1;
                 }
             }
             // Provisional responses are not handed up in 0.2.0. A non-INVITE
@@ -755,20 +841,19 @@ where
         let marked = mark_via(value, &via, &link.flow);
         let key = ServerKey::new(value, &via, request.method());
 
-        // The `Via` the request goes up with, and that every response
-        // carries, has `received` and `rport` filled in (RFC 3261 section
-        // 18.2.1, RFC 3581).
+        // The `Via` the request goes up with, and that every response carries,
+        // has `received` and `rport` filled in (RFC 3261 section 18.2.1,
+        // RFC 3581).
         if let Some(marked) = marked {
             *request.headers_mut().get_mut(VIA).expect("found above") = marked;
         }
-        // The service sees where the request came from. The link keeps
-        // where the response goes, which differs in the port without
-        // `rport`.
+        // The service sees where the request came from. The link keeps where
+        // the response goes, which differs in the port without `rport`.
         let source = link.flow;
         let link = Link { flow: reply, writer: link.writer };
 
-        // 0.2.0 has no INVITE transactions. An ACK outside one has nothing
-        // to match and is dropped (section 17.2.3), and a CANCEL with no
+        // 0.2.0 has no INVITE transactions. An ACK outside one has nothing to
+        // match and is dropped (section 17.2.3), and a CANCEL with no
         // transaction to cancel gets a 481 (section 9.2).
         let method = request.method();
         if *method == Method::INVITE {
@@ -792,12 +877,15 @@ where
             }
         }
 
-        // Overload answers with a stateless 503, so the peer stops
-        // retransmitting and can try elsewhere. Not reading the socket
-        // instead would stall every flow on a TCP connection, including
-        // the responses to this endpoint's own requests on it.
+        // Overload and shutdown answer with a stateless 503, so the peer stops
+        // retransmitting and can try elsewhere. Not reading the socket instead
+        // would stall every flow on a TCP connection, including the responses
+        // to this endpoint's own requests on it.
         let waiting = self.pending + self.queue.len();
-        if self.service_failed || waiting >= self.config.max_pending_requests {
+        if self.service_failed
+            || self.shutting_down
+            || waiting >= self.config.max_pending_requests
+        {
             self.stateless(&request, &link, SERVICE_UNAVAILABLE);
             return;
         }
@@ -875,9 +963,16 @@ where
 }
 
 impl ClientEntry {
-    fn fail(&mut self, err: Error) {
-        if let Some(respond) = self.respond.take() {
-            let _ = respond.send(Err(err));
+    /// Delivers the final response or the error to the client. Returns `false`
+    /// when the transaction was answered before, so the caller counts each
+    /// transaction once.
+    fn answer(&mut self, result: Result<Response<Bytes>, Error>) -> bool {
+        match self.respond.take() {
+            Some(respond) => {
+                let _ = respond.send(result);
+                true
+            }
+            None => false,
         }
     }
 }
@@ -934,6 +1029,7 @@ impl Udp {
                 }
                 Poll::Pending => return,
             }
+
             match self.socket.try_send(bytes, flow) {
                 // Readiness is cleared, and the next poll waits for it.
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
