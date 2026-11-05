@@ -111,3 +111,23 @@ jobs:
           toolchain: stable
       - name: Build docs
         run: cargo doc --no-deps --verbose
+
+  # signa's own `unsafe` is `from_utf8_unchecked` on bytes a check has
+  # accepted, which Miri cannot verify. The tests still drive siparse's
+  # raw-pointer cursor and the `bytes` crate's buffer sharing with signa's
+  # inputs, so this catches undefined behavior there that siparse's own
+  # tests may not reach.
+  # TODO: Mark the socket tests `#[cfg_attr(miri, ignore)]` once the
+  # transports land, since Miri has no network I/O.
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: miri
+      - name: Run tests under Miri
+        run: cargo miri test --verbose
