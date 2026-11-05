@@ -1,10 +1,13 @@
 name: bench
 
+# Pull requests compare against their base. A squash merge lands the same
+# tree on `main`, so a push there is not benchmarked again. A release tag
+# compares against the release before it.
 on:
   pull_request:
   push:
-    branches:
-      - main
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+*'
 
 permissions:
   contents: read
@@ -15,36 +18,71 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Compares the whole-message benchmarks against the commit this change
-  # builds on. Shared runners are noisy, so the result is informational and
-  # never fails the job. Clippy and the benchmark assertions run in `ci`.
+  # Compares the whole-message benchmarks against a base commit. Shared runners
+  # are noisy, so the result is informational and never fails the job. Clippy
+  # and the benchmark assertions run in `ci`.
+  #
+  # One runner is enough. Nothing in signa depends on the CPU, and the
+  # delimiter scans that do live in siparse, whose own benchmark CI runs them
+  # on each target.
   compare:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       # The per-value benchmarks take a few nanoseconds each, where runner
       # noise outweighs most changes. Compare them locally instead.
-      FILTER: ^(parse|encode)/
-      BASE_SHA: >-
-        ${{ github.event.pull_request.base.sha || github.event.before }}
+      FILTER: ^(parse|encode|frame)/
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
+          # The base commit and the earlier release tags.
           fetch-depth: 0
+          fetch-tags: true
+      - name: Pick the base commit
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+            base="$PR_BASE_SHA"
+            label="$base"
+          else
+            # The highest release below this tag. Only `x.y.z` tags count as a
+            # base, so a pre-release never is one.
+            previous=$(
+              {
+                git tag --list | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$'
+                echo "$GITHUB_REF_NAME"
+              } | sort -uV | awk -v tag="$GITHUB_REF_NAME" \
+                '$0 == tag { print prev; exit } { prev = $0 }'
+            )
+            if [[ -z "$previous" ]]; then
+              echo "No release before $GITHUB_REF_NAME. Skipping."
+              exit 0
+            fi
+            base=$(git rev-parse "$previous^{commit}")
+            label="$previous"
+          fi
+          {
+            echo "BASE_SHA=$base"
+            echo "BASE_LABEL=$label"
+          } >> "$GITHUB_ENV"
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
       - name: Install critcmp
         run: cargo install --locked critcmp
-      # `bench/target` is ignored by Git, so the saved baseline survives
-      # the checkouts below.
+      # `bench/target` is ignored by Git, so the saved baseline survives the
+      # checkouts below.
       - name: Benchmark the base commit
         id: base
         run: |
-          # A push that creates the branch has no previous commit, and an
-          # old base may predate the benchmark crate.
+          # A first release has no base, and an old base may predate the
+          # benchmark crate.
+          if [[ -z "$BASE_SHA" ]]; then
+            exit 0
+          fi
           if ! git cat-file -e "$BASE_SHA:bench/Cargo.toml" 2>/dev/null; then
             echo "No benchmarks at base commit $BASE_SHA. Skipping."
             exit 0
@@ -60,12 +98,12 @@ jobs:
       - name: Compare
         if: steps.base.outputs.ran == 'true'
         working-directory: bench
-        # `-t 5` alone prints nothing useful when no benchmark moved by 5%
-        # or more, so print the full table first. The summary shows the
-        # same tables on the run page.
+        # `-t 5` alone prints nothing useful when no benchmark moved by 5% or
+        # more, so print the full table first. The summary shows the same
+        # tables on the run page.
         run: |
           {
-            echo "## Benchmarks against $BASE_SHA"
+            echo "## Benchmarks against $BASE_LABEL"
             echo
             echo '```'
             critcmp base head
