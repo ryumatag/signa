@@ -368,6 +368,15 @@ impl HeaderValue {
             is_sensitive: false,
         }
     }
+
+    /// Wraps a value signa wrote itself from parts it has checked, such as the
+    /// `Via` the endpoint adds to a request.
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    pub(crate) fn from_built(src: String) -> HeaderValue {
+        debug_assert!(check::header_value(src.as_bytes()).is_ok());
+
+        HeaderValue { raw: Bytes::from(src), is_sensitive: false }
+    }
 }
 
 /// Checks a header field value with siparse.

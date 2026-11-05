@@ -21,7 +21,16 @@ TODO: Close connections from the outside for shutdown. That comes with the
 endpoint, which knows when it is shutting down.
 */
 
-use std::{fmt, io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    future::{poll_fn, Future},
+    io,
+    net::SocketAddr,
+    pin::pin,
+    sync::Arc,
+    task::Poll,
+    time::Duration,
+};
 
 use bytes::{Buf, Bytes, BytesMut};
 use tokio::{
@@ -34,7 +43,7 @@ use tokio::{
         mpsc::{self, error::TrySendError},
         OwnedSemaphorePermit, Semaphore,
     },
-    time::timeout,
+    time::{sleep, timeout},
 };
 
 use crate::{
@@ -113,6 +122,11 @@ pub enum SendError {
 }
 
 impl Writer {
+    /// Returns `true` once the connection has ended.
+    pub fn is_closed(&self) -> bool {
+        self.queue.is_closed()
+    }
+
     /// Queues `bytes` to be written. Returns at once.
     pub fn send(&self, bytes: Bytes) -> Result<(), SendError> {
         self.queue.try_send(bytes).map_err(|err| match err {
@@ -192,6 +206,31 @@ impl Listener {
         )?;
 
         Ok(flow)
+    }
+
+    /// Accepts connections until the receiver of `inbound` is gone, which is
+    /// how the endpoint ends.
+    ///
+    /// An accept error is usually the process being out of descriptors. The
+    /// loop waits a moment and tries again, as hyper does, rather than ending
+    /// the listener over it.
+    pub async fn run(self) {
+        let mut closed = pin!(self.inbound.closed());
+        loop {
+            let mut accept = pin!(self.accept());
+            let accepted = poll_fn(|cx| {
+                if closed.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(None);
+                }
+                accept.as_mut().poll(cx).map(Some)
+            })
+            .await;
+            match accepted {
+                None => return,
+                Some(Ok(_)) => {}
+                Some(Err(_)) => sleep(Duration::from_millis(100)).await,
+            }
+        }
     }
 }
 
