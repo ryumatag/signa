@@ -534,6 +534,8 @@ mod tests {
         for byte in 0..=255u8 {
             for backslashes in 0..=4 {
                 let mut value = vec![b'a'];
+                // MSRV(1.82): Write this as
+                // `value.extend(std::iter::repeat_n(b'\\', backslashes))`.
                 value.resize(1 + backslashes, b'\\');
                 value.extend([byte, b'z']);
                 assert_eq!(
