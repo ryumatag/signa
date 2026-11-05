@@ -30,7 +30,10 @@ use crate::{
 /// phrase it arrived with. A response built without one leaves the choice to
 /// serialization, which uses [`StatusCode::canonical_reason`].
 ///
-/// [`Response::builder`] builds a response step by step:
+/// # Example
+///
+/// [`Response::builder`] builds a response step by step, and
+/// [`Response::reply_to`] starts one from the request it answers:
 ///
 /// ```
 /// use signa::{Response, StatusCode};

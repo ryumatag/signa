@@ -12,6 +12,8 @@ use crate::{error::InvalidMessage, request::Request, response::Response};
 /// be either. [`Message::from_shared`] parses the head once and decides from
 /// its start-line.
 ///
+/// # Example
+///
 /// ```
 /// use bytes::Bytes;
 /// use signa::{Message, StatusCode};

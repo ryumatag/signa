@@ -19,6 +19,8 @@ use std::{convert::Infallible, error, fmt};
 /// [`Error::get_ref`] returns the underlying error, and [`Error::is`] checks
 /// its type.
 ///
+/// # Example
+///
 /// ```
 /// use signa::{error::InvalidMethod, Request};
 ///

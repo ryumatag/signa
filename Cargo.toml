@@ -12,6 +12,7 @@ edition = "2021"
 rust-version = "1.71"
 include = [
   "/src/**/*.rs",
+  "/src/**/*.md",
   "/README.md",
   "LICENSE-APACHE",
   "LICENSE-MIT",
@@ -39,6 +40,11 @@ foldhash = { version = "0.2", optional = true }
 # not expose.
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true }
+
+# The example runs an endpoint, which needs the `tokio` feature.
+[[example]]
+name = "options"
+required-features = ["tokio"]
 
 [dev-dependencies]
 tokio = { version = "1.47", features = ["macros", "rt-multi-thread"] }

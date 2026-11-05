@@ -23,6 +23,8 @@ use crate::{
 /// body, and higher layers can turn it into a typed body with
 /// [`Request::map`].
 ///
+/// # Example
+///
 /// [`Request::builder`] builds a request step by step:
 ///
 /// ```

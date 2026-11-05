@@ -11,9 +11,10 @@ use siparse::check;
 
 use crate::{error::InvalidUri, util::ByteStr};
 
-// TODO: Add structured access before transport work in 0.2.0, which needs the
-// host, port, `transport`, `maddr`, and `sips` scheme to pick a target
-// (RFC 3263). It is deferred because it needs its own design.
+// TODO: Add structured access when something in signa picks a target from a
+// URI, which needs the host, port, `transport`, `maddr`, and `sips` scheme
+// (RFC 3263). Nothing in 0.2.0 does. The `Client` is bound to a next hop given
+// as an address. It is deferred because it needs its own design.
 //
 // * SIP and SIPS URIs (RFC 3261 section 19.1), tel URIs (RFC 3966), and other
 //   absolute URIs each have their own grammar.
@@ -30,8 +31,12 @@ use crate::{error::InvalidUri, util::ByteStr};
 /// [RFC 3261 section 25.1] defines `Request-URI` as `SIP-URI / SIPS-URI /
 /// absoluteURI`, so a request may target `sip:`, `sips:`, `tel:`, or any other
 /// URI scheme. This type stores the URI as text and does not parse its
-/// structure. It only checks that every byte belongs to the URI character
-/// classes that [siparse] accepts in a request-line:
+/// structure.
+///
+/// # Accepted bytes
+///
+/// It only checks that every byte belongs to the URI character classes that
+/// [siparse] accepts in a request-line:
 ///
 /// * ASCII letters and digits
 /// * the RFC 2396 `reserved` and `mark` characters, `%`, `[`, and `]`
@@ -43,11 +48,15 @@ use crate::{error::InvalidUri, util::ByteStr};
 /// Accepting a URI does not establish that it is well formed for its scheme.
 /// Structured access to SIP URIs (user, host, parameters) is later work.
 ///
+/// # Equality
+///
 /// `Uri` does not implement `PartialEq` or `Hash`. [RFC 3261 section 19.1.4]
 /// compares SIP URIs component by component, with case-insensitive parts and
 /// rules for parameters, so comparing the text would give the wrong answer for
 /// equivalent URIs. Compare [`Uri::as_str`] when exact text is what you want.
 /// I would rather add RFC equivalence later than change what `==` means.
+///
+/// # Example
 ///
 /// ```
 /// use signa::Uri;

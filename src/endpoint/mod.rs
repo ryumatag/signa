@@ -162,6 +162,8 @@ impl fmt::Debug for Endpoint {
 
 /// Builds an [`Endpoint`].
 ///
+/// # Example
+///
 /// ```no_run
 /// use std::time::Duration;
 ///

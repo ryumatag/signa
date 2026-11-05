@@ -15,6 +15,9 @@ use crate::{error::InvalidReasonPhrase, util::ByteStr};
 /// The reason phrase of a SIP status-line.
 ///
 /// The reason phrase is a short text for humans, such as `Busy Here`.
+///
+/// # Accepted text
+///
 /// [RFC 3261 section 25.1] defines it as:
 ///
 /// ```text
@@ -34,8 +37,12 @@ use crate::{error::InvalidReasonPhrase, util::ByteStr};
 /// phrase received in a response can also be built with this type, and the
 /// reverse.
 ///
+/// # Equality
+///
 /// Equality compares the text exactly. The reason phrase carries no protocol
 /// meaning, so there is no looser notion of equivalence to follow.
+///
+/// # Example
 ///
 /// ```
 /// use signa::ReasonPhrase;

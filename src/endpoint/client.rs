@@ -24,6 +24,8 @@ use crate::{Request, Response};
 /// goes to is for a layer above to decide, with RFC 3263 or a router, and
 /// that layer holds one client per hop. [`Endpoint::client`] makes one.
 ///
+/// # What a request becomes
+///
 /// `Client` implements [`Service`]. It is always ready, and [`Service::call`]
 /// hands the request to the endpoint without waiting. The endpoint adds the
 /// topmost `Via` with a new branch, starts a client transaction, and sends the
@@ -33,6 +35,8 @@ use crate::{Request, Response};
 /// says nothing (RFC 4320), so there is nothing to return before the final
 /// response.
 ///
+/// # Dropping the future
+///
 /// Dropping the future does not end the transaction. The endpoint keeps
 /// retransmitting until a final response arrives or Timer F fires, as
 /// RFC 3261 section 17.1.2 requires. A timeout or retry layer around a
@@ -40,6 +44,8 @@ use crate::{Request, Response};
 /// while the old one runs on. That is what the RFC asks of a UA that gives up
 /// on a non-INVITE request, but it is not free, and a retry layer that does
 /// not know SIP should not be put around a client without thought.
+///
+/// # What the request needs
 ///
 /// The request must have a `CSeq`, since responses are matched by its method.
 /// RFC 3261 section 8.1.1 requires `To`, `From`, `Call-ID`, and `Max-Forwards`
