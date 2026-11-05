@@ -37,6 +37,8 @@ use std::{
     str::{self, FromStr},
 };
 
+use siparse::check;
+
 use crate::error::InvalidMethod;
 
 use self::{
@@ -371,57 +373,13 @@ mod extension {
         }
     }
 
-    /// Valid extension method characters.
+    /// Copies `src` into `dst` if it is a SIP `token`.
     ///
-    /// RFC 3261, Section 25.1 defines:
-    ///
-    /// ```text
-    /// token             =  1*(alphanum / "-" / "." / "!" / "%" / "*"
-    ///                      / "_" / "+" / "`" / "'" / "~")
-    /// extension-method  =  token
-    /// ```
-    ///
-    /// This table is generated from the token grammar above. The allowed bytes
-    /// are all ASCII, so every validated token is valid UTF-8.
-    #[rustfmt::skip]
-    const EXTENSION_METHOD_CHARS: [bool; 256] = {
-        let mut table = [false; 256];
-        let mut i = 0;
-
-        while i < 256 {
-            table[i] = matches!(
-              i as u8,
-              b'A'..=b'Z'
-                  | b'a'..=b'z'
-                  | b'0'..=b'9'
-                  | b'-'
-                  | b'.'
-                  | b'!'
-                  | b'%'
-                  | b'*'
-                  | b'_'
-                  | b'+'
-                  | b'`'
-                  | b'\''
-                  | b'~'
-            );
-            i += 1
-        }
-
-        table
-    };
-
+    /// The check is `siparse`'s, so an extension method is valid here
+    /// exactly when the parser accepts it in a request-line.
     fn write_checked(src: &[u8], dst: &mut [u8]) -> Result<(), InvalidMethod> {
-        debug_assert!(dst.len() >= src.len());
-
-        for (i, &byte) in src.iter().enumerate() {
-            if !EXTENSION_METHOD_CHARS[byte as usize] {
-                return Err(InvalidMethod::new());
-            }
-
-            dst[i] = byte;
-        }
-
+        let token = check::method(src).map_err(|_| InvalidMethod::new())?;
+        dst[..token.len()].copy_from_slice(token.as_bytes());
         Ok(())
     }
 }

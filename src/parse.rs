@@ -134,17 +134,16 @@ fn headers(
     for row in rows {
         // `HeaderName` lowercases the name and expands compact forms, so it
         // copies unless the name is a standard one.
-        let name = HeaderName::from_bytes(row.name.as_bytes())
-            .map_err(|_| drifted(ErrorKind::HeaderName))?;
+        let name = HeaderName::from_parsed(row.name);
         headers.append(name, HeaderValue::from_parsed(src, row.value));
     }
 
     Ok(headers)
 }
 
-// `Method` and `HeaderName` accept the same `token` set as `siparse`, so
-// they never reject a parsed token. If the two sets ever drift apart, this
-// reports the token as invalid instead of panicking on untrusted input.
+// `Method` uses `siparse`'s own check, so it never rejects a parsed method.
+// If that ever changed, this reports the method as invalid instead of
+// panicking on untrusted input.
 fn drifted(kind: ErrorKind) -> InvalidMessage {
     InvalidMessage::new(InvalidMessageKind::Head(kind))
 }

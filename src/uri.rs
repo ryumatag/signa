@@ -7,6 +7,7 @@ This module defines [`Uri`], the target of a SIP request.
 use std::{fmt, str::FromStr};
 
 use bytes::Bytes;
+use siparse::check;
 
 use crate::{error::InvalidUri, util::ByteStr};
 
@@ -83,7 +84,7 @@ impl Uri {
     /// Panics if `src` is not a valid request URI. In a `const` context this
     /// is a compile error.
     pub const fn from_static(src: &'static str) -> Uri {
-        if !is_valid(src.as_bytes()) {
+        if check::request_uri_const(src.as_bytes()).is_err() {
             panic!("invalid SIP request URI");
         }
 
@@ -97,14 +98,8 @@ impl Uri {
     /// Returns [`InvalidUri`] if `src` is empty or contains a byte outside
     /// the accepted URI character classes.
     pub fn from_bytes(src: &[u8]) -> Result<Uri, InvalidUri> {
-        if !is_valid(src) {
-            return Err(InvalidUri::new());
-        }
-
-        // SAFETY: `is_valid` only accepts ASCII bytes.
-        Ok(Uri(unsafe {
-            ByteStr::from_utf8_unchecked(Bytes::copy_from_slice(src))
-        }))
+        let uri = check::request_uri(src).map_err(|_| InvalidUri::new())?;
+        Ok(Uri(ByteStr::from(uri)))
     }
 
     /// Returns the URI as a string slice.
@@ -163,7 +158,7 @@ impl Uri {
     ///
     /// Panics if `uri` does not lie within `src`.
     pub(crate) fn from_parsed(src: &Bytes, uri: &str) -> Uri {
-        debug_assert!(is_valid(uri.as_bytes()));
+        debug_assert!(check::request_uri(uri.as_bytes()).is_ok());
 
         // SAFETY: The slice holds the same bytes as `uri`, which is a `str`.
         Uri(unsafe {
@@ -171,69 +166,6 @@ impl Uri {
         })
     }
 }
-
-// TODO: Switch to `siparse`'s public request URI check once it exists, so
-// the character classes live in one place. It is planned together with the
-// other shared checks before signa 0.1.0.
-//
-/// Returns `true` if `src` is a non-empty run of URI characters.
-const fn is_valid(src: &[u8]) -> bool {
-    if src.is_empty() {
-        return false;
-    }
-
-    let mut i = 0;
-    while i < src.len() {
-        if !URI_CHARS[src[i] as usize] {
-            return false;
-        }
-        i += 1;
-    }
-
-    true
-}
-
-// The same character classes as `siparse`'s request-line URI check. RFC 2396
-// `reserved` and `unreserved` cover every URI form that RFC 3261 allows,
-// with `%` for escapes and `[` `]` for IPv6 references.
-const URI_CHARS: [bool; 256] = {
-    let mut table = [false; 256];
-    let mut i = 0;
-
-    while i < 256 {
-        table[i] = matches!(
-            i as u8,
-            b'A'..=b'Z'
-                | b'a'..=b'z'
-                | b'0'..=b'9'
-                | b';'
-                | b'/'
-                | b'?'
-                | b':'
-                | b'@'
-                | b'&'
-                | b'='
-                | b'+'
-                | b'$'
-                | b','
-                | b'-'
-                | b'_'
-                | b'.'
-                | b'!'
-                | b'~'
-                | b'*'
-                | b'\''
-                | b'('
-                | b')'
-                | b'%'
-                | b'['
-                | b']'
-        );
-        i += 1;
-    }
-
-    table
-};
 
 #[cfg(test)]
 mod tests {
@@ -275,7 +207,11 @@ mod tests {
         for byte in 0..=255u8 {
             let expected = byte.is_ascii_alphanumeric()
                 || b";/?:@&=+$,-_.!~*'()%[]".contains(&byte);
-            assert_eq!(URI_CHARS[byte as usize], expected, "{byte:#04x}");
+            assert_eq!(
+                Uri::from_bytes(&[byte]).is_ok(),
+                expected,
+                "{byte:#04x}"
+            );
         }
     }
 

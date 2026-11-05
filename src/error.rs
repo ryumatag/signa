@@ -8,7 +8,7 @@ builders and other code that takes several kinds of input report.
 [`Method`]: crate::Method
 */
 
-use std::{convert::Infallible, error, fmt, str};
+use std::{convert::Infallible, error, fmt};
 
 /// A general error for building SIP messages.
 ///
@@ -180,58 +180,41 @@ invalid_errors! {
 
 /// An error returned when parsing an invalid SIP header field value.
 ///
-/// Its `Display` output says what was wrong with the value.
+/// Its `Display` output says what was wrong with the value and at which
+/// byte, counting from 0, as in `CR not followed by LF at byte 6`.
 ///
-/// The error deliberately does not keep the rejected value. Header values can
-/// carry credentials, such as `Authorization`, and an error is easy to log by
-/// accident. Not keeping the value also avoids allocating on the error path.
+/// The error deliberately does not keep the rejected value, not even the
+/// byte at fault. Header values can carry credentials, such as
+/// `Authorization`, and an error is easy to log by accident. Not keeping the
+/// value also avoids allocating on the error path.
 pub struct InvalidHeaderValue {
-    kind: InvalidHeaderValueKind,
-}
-
-/// What made a header value invalid.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum InvalidHeaderValueKind {
-    Byte(u8),
-    BareCr,
-    BareLf,
-    MissingWspAfterCrLf,
-    Utf8(str::Utf8Error),
+    kind: siparse::ErrorKind,
+    offset: usize,
 }
 
 impl InvalidHeaderValue {
     pub(crate) const fn new(
-        kind: InvalidHeaderValueKind,
+        kind: siparse::ErrorKind,
+        offset: usize,
     ) -> InvalidHeaderValue {
-        InvalidHeaderValue { kind }
+        InvalidHeaderValue { kind, offset }
     }
 }
 
 impl fmt::Debug for InvalidHeaderValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("InvalidHeaderValue").field("kind", &self.kind).finish()
+        f.debug_struct("InvalidHeaderValue")
+            .field("kind", &self.kind)
+            .field("offset", &self.offset)
+            .finish()
     }
 }
 
 impl fmt::Display for InvalidHeaderValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.kind {
-            InvalidHeaderValueKind::Byte(byte) => {
-                write!(f, "invalid byte 0x{byte:02X} in SIP header value")
-            }
-            InvalidHeaderValueKind::BareCr => {
-                f.write_str("bare CR in SIP header value")
-            }
-            InvalidHeaderValueKind::BareLf => {
-                f.write_str("bare LF in SIP header value")
-            }
-            InvalidHeaderValueKind::MissingWspAfterCrLf => f.write_str(
-                "missing SP or HTAB after CRLF in SIP header value",
-            ),
-            InvalidHeaderValueKind::Utf8(_) => {
-                f.write_str("invalid UTF-8 in SIP header value")
-            }
-        }
+        // `siparse` describes the kind, such as "invalid SIP header value"
+        // or "CR not followed by LF".
+        write!(f, "{} at byte {}", self.kind, self.offset)
     }
 }
 
