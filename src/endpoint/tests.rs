@@ -806,3 +806,225 @@ async fn a_stopped_endpoint_fails_requests() {
     let err = (&mut pending).await.unwrap_err();
     assert!(err.is_closed(), "{err}");
 }
+
+/// A service that answers 200 once `gate` is notified, once per request.
+#[derive(Clone)]
+struct Gated {
+    gate: Arc<Notify>,
+}
+
+impl Service<Request<Bytes>> for Gated {
+    type Response = Response<Bytes>;
+    type Error = Infallible;
+    type Future = Pin<
+        Box<dyn Future<Output = Result<Response<Bytes>, Infallible>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<(), Infallible>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: Request<Bytes>) -> Self::Future {
+        let gate = self.gate.clone();
+        Box::pin(async move {
+            gate.notified().await;
+            Ok(ok(&request))
+        })
+    }
+}
+
+impl Peer {
+    /// Receives datagrams until a final response, or `None` when none comes.
+    async fn recv_final(&mut self) -> Option<String> {
+        loop {
+            let message = self.recv().await?;
+            if !message.starts_with("SIP/2.0 1") {
+                return Some(message);
+            }
+        }
+    }
+}
+
+/// Answers a request received by a raw peer with a 200, on the same `Via`.
+fn answer(received: &str) -> String {
+    let (head, _) = received.split_once("\r\n").unwrap();
+
+    received.replacen(head, "SIP/2.0 200 OK", 1)
+}
+
+#[tokio::test]
+async fn shutdown_waits_for_the_service_and_refuses_the_rest() {
+    let gate = Arc::new(Notify::new());
+    let server = serve(Gated { gate: gate.clone() });
+    let to = server.udp_addr().unwrap();
+    let mut peer = Peer::new().await;
+    let first = peer.request(
+        "OPTIONS",
+        &format!("SIP/2.0/UDP 127.0.0.1:{};branch=z9hG4bK1", peer.port()),
+    );
+    let second = peer.request(
+        "OPTIONS",
+        &format!("SIP/2.0/UDP 127.0.0.1:{};branch=z9hG4bK2", peer.port()),
+    );
+
+    peer.send(to, &first).await;
+    // The 100 shows the service has the request.
+    let trying = peer.recv().await.unwrap();
+    assert!(trying.starts_with("SIP/2.0 100 "), "{trying}");
+
+    let mut shutdown = Box::pin(server.shutdown(Duration::from_secs(5)));
+    assert!(timeout(Duration::from_millis(50), &mut shutdown).await.is_err());
+
+    // A new request is refused, and a retransmission of the first is still
+    // absorbed by its transaction.
+    peer.send(to, &second).await;
+    let response = peer.recv().await.unwrap();
+    assert!(response.starts_with("SIP/2.0 503 "), "{response}");
+    assert!(response.contains("branch=z9hG4bK2"), "{response}");
+    peer.send(to, &first).await;
+    let trying = peer.recv().await.unwrap();
+    assert!(trying.starts_with("SIP/2.0 100 "), "{trying}");
+
+    // The service's answer goes out, and then the endpoint stops.
+    gate.notify_one();
+    let response = peer.recv_final().await.unwrap();
+    assert!(response.starts_with("SIP/2.0 200 OK\r\n"), "{response}");
+    assert!(response.contains("branch=z9hG4bK1"), "{response}");
+    timeout(Duration::from_secs(1), shutdown).await.unwrap();
+    assert!(UdpSocket::bind(to).await.is_ok(), "the socket was closed");
+}
+
+#[tokio::test]
+async fn shutdown_waits_for_the_response_to_its_own_request() {
+    let mut peer = Peer::new().await;
+    let client_end = serve(Counting::default());
+    let mut client =
+        client_end.client(Transport::Udp, peer.socket.local_addr().unwrap());
+
+    let call =
+        tokio::spawn(async move { client.call(request("OPTIONS")).await });
+    let received = peer.recv().await.unwrap();
+
+    let other = client_end.clone();
+    let mut shutdown = Box::pin(client_end.shutdown(Duration::from_secs(5)));
+    assert!(timeout(Duration::from_millis(50), &mut shutdown).await.is_err());
+
+    // A request after the call is refused. The one in flight is waited for.
+    let mut late =
+        other.client(Transport::Udp, peer.socket.local_addr().unwrap());
+    let err = late.call(request("OPTIONS")).await.unwrap_err();
+    assert!(err.is_closed(), "{err}");
+
+    peer.send(other.udp_addr().unwrap(), &answer(&received)).await;
+    let response = call.await.unwrap().unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // The second handle asking too makes no difference.
+    let again = other.shutdown(Duration::from_secs(5));
+    timeout(Duration::from_secs(1), shutdown).await.unwrap();
+    timeout(Duration::from_secs(1), again).await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_gives_up_at_the_deadline() {
+    let gate = Arc::new(Notify::new());
+    let server = serve(Gated { gate });
+    let to = server.udp_addr().unwrap();
+    let mut peer = Peer::new().await;
+    let request = peer.request(
+        "OPTIONS",
+        &format!("SIP/2.0/UDP 127.0.0.1:{};branch=z9hG4bK1", peer.port()),
+    );
+    let mut client =
+        server.client(Transport::Udp, peer.socket.local_addr().unwrap());
+    let call =
+        tokio::spawn(
+            async move { client.call(self::request("OPTIONS")).await },
+        );
+
+    // The service never answers, and neither does the peer.
+    peer.send(to, &request).await;
+    assert!(peer.recv().await.is_some());
+
+    let started = tokio::time::Instant::now();
+    timeout(
+        Duration::from_secs(1),
+        server.shutdown(Duration::from_millis(100)),
+    )
+    .await
+    .unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(100));
+    let err = call.await.unwrap().unwrap_err();
+    assert!(err.is_closed(), "{err}");
+    assert!(UdpSocket::bind(to).await.is_ok(), "the socket was closed");
+}
+
+#[tokio::test]
+async fn stopping_closes_the_connections() {
+    let server = serve(Counting::default());
+    let mut stream =
+        TcpStream::connect(server.tcp_addr().unwrap()).await.unwrap();
+    let request = format!(
+        "OPTIONS sip:bob@example.com SIP/2.0\r\n\
+         Via: SIP/2.0/TCP 127.0.0.1:{};branch=z9hG4bK1\r\n\
+         From: <sip:alice@example.com>;tag=1\r\n\
+         To: <sip:bob@example.com>\r\n\
+         Call-ID: tcp-1\r\n\
+         CSeq: 1 OPTIONS\r\n\
+         Content-Length: 0\r\n\
+         \r\n",
+        stream.local_addr().unwrap().port()
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let response = read_final(&mut stream).await;
+    assert!(response.starts_with("SIP/2.0 200 OK\r\n"), "{response}");
+
+    // The endpoint is gone, so the connection ends at once rather than at the
+    // idle timeout.
+    drop(server);
+    let mut buf = [0; 1];
+    let n = timeout(Duration::from_secs(1), stream.read(&mut buf))
+        .await
+        .expect("closed within a second")
+        .unwrap();
+    assert_eq!(n, 0, "EOF");
+}
+
+#[tokio::test]
+async fn the_last_responses_go_out_before_the_connections_close() {
+    let gate = Arc::new(Notify::new());
+    let server = serve(Gated { gate: gate.clone() });
+    let mut stream =
+        TcpStream::connect(server.tcp_addr().unwrap()).await.unwrap();
+    let request = format!(
+        "OPTIONS sip:bob@example.com SIP/2.0\r\n\
+         Via: SIP/2.0/TCP 127.0.0.1:{};branch=z9hG4bK1\r\n\
+         From: <sip:alice@example.com>;tag=1\r\n\
+         To: <sip:bob@example.com>\r\n\
+         Call-ID: tcp-1\r\n\
+         CSeq: 1 OPTIONS\r\n\
+         Content-Length: 0\r\n\
+         \r\n",
+        stream.local_addr().unwrap().port()
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let trying = read_head(&mut stream).await;
+    assert!(trying.starts_with("SIP/2.0 100 "), "{trying}");
+
+    // The endpoint stops right after it queues the 200, and the connection
+    // still carries it before closing.
+    let shutdown = server.shutdown(Duration::from_secs(5));
+    gate.notify_one();
+    let response = read_final(&mut stream).await;
+    assert!(response.starts_with("SIP/2.0 200 OK\r\n"), "{response}");
+    timeout(Duration::from_secs(1), shutdown).await.unwrap();
+    let mut buf = [0; 1];
+    let n = timeout(Duration::from_secs(1), stream.read(&mut buf))
+        .await
+        .expect("closed within a second")
+        .unwrap();
+    assert_eq!(n, 0, "EOF");
+}

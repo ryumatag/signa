@@ -24,7 +24,8 @@ code through a [Tower] `Service`. Its design draws heavily on the [`http`] and
   non-INVITE client and server transactions of RFC 3261 section 17 as updated
   by RFC 4320, and hands each request to a Tower `Service`. Its `Client` sends
   requests to one next hop and is a `Service` too, so Tower middleware fits on
-  both sides. Both live in the `endpoint` module.
+  both sides. Both live in the `endpoint` module. A graceful shutdown answers
+  new requests with a 503 and waits for the ones in hand up to a deadline.
 
 # What it does not cover yet
 
@@ -34,7 +35,6 @@ code through a [Tower] `Service`. Its design draws heavily on the [`http`] and
 * Choosing a next hop. RFC 3263 resolution, and the structured view of a
   [`Uri`] it needs, belong to a layer above, which holds one `Client` per hop.
 * TLS, and anything that would make `sips:` mean what it says.
-* Graceful shutdown. Dropping the last handle to an endpoint stops it at once.
 * Dialogs, registration, proxying, and the rest of what an application does
   with messages. Those belong in crates built on signa.
 

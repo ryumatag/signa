@@ -17,8 +17,10 @@ decode error, or when a write fails. Bytes left in the read buffer at EOF are
 an unfinished message and are dropped. The listener holds at most
 `max_connections` open and leaves the rest in the OS backlog.
 
-TODO: Close connections from the outside for shutdown. That comes with the
-endpoint, which knows when it is shutting down.
+A connection also ends when the endpoint is gone, which the reader sees as the
+channel closing. That is how every connection closes when the endpoint stops.
+The writer then finishes what is queued before the stream is dropped, since the
+endpoint's last responses are in that queue.
 */
 
 use std::{
@@ -62,6 +64,10 @@ const WRITE_BATCH: usize = 64;
 
 /// The answer to an RFC 5626 ping.
 const PONG: Bytes = Bytes::from_static(b"\r\n");
+
+/// How long the writer gets to finish its queue once the endpoint is gone. A
+/// peer that takes longer to read a few messages is not reading at all.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Settings for every connection a listener accepts or [`connect`] opens.
 #[derive(Clone, Copy, Debug)]
@@ -270,7 +276,7 @@ fn start(
     let (read, write) = stream.into_split();
     let (queue, pending) = mpsc::channel(config.write_queue);
     let writer = Writer { queue };
-    let writing = tokio::spawn(write_loop(write, pending));
+    let mut writing = tokio::spawn(write_loop(write, pending));
     let reading = read_loop(
         read,
         flow,
@@ -283,14 +289,31 @@ fn start(
     let permit = permit.into();
 
     tokio::spawn(async move {
-        reading.await;
-        // The connection is over. A write still in flight is lost, which is no
-        // worse than the peer having gone away.
-        writing.abort();
+        match reading.await {
+            // The connection is over. A write still in flight is lost, which
+            // is no worse than the peer having gone away.
+            End::Peer => writing.abort(),
+            // The endpoint stopped. What it queued last, such as the final
+            // responses before a shutdown, still goes out. The queue closes
+            // with the endpoint's last `Writer`, and the writer ends with it.
+            End::Endpoint => {
+                if timeout(DRAIN_TIMEOUT, &mut writing).await.is_err() {
+                    writing.abort();
+                }
+            }
+        }
         drop(permit);
     });
 
     Ok(writer)
+}
+
+/// Why the reader ended.
+enum End {
+    /// EOF, a read error, the idle timeout, or a bad message.
+    Peer,
+    /// The endpoint is gone.
+    Endpoint,
 }
 
 /// Reads and frames the stream until the connection ends.
@@ -302,9 +325,12 @@ async fn read_loop(
     idle_timeout: Duration,
     inbound: mpsc::Sender<Inbound>,
     writer: Writer,
-) {
+) -> End {
     let mut decoder = Decoder::new(role, limits);
     let mut buf = BytesMut::with_capacity(READ_SIZE);
+    // Resolves when the endpoint drops its receiver, so an idle connection
+    // closes with the endpoint instead of at the idle timeout.
+    let mut closed = pin!(inbound.closed());
     loop {
         loop {
             match decoder.decode(&mut buf) {
@@ -312,8 +338,7 @@ async fn read_loop(
                     let writer = writer.clone();
                     let inbound_message = Inbound { message, flow, writer };
                     if inbound.send(inbound_message).await.is_err() {
-                        // The endpoint is gone.
-                        return;
+                        return End::Endpoint;
                     }
                 }
                 Ok(Some(Frame::Ping)) => {
@@ -328,16 +353,25 @@ async fn read_loop(
                 Ok(None) => break,
                 // The stream has no way to find the next message after a bad
                 // one, so the connection closes (RFC 3261 section 18.3).
-                Err(_) => return,
+                Err(_) => return End::Peer,
             }
         }
 
         buf.reserve(READ_SIZE);
 
-        match timeout(idle_timeout, read.read_buf(&mut buf)).await {
-            Ok(Ok(n)) if n > 0 => {}
+        let mut read = pin!(timeout(idle_timeout, read.read_buf(&mut buf)));
+        let read = poll_fn(|cx| {
+            if closed.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(None);
+            }
+            read.as_mut().poll(cx).map(Some)
+        })
+        .await;
+        match read {
+            None => return End::Endpoint,
+            Some(Ok(Ok(n))) if n > 0 => {}
             // EOF, a read error, or the idle timeout.
-            _ => return,
+            _ => return End::Peer,
         }
     }
 }
