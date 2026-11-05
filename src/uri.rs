@@ -11,15 +11,15 @@ use siparse::check;
 
 use crate::{error::InvalidUri, util::ByteStr};
 
-// TODO: Add structured access before transport work in 0.2.0, which needs
-// the host, port, `transport`, `maddr`, and `sips` scheme to pick a target
+// TODO: Add structured access before transport work in 0.2.0, which needs the
+// host, port, `transport`, `maddr`, and `sips` scheme to pick a target
 // (RFC 3263). It is deferred because it needs its own design.
 //
-// * SIP and SIPS URIs (RFC 3261 section 19.1), tel URIs (RFC 3966), and
-//   other absolute URIs each have their own grammar.
+// * SIP and SIPS URIs (RFC 3261 section 19.1), tel URIs (RFC 3966), and other
+//   absolute URIs each have their own grammar.
 // * Views should be offsets into the stored text, as in `http::Uri`, so the
-//   original text stays intact for forwarding while `%`-escapes can be
-//   decoded for comparison.
+//   original text stays intact for forwarding while `%`-escapes can be decoded
+//   for comparison.
 // * RFC 3261 section 19.1.4 equivalence decides what `PartialEq` means.
 //
 // Keeping the text in `Bytes` lets this be added as new methods, such as a
@@ -27,29 +27,27 @@ use crate::{error::InvalidUri, util::ByteStr};
 //
 /// A SIP `Request-URI`.
 ///
-/// [RFC 3261 section 25.1] defines `Request-URI` as
-/// `SIP-URI / SIPS-URI / absoluteURI`, so a request may target `sip:`,
-/// `sips:`, `tel:`, or any other URI scheme. This type stores the URI as
-/// text and does not parse its structure. It only checks that every byte
-/// belongs to the URI character classes that [`siparse`] accepts in a
-/// request-line:
+/// [RFC 3261 section 25.1] defines `Request-URI` as `SIP-URI / SIPS-URI /
+/// absoluteURI`, so a request may target `sip:`, `sips:`, `tel:`, or any other
+/// URI scheme. This type stores the URI as text and does not parse its
+/// structure. It only checks that every byte belongs to the URI character
+/// classes that [siparse] accepts in a request-line:
 ///
 /// * ASCII letters and digits
 /// * the RFC 2396 `reserved` and `mark` characters, `%`, `[`, and `]`
 ///
 /// Whitespace, controls, `DEL`, raw non-ASCII bytes, and other visible ASCII
-/// characters are rejected. Matching `siparse` means that any URI received
-/// in a request can also be built with this type, and the reverse.
+/// characters are rejected. Matching siparse means that any URI received in a
+/// request can also be built with this type, and the reverse.
 ///
 /// Accepting a URI does not establish that it is well formed for its scheme.
 /// Structured access to SIP URIs (user, host, parameters) is later work.
 ///
 /// `Uri` does not implement `PartialEq` or `Hash`. [RFC 3261 section 19.1.4]
-/// compares SIP URIs component by component, with case-insensitive parts
-/// and rules for parameters, so comparing the text would give the wrong
-/// answer for equivalent URIs. Compare [`Uri::as_str`] when exact text is
-/// what you want. I would rather add RFC equivalence later than change what
-/// `==` means.
+/// compares SIP URIs component by component, with case-insensitive parts and
+/// rules for parameters, so comparing the text would give the wrong answer for
+/// equivalent URIs. Compare [`Uri::as_str`] when exact text is what you want.
+/// I would rather add RFC equivalence later than change what `==` means.
 ///
 /// ```
 /// use signa::Uri;
@@ -61,7 +59,7 @@ use crate::{error::InvalidUri, util::ByteStr};
 /// # Ok::<(), signa::error::InvalidUri>(())
 /// ```
 ///
-/// [`siparse`]: https://docs.rs/siparse
+/// [siparse]: https://docs.rs/siparse
 /// [RFC 3261 section 25.1]: https://www.rfc-editor.org/rfc/rfc3261#section-25.1
 /// [RFC 3261 section 19.1.4]: https://www.rfc-editor.org/rfc/rfc3261#section-19.1.4
 #[derive(Clone)]
@@ -71,6 +69,8 @@ impl Uri {
     /// Creates a `Uri` from a static string without copying it.
     ///
     /// This is usable in `const` contexts.
+    ///
+    /// # Example
     ///
     /// ```
     /// use signa::Uri;
@@ -95,8 +95,8 @@ impl Uri {
     ///
     /// # Errors
     ///
-    /// Returns [`InvalidUri`] if `src` is empty or contains a byte outside
-    /// the accepted URI character classes.
+    /// Returns [`InvalidUri`] if `src` is empty or contains a byte outside the
+    /// accepted URI character classes.
     pub fn from_bytes(src: &[u8]) -> Result<Uri, InvalidUri> {
         let uri = check::request_uri(src).map_err(|_| InvalidUri::new())?;
         Ok(Uri(ByteStr::from(uri)))
@@ -151,7 +151,7 @@ impl FromStr for Uri {
 }
 
 impl Uri {
-    /// Creates a `Uri` from a Request-URI that `siparse` parsed out of `src`,
+    /// Creates a `Uri` from a Request-URI that siparse parsed out of `src`,
     /// without copying or checking it again.
     ///
     /// # Panics
@@ -215,8 +215,8 @@ mod tests {
         }
     }
 
-    // Any URI that `siparse` accepts in a request-line must be accepted
-    // here, and the reverse, so received requests can be rebuilt.
+    // Any URI that siparse accepts in a request-line must be accepted here,
+    // and the reverse, so received requests can be rebuilt.
     #[test]
     fn agrees_with_siparse_for_every_byte() {
         for byte in 0..=255u8 {

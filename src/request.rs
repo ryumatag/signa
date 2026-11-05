@@ -113,17 +113,19 @@ impl Request<Bytes> {
         Request::from_shared(Bytes::copy_from_slice(src))
     }
 
-    /// Parses a request from the bytes of one complete message without
-    /// copying them.
+    /// Parses a request from the bytes of one complete message without copying
+    /// them.
     ///
     /// The Request-URI, the header values, and the body share `src`. Only
     /// header names are copied, when they are not standard names, because
     /// [`HeaderName`] normalizes them.
     ///
-    /// `src` must hold the whole message, such as one UDP datagram. This
-    /// does not frame messages on a stream. The body is the rest of `src`
-    /// after the head, cut to `Content-Length` if the message has one. Bytes
-    /// after that are dropped, as RFC 3261 section 18.3 says for datagrams.
+    /// `src` must hold the whole message, such as one UDP datagram. This does
+    /// not frame messages on a stream. The body is the rest of `src` after the
+    /// head, cut to `Content-Length` if the message has one. Bytes after that
+    /// are dropped, as RFC 3261 section 18.3 says for datagrams.
+    ///
+    /// # Example
     ///
     /// ```
     /// use bytes::Bytes;
@@ -161,15 +163,17 @@ impl<T: AsRef<[u8]>> Request<T> {
     /// Writes the request to the end of `dst` as one complete message.
     ///
     /// Header fields are written in the order of [`Request::headers`], with
-    /// their values as stored, folds included. Standard names take their
-    /// long form, such as `Call-ID`, and other names stay lowercase.
+    /// their values as stored, folds included. Standard names take their long
+    /// form, such as `Call-ID`, and other names stay lowercase.
     ///
-    /// The `Content-Length` field always comes from the body, after the
-    /// other fields. Any `Content-Length` in the headers is skipped, so the
-    /// two cannot disagree.
+    /// The `Content-Length` field always comes from the body, after the other
+    /// fields. Any `Content-Length` in the headers is skipped, so the two
+    /// cannot disagree.
     ///
     /// A request built without a body has a `()` body, which this cannot
     /// write. Give it an empty `Bytes` instead.
+    ///
+    /// # Example
     ///
     /// ```
     /// use bytes::{Bytes, BytesMut};
@@ -279,6 +283,8 @@ impl<T> Request<T> {
     }
 
     /// Converts the body with `f`, keeping the other parts.
+    ///
+    /// # Example
     ///
     /// ```
     /// use signa::Request;
@@ -443,8 +449,8 @@ impl Builder {
     ///
     /// # Errors
     ///
-    /// Returns the first error from an earlier call, or an error if the
-    /// method or Request-URI was never set.
+    /// Returns the first error from an earlier call, or an error if the method
+    /// or Request-URI was never set.
     pub fn body<T>(self, body: T) -> Result<Request<T>, Error> {
         let head = self.inner?;
         let method = head.method.ok_or_else(|| Error::missing("method"))?;

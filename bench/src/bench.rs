@@ -24,7 +24,7 @@ criterion::criterion_group! {
         message::parse,
         encode::encode,
         // One value at a time. These cover the checks that will move to
-        // `siparse`, so they show what the switch changes for each type.
+        // siparse, so they show what the switch changes for each type.
         header_name::from_bytes,
         header_value::from_shared,
         method::from_bytes,

@@ -8,9 +8,9 @@ use crate::{error::InvalidMessage, request::Request, response::Response};
 
 /// A SIP request or response.
 ///
-/// UDP sockets and TCP connections carry both kinds, so a received message
-/// may be either. [`Message::from_shared`] parses the head once and decides
-/// from its start-line.
+/// UDP sockets and TCP connections carry both kinds, so a received message may
+/// be either. [`Message::from_shared`] parses the head once and decides from
+/// its start-line.
 ///
 /// ```
 /// use bytes::Bytes;

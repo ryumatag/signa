@@ -18,8 +18,8 @@ type AnyMap = HashMap<
 >;
 
 // A `TypeId` is already a hash computed by the compiler, so hashing it again
-// is wasted work. `IdHasher` keeps the `u64` that `TypeId` writes and
-// returns it as is.
+// is wasted work. `IdHasher` keeps the `u64` that `TypeId` writes and returns
+// it as is.
 #[derive(Default)]
 struct IdHasher(u64);
 
@@ -47,10 +47,10 @@ impl Hasher for IdHasher {
 
 /// A type map of extra data attached to a SIP message.
 ///
-/// A request or response can carry values of any type that is
-/// `Clone + Send + Sync + 'static`, at most one per type. Layers that
-/// handle the message use this to pass along data that is not part of the
-/// message itself, such as where it was received from.
+/// A request or response can carry values of any type that is `Clone + Send +
+/// Sync + 'static`, at most one per type. Layers that handle the message use
+/// this to pass along data that is not part of the message itself, such as
+/// where it was received from.
 ///
 /// ```
 /// use signa::Extensions;
@@ -66,8 +66,8 @@ impl Hasher for IdHasher {
 /// ```
 #[derive(Clone, Default)]
 pub struct Extensions {
-    // Most messages carry no extensions. `None` keeps an empty map at one
-    // word and avoids allocating until something is inserted.
+    // Most messages carry no extensions. `None` keeps an empty map at one word
+    // and avoids allocating until something is inserted.
     map: Option<Box<AnyMap>>,
 }
 
@@ -81,6 +81,8 @@ impl Extensions {
     }
 
     /// Inserts `value`, returning the previous value of the same type.
+    ///
+    /// # Example
     ///
     /// ```
     /// use signa::Extensions;
@@ -118,8 +120,8 @@ impl Extensions {
             .and_then(|boxed| (**boxed).as_any_mut().downcast_mut())
     }
 
-    /// Returns a mutable reference to the value of type `T`, inserting
-    /// `value` first if there is none.
+    /// Returns a mutable reference to the value of type `T`, inserting `value`
+    /// first if there is none.
     pub fn get_or_insert<T: Clone + Send + Sync + 'static>(
         &mut self,
         value: T,
@@ -129,6 +131,8 @@ impl Extensions {
 
     /// Returns a mutable reference to the value of type `T`, inserting the
     /// result of `f` first if there is none.
+    ///
+    /// # Example
     ///
     /// ```
     /// use signa::Extensions;
@@ -196,6 +200,8 @@ impl Extensions {
     ///
     /// A value in `other` replaces a value of the same type in `self`.
     ///
+    /// # Example
+    ///
     /// ```
     /// use signa::Extensions;
     ///
@@ -224,8 +230,8 @@ impl Extensions {
 }
 
 impl fmt::Debug for Extensions {
-    /// Lists the type names of the stored values. The values themselves
-    /// need not implement `Debug`, so they are not shown.
+    /// Lists the type names of the stored values. The values themselves need
+    /// not implement `Debug`, so they are not shown.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         struct TypeName(&'static str);
 

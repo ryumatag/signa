@@ -54,8 +54,8 @@ use self::{
 ///
 /// SIP methods are treated as case-sensitive protocol values.
 ///
-/// Standard methods are recognized only in their canonical uppercase form,
-/// and extension methods preserve their original casing.
+/// Standard methods are recognized only in their canonical uppercase form, and
+/// extension methods preserve their original casing.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Method(Repr);
 
@@ -375,8 +375,8 @@ mod extension {
 
     /// Copies `src` into `dst` if it is a SIP `token`.
     ///
-    /// The check is `siparse`'s, so an extension method is valid here
-    /// exactly when the parser accepts it in a request-line.
+    /// The check is siparse's, so an extension method is valid here exactly
+    /// when the parser accepts it in a request-line.
     fn write_checked(src: &[u8], dst: &mut [u8]) -> Result<(), InvalidMethod> {
         let token = check::method(src).map_err(|_| InvalidMethod::new())?;
         dst[..token.len()].copy_from_slice(token.as_bytes());

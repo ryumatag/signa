@@ -22,7 +22,7 @@ use crate::{error::InvalidReasonPhrase, util::ByteStr};
 ///                 / UTF8-NONASCII / UTF8-CONT / SP / HTAB)
 /// ```
 ///
-/// This type accepts what [`siparse`] accepts in a status-line:
+/// This type accepts what [siparse] accepts in a status-line:
 ///
 /// * ASCII letters and digits, `SP`, and `HTAB`
 /// * the RFC 3261 `reserved` and `mark` characters
@@ -30,7 +30,7 @@ use crate::{error::InvalidReasonPhrase, util::ByteStr};
 /// * any non-ASCII text that is valid UTF-8
 ///
 /// Other ASCII characters, such as `"`, `<`, and `#`, must be `%`-escaped.
-/// An empty reason phrase is valid. Matching `siparse` means that any reason
+/// An empty reason phrase is valid. Matching siparse means that any reason
 /// phrase received in a response can also be built with this type, and the
 /// reverse.
 ///
@@ -48,7 +48,7 @@ use crate::{error::InvalidReasonPhrase, util::ByteStr};
 /// # Ok::<(), signa::error::InvalidReasonPhrase>(())
 /// ```
 ///
-/// [`siparse`]: https://docs.rs/siparse
+/// [siparse]: https://docs.rs/siparse
 /// [RFC 3261 section 25.1]: https://www.rfc-editor.org/rfc/rfc3261#section-25.1
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct ReasonPhrase(ByteStr);
@@ -57,6 +57,8 @@ impl ReasonPhrase {
     /// Creates a `ReasonPhrase` from a static string without copying it.
     ///
     /// This is usable in `const` contexts.
+    ///
+    /// # Example
     ///
     /// ```
     /// use signa::ReasonPhrase;
@@ -164,8 +166,8 @@ impl FromStr for ReasonPhrase {
 }
 
 impl ReasonPhrase {
-    /// Creates a `ReasonPhrase` from a reason phrase that `siparse` parsed
-    /// out of `src`, without copying or checking it again.
+    /// Creates a `ReasonPhrase` from a reason phrase that siparse parsed out
+    /// of `src`, without copying or checking it again.
     ///
     /// # Panics
     ///
@@ -185,7 +187,7 @@ impl ReasonPhrase {
 mod tests {
     use super::*;
 
-    /// Returns whether `siparse` accepts `reason` in a status-line.
+    /// Returns whether siparse accepts `reason` in a status-line.
     fn siparse_accepts(reason: &[u8]) -> bool {
         let mut head = b"SIP/2.0 486 ".to_vec();
         head.extend_from_slice(reason);
@@ -231,8 +233,8 @@ mod tests {
         }
     }
 
-    // Any reason phrase that `siparse` accepts in a status-line must be
-    // accepted here, and the reverse, so received responses can be rebuilt.
+    // Any reason phrase that siparse accepts in a status-line must be accepted
+    // here, and the reverse, so received responses can be rebuilt.
     #[test]
     fn agrees_with_siparse_for_every_byte() {
         for byte in 0..=255u8 {
