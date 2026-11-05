@@ -129,6 +129,7 @@ mod extensions;
 // Everything `pub` in `frame` exists for the `__bench` feature, which
 // re-exports it. Without the feature nothing reaches it, which
 // `unreachable_pub` would otherwise flag.
+//
 // TODO: Drop `dead_code` once the TCP transport uses the decoder.
 #[cfg_attr(not(feature = "__bench"), allow(unreachable_pub, dead_code))]
 mod frame;
@@ -140,6 +141,16 @@ mod reason;
 pub mod request;
 pub mod response;
 mod status;
+// Crate-private until the endpoint drives the transactions. `pub` items exist
+// for the `__bench` feature, as in `frame`.
+//
+// TODO: Drop `dead_code` and `unused_imports` once the endpoint uses the
+// transactions.
+#[cfg_attr(
+    not(feature = "__bench"),
+    allow(unreachable_pub, dead_code, unused_imports)
+)]
+mod transaction;
 mod uri;
 mod util;
 mod version;
@@ -154,4 +165,8 @@ pub mod bench {
     #[doc(hidden)]
     pub use crate::frame::{DecodeError, Decoder, Frame, Limits, Role};
     pub use crate::header::{cseq::CSeq, via::Via};
+    pub use crate::transaction::{
+        ClientEvent, ClientKey, ClientTransaction, ServerKey,
+        ServerTransaction, Timers,
+    };
 }

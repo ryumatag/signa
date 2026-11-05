@@ -8,6 +8,7 @@ mod header_value;
 mod message;
 mod method;
 mod reason;
+mod transaction;
 mod uri;
 mod via;
 
@@ -31,6 +32,7 @@ criterion::criterion_group! {
         frame::stream,
         via::parse,
         header_map::prepend,
+        transaction::non_invite,
         // One value at a time. These cover the checks that will move to
         // siparse, so they show what the switch changes for each type.
         header_name::from_bytes,
