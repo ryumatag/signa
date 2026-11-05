@@ -9,7 +9,7 @@ readme = "README.md"
 keywords = ["sip", "rfc3261", "voip", "telephony"]
 categories = ["network-programming"]
 edition = "2021"
-rust-version = "1.65"
+rust-version = "1.71"
 include = [
   "/src/**/*.rs",
   "/README.md",
@@ -18,7 +18,10 @@ include = [
 ]
 
 [features]
-default = []
+default = ["tokio"]
+# The transports, and later the endpoint, run on tokio. Without this feature
+# only the message layer is built.
+tokio = ["dep:tokio", "dep:libc"]
 # Exposes crate internals to the benchmark crate in `bench/`. Unstable, with
 # no semver guarantee. Not for use outside this repository.
 __bench = []
@@ -26,3 +29,12 @@ __bench = []
 [dependencies]
 bytes = { version = "1.12.1", default-features = false, features = ["std"] }
 siparse = "0.4.0"
+tokio = { version = "1.47", default-features = false, features = ["io-util", "net", "rt", "sync", "time"], optional = true }
+
+# `recvmsg` and `sendmsg` with the `PKTINFO` control messages, which tokio
+# does not expose.
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread"] }

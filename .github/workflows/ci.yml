@@ -40,6 +40,8 @@ jobs:
           toolchain: ${{ matrix.rust }}
       - name: Test
         run: cargo test --verbose
+      - name: Test without default features
+        run: cargo test --no-default-features --verbose
 
   # Runs every benchmark once and checks its assertions, so a change that
   # breaks a benchmark fails here instead of in a later comparison.
@@ -68,6 +70,7 @@ jobs:
       - name: Run clippy
         run: |
           cargo clippy --all-targets -- -D warnings
+          cargo clippy --all-targets --no-default-features -- -D warnings
           cargo clippy --manifest-path bench/Cargo.toml --all-targets -- -D warnings
 
   rustfmt:
@@ -86,17 +89,26 @@ jobs:
           cargo fmt -- --check
           cargo fmt --manifest-path bench/Cargo.toml -- --check
 
+  # The newest tokio needs a newer Rust than the MSRV, so a stable cargo
+  # resolves the dependencies to versions the MSRV can build first. Cargo picks
+  # the lockfile format from `rust-version`, so the old cargo reads it.
   msrv:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Resolve dependencies for the MSRV
+        run: cargo +stable generate-lockfile
+        env:
+          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.65"
+          toolchain: "1.71"
       - name: Build
-        run: cargo build --verbose
+        run: cargo +1.71 build --locked --verbose
 
   rustdoc:
     runs-on: ubuntu-latest
@@ -115,10 +127,11 @@ jobs:
   # signa's own `unsafe` is `from_utf8_unchecked` on bytes a check has
   # accepted, which Miri cannot verify. The tests still drive siparse's
   # raw-pointer cursor and the `bytes` crate's buffer sharing with signa's
-  # inputs, so this catches undefined behavior there that siparse's own
-  # tests may not reach.
-  # TODO: Mark the socket tests `#[cfg_attr(miri, ignore)]` once the
-  # transports land, since Miri has no network I/O.
+  # inputs, so this catches undefined behavior there that siparse's own tests
+  # may not reach.
+  #
+  # The socket tests are `#[cfg_attr(miri, ignore)]`, since Miri has no
+  # network I/O.
   miri:
     runs-on: ubuntu-latest
     steps:
