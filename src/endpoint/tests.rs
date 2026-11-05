@@ -16,17 +16,22 @@ use std::{
 
 use bytes::Bytes;
 use tokio::{
-    net::{TcpListener, UdpSocket},
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream, UdpSocket},
     sync::Notify,
     time::{sleep, timeout},
 };
 use tower::{limit::ConcurrencyLimit, service_fn, ServiceExt};
 use tower_service::Service;
 
-use super::{Endpoint, Error, Flow, Timers, Transport};
 use crate::{
+    endpoint::{error::Error, Endpoint},
     header::{CSEQ, VIA},
-    Request, Response, StatusCode,
+    request::Request,
+    response::Response,
+    status::StatusCode,
+    transaction::Timers,
+    transport::{Flow, Transport},
 };
 
 const LOCALHOST: SocketAddr =
@@ -203,6 +208,118 @@ async fn tcp_round_trip_reuses_the_connection() {
     assert_eq!(flows.len(), 2);
     assert_eq!(flows[0].transport, Transport::Tcp);
     assert_eq!(flows[0], flows[1], "both requests on one connection");
+}
+
+/// Reads one message without a body from a connection.
+async fn read_head(stream: &mut TcpStream) -> String {
+    let mut buf = Vec::new();
+    let mut byte = [0; 1];
+    while !buf.ends_with(b"\r\n\r\n") {
+        let n = timeout(Duration::from_secs(1), stream.read(&mut byte))
+            .await
+            .expect("a message within a second")
+            .unwrap();
+        assert!(n > 0, "closed before the message ended");
+        buf.push(byte[0]);
+    }
+
+    String::from_utf8(buf).unwrap()
+}
+
+/// Reads messages from a connection until a final response.
+async fn read_final(stream: &mut TcpStream) -> String {
+    loop {
+        let message = read_head(stream).await;
+        if !message.starts_with("SIP/2.0 1") {
+            return message;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_response_opens_a_new_connection_when_the_request_s_has_closed() {
+    let gate = Arc::new(Notify::new());
+    let service = {
+        let gate = gate.clone();
+        service_fn(move |request: Request<Bytes>| {
+            let gate = gate.clone();
+            async move {
+                gate.notified().await;
+                Ok::<_, Infallible>(ok(&request))
+            }
+        })
+    };
+    let server = serve(service);
+    let peer = Peer::new().await;
+
+    // The peer listens on its `sent-by` port, sends a request on one
+    // connection, and closes it before the response.
+    let listener = TcpListener::bind(LOCALHOST).await.unwrap();
+    let sent_by = listener.local_addr().unwrap();
+    let mut stream =
+        TcpStream::connect(server.tcp_addr().unwrap()).await.unwrap();
+    let request = peer.request(
+        "OPTIONS",
+        &format!(
+            "SIP/2.0/TCP 127.0.0.1:{};rport;branch=z9hG4bK1",
+            sent_by.port()
+        ),
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    drop(stream);
+    // Let the endpoint see the close.
+    sleep(Duration::from_millis(50)).await;
+    gate.notify_one();
+
+    // The response arrives on a new connection to `sent-by`, and not to
+    // the source port, since `rport` means nothing over TCP (RFC 3581).
+    let (mut conn, _) = timeout(Duration::from_secs(1), listener.accept())
+        .await
+        .expect("a connection within a second")
+        .unwrap();
+    // With the short timers a 100 may come first, on that connection too.
+    let response = read_final(&mut conn).await;
+    assert!(response.starts_with("SIP/2.0 200 OK\r\n"), "{response}");
+    assert!(response.contains("branch=z9hG4bK1"), "{response}");
+
+    // A second response to the same `sent-by` reuses that connection.
+    let mut stream =
+        TcpStream::connect(server.tcp_addr().unwrap()).await.unwrap();
+    let request = peer.request(
+        "OPTIONS",
+        &format!("SIP/2.0/TCP 127.0.0.1:{};branch=z9hG4bK2", sent_by.port()),
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    drop(stream);
+    sleep(Duration::from_millis(50)).await;
+    gate.notify_one();
+    let response = read_final(&mut conn).await;
+    assert!(response.starts_with("SIP/2.0 200 OK\r\n"), "{response}");
+    assert!(response.contains("branch=z9hG4bK2"), "{response}");
+}
+
+#[tokio::test]
+async fn a_response_nobody_listens_for_is_dropped() {
+    let service = Counting::default();
+    let server = serve(service.clone());
+    let peer = Peer::new().await;
+
+    // Nothing listens on port 1, so the new connection fails.
+    let mut stream =
+        TcpStream::connect(server.tcp_addr().unwrap()).await.unwrap();
+    let request =
+        peer.request("OPTIONS", "SIP/2.0/TCP 127.0.0.1:1;branch=z9hG4bK1");
+    stream.write_all(request.as_bytes()).await.unwrap();
+    // The service answers at once, so the response may go on this
+    // connection or on the failed one. Either way the endpoint goes on.
+    drop(stream);
+    sleep(Duration::from_millis(50)).await;
+
+    let mut client = serve(Counting::default())
+        .client(Transport::Udp, server.udp_addr().unwrap());
+    let response = client.call(self::request("OPTIONS")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(service.requests.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
