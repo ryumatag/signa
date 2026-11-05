@@ -30,6 +30,10 @@ transactions. I plan stream framing, UDP and TCP I/O, non-INVITE transactions,
 and the `Service` boundary for 0.2.0, and INVITE, ACK, and CANCEL transactions
 for 0.3.0.
 
+The `tokio` feature, on by default, pulls in tokio for the I/O that 0.2.0 is
+building up. Nothing public depends on it yet. With `default-features = false`
+only the message layer is built.
+
 # Example
 
 A UAS answering an `OPTIONS` request received in a datagram:
@@ -128,10 +132,10 @@ pub mod error;
 mod extensions;
 // Everything `pub` in `frame` exists for the `__bench` feature, which
 // re-exports it. Without the feature nothing reaches it, which
-// `unreachable_pub` would otherwise flag.
-//
-// TODO: Drop `dead_code` once the TCP transport uses the decoder.
-#[cfg_attr(not(feature = "__bench"), allow(unreachable_pub, dead_code))]
+// `unreachable_pub` would otherwise flag. The TCP transport is the only
+// user, so without `tokio` the module is dead.
+#[cfg_attr(not(feature = "__bench"), allow(unreachable_pub))]
+#[cfg_attr(not(any(feature = "__bench", feature = "tokio")), allow(dead_code))]
 mod frame;
 pub mod header;
 mod message;
@@ -151,6 +155,17 @@ mod status;
     allow(unreachable_pub, dead_code, unused_imports)
 )]
 mod transaction;
+// The transports run on tokio. Crate-private until the endpoint drives them,
+// with `pub` items for the `__bench` feature, as in `frame`.
+//
+// TODO: Drop `dead_code` and `unused_imports` once the endpoint uses the
+// transports.
+#[cfg(feature = "tokio")]
+#[cfg_attr(
+    not(feature = "__bench"),
+    allow(unreachable_pub, dead_code, unused_imports)
+)]
+mod transport;
 mod uri;
 mod util;
 mod version;
@@ -169,4 +184,6 @@ pub mod bench {
         ClientEvent, ClientKey, ClientTransaction, ServerKey,
         ServerTransaction, Timers,
     };
+    #[cfg(feature = "tokio")]
+    pub use crate::transport::{tcp, udp, Flow, Transport};
 }

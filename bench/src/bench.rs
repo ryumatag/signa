@@ -9,6 +9,7 @@ mod message;
 mod method;
 mod reason;
 mod transaction;
+mod transport;
 mod uri;
 mod via;
 
@@ -33,6 +34,10 @@ criterion::criterion_group! {
         via::parse,
         header_map::prepend,
         transaction::non_invite,
+        // Loopback round trips through the transports, on a
+        // current-thread runtime. These include the syscalls.
+        transport::udp,
+        transport::tcp,
         // One value at a time. These cover the checks that will move to
         // siparse, so they show what the switch changes for each type.
         header_name::from_bytes,
