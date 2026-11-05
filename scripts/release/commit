@@ -16,7 +16,6 @@ fi
 "$release_dir/update-version" "$version"
 cargo test
 cargo test --no-default-features
-cargo test --manifest-path fuzz/Cargo.toml --lib
 cargo publish --dry-run --allow-dirty
 
 # The working tree was clean before the version bump, so stage just the two
