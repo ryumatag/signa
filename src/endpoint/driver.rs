@@ -36,6 +36,7 @@ use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -43,7 +44,7 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use foldhash::fast::RandomState;
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, Semaphore},
     time::Sleep,
 };
 use tower_service::Service;
@@ -51,6 +52,7 @@ use tower_service::Service;
 use crate::{
     endpoint::{
         error::Error,
+        reply::{Admission, Completion, ReplyError, ReplyRoute},
         table::{Id, Table},
     },
     header::{via::Via, HeaderValue, CSEQ, VIA},
@@ -82,6 +84,9 @@ const DEFAULT_PORT: u16 = 5060;
 /// How many datagrams may wait for the UDP socket to be writable. Beyond
 /// that a send fails, and the transaction retransmits later if it does.
 const UDP_BACKLOG: usize = 1024;
+
+/// One-shot replies hold a slot through command, connect, and local write.
+const REPLY_OPERATIONS: usize = 64;
 
 const SERVER_ERROR: StatusCode = status(500);
 const NOT_IMPLEMENTED: StatusCode = status(501);
@@ -116,6 +121,8 @@ pub(super) enum Command {
         next_hop: SocketAddr,
         respond: Responder,
     },
+    /// A route sends one response without a transaction.
+    Reply { link: Link, bytes: Bytes, completion: Completion },
     /// The service answered a request, or failed on it.
     Respond { slot: Slot, response: Option<Response<Bytes>> },
     /// A connection the driver asked for is open, or could not be opened.
@@ -140,8 +147,8 @@ pub(super) enum Slot {
 /// A way to send: the flow, and the connection when the flow is TCP.
 #[derive(Clone)]
 pub(super) struct Link {
-    flow: Flow,
-    writer: Option<tcp::Writer>,
+    pub(super) flow: Flow,
+    pub(super) writer: Option<tcp::Writer>,
 }
 
 struct ServerEntry {
@@ -185,6 +192,7 @@ enum Pending {
     /// since. It goes to `sent-by` on a new connection
     /// (RFC 3261 section 18.2.2).
     Response(Bytes),
+    OneShot(Bytes, Completion),
 }
 
 /// A heap entry. Earlier deadlines come out first.
@@ -263,6 +271,9 @@ enum Event {
 
 pub(super) struct Driver<S> {
     service: S,
+    command_sender: mpsc::WeakUnboundedSender<Command>,
+    reply_admission: Admission,
+    writes: Vec<(tcp::Receipt, Completion)>,
     /// `poll_ready` failed, so the service takes nothing any more.
     service_failed: bool,
     /// From the `Endpoint` and `Client` handles. The driver ends when they
@@ -309,11 +320,17 @@ where
         tcp: mpsc::Receiver<tcp::Inbound>,
         tcp_tx: mpsc::Sender<tcp::Inbound>,
         commands: mpsc::UnboundedReceiver<Command>,
+        command_sender: mpsc::WeakUnboundedSender<Command>,
     ) -> Driver<S> {
         let (internal_tx, internal) = mpsc::unbounded_channel();
 
         Driver {
             service,
+            command_sender,
+            reply_admission: Admission(Arc::new(Semaphore::new(
+                REPLY_OPERATIONS,
+            ))),
+            writes: Vec::new(),
             service_failed: false,
             commands,
             internal,
@@ -380,6 +397,19 @@ where
             }
         }
 
+        let mut index = 0;
+
+        while index < self.writes.len() {
+            if let Poll::Ready(result) =
+                Pin::new(&mut self.writes[index].0).poll(cx)
+            {
+                let (_, completion) = self.writes.swap_remove(index);
+                completion.finish(result.map_err(ReplyError::Transport));
+            } else {
+                index += 1;
+            }
+        }
+
         if let Poll::Ready(Some(command)) = self.internal.poll_recv(cx) {
             return Poll::Ready(Event::Command(command));
         }
@@ -429,7 +459,8 @@ where
     /// is not waited for, since whatever it would answer goes unanswered once
     /// the endpoint is gone anyway.
     fn is_drained(&self) -> bool {
-        self.queue.is_empty()
+        self.writes.is_empty()
+            && self.queue.is_empty()
             && self.pending == 0
             && self.unanswered == 0
             && self.udp.as_ref().map_or(true, |udp| udp.backlog.is_empty())
@@ -473,6 +504,9 @@ where
 
     fn on_command(&mut self, command: Command) {
         match command {
+            Command::Reply { link, bytes, completion } => {
+                self.on_reply(link, bytes, completion)
+            }
             Command::Send { request, transport, next_hop, respond } => {
                 self.on_send(request, transport, next_hop, respond);
             }
@@ -668,9 +702,80 @@ where
             // A response that cannot be queued is lost. The connection is full
             // or gone again, and a server transaction over TCP has nothing to
             // retransmit it with.
+            Pending::OneShot(bytes, completion) => {
+                match writer.submit(bytes) {
+                    Ok(receipt) => self.writes.push((receipt, completion)),
+                    Err(error) => completion.finish(Err(match error {
+                        tcp::SendError::Full => ReplyError::Busy,
+                        tcp::SendError::Closed => ReplyError::Transport(
+                            io::Error::new(io::ErrorKind::BrokenPipe, error),
+                        ),
+                    })),
+                }
+            }
             Pending::Response(bytes) => {
                 let _ = writer.send(bytes);
             }
+        }
+    }
+
+    // Issued to incoming TU envelopes once that interface replaces Service.
+    #[allow(dead_code)]
+    pub(super) fn prepare_reply(
+        &self,
+        mut request: Request<Bytes>,
+        mut link: Link,
+    ) -> Result<(Request<Bytes>, ReplyRoute), ReplyError> {
+        let value =
+            request.headers().get(VIA).ok_or(ReplyError::Unsupported)?;
+        let via = Via::top(value).ok_or(ReplyError::Unsupported)?;
+        // Multicast routing needs different socket and TTL semantics.
+        if via.maddr.is_some() {
+            return Err(ReplyError::Unsupported);
+        }
+
+        let corrected = mark_via(value, &via, &link.flow);
+        link.flow = reply_flow(&via, &link.flow);
+
+        if let Some(value) = corrected {
+            *request.headers_mut().get_mut(VIA).expect("validated top Via") =
+                value;
+        }
+
+        let route = ReplyRoute::new(
+            &request,
+            link,
+            self.command_sender.upgrade().ok_or(ReplyError::Closed)?,
+            self.reply_admission.0.clone(),
+        );
+
+        Ok((request, route))
+    }
+
+    fn on_reply(&mut self, link: Link, bytes: Bytes, completion: Completion) {
+        if self.shutting_down {
+            completion.finish(Err(ReplyError::Closed));
+            return;
+        }
+
+        if let Some(writer) = &link.writer {
+            match writer.submit(bytes.clone()) {
+                Ok(receipt) => self.writes.push((receipt, completion)),
+                Err(tcp::SendError::Full) => {
+                    completion.finish(Err(ReplyError::Busy))
+                }
+                Err(tcp::SendError::Closed) => self.send_over_tcp(
+                    link.flow.remote,
+                    Pending::OneShot(bytes, completion),
+                ),
+            }
+        } else if let Some(udp) = self.udp.as_mut() {
+            udp.submit(bytes, link.flow, completion);
+        } else {
+            completion.finish(Err(ReplyError::Transport(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "no UDP socket",
+            ))));
         }
     }
 
@@ -789,15 +894,27 @@ where
                 }
             }
             Err(err) => {
+                let source = Arc::new(err);
+
                 for pending in pending {
                     match pending {
                         Pending::Request(_, respond) => {
-                            let err =
-                                io::Error::new(err.kind(), err.to_string());
+                            let err = io::Error::new(
+                                source.kind(),
+                                Arc::clone(&source),
+                            );
                             let _ = respond.send(Err(Error::transport(err)));
                         }
                         // See `send_reply`.
                         Pending::Response(_) => {}
+                        Pending::OneShot(_, completion) => {
+                            completion.finish(Err(ReplyError::Transport(
+                                io::Error::new(
+                                    source.kind(),
+                                    Arc::clone(&source),
+                                ),
+                            )));
+                        }
                     }
                 }
             }
@@ -1008,7 +1125,7 @@ fn now() -> Instant {
 struct Udp {
     socket: udp::Socket,
     buf: BytesMut,
-    backlog: VecDeque<(Bytes, Flow)>,
+    backlog: VecDeque<(Bytes, Flow, Option<Completion>)>,
 }
 
 impl Udp {
@@ -1034,18 +1151,42 @@ impl Udp {
                 "the UDP send backlog is full",
             ));
         }
-        self.backlog.push_back((bytes.clone(), *flow));
+        self.backlog.push_back((bytes.clone(), *flow, None));
 
         Ok(())
     }
 
+    fn submit(&mut self, bytes: Bytes, flow: Flow, completion: Completion) {
+        let before = self.backlog.len();
+
+        match self.send(&bytes, &flow) {
+            Ok(()) if self.backlog.len() > before => {
+                self.backlog.back_mut().expect("just enqueued").2 =
+                    Some(completion);
+            }
+            result => completion.finish(result.map_err(|error| {
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    ReplyError::Busy
+                } else {
+                    ReplyError::Transport(error)
+                }
+            })),
+        }
+    }
+
+    fn finish_front(&mut self, result: io::Result<()>) {
+        if let Some((_, _, Some(completion))) = self.backlog.pop_front() {
+            completion.finish(result.map_err(ReplyError::Transport));
+        }
+    }
+
     /// Sends what waits, as far as the socket takes it.
     fn poll_flush(&mut self, cx: &mut Context<'_>) {
-        while let Some((bytes, flow)) = self.backlog.front() {
+        while let Some((bytes, flow, _)) = self.backlog.front() {
             match self.socket.poll_send_ready(cx) {
                 Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(_)) => {
-                    self.backlog.pop_front();
+                Poll::Ready(Err(error)) => {
+                    self.finish_front(Err(error));
                     continue;
                 }
                 Poll::Pending => return,
@@ -1054,9 +1195,7 @@ impl Udp {
             match self.socket.try_send(bytes, flow) {
                 // Readiness is cleared, and the next poll waits for it.
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
-                _ => {
-                    self.backlog.pop_front();
-                }
+                result => self.finish_front(result),
             }
         }
     }
@@ -1176,4 +1315,190 @@ fn mark_via(
     marked.push_str(&src[via.end..]);
 
     Some(HeaderValue::from_built(marked))
+}
+
+// These private driver tests use sockets, which Miri cannot provide.
+#[cfg(all(test, not(miri)))]
+mod tests {
+    use super::super::tests::{
+        reply_driver, route_request, route_response, udp_reply_link,
+        REPLY_LOCAL,
+    };
+    use super::*;
+    use tokio::{net::UdpSocket, time::timeout};
+
+    #[tokio::test]
+    async fn cancellation_before_enqueue_has_no_effect_and_after_enqueue_keeps_the_write(
+    ) {
+        let (mut driver, commands, local) = reply_driver();
+        let peer = UdpSocket::bind(REPLY_LOCAL).await.unwrap();
+        let link = udp_reply_link(local, peer.local_addr().unwrap());
+        let (request, route) = driver
+            .prepare_reply(
+                route_request(
+                    "SIP/2.0/UDP example.com:9;branch=z9hG4bKroute;rport",
+                ),
+                link.clone(),
+            )
+            .unwrap();
+        let response = route_response(&request);
+        let capacity = driver.reply_admission.0.clone();
+        let all = capacity.clone().acquire_many_owned(64).await.unwrap();
+
+        {
+            let mut send = std::pin::pin!(route.send(response.clone()));
+            poll_fn(|cx| {
+                assert!(send.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+        }
+        assert!(driver.commands.is_empty());
+
+        drop(all);
+
+        // Force the backlog path without relying on kernel send-buffer pressure.
+        driver.udp.as_mut().unwrap().backlog.push_back((
+            Bytes::from_static(b"first"),
+            link.flow,
+            None,
+        ));
+
+        {
+            let mut send = std::pin::pin!(route.send(response.clone()));
+            poll_fn(|cx| {
+                assert!(send.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+        }
+
+        let command = driver.commands.try_recv().unwrap();
+        driver.on_command(command);
+
+        assert_eq!(capacity.available_permits(), 63);
+        assert_eq!(driver.udp.as_ref().unwrap().backlog.len(), 2);
+
+        drop(route);
+        drop(commands);
+
+        let task = tokio::spawn(driver.run());
+
+        let mut buf = [0; 2048];
+        let (n, _) = timeout(Duration::from_secs(1), peer.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[..n], b"first");
+
+        let (n, _) = timeout(Duration::from_secs(1), peer.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[..n], &response.to_bytes());
+        assert_eq!(capacity.available_permits(), 64);
+
+        timeout(Duration::from_secs(1), task).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_wakes_capacity_waiters_and_fails_queued_operations() {
+        let (driver, commands, local) = reply_driver();
+        let link = udp_reply_link(local, "127.0.0.1:9".parse().unwrap());
+        let (request, route) = driver
+            .prepare_reply(
+                route_request(
+                    "SIP/2.0/UDP example.com:9;branch=z9hG4bKroute;rport",
+                ),
+                link,
+            )
+            .unwrap();
+        let capacity = driver.reply_admission.0.clone();
+        let all = capacity.acquire_many_owned(64).await.unwrap();
+
+        let mut send = std::pin::pin!(route.send(route_response(&request)));
+        poll_fn(|cx| {
+            assert!(send.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+
+        drop(driver);
+        drop(all);
+        drop(commands);
+
+        assert!(matches!(send.await, Err(ReplyError::Closed)));
+    }
+
+    #[tokio::test]
+    async fn a_queued_udp_error_is_observed_with_its_io_source() {
+        let (mut driver, _commands, local) = reply_driver();
+        let link = udp_reply_link(local, "127.0.0.1:9".parse().unwrap());
+        let (request, route) = driver
+            .prepare_reply(
+                route_request(
+                    "SIP/2.0/UDP example.com:9;branch=z9hG4bKroute;rport",
+                ),
+                link.clone(),
+            )
+            .unwrap();
+
+        driver.udp.as_mut().unwrap().backlog.push_back((
+            Bytes::new(),
+            link.flow,
+            None,
+        ));
+
+        let mut send = std::pin::pin!(route.send(route_response(&request)));
+        poll_fn(|cx| {
+            assert!(send.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+
+        let command = driver.commands.try_recv().unwrap();
+        driver.on_command(command);
+        let udp = driver.udp.as_mut().unwrap();
+        udp.finish_front(Ok(()));
+        udp.finish_front(Err(io::Error::from_raw_os_error(5)));
+
+        let Err(ReplyError::Transport(error)) = send.await else {
+            panic!("expected datagram error");
+        };
+
+        assert_eq!(error.raw_os_error(), Some(5));
+        assert_eq!(driver.reply_admission.0.available_permits(), 64);
+    }
+
+    #[tokio::test]
+    async fn route_identity_is_owned_and_all_via_rows_are_preserved() {
+        let (driver, _commands, local) = reply_driver();
+        let link = udp_reply_link(local, "127.0.0.1:9".parse().unwrap());
+        let mut original = route_request(
+            "SIP/2.0/UDP example.com:9;branch=z9hG4bKroute;rport",
+        );
+        original.headers_mut().append(
+            VIA,
+            HeaderValue::from_static(
+                "SIP/2.0/UDP older.example.com;branch=z9hG4bKolder",
+            ),
+        );
+
+        let input = original.to_bytes();
+        let original = Request::from_shared(input.clone()).unwrap();
+        let (corrected, route) = driver.prepare_reply(original, link).unwrap();
+
+        assert_eq!(corrected.headers().get_all(VIA).count(), 2);
+        let encoded = route_response(&corrected).to_bytes();
+        drop(corrected);
+
+        assert!(input.is_unique());
+
+        // The route remains usable after dropping the received message.
+
+        let task = tokio::spawn(driver.run());
+        route.send(Response::from_shared(encoded).unwrap()).await.unwrap();
+
+        task.abort();
+    }
 }

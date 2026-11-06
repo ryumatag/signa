@@ -181,14 +181,20 @@ mod version;
 #[cfg(feature = "__bench")]
 #[doc(hidden)]
 pub mod bench {
-    #[doc(hidden)]
-    pub use crate::frame::{DecodeError, Decoder, Frame, Limits, Role};
-    pub use crate::header::{cseq::CSeq, via::Via};
-    pub use crate::transaction::invite;
-    pub use crate::transaction::{
-        ClientEvent, ClientKey, ClientTransaction, ServerKey,
-        ServerTransaction, Timers,
-    };
     #[cfg(feature = "tokio")]
-    pub use crate::transport::{tcp, udp, Flow, Transport};
+    #[doc(hidden)]
+    pub use crate::{
+        endpoint::reply_driver,
+        transport::{tcp, udp, Flow, Transport},
+    };
+    #[doc(hidden)]
+    pub use crate::{
+        frame::{DecodeError, Decoder, Frame, Limits, Role},
+        header::{cseq::CSeq, via::Via},
+        transaction::invite,
+        transaction::{
+            ClientEvent, ClientKey, ClientTransaction, ServerKey,
+            ServerTransaction, Timers,
+        },
+    };
 }
