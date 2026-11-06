@@ -1764,12 +1764,15 @@ mod tests {
         let task = tokio::spawn(async move {
             driver.run().await;
         });
+
+        // Windows may retry SYNs before reporting connection refusal, even
+        // on loopback. Allow time for the OS to finish those retries.
         let result = timeout(
-            Duration::from_secs(1),
+            Duration::from_secs(10),
             route.send(route_response(&request)),
         )
         .await
-        .unwrap();
+        .expect("fallback connection error was not delivered");
         let Err(ReplyError::Transport(error)) = result else {
             panic!("expected connect error");
         };
