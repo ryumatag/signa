@@ -28,7 +28,6 @@ use crate::{response::Response, transaction::Timers};
 /// [`is_terminated`]: ClientTransaction::is_terminated
 #[derive(Debug)]
 pub struct ClientTransaction {
-    request: Bytes,
     timers: Timers,
     state: State,
 }
@@ -55,18 +54,22 @@ pub enum ClientEvent {
     Timeout,
 }
 
+/// The encoded request lives in the states that retransmit it, so that it is
+/// freed with the final response rather than with the transaction.
 #[derive(Debug)]
 enum State {
     /// No response yet. `e` is the next retransmission, `None` over a reliable
     /// transport, and `interval` the gap before the one after it. `f` is the
     /// transaction timeout.
     Trying {
+        request: Bytes,
         e: Option<Instant>,
         interval: Duration,
         f: Instant,
     },
     /// A provisional response arrived. Retransmissions continue at T2.
     Proceeding {
+        request: Bytes,
         e: Option<Instant>,
         f: Instant,
     },
@@ -93,9 +96,8 @@ impl ClientTransaction {
         let f = now + timers.transaction_timeout();
 
         ClientTransaction {
-            request,
             timers,
-            state: State::Trying { e, interval: timers.t1, f },
+            state: State::Trying { request, e, interval: timers.t1, f },
         }
     }
 
@@ -105,7 +107,7 @@ impl ClientTransaction {
     /// [`on_timeout`]: ClientTransaction::on_timeout
     pub fn deadline(&self) -> Option<Instant> {
         match self.state {
-            State::Trying { e, f, .. } | State::Proceeding { e, f } => {
+            State::Trying { e, f, .. } | State::Proceeding { e, f, .. } => {
                 Some(e.map_or(f, |e| e.min(f)))
             }
             State::Completed { k } => Some(k),
@@ -125,7 +127,7 @@ impl ClientTransaction {
     /// could not be answered in time anyway.
     pub fn on_timeout(&mut self, now: Instant) -> ClientEvent {
         match &mut self.state {
-            State::Trying { e, interval, f } => {
+            State::Trying { request, e, interval, f } => {
                 if *f <= now {
                     self.state = State::Terminated;
                     return ClientEvent::Timeout;
@@ -136,12 +138,12 @@ impl ClientTransaction {
                     Some(due) if *due <= now => {
                         *interval = (*interval * 2).min(self.timers.t2);
                         *due = now + *interval;
-                        ClientEvent::Retransmit(self.request.clone())
+                        ClientEvent::Retransmit(request.clone())
                     }
                     _ => ClientEvent::None,
                 }
             }
-            State::Proceeding { e, f } => {
+            State::Proceeding { request, e, f } => {
                 if *f <= now {
                     self.state = State::Terminated;
                     return ClientEvent::Timeout;
@@ -150,7 +152,7 @@ impl ClientTransaction {
                 match e {
                     Some(due) if *due <= now => {
                         *due = now + self.timers.t2;
-                        ClientEvent::Retransmit(self.request.clone())
+                        ClientEvent::Retransmit(request.clone())
                     }
                     _ => ClientEvent::None,
                 }
@@ -176,7 +178,9 @@ impl ClientTransaction {
         now: Instant,
     ) -> ClientEvent {
         let (e, f) = match self.state {
-            State::Trying { e, f, .. } | State::Proceeding { e, f } => (e, f),
+            State::Trying { e, f, .. } | State::Proceeding { e, f, .. } => {
+                (e, f)
+            }
             State::Completed { .. } | State::Terminated => {
                 return ClientEvent::None
             }
@@ -185,7 +189,7 @@ impl ClientTransaction {
         if response.status().is_final() {
             // Timer K is T4 over an unreliable transport, where a
             // retransmitted response may still arrive, and zero over a
-            // reliable one.
+            // reliable one. The request goes with the old state.
             self.state = match e {
                 Some(_) => State::Completed { k: now + self.timers.t4 },
                 None => State::Terminated,
@@ -196,7 +200,15 @@ impl ClientTransaction {
 
         // The retransmission that is due next keeps its deadline. Only the
         // interval after it changes, to T2.
-        self.state = State::Proceeding { e, f };
+        let request =
+            match std::mem::replace(&mut self.state, State::Terminated) {
+                State::Trying { request, .. }
+                | State::Proceeding { request, .. } => request,
+                State::Completed { .. } | State::Terminated => {
+                    unreachable!("checked above")
+                }
+            };
+        self.state = State::Proceeding { request, e, f };
 
         ClientEvent::Provisional(response)
     }
