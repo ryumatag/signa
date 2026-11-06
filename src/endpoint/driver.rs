@@ -497,6 +497,7 @@ where
 
     fn on_timer(&mut self, key: Key) {
         let now = now();
+        let timers = self.config.timers;
         match key {
             Key::Server(id) => {
                 let Some(entry) = self.servers.get_mut(id) else { return };
@@ -514,7 +515,7 @@ where
             Key::Client(id) => {
                 let Some(entry) = self.clients.get_mut(id) else { return };
                 let before = entry.tx.deadline();
-                let answered = match entry.tx.on_timeout(now) {
+                let answered = match entry.tx.on_timeout(&timers, now) {
                     ClientEvent::Retransmit(request) => {
                         match send_on(self.udp.as_mut(), &entry.link, &request)
                         {
@@ -751,8 +752,12 @@ where
         }
 
         let reliable = link.flow.transport.is_reliable();
-        let tx =
-            ClientTransaction::new(bytes, reliable, self.config.timers, now());
+        let tx = ClientTransaction::new(
+            bytes,
+            reliable,
+            &self.config.timers,
+            now(),
+        );
         let deadline = tx.deadline();
         let entry = ClientEntry { tx, link, respond: Some(respond) };
         let id = self.clients.insert(key, entry);
@@ -821,7 +826,7 @@ where
         }
 
         let before = entry.tx.deadline();
-        match entry.tx.on_response(response, now()) {
+        match entry.tx.on_response(response, &self.config.timers, now()) {
             ClientEvent::Final(response) => {
                 if entry.answer(Ok(response)) {
                     self.unanswered -= 1;
@@ -902,7 +907,7 @@ where
                 let tx = ServerTransaction::new(
                     &request,
                     reliable,
-                    self.config.timers,
+                    &self.config.timers,
                     now(),
                 );
                 let deadline = tx.deadline();
@@ -954,7 +959,13 @@ where
                     },
                 };
                 let before = entry.tx.deadline();
-                let send = entry.tx.on_response(status, bytes.clone(), now());
+                let timers = self.config.timers;
+                let send = entry.tx.on_response(
+                    status,
+                    bytes.clone(),
+                    &timers,
+                    now(),
+                );
                 let link = entry.link.clone();
                 if send && self.send_reply(&link, &bytes).is_err() {
                     if let Some(entry) = self.servers.get_mut(id) {

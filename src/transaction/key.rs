@@ -36,7 +36,9 @@ const COOKIE: &str = "z9hG4bK";
 pub struct ServerKey {
     /// The branch, then the host, in one allocation.
     text: Bytes,
-    branch_len: usize,
+    /// A branch longer than this is not one an RFC 3261 element made, and a
+    /// request with one gets no key, so it is handled statelessly.
+    branch_len: u16,
     port: Option<u16>,
     method: Method,
 }
@@ -59,22 +61,23 @@ impl ServerKey {
     /// already, or `None` if it has no RFC 3261 branch.
     pub fn new(via: &Via<'_>, method: &Method) -> Option<ServerKey> {
         let branch = branch(via)?;
+        let branch_len = u16::try_from(branch.len()).ok()?;
         let text = Bytes::from([branch, via.host].concat());
 
         Some(ServerKey {
             text,
-            branch_len: branch.len(),
+            branch_len,
             port: via.port,
             method: method.clone(),
         })
     }
 
     fn branch(&self) -> &[u8] {
-        &self.text[..self.branch_len]
+        &self.text[..usize::from(self.branch_len)]
     }
 
     fn host(&self) -> &[u8] {
-        &self.text[self.branch_len..]
+        &self.text[usize::from(self.branch_len)..]
     }
 }
 
@@ -104,9 +107,11 @@ impl Hash for ServerKey {
 /// and the key to look up comes from the response with
 /// [`ClientKey::from_response`].
 ///
-/// The branch is a slice of the `Via` value. The key that lives in the table
-/// comes from a request this element built, whose `Via` is a small allocation
-/// of its own, and the key from a response is dropped after the lookup.
+/// The key that lives in the table copies the branch out of the request, so
+/// that the `Via` value this element built, which is larger than the branch,
+/// goes with the encoded request at the final response rather than at Timer K.
+/// The key from a response is a slice of its `Via`, since it is dropped after
+/// the lookup.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ClientKey {
     branch: Bytes,
@@ -119,7 +124,7 @@ impl ClientKey {
     pub fn from_request(request: &Request<Bytes>) -> Option<ClientKey> {
         let value = request.headers().get(VIA)?;
         let branch = branch(&Via::top(value)?)?;
-        let branch = value.as_shared().slice_ref(branch.as_bytes());
+        let branch = Bytes::copy_from_slice(branch.as_bytes());
 
         Some(ClientKey { branch, method: request.method().clone() })
     }
@@ -261,7 +266,7 @@ mod tests {
     }
 
     #[test]
-    fn a_server_key_does_not_hold_the_message_buffer() {
+    fn a_stored_key_does_not_hold_the_message_buffer() {
         let request = request(OPTIONS);
         let value = request.headers().get(VIA).unwrap();
         let range = value.as_bytes().as_ptr_range();
@@ -270,8 +275,18 @@ mod tests {
         assert!(!range.contains(&key.branch().as_ptr()));
         assert!(!range.contains(&key.host().as_ptr()));
 
-        // The client key is a slice, see its docs.
         let key = ClientKey::from_request(&request).unwrap();
+        assert!(!range.contains(&key.branch.as_ptr()));
+
+        // The key to look a response up with is a slice, see its docs.
+        let response = response(
+            "SIP/2.0 200 OK\r\n\
+             Via: SIP/2.0/UDP PC33.atlanta.example.com:5060;branch=z9hG4bKhjhs8ass877\r\n\
+             CSeq: 63104 OPTIONS\r\n",
+        );
+        let value = response.headers().get(VIA).unwrap();
+        let range = value.as_bytes().as_ptr_range();
+        let key = ClientKey::from_response(&response).unwrap();
         assert!(range.contains(&key.branch.as_ptr()));
     }
 }

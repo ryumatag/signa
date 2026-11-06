@@ -40,25 +40,27 @@ use crate::{
 /// [`is_terminated`]: ServerTransaction::is_terminated
 #[derive(Debug)]
 pub struct ServerTransaction {
-    timers: Timers,
-    reliable: bool,
-    /// The header fields a response has to carry, copied from the request for
-    /// the 100 that the transaction may send itself. `None` once the final
-    /// response is out, since nothing is sent after it and the values would
-    /// keep the request's buffer alive for Timer J.
-    headers: Option<HeaderMap>,
     state: State,
 }
 
+/// What the transaction keeps is what its next step needs, so that a
+/// transaction in `Completed` for Timer J holds only its response. The timers
+/// are the caller's, passed in with each event that uses them.
 #[derive(Debug)]
 enum State {
-    /// Nothing sent. At `trying`, a 100 goes out on its own.
+    /// Nothing sent. At `trying`, a 100 built from `headers` goes out on its
+    /// own.
     Trying {
         trying: Instant,
+        headers: HeaderMap,
+        reliable: bool,
     },
-    /// A provisional response went out. Retransmissions get it again.
+    /// A provisional response went out. Retransmissions get it again. The
+    /// caller may still build a response of its own from `headers`.
     Proceeding {
         response: Bytes,
+        headers: HeaderMap,
+        reliable: bool,
     },
     /// The final response went out. Retransmissions get it again until
     /// Timer J.
@@ -87,14 +89,15 @@ impl ServerTransaction {
     pub fn new(
         request: &Request<Bytes>,
         reliable: bool,
-        timers: Timers,
+        timers: &Timers,
         now: Instant,
     ) -> ServerTransaction {
         ServerTransaction {
-            timers,
-            reliable,
-            headers: Some(reply_headers(request.headers())),
-            state: State::Trying { trying: now + timers.trying_after() },
+            state: State::Trying {
+                trying: now + timers.trying_after(),
+                headers: reply_headers(request.headers()),
+                reliable,
+            },
         }
     }
 
@@ -103,9 +106,14 @@ impl ServerTransaction {
     ///
     /// The caller builds a response of its own from them, such as a 500 when
     /// the transaction user gave it nothing usable. `None` once the final
-    /// response is out, when no response can be sent any more.
+    /// response is out, when no response can be sent any more. The values
+    /// would keep the request's buffer alive for Timer J otherwise.
     pub fn headers(&self) -> Option<&HeaderMap> {
-        self.headers.as_ref()
+        match &self.state {
+            State::Trying { headers, .. }
+            | State::Proceeding { headers, .. } => Some(headers),
+            State::Completed { .. } | State::Terminated => None,
+        }
     }
 
     /// Returns when the caller should call [`on_timeout`] next, or `None` when
@@ -114,7 +122,7 @@ impl ServerTransaction {
     /// [`on_timeout`]: ServerTransaction::on_timeout
     pub fn deadline(&self) -> Option<Instant> {
         match self.state {
-            State::Trying { trying } => Some(trying),
+            State::Trying { trying, .. } => Some(trying),
             State::Proceeding { .. } | State::Terminated => None,
             State::Completed { j, .. } => Some(j),
         }
@@ -131,11 +139,18 @@ impl ServerTransaction {
     /// time (RFC 4320 section 4.1). Calling this early is harmless.
     pub fn on_timeout(&mut self, now: Instant) -> Option<Bytes> {
         match &self.state {
-            State::Trying { trying } if *trying <= now => {
-                let headers =
-                    self.headers.as_ref().expect("set until Completed");
-                let response = bare_response(headers, TRYING);
-                self.state = State::Proceeding { response: response.clone() };
+            State::Trying { trying, .. } if *trying <= now => {
+                let State::Trying { headers, reliable, .. } =
+                    std::mem::replace(&mut self.state, State::Terminated)
+                else {
+                    unreachable!("matched above")
+                };
+                let response = bare_response(&headers, TRYING);
+                self.state = State::Proceeding {
+                    response: response.clone(),
+                    headers,
+                    reliable,
+                };
 
                 Some(response)
             }
@@ -154,7 +169,7 @@ impl ServerTransaction {
     /// `Proceeding`, and the final response in `Completed`.
     pub fn on_retransmission(&self) -> Option<Bytes> {
         match &self.state {
-            State::Proceeding { response }
+            State::Proceeding { response, .. }
             | State::Completed { response, .. } => Some(response.clone()),
             State::Trying { .. } | State::Terminated => None,
         }
@@ -170,40 +185,48 @@ impl ServerTransaction {
         &mut self,
         status: StatusCode,
         response: Bytes,
+        timers: &Timers,
         now: Instant,
     ) -> bool {
         match self.state {
             State::Trying { .. } | State::Proceeding { .. } => {}
             State::Completed { .. } | State::Terminated => return false,
         }
-
-        if !status.is_final() {
-            if status != TRYING {
-                return false;
-            }
-            self.state = State::Proceeding { response };
-
-            return true;
+        if !status.is_final() && status != TRYING {
+            return false;
         }
-
         if status == REQUEST_TIMEOUT {
             self.state = State::Terminated;
-            self.headers = None;
 
             return false;
         }
 
+        let (headers, reliable) =
+            match std::mem::replace(&mut self.state, State::Terminated) {
+                State::Trying { headers, reliable, .. }
+                | State::Proceeding { headers, reliable, .. } => {
+                    (headers, reliable)
+                }
+                State::Completed { .. } | State::Terminated => {
+                    unreachable!("checked above")
+                }
+            };
+
+        if !status.is_final() {
+            self.state = State::Proceeding { response, headers, reliable };
+
+            return true;
+        }
+
         // Timer J is 64 T1 over an unreliable transport, where the request may
-        // still be retransmitted, and zero over a reliable one.
-        self.headers = None;
-        self.state = if self.reliable {
-            State::Terminated
-        } else {
-            State::Completed {
+        // still be retransmitted, and zero over a reliable one. The headers go
+        // with the old state.
+        if !reliable {
+            self.state = State::Completed {
                 response,
-                j: now + self.timers.transaction_timeout(),
-            }
-        };
+                j: now + timers.transaction_timeout(),
+            };
+        }
 
         true
     }
@@ -211,7 +234,6 @@ impl ServerTransaction {
     /// Ends the transaction because the transport could not send a response.
     pub fn on_transport_error(&mut self) {
         self.state = State::Terminated;
-        self.headers = None;
     }
 }
 
@@ -231,6 +253,11 @@ mod tests {
     use super::*;
 
     const T1: Duration = Duration::from_millis(500);
+    const TIMERS: Timers = Timers {
+        t1: T1,
+        t2: Duration::from_secs(4),
+        t4: Duration::from_secs(5),
+    };
 
     const REQUEST: &[u8] = b"OPTIONS sip:carol@chicago.example.com SIP/2.0\r\n\
         Via: SIP/2.0/UDP proxy.example.com;branch=z9hG4bKnashds8\r\n\
@@ -256,7 +283,7 @@ mod tests {
     }
 
     fn transaction(reliable: bool, now: Instant) -> ServerTransaction {
-        ServerTransaction::new(&request(), reliable, Timers::default(), now)
+        ServerTransaction::new(&request(), reliable, &TIMERS, now)
     }
 
     #[test]
@@ -305,7 +332,12 @@ mod tests {
     fn a_response_in_time_cancels_the_100() {
         let start = Instant::now();
         let mut tx = transaction(false, start);
-        assert!(tx.on_response(status(200), response(200), start + T1));
+        assert!(tx.on_response(
+            status(200),
+            response(200),
+            &TIMERS,
+            start + T1
+        ));
         assert_eq!(tx.deadline(), Some(start + T1 + 64 * T1));
         assert_eq!(tx.on_timeout(start + 7 * T1), None);
         assert_eq!(tx.on_retransmission(), Some(response(200)));
@@ -315,12 +347,12 @@ mod tests {
     fn a_100_from_the_user_is_sent_and_other_provisionals_are_not() {
         let start = Instant::now();
         let mut tx = transaction(false, start);
-        assert!(!tx.on_response(status(180), response(180), start));
+        assert!(!tx.on_response(status(180), response(180), &TIMERS, start));
         assert_eq!(tx.on_retransmission(), None);
-        assert!(tx.on_response(status(100), response(100), start));
+        assert!(tx.on_response(status(100), response(100), &TIMERS, start));
         assert_eq!(tx.on_retransmission(), Some(response(100)));
         assert_eq!(tx.deadline(), None);
-        assert!(!tx.on_response(status(183), response(183), start));
+        assert!(!tx.on_response(status(183), response(183), &TIMERS, start));
         assert_eq!(tx.on_retransmission(), Some(response(100)));
     }
 
@@ -328,16 +360,21 @@ mod tests {
     fn the_final_response_is_resent_until_timer_j() {
         let start = Instant::now();
         let mut tx = transaction(false, start);
-        assert!(tx.on_response(status(100), response(100), start + T1));
+        assert!(tx.on_response(
+            status(100),
+            response(100),
+            &TIMERS,
+            start + T1
+        ));
         let at = start + 2 * T1;
-        assert!(tx.on_response(status(486), response(486), at));
+        assert!(tx.on_response(status(486), response(486), &TIMERS, at));
         assert!(!tx.is_terminated());
         assert_eq!(tx.deadline(), Some(at + 64 * T1));
         assert_eq!(tx.on_retransmission(), Some(response(486)));
 
         // Nothing more goes out after the final response.
-        assert!(!tx.on_response(status(200), response(200), at + T1));
-        assert!(!tx.on_response(status(100), response(100), at + T1));
+        assert!(!tx.on_response(status(200), response(200), &TIMERS, at + T1));
+        assert!(!tx.on_response(status(100), response(100), &TIMERS, at + T1));
         assert_eq!(tx.on_retransmission(), Some(response(486)));
 
         assert_eq!(tx.on_timeout(at + 63 * T1), None);
@@ -354,7 +391,12 @@ mod tests {
         let mut tx = transaction(true, start);
         // The 100 rule holds on every transport.
         assert_eq!(tx.deadline(), Some(start + 7 * T1));
-        assert!(tx.on_response(status(200), response(200), start + T1));
+        assert!(tx.on_response(
+            status(200),
+            response(200),
+            &TIMERS,
+            start + T1
+        ));
         assert!(tx.is_terminated());
         assert_eq!(tx.deadline(), None);
         assert_eq!(tx.on_retransmission(), None);
@@ -364,7 +406,12 @@ mod tests {
     fn a_408_is_dropped_and_ends_it() {
         let start = Instant::now();
         let mut tx = transaction(false, start);
-        assert!(!tx.on_response(status(408), response(408), start + T1));
+        assert!(!tx.on_response(
+            status(408),
+            response(408),
+            &TIMERS,
+            start + T1
+        ));
         assert!(tx.is_terminated());
         assert_eq!(tx.deadline(), None);
     }
@@ -375,7 +422,7 @@ mod tests {
         let mut tx = transaction(false, start);
         tx.on_transport_error();
         assert!(tx.is_terminated());
-        assert!(!tx.on_response(status(200), response(200), start));
+        assert!(!tx.on_response(status(200), response(200), &TIMERS, start));
         assert_eq!(tx.on_timeout(start + 7 * T1), None);
     }
 }

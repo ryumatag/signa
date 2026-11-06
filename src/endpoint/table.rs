@@ -32,16 +32,14 @@ pub(super) struct Id {
 pub(super) struct Table<K, E> {
     /// The slot number of each entry, by the hash of its key.
     index: HashTable<u32>,
-    slots: Vec<Slot<K, E>>,
+    slots: Vec<Option<(K, E)>>,
+    /// The generation of each slot, which goes up when the slot is vacated.
+    /// Kept beside the slots rather than in them, where each would take eight
+    /// bytes with its padding.
+    generations: Vec<u32>,
     /// The vacant slots.
     free: Vec<u32>,
     hasher: RandomState,
-}
-
-struct Slot<K, E> {
-    /// Goes up when the slot is vacated.
-    generation: u32,
-    occupant: Option<(K, E)>,
 }
 
 impl<K: Hash + Eq, E> Table<K, E> {
@@ -49,6 +47,7 @@ impl<K: Hash + Eq, E> Table<K, E> {
         Table {
             index: HashTable::new(),
             slots: Vec::new(),
+            generations: Vec::new(),
             free: Vec::new(),
             hasher: RandomState::default(),
         }
@@ -62,39 +61,37 @@ impl<K: Hash + Eq, E> Table<K, E> {
     /// Returns the entry under `key` and its id, if there is one.
     pub(super) fn find(&self, key: &K) -> Option<(Id, &E)> {
         let slot = self.slot_of(key)?;
-        let Slot { generation, occupant } = &self.slots[slot as usize];
-        let (_, entry) = occupant.as_ref().expect("indexed");
+        let (_, entry) = self.slots[slot as usize].as_ref().expect("indexed");
+        let generation = self.generations[slot as usize];
 
-        Some((Id { slot, generation: *generation }, entry))
+        Some((Id { slot, generation }, entry))
     }
 
     /// See [`Table::find`].
     pub(super) fn find_mut(&mut self, key: &K) -> Option<(Id, &mut E)> {
         let slot = self.slot_of(key)?;
-        let Slot { generation, occupant } = &mut self.slots[slot as usize];
-        let (_, entry) = occupant.as_mut().expect("indexed");
+        let generation = self.generations[slot as usize];
+        let (_, entry) = self.slots[slot as usize].as_mut().expect("indexed");
 
-        Some((Id { slot, generation: *generation }, entry))
+        Some((Id { slot, generation }, entry))
     }
 
     /// Returns the entry `id` names, or `None` once it is removed.
     pub(super) fn get(&self, id: Id) -> Option<&E> {
-        let slot = self.slots.get(id.slot as usize)?;
-        if slot.generation != id.generation {
+        if self.generations.get(id.slot as usize) != Some(&id.generation) {
             return None;
         }
 
-        slot.occupant.as_ref().map(|(_, entry)| entry)
+        self.slots[id.slot as usize].as_ref().map(|(_, entry)| entry)
     }
 
     /// See [`Table::get`].
     pub(super) fn get_mut(&mut self, id: Id) -> Option<&mut E> {
-        let slot = self.slots.get_mut(id.slot as usize)?;
-        if slot.generation != id.generation {
+        if self.generations.get(id.slot as usize) != Some(&id.generation) {
             return None;
         }
 
-        slot.occupant.as_mut().map(|(_, entry)| entry)
+        self.slots[id.slot as usize].as_mut().map(|(_, entry)| entry)
     }
 
     /// Adds `entry` under `key`, which must not be in the table, and returns
@@ -111,17 +108,15 @@ impl<K: Hash + Eq, E> Table<K, E> {
         let hash = self.hasher.hash_one(&key);
         let slot = match self.free.pop() {
             Some(slot) => {
-                self.slots[slot as usize].occupant = Some((key, entry));
+                self.slots[slot as usize] = Some((key, entry));
                 slot
             }
             None => {
                 // The slots would take terabytes before this overflows.
                 let slot =
                     u32::try_from(self.slots.len()).expect("fewer slots");
-                self.slots.push(Slot {
-                    generation: 0,
-                    occupant: Some((key, entry)),
-                });
+                self.slots.push(Some((key, entry)));
+                self.generations.push(0);
                 slot
             }
         };
@@ -131,18 +126,18 @@ impl<K: Hash + Eq, E> Table<K, E> {
             hasher.hash_one(key_of(slots, slot))
         });
 
-        Id { slot, generation: self.slots[slot as usize].generation }
+        Id { slot, generation: self.generations[slot as usize] }
     }
 
     /// Removes the entry `id` names and returns it, or `None` once it is
     /// removed already.
     pub(super) fn remove(&mut self, id: Id) -> Option<E> {
-        let slot = self.slots.get_mut(id.slot as usize)?;
-        if slot.generation != id.generation {
+        let generation = self.generations.get_mut(id.slot as usize)?;
+        if *generation != id.generation {
             return None;
         }
-        let (key, entry) = slot.occupant.take()?;
-        slot.generation = slot.generation.wrapping_add(1);
+        let (key, entry) = self.slots[id.slot as usize].take()?;
+        *generation = generation.wrapping_add(1);
 
         let hash = self.hasher.hash_one(&key);
         match self.index.find_entry(hash, |&slot| slot == id.slot) {
@@ -166,11 +161,9 @@ impl<K: Hash + Eq, E> Table<K, E> {
 }
 
 /// The key in `slot`, which the index says is occupied.
-fn key_of<K, E>(slots: &[Slot<K, E>], slot: u32) -> &K {
-    let (key, _) = slots[slot as usize]
-        .occupant
-        .as_ref()
-        .expect("an indexed slot is occupied");
+fn key_of<K, E>(slots: &[Option<(K, E)>], slot: u32) -> &K {
+    let (key, _) =
+        slots[slot as usize].as_ref().expect("an indexed slot is occupied");
 
     key
 }

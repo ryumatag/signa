@@ -28,7 +28,6 @@ use crate::{response::Response, transaction::Timers};
 /// [`is_terminated`]: ClientTransaction::is_terminated
 #[derive(Debug)]
 pub struct ClientTransaction {
-    timers: Timers,
     state: State,
 }
 
@@ -54,17 +53,19 @@ pub enum ClientEvent {
     Timeout,
 }
 
-/// The encoded request lives in the states that retransmit it, so that it is
-/// freed with the final response rather than with the transaction.
+/// What the transaction keeps is what its next step needs. The encoded
+/// request lives in the states that retransmit it, so that it is freed with
+/// the final response rather than with the transaction, and the timers are
+/// the caller's, passed in with each event that uses them.
 #[derive(Debug)]
 enum State {
     /// No response yet. `e` is the next retransmission, `None` over a reliable
-    /// transport, and `interval` the gap before the one after it. `f` is the
-    /// transaction timeout.
+    /// transport, and `doublings` how many times the gap before the one after
+    /// it has doubled from T1. `f` is the transaction timeout.
     Trying {
         request: Bytes,
         e: Option<Instant>,
-        interval: Duration,
+        doublings: u8,
         f: Instant,
     },
     /// A provisional response arrived. Retransmissions continue at T2.
@@ -89,15 +90,14 @@ impl ClientTransaction {
     pub fn new(
         request: Bytes,
         reliable: bool,
-        timers: Timers,
+        timers: &Timers,
         now: Instant,
     ) -> ClientTransaction {
         let e = if reliable { None } else { Some(now + timers.t1) };
         let f = now + timers.transaction_timeout();
 
         ClientTransaction {
-            timers,
-            state: State::Trying { request, e, interval: timers.t1, f },
+            state: State::Trying { request, e, doublings: 0, f },
         }
     }
 
@@ -125,9 +125,13 @@ impl ClientTransaction {
     /// Calling this early is harmless and returns [`ClientEvent::None`]. When
     /// Timer E and Timer F are both due, F wins, since a request sent now
     /// could not be answered in time anyway.
-    pub fn on_timeout(&mut self, now: Instant) -> ClientEvent {
+    pub fn on_timeout(
+        &mut self,
+        timers: &Timers,
+        now: Instant,
+    ) -> ClientEvent {
         match &mut self.state {
-            State::Trying { request, e, interval, f } => {
+            State::Trying { request, e, doublings, f } => {
                 if *f <= now {
                     self.state = State::Terminated;
                     return ClientEvent::Timeout;
@@ -136,8 +140,8 @@ impl ClientTransaction {
                 // retransmission, up to T2.
                 match e {
                     Some(due) if *due <= now => {
-                        *interval = (*interval * 2).min(self.timers.t2);
-                        *due = now + *interval;
+                        *doublings = doublings.saturating_add(1);
+                        *due = now + interval(timers, *doublings);
                         ClientEvent::Retransmit(request.clone())
                     }
                     _ => ClientEvent::None,
@@ -151,7 +155,7 @@ impl ClientTransaction {
                 // In Proceeding, every retransmission waits T2.
                 match e {
                     Some(due) if *due <= now => {
-                        *due = now + self.timers.t2;
+                        *due = now + timers.t2;
                         ClientEvent::Retransmit(request.clone())
                     }
                     _ => ClientEvent::None,
@@ -175,6 +179,7 @@ impl ClientTransaction {
     pub fn on_response(
         &mut self,
         response: Response<Bytes>,
+        timers: &Timers,
         now: Instant,
     ) -> ClientEvent {
         let (e, f) = match self.state {
@@ -191,7 +196,7 @@ impl ClientTransaction {
             // retransmitted response may still arrive, and zero over a
             // reliable one. The request goes with the old state.
             self.state = match e {
-                Some(_) => State::Completed { k: now + self.timers.t4 },
+                Some(_) => State::Completed { k: now + timers.t4 },
                 None => State::Terminated,
             };
 
@@ -222,6 +227,17 @@ impl ClientTransaction {
     }
 }
 
+/// The gap before the next retransmission after `doublings` of them, T1
+/// doubled that many times and no more than T2.
+///
+/// The count stands in for the interval itself, which is 16 bytes, and
+/// saturates where the interval would overflow, which is past T2 anyway.
+fn interval(timers: &Timers, doublings: u8) -> Duration {
+    let factor = 1u32.checked_shl(u32::from(doublings)).unwrap_or(u32::MAX);
+
+    timers.t1.checked_mul(factor).map_or(timers.t2, |gap| gap.min(timers.t2))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +246,7 @@ mod tests {
     const T1: Duration = Duration::from_millis(500);
     const T2: Duration = Duration::from_secs(4);
     const T4: Duration = Duration::from_secs(5);
+    const TIMERS: Timers = Timers { t1: T1, t2: T2, t4: T4 };
 
     fn request() -> Bytes {
         Bytes::from_static(b"OPTIONS sip:a@b SIP/2.0\r\n\r\n")
@@ -251,8 +268,7 @@ mod tests {
     #[test]
     fn retransmits_on_timer_e_until_timer_f() {
         let start = Instant::now();
-        let mut tx =
-            ClientTransaction::new(request(), false, Timers::default(), start);
+        let mut tx = ClientTransaction::new(request(), false, &TIMERS, start);
 
         // T1, then doubling, then every T2.
         let mut now = start;
@@ -261,7 +277,7 @@ mod tests {
             let deadline = tx.deadline().unwrap();
             assert_eq!(deadline, now + Duration::from_millis(ms));
             now = deadline;
-            let event = tx.on_timeout(now);
+            let event = tx.on_timeout(&TIMERS, now);
             assert!(
                 matches!(event, ClientEvent::Retransmit(ref b) if *b == request()),
                 "{event:?}"
@@ -273,21 +289,23 @@ mod tests {
         // Timer F at 64 T1 comes before the next E and ends it all.
         let f = start + 64 * T1;
         assert_eq!(tx.deadline(), Some(f));
-        assert!(matches!(tx.on_timeout(f), ClientEvent::Timeout));
+        assert!(matches!(tx.on_timeout(&TIMERS, f), ClientEvent::Timeout));
         assert!(tx.is_terminated());
         assert_eq!(tx.deadline(), None);
-        assert!(matches!(tx.on_timeout(f + T1), ClientEvent::None));
-        assert!(matches!(tx.on_response(response(200), f), ClientEvent::None));
+        assert!(matches!(tx.on_timeout(&TIMERS, f + T1), ClientEvent::None));
+        assert!(matches!(
+            tx.on_response(response(200), &TIMERS, f),
+            ClientEvent::None
+        ));
     }
 
     #[test]
     fn calling_on_timeout_early_does_nothing() {
         let start = Instant::now();
-        let mut tx =
-            ClientTransaction::new(request(), false, Timers::default(), start);
-        assert!(matches!(tx.on_timeout(start), ClientEvent::None));
+        let mut tx = ClientTransaction::new(request(), false, &TIMERS, start);
+        assert!(matches!(tx.on_timeout(&TIMERS, start), ClientEvent::None));
         assert!(matches!(
-            tx.on_timeout(start + T1 - Duration::from_millis(1)),
+            tx.on_timeout(&TIMERS, start + T1 - Duration::from_millis(1)),
             ClientEvent::None
         ));
         assert_eq!(tx.deadline(), Some(start + T1));
@@ -296,10 +314,9 @@ mod tests {
     #[test]
     fn timer_f_wins_when_both_are_due() {
         let start = Instant::now();
-        let mut tx =
-            ClientTransaction::new(request(), false, Timers::default(), start);
+        let mut tx = ClientTransaction::new(request(), false, &TIMERS, start);
         assert!(matches!(
-            tx.on_timeout(start + 64 * T1),
+            tx.on_timeout(&TIMERS, start + 64 * T1),
             ClientEvent::Timeout
         ));
         assert!(tx.is_terminated());
@@ -308,31 +325,33 @@ mod tests {
     #[test]
     fn a_provisional_response_moves_retransmissions_to_t2() {
         let start = Instant::now();
-        let mut tx =
-            ClientTransaction::new(request(), false, Timers::default(), start);
+        let mut tx = ClientTransaction::new(request(), false, &TIMERS, start);
 
-        let event =
-            tx.on_response(response(100), start + Duration::from_millis(100));
+        let event = tx.on_response(
+            response(100),
+            &TIMERS,
+            start + Duration::from_millis(100),
+        );
         assert_eq!(status(&event), Some(StatusCode::from_u16(100).unwrap()));
 
         // The retransmission that was due stays due, the next waits T2.
         assert_eq!(tx.deadline(), Some(start + T1));
         assert!(matches!(
-            tx.on_timeout(start + T1),
+            tx.on_timeout(&TIMERS, start + T1),
             ClientEvent::Retransmit(_)
         ));
         assert_eq!(tx.deadline(), Some(start + T1 + T2));
         assert!(matches!(
-            tx.on_timeout(start + T1 + T2),
+            tx.on_timeout(&TIMERS, start + T1 + T2),
             ClientEvent::Retransmit(_)
         ));
         assert_eq!(tx.deadline(), Some(start + T1 + 2 * T2));
 
         // More provisionals change nothing. Timer F still ends it.
-        let event = tx.on_response(response(100), start + 2 * T2);
+        let event = tx.on_response(response(100), &TIMERS, start + 2 * T2);
         assert!(matches!(event, ClientEvent::Provisional(_)));
         assert!(matches!(
-            tx.on_timeout(start + 64 * T1),
+            tx.on_timeout(&TIMERS, start + 64 * T1),
             ClientEvent::Timeout
         ));
     }
@@ -340,11 +359,10 @@ mod tests {
     #[test]
     fn the_final_response_ends_it_after_timer_k() {
         let start = Instant::now();
-        let mut tx =
-            ClientTransaction::new(request(), false, Timers::default(), start);
+        let mut tx = ClientTransaction::new(request(), false, &TIMERS, start);
 
         let at = start + Duration::from_millis(300);
-        let event = tx.on_response(response(404), at);
+        let event = tx.on_response(response(404), &TIMERS, at);
         assert_eq!(status(&event), Some(StatusCode::from_u16(404).unwrap()));
         assert!(matches!(event, ClientEvent::Final(_)));
         assert!(!tx.is_terminated());
@@ -352,33 +370,35 @@ mod tests {
         // Completed absorbs retransmitted responses and sends nothing.
         assert_eq!(tx.deadline(), Some(at + T4));
         assert!(matches!(
-            tx.on_response(response(404), at + T1),
+            tx.on_response(response(404), &TIMERS, at + T1),
             ClientEvent::None
         ));
         assert!(matches!(
-            tx.on_response(response(200), at + T1),
+            tx.on_response(response(200), &TIMERS, at + T1),
             ClientEvent::None
         ));
-        assert!(matches!(tx.on_timeout(at + T1), ClientEvent::None));
+        assert!(matches!(tx.on_timeout(&TIMERS, at + T1), ClientEvent::None));
         assert!(!tx.is_terminated());
 
-        assert!(matches!(tx.on_timeout(at + T4), ClientEvent::None));
+        assert!(matches!(tx.on_timeout(&TIMERS, at + T4), ClientEvent::None));
         assert!(tx.is_terminated());
     }
 
     #[test]
     fn a_reliable_transport_never_retransmits_and_ends_with_the_response() {
         let start = Instant::now();
-        let mut tx =
-            ClientTransaction::new(request(), true, Timers::default(), start);
+        let mut tx = ClientTransaction::new(request(), true, &TIMERS, start);
         assert_eq!(tx.deadline(), Some(start + 64 * T1));
-        assert!(matches!(tx.on_timeout(start + T2), ClientEvent::None));
+        assert!(matches!(
+            tx.on_timeout(&TIMERS, start + T2),
+            ClientEvent::None
+        ));
 
-        let event = tx.on_response(response(180), start + T2);
+        let event = tx.on_response(response(180), &TIMERS, start + T2);
         assert!(matches!(event, ClientEvent::Provisional(_)));
         assert_eq!(tx.deadline(), Some(start + 64 * T1));
 
-        let event = tx.on_response(response(200), start + 2 * T2);
+        let event = tx.on_response(response(200), &TIMERS, start + 2 * T2);
         assert!(matches!(event, ClientEvent::Final(_)));
         assert!(tx.is_terminated());
         assert_eq!(tx.deadline(), None);
@@ -387,10 +407,9 @@ mod tests {
     #[test]
     fn a_reliable_transport_still_times_out() {
         let start = Instant::now();
-        let mut tx =
-            ClientTransaction::new(request(), true, Timers::default(), start);
+        let mut tx = ClientTransaction::new(request(), true, &TIMERS, start);
         assert!(matches!(
-            tx.on_timeout(start + 64 * T1),
+            tx.on_timeout(&TIMERS, start + 64 * T1),
             ClientEvent::Timeout
         ));
         assert!(tx.is_terminated());
@@ -399,13 +418,12 @@ mod tests {
     #[test]
     fn a_transport_error_ends_it() {
         let start = Instant::now();
-        let mut tx =
-            ClientTransaction::new(request(), false, Timers::default(), start);
+        let mut tx = ClientTransaction::new(request(), false, &TIMERS, start);
         tx.on_transport_error();
         assert!(tx.is_terminated());
         assert_eq!(tx.deadline(), None);
         assert!(matches!(
-            tx.on_response(response(200), start),
+            tx.on_response(response(200), &TIMERS, start),
             ClientEvent::None
         ));
     }

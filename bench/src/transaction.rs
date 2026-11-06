@@ -39,14 +39,10 @@ pub(super) fn non_invite(c: &mut Criterion) {
     });
 
     let now = Instant::now();
+    let timers = Timers::default();
     benchmark(c, "transaction/non_invite/server_start", len, |b| {
         b.iter(|| {
-            let tx = ServerTransaction::new(
-                bb(&request),
-                false,
-                Timers::default(),
-                now,
-            );
+            let tx = ServerTransaction::new(bb(&request), false, &timers, now);
             assert!(!bb(&tx).is_terminated());
         });
     });
@@ -62,10 +58,10 @@ pub(super) fn non_invite(c: &mut Criterion) {
                 let mut tx = ClientTransaction::new(
                     encoded.clone(),
                     false,
-                    Timers::default(),
+                    &timers,
                     now,
                 );
-                let event = tx.on_response(bb(response), now);
+                let event = tx.on_response(bb(response), &timers, now);
                 assert!(matches!(event, ClientEvent::Final(_)));
                 assert!(!bb(&tx).is_terminated());
             },
