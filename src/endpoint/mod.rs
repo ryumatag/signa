@@ -123,6 +123,7 @@ mod client;
 mod driver;
 mod error;
 mod shutdown;
+mod table;
 #[cfg(test)]
 mod tests;
 

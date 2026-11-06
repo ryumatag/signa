@@ -22,7 +22,13 @@ include = [
 default = ["tokio"]
 # The transports and the endpoint run on tokio. Without this feature only the
 # message layer is built.
-tokio = ["dep:tokio", "dep:libc", "dep:tower-service", "dep:foldhash"]
+tokio = [
+  "dep:tokio",
+  "dep:libc",
+  "dep:tower-service",
+  "dep:foldhash",
+  "dep:hashbrown",
+]
 # Exposes crate internals to the benchmark crate in `bench/`. Unstable, with no
 # semver guarantee. Not for use outside this repository.
 __bench = []
@@ -35,6 +41,10 @@ tower-service = { version = "0.3.3", optional = true }
 # Keys the transaction tables. Branches come from the network, so the hasher
 # must be seeded, and it must be fast, since every message is looked up.
 foldhash = { version = "0.2", optional = true }
+# The tables index a slab of transactions through a `HashTable`, so that each
+# key is stored once. The `HashMap` of the standard library is hashbrown too,
+# but it keeps the value in the bucket.
+hashbrown = { version = "0.16", default-features = false, features = ["inline-more"], optional = true }
 
 # `recvmsg` and `sendmsg` with the `PKTINFO` control messages, which tokio does
 # not expose.

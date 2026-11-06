@@ -9,10 +9,12 @@ for the service, the service's readiness. A request the service takes runs in
 a task of its own, since requests must run concurrently, and comes back as a
 command with its response.
 
-The timers are one heap of deadlines, with one `Sleep` set to the earliest.
-A transaction whose deadline moves gets a new entry, and an entry whose
-transaction has moved on is harmless, because a transaction fires nothing
-before its time. So nothing is ever removed from the heap except by popping.
+The tables are slabs, see [`table`], and the timers are one heap of deadlines,
+with one `Sleep` set to the earliest. An entry names its transaction by its
+table id. A transaction whose deadline moves gets a new entry, and an entry
+whose transaction has moved on is harmless, because a transaction fires nothing
+before its time, and one whose transaction is gone finds nothing. So nothing is
+ever removed from the heap except by popping.
 
 A shutdown is a deadline on the heap too. From the command on, the driver
 answers new requests with a 503 and refuses new sends, and it stops as soon as
@@ -47,7 +49,10 @@ use tokio::{
 use tower_service::Service;
 
 use crate::{
-    endpoint::error::Error,
+    endpoint::{
+        error::Error,
+        table::{Id, Table},
+    },
     header::{via::Via, HeaderValue, CSEQ, VIA},
     message::Message,
     method::Method,
@@ -67,12 +72,12 @@ use crate::{
 /// signa does not know it.
 pub(super) const MAX_UDP_REQUEST: usize = 1300;
 
-/// The port `sent-by` means when it names none (RFC 3261 section 18.2.2).
-const DEFAULT_PORT: u16 = 5060;
-
 /// How many messages from TCP connections may wait for the driver. When it
 /// falls behind, the readers stop and TCP flow control holds the peers back.
 pub(super) const TCP_INBOUND: usize = 256;
+
+/// The port `sent-by` means when it names none (RFC 3261 section 18.2.2).
+const DEFAULT_PORT: u16 = 5060;
 
 /// How many datagrams may wait for the UDP socket to be writable. Beyond
 /// that a send fails, and the transaction retransmits later if it does.
@@ -125,7 +130,7 @@ pub(super) enum Command {
 pub(super) enum Slot {
     /// A server transaction, which sends the response and answers
     /// retransmissions with it.
-    Transaction(ServerKey),
+    Transaction(Id),
     /// No transaction, because the request had no RFC 3261 branch. The
     /// response is sent once, and a retransmission of the request reaches
     /// the service again.
@@ -183,14 +188,16 @@ enum Pending {
 }
 
 /// A heap entry. Earlier deadlines come out first.
+#[derive(Clone, Copy)]
 struct Timer {
     at: Instant,
     key: Key,
 }
 
+#[derive(Clone, Copy)]
 enum Key {
-    Server(ServerKey),
-    Client(ClientKey),
+    Server(Id),
+    Client(Id),
     /// The shutdown deadline. The driver stops when it fires.
     Shutdown,
 }
@@ -270,8 +277,8 @@ pub(super) struct Driver<S> {
     /// For the connections the driver opens.
     tcp_tx: mpsc::Sender<tcp::Inbound>,
     config: Config,
-    servers: HashMap<ServerKey, ServerEntry, RandomState>,
-    clients: HashMap<ClientKey, ClientEntry, RandomState>,
+    servers: Table<ServerKey, ServerEntry>,
+    clients: Table<ClientKey, ClientEntry>,
     routes: HashMap<SocketAddr, Route, RandomState>,
     timers: BinaryHeap<Timer>,
     sleep: Pin<Box<Sleep>>,
@@ -315,8 +322,8 @@ where
             tcp,
             tcp_tx,
             config,
-            servers: HashMap::default(),
-            clients: HashMap::default(),
+            servers: Table::new(),
+            clients: Table::new(),
             routes: HashMap::default(),
             timers: BinaryHeap::new(),
             sleep: Box::pin(tokio::time::sleep(std::time::Duration::ZERO)),
@@ -491,25 +498,21 @@ where
     fn on_timer(&mut self, key: Key) {
         let now = now();
         match key {
-            Key::Server(key) => {
-                let Some(entry) = self.servers.get_mut(&key) else {
-                    return;
-                };
+            Key::Server(id) => {
+                let Some(entry) = self.servers.get_mut(id) else { return };
                 let before = entry.tx.deadline();
                 if let Some(trying) = entry.tx.on_timeout(now) {
                     let link = entry.link.clone();
                     if self.send_reply(&link, &trying).is_err() {
-                        if let Some(entry) = self.servers.get_mut(&key) {
+                        if let Some(entry) = self.servers.get_mut(id) {
                             entry.tx.on_transport_error();
                         }
                     }
                 }
-                self.settle_server(&key, before);
+                self.settle_server(id, before);
             }
-            Key::Client(key) => {
-                let Some(entry) = self.clients.get_mut(&key) else {
-                    return;
-                };
+            Key::Client(id) => {
+                let Some(entry) = self.clients.get_mut(id) else { return };
                 let before = entry.tx.deadline();
                 let answered = match entry.tx.on_timeout(now) {
                     ClientEvent::Retransmit(request) => {
@@ -534,7 +537,7 @@ where
                     self.unanswered -= 1;
                 }
 
-                self.settle_client(&key, before);
+                self.settle_client(id, before);
             }
             Key::Shutdown => unreachable!("handled by the loop"),
         }
@@ -542,44 +545,33 @@ where
 
     /// Drops a server transaction that is over, or schedules its next deadline
     /// when it moved.
-    ///
-    /// The timer gets the table's own key, not `key`. A key made from a
-    /// received message to look the transaction up is a slice of that message,
-    /// and in the heap it would keep the message's read chunk alive until the
-    /// timer fires.
-    fn settle_server(&mut self, key: &ServerKey, before: Option<Instant>) {
-        let Some((stored, entry)) = self.servers.get_key_value(key) else {
-            return;
-        };
+    fn settle_server(&mut self, id: Id, before: Option<Instant>) {
+        let Some(entry) = self.servers.get(id) else { return };
         if entry.tx.is_terminated() {
-            self.servers.remove(key);
+            self.servers.remove(id);
             return;
         }
 
         let after = entry.tx.deadline();
         if after != before {
             if let Some(at) = after {
-                let key = Key::Server(stored.clone());
-                self.timers.push(Timer { at, key });
+                self.timers.push(Timer { at, key: Key::Server(id) });
             }
         }
     }
 
     /// See [`Driver::settle_server`].
-    fn settle_client(&mut self, key: &ClientKey, before: Option<Instant>) {
-        let Some((stored, entry)) = self.clients.get_key_value(key) else {
-            return;
-        };
+    fn settle_client(&mut self, id: Id, before: Option<Instant>) {
+        let Some(entry) = self.clients.get(id) else { return };
         if entry.tx.is_terminated() {
-            self.clients.remove(key);
+            self.clients.remove(id);
             return;
         }
 
         let after = entry.tx.deadline();
         if after != before {
             if let Some(at) = after {
-                let key = Key::Client(stored.clone());
-                self.timers.push(Timer { at, key });
+                self.timers.push(Timer { at, key: Key::Client(id) });
             }
         }
     }
@@ -761,11 +753,12 @@ where
         let reliable = link.flow.transport.is_reliable();
         let tx =
             ClientTransaction::new(bytes, reliable, self.config.timers, now());
-        if let Some(at) = tx.deadline() {
-            self.timers.push(Timer { at, key: Key::Client(key.clone()) });
-        }
+        let deadline = tx.deadline();
         let entry = ClientEntry { tx, link, respond: Some(respond) };
-        self.clients.insert(key, entry);
+        let id = self.clients.insert(key, entry);
+        if let Some(at) = deadline {
+            self.timers.push(Timer { at, key: Key::Client(id) });
+        }
         self.unanswered += 1;
     }
 
@@ -815,7 +808,7 @@ where
 
     fn on_received_response(&mut self, response: Response<Bytes>) {
         let Some(key) = ClientKey::from_response(&response) else { return };
-        let Some(entry) = self.clients.get_mut(&key) else { return };
+        let Some((id, entry)) = self.clients.find_mut(&key) else { return };
         // RFC 3261 section 18.1.2 discards a response whose top `Via` names
         // a `sent-by` other than this one's.
         let ours = response
@@ -841,7 +834,7 @@ where
             | ClientEvent::Retransmit(_)
             | ClientEvent::Timeout => {}
         }
-        self.settle_client(&key, before);
+        self.settle_client(id, before);
     }
 
     fn on_request(&mut self, mut request: Request<Bytes>, link: Link) {
@@ -881,7 +874,7 @@ where
         }
 
         if let Some(key) = &key {
-            if let Some(entry) = self.servers.get(key) {
+            if let Some((_, entry)) = self.servers.find(key) {
                 if let Some(response) = entry.tx.on_retransmission() {
                     let _ = send_on(self.udp.as_mut(), &entry.link, &response);
                 }
@@ -912,12 +905,13 @@ where
                     self.config.timers,
                     now(),
                 );
-                if let Some(at) = tx.deadline() {
-                    self.timers
-                        .push(Timer { at, key: Key::Server(key.clone()) });
+                let deadline = tx.deadline();
+                let id = self.servers.insert(key, ServerEntry { tx, link });
+                if let Some(at) = deadline {
+                    self.timers.push(Timer { at, key: Key::Server(id) });
                 }
-                self.servers.insert(key.clone(), ServerEntry { tx, link });
-                Slot::Transaction(key)
+
+                Slot::Transaction(id)
             }
             None => Slot::Stateless(link),
         };
@@ -946,8 +940,8 @@ where
             r.status().is_final() && r.headers().contains_key(VIA)
         });
         match slot {
-            Slot::Transaction(key) => {
-                let Some(entry) = self.servers.get_mut(&key) else { return };
+            Slot::Transaction(id) => {
+                let Some(entry) = self.servers.get_mut(id) else { return };
                 let (status, bytes) = match &response {
                     Some(response) => (response.status(), response.to_bytes()),
                     None => match entry.tx.headers() {
@@ -963,11 +957,11 @@ where
                 let send = entry.tx.on_response(status, bytes.clone(), now());
                 let link = entry.link.clone();
                 if send && self.send_reply(&link, &bytes).is_err() {
-                    if let Some(entry) = self.servers.get_mut(&key) {
+                    if let Some(entry) = self.servers.get_mut(id) {
                         entry.tx.on_transport_error();
                     }
                 }
-                self.settle_server(&key, before);
+                self.settle_server(id, before);
             }
             Slot::Stateless(link) => {
                 if let Some(response) = response {
@@ -1136,14 +1130,14 @@ fn reply_flow(via: &Via<'_>, flow: &Flow) -> Flow {
     Flow { remote: SocketAddr::new(flow.remote.ip(), port), ..*flow }
 }
 
-/// Returns the top `Via` with `received` and `rport` filled in, or `None`
-/// when neither is called for.
+/// Returns the top `Via` with `received` and `rport` filled in, or `None` when
+/// neither is called for.
 ///
-/// `received` is added at the end of the first `via-parm` when `sent-by`
-/// names a host other than the source address (RFC 3261 section 18.2.1). A
-/// valueless `rport` is given the source port in place (RFC 3581 section 4).
-/// An `rport` that came with a value is left alone. The response goes to the
-/// source port either way, see [`reply_flow`].
+/// `received` is added at the end of the first `via-parm` when `sent-by` names
+/// a host other than the source address (RFC 3261 section 18.2.1). A valueless
+/// `rport` is given the source port in place (RFC 3581 section 4). An `rport`
+/// that came with a value is left alone. The response goes to the source port
+/// either way, see [`reply_flow`].
 fn mark_via(
     value: &HeaderValue,
     via: &Via<'_>,
