@@ -94,4 +94,22 @@ pub(super) fn tcp(c: &mut Criterion) {
             });
         });
     });
+
+    benchmark(c, "transport/tcp/round_trip_receipts", len, |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                client.submit(bb(request.clone())).unwrap().await.unwrap();
+                let inbound = server_rx.recv().await.unwrap();
+                assert!(matches!(inbound.message, Message::Request(_)));
+                inbound
+                    .writer
+                    .submit(bb(response.clone()))
+                    .unwrap()
+                    .await
+                    .unwrap();
+                let inbound = client_rx.recv().await.unwrap();
+                assert!(matches!(inbound.message, Message::Response(_)));
+            });
+        });
+    });
 }

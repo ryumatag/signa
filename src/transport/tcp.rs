@@ -36,14 +36,11 @@ use std::{
 
 use bytes::{Buf, Bytes, BytesMut};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
-        TcpListener, TcpStream,
-    },
+    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::{tcp::OwnedReadHalf, TcpListener, TcpStream},
     sync::{
         mpsc::{self, error::TrySendError},
-        OwnedSemaphorePermit, Semaphore,
+        oneshot, OwnedSemaphorePermit, Semaphore,
     },
     time::{sleep, timeout},
 };
@@ -115,7 +112,7 @@ pub struct Inbound {
 /// write, whether or not a `Writer` exists.
 #[derive(Clone, Debug)]
 pub struct Writer {
-    queue: mpsc::Sender<Bytes>,
+    queue: mpsc::Sender<Write>,
 }
 
 /// Why a message could not be queued.
@@ -135,10 +132,71 @@ impl Writer {
 
     /// Queues `bytes` to be written. Returns at once.
     pub fn send(&self, bytes: Bytes) -> Result<(), SendError> {
-        self.queue.try_send(bytes).map_err(|err| match err {
+        self.enqueue(Write { bytes, done: None })
+    }
+
+    /// Queues a write and returns its local completion receipt.
+    ///
+    /// Successful enqueue commits the write. Dropping the receipt does not
+    /// cancel it. The receipt succeeds once all bytes have been written to
+    /// the local stream, without promising peer receipt. An error can follow
+    /// a partial write. Connection teardown fails outstanding receipts.
+    #[allow(dead_code)] // Used by the reply-route integration.
+    pub fn submit(&self, bytes: Bytes) -> Result<Receipt, SendError> {
+        let (done, result) = oneshot::channel();
+        self.enqueue(Write { bytes, done: Some(done) })?;
+        Ok(Receipt(result))
+    }
+
+    fn enqueue(&self, write: Write) -> Result<(), SendError> {
+        self.queue.try_send(write).map_err(|err| match err {
             TrySendError::Full(_) => SendError::Full,
             TrySendError::Closed(_) => SendError::Closed,
         })
+    }
+}
+
+/// Completion of a queued local write, not acknowledgement by the peer.
+#[derive(Debug)]
+#[must_use = "await the receipt to observe local write completion"]
+#[allow(dead_code)] // Used by the reply-route integration.
+pub struct Receipt(oneshot::Receiver<io::Result<()>>);
+
+impl Future for Receipt {
+    type Output = io::Result<()>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0).poll(cx).map(|result| {
+            result.unwrap_or_else(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "connection ended before write completion",
+                ))
+            })
+        })
+    }
+}
+
+#[derive(Debug)]
+struct Write {
+    bytes: Bytes,
+    done: Option<oneshot::Sender<io::Result<()>>>,
+}
+
+impl Write {
+    fn complete(&mut self, result: io::Result<()>) {
+        if let Some(done) = self.done.take() {
+            let _ = done.send(result);
+        }
+    }
+}
+
+impl From<Bytes> for Write {
+    fn from(bytes: Bytes) -> Self {
+        Write { bytes, done: None }
     }
 }
 
@@ -378,14 +436,32 @@ async fn read_loop(
 
 /// Writes queued messages until the queue closes or a write fails.
 async fn write_loop(
-    mut write: OwnedWriteHalf,
-    mut pending: mpsc::Receiver<Bytes>,
+    mut write: impl AsyncWrite + Unpin,
+    mut pending: mpsc::Receiver<Write>,
 ) {
     let mut queue = Queue::default();
     while pending.recv_many(&mut queue.items, WRITE_BATCH).await > 0 {
-        queue.remaining = queue.items.iter().map(Bytes::len).sum();
-        if write.write_all_buf(&mut queue).await.is_err() {
+        queue.remaining =
+            queue.items.iter().map(|item| item.bytes.len()).sum();
+        // An empty write at the head is already complete, including when
+        // the following nonempty write fails before making progress.
+        queue.advance(0);
+        if let Err(error) = write.write_all_buf(&mut queue).await {
+            // Stop admission before draining failures. Fully written messages
+            // already completed in advance(), even if this batch later fails.
+            pending.close();
+            let kind = error.kind();
+            let source = Arc::new(error);
+            for item in &mut queue.items {
+                item.complete(Err(io::Error::new(kind, source.clone())));
+            }
+            while let Some(mut item) = pending.recv().await {
+                item.complete(Err(io::Error::new(kind, source.clone())));
+            }
             return;
+        }
+        for item in &mut queue.items {
+            item.complete(Ok(()));
         }
         queue.items.clear();
         queue.next = 0;
@@ -396,7 +472,7 @@ async fn write_loop(
 /// them with one vectored call.
 #[derive(Default)]
 struct Queue {
-    items: Vec<Bytes>,
+    items: Vec<Write>,
     /// The first item not fully written.
     next: usize,
     /// The bytes left over all items.
@@ -409,14 +485,14 @@ impl Buf for Queue {
     }
 
     fn chunk(&self) -> &[u8] {
-        self.items.get(self.next).map_or(&[], |item| item)
+        self.items.get(self.next).map_or(&[], |item| &item.bytes)
     }
 
     fn chunks_vectored<'a>(&'a self, dst: &mut [io::IoSlice<'a>]) -> usize {
         let items = self.items[self.next..].iter();
         let mut n = 0;
         for (slot, item) in dst.iter_mut().zip(items) {
-            *slot = io::IoSlice::new(item);
+            *slot = io::IoSlice::new(&item.bytes);
             n += 1;
         }
 
@@ -425,14 +501,18 @@ impl Buf for Queue {
 
     fn advance(&mut self, mut cnt: usize) {
         assert!(cnt <= self.remaining, "advanced past the end of the queue");
+
         self.remaining -= cnt;
-        while cnt > 0 {
+        while self.next < self.items.len()
+            && (cnt > 0 || self.items[self.next].bytes.is_empty())
+        {
             let item = &mut self.items[self.next];
-            if cnt < item.len() {
-                item.advance(cnt);
+            if cnt < item.bytes.len() {
+                item.bytes.advance(cnt);
                 return;
             }
-            cnt -= item.len();
+            cnt -= item.bytes.len();
+            item.complete(Ok(()));
             self.next += 1;
         }
     }
@@ -446,6 +526,184 @@ mod tests {
 
     use super::*;
     use crate::{method::Method, status::StatusCode};
+
+    struct FailsAfter(usize);
+
+    impl AsyncWrite for FailsAfter {
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_write_vectored(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buffers: &[io::IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            if self.0 == 0 {
+                return Poll::Ready(Err(io::Error::from_raw_os_error(5)));
+            }
+
+            let n = buffers
+                .iter()
+                .map(|buffer| buffer.len())
+                .sum::<usize>()
+                .min(self.0);
+            self.0 -= n;
+
+            Poll::Ready(Ok(n))
+        }
+
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.0 == 0 {
+                return Poll::Ready(Err(io::Error::from_raw_os_error(5)));
+            }
+            let n = bytes.len().min(self.0);
+            self.0 -= n;
+
+            Poll::Ready(Ok(n))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    // The receipt tests build runtimes without an I/O driver to run under
+    // Miri. #[tokio::test] initializes kqueue, which Miri does not support.
+    // Channels and mock writers need no I/O driver.
+
+    #[test]
+    fn receipts_distinguish_complete_partial_and_unwritten_messages() {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (queue, pending) = mpsc::channel(WRITE_BATCH + 3);
+                let writer = Writer { queue };
+                let complete =
+                    writer.submit(Bytes::from_static(b"abc")).unwrap();
+                let partial =
+                    writer.submit(Bytes::from_static(b"def")).unwrap();
+                // Include messages outside recv_many's first batch.
+                let mut failures = vec![partial];
+                for _ in 0..WRITE_BATCH + 1 {
+                    failures.push(
+                        writer.submit(Bytes::from_static(b"ghi")).unwrap(),
+                    );
+                }
+                write_loop(FailsAfter(5), pending).await;
+                complete.await.unwrap();
+                for receipt in failures {
+                    let error = receipt.await.unwrap_err();
+                    let source = error
+                        .get_ref()
+                        .unwrap()
+                        .downcast_ref::<Arc<io::Error>>()
+                        .unwrap();
+                    assert_eq!(source.raw_os_error(), Some(5));
+                }
+
+                assert!(writer.is_closed());
+            });
+    }
+
+    #[test]
+    fn empty_writes_complete_before_a_later_write_failure() {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (queue, pending) = mpsc::channel(3);
+                let writer = Writer { queue };
+                let empty = writer.submit(Bytes::new()).unwrap();
+                let complete =
+                    writer.submit(Bytes::from_static(b"abc")).unwrap();
+                let trailing = writer.submit(Bytes::new()).unwrap();
+
+                drop(writer);
+
+                write_loop(FailsAfter(3), pending).await;
+                empty.await.unwrap();
+                complete.await.unwrap();
+                trailing.await.unwrap();
+
+                let (queue, pending) = mpsc::channel(2);
+                let writer = Writer { queue };
+                let empty = writer.submit(Bytes::new()).unwrap();
+                let failure =
+                    writer.submit(Bytes::from_static(b"abc")).unwrap();
+                write_loop(FailsAfter(0), pending).await;
+                empty.await.unwrap();
+
+                assert!(failure.await.is_err());
+            });
+    }
+
+    #[test]
+    fn dropping_a_receipt_does_not_cancel_the_write() {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (queue, pending) = mpsc::channel(2);
+                let writer = Writer { queue };
+
+                drop(writer.submit(Bytes::from_static(b"abc")).unwrap());
+
+                let receipt =
+                    writer.submit(Bytes::from_static(b"def")).unwrap();
+
+                drop(writer);
+
+                let mut output = Vec::new();
+                write_loop(&mut output, pending).await;
+                receipt.await.unwrap();
+
+                assert_eq!(output, b"abcdef");
+            });
+    }
+
+    #[test]
+    fn admission_and_connection_loss_are_distinct() {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (queue, pending) = mpsc::channel(1);
+                let writer = Writer { queue };
+                let receipt =
+                    writer.submit(Bytes::from_static(b"abc")).unwrap();
+                assert_eq!(
+                    writer.submit(Bytes::new()).unwrap_err(),
+                    SendError::Full
+                );
+
+                drop(pending);
+
+                assert_eq!(
+                    receipt.await.unwrap_err().kind(),
+                    io::ErrorKind::BrokenPipe
+                );
+                assert_eq!(
+                    writer.submit(Bytes::new()).unwrap_err(),
+                    SendError::Closed
+                );
+            });
+    }
 
     const LOCALHOST: SocketAddr =
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
@@ -685,9 +943,9 @@ mod tests {
 
         let mut queue = Queue {
             items: vec![
-                Bytes::from_static(b"ab"),
-                Bytes::from_static(b"cde"),
-                Bytes::from_static(b"f"),
+                Bytes::from_static(b"ab").into(),
+                Bytes::from_static(b"cde").into(),
+                Bytes::from_static(b"f").into(),
             ],
             next: 0,
             remaining: 6,
