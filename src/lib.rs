@@ -32,8 +32,9 @@ code through a [Tower] `Service`. Its design draws heavily on the [`http`] and
 * INVITE, ACK, and CANCEL transactions, and with them provisional responses
   other than the 100 the endpoint sends itself. An INVITE gets a 501 and a
   CANCEL a 481. They are planned for 0.3.0, with RFC 6026.
-* Choosing a next hop. RFC 3263 resolution, and the structured view of a
-  [`Uri`] it needs, belong to a layer above, which holds one `Client` per hop.
+* Choosing a next hop. RFC 3263 resolution belongs to a layer above, which
+  holds one `Client` per hop. [`Uri::sip`] exposes SIP/SIPS components without
+  selecting a destination or transport.
 * TLS, and anything that would make `sips:` mean what it says.
 * Dialogs, registration, proxying, and the rest of what an application does
   with messages. Those belong in crates built on signa.
@@ -50,7 +51,8 @@ examples are omitted when this feature is disabled.
 - [`message`] owns message values, builders, parsing and encoding. The crate
   root re-exports the principal types. Parts, header constants and construction
   errors use paths such as [`message::request::Parts`], [`message::header`]
-  and [`message::BuildError`].
+  and [`message::BuildError`]. [`message::uri::SipUri`] provides validated,
+  borrowed SIP/SIPS structure on demand.
 - [`transaction`] exposes transaction timer configuration. Its state machines
   are internal protocol machinery.
 - [`transport`] exposes [`transport::Flow`], [`transport::Transport`] and
@@ -103,14 +105,15 @@ assert!(bytes.ends_with(b"Content-Length: 0\r\n\r\n"));
 
 # Validation
 
-Every value type except [`StatusCode`] accepts exactly what [siparse] accepts
-in a head, using its [`check`](siparse::check) functions. [`StatusCode`] only
-takes `100..=699`, the classes RFC 3261 defines, while siparse accepts any
+Message token constructors accept exactly what [siparse] accepts in a head,
+using its [`check`](siparse::check) functions, except for [`StatusCode`].
+[`StatusCode`] only takes `100..=699`, the classes RFC 3261 defines, while siparse accepts any
 three digits. A message parsed from the wire can always be rebuilt from its
 parts, and a value built by hand is never one that the parser would reject.
 Parsing does not check a value a second time, except the method and status
 code. The [`Uri`], [`ReasonPhrase`], and header values share the input buffer
-instead of copying it.
+instead of copying it. [`Uri::sip`] separately validates SIP/SIPS structure
+when requested. It does not add validation or allocations to message parsing.
 
 Header values are checked only against the envelope that every header field
 shares, not against the grammar of each field. Typed header parsing belongs

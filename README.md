@@ -36,6 +36,8 @@ are later work. The [crate docs] say what is covered in detail.
 The main types remain available at the crate root, such as `signa::Request`.
 Use `signa::message::request::Parts`, `signa::message::header::VIA` and
 `signa::message::BuildError` for detailed message APIs.
+`Uri::sip()` and `message::uri::SipUri::parse()` provide borrowed SIP/SIPS
+components on demand, preserving the original text and escapes.
 
 `transaction::Timers` configures transaction deadlines.
 `transport::{Flow, Transport, MessageLimits}` describes transport metadata and

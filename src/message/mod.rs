@@ -11,10 +11,11 @@ The crate root also exposes the principal message types. Use [`request`],
 [`error::InvalidMessage`] instead.
 
 Value implementation modules are private. Use [`Method`] rather than its
-implementation path. The following cannot compile because `method` is private:
+implementation path. The following cannot compile because `start_line` is
+private:
 
 ```compile_fail
-use signa::message::method::Method;
+use signa::message::start_line::Method;
 ```
 */
 
@@ -24,7 +25,7 @@ pub use self::{
     header::{HeaderMap, HeaderName, HeaderValue},
     request::Request,
     response::Response,
-    start_line::{Method, ReasonPhrase, StatusCode, Uri, Version},
+    start_line::{uri, Method, ReasonPhrase, StatusCode, Uri, Version},
 };
 
 mod byte_str;

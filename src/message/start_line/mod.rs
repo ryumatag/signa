@@ -6,5 +6,5 @@ pub use self::{
 mod method;
 mod reason;
 mod status;
-mod uri;
+pub mod uri;
 mod version;

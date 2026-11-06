@@ -53,6 +53,8 @@ hashbrown = { version = "0.16", default-features = false, features = ["inline-mo
 libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
+# Keep property tests compatible with the crate's MSRV.
+quickcheck = { version = "~1.0.3", default-features = false }
 tokio = { version = "1.47", features = ["macros", "rt-multi-thread"] }
 tower = { version = "0.5", features = ["limit", "util"] }
 

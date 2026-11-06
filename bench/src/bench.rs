@@ -51,6 +51,7 @@ criterion::criterion_group! {
         method::from_bytes,
         reason::from_bytes,
         uri::from_bytes,
+        uri::structured,
 }
 
 criterion::criterion_main!(benches);

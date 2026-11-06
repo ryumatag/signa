@@ -1,7 +1,43 @@
 /*!
-SIP request URI types.
+Request-URI text and borrowed SIP/SIPS structure.
 
-This module defines [`Uri`], the target of a SIP request.
+[`Uri`] retains the original message token. [`SipUri`] validates its structure
+on demand, or borrows a standalone string. Neither rewrites the text.
+Component getters retain escapes. Use [`Component::decoded_bytes`] or
+[`Component::decode`] to decode a component explicitly. The result is bytes,
+because percent escapes need not encode UTF-8. A `+` stays a plus.
+
+The view checks component syntax, escapes and IP literals according to
+[RFC 3261 sections 19.1 and 25.1] and [RFC 5954]. Parameters use the generic
+`pname [ "=" pvalue ]` grammar. Their specialized values and usage rules,
+such as TTL, transport reliability and maddr routing, belong to the consumer.
+Duplicate parameters remain visible in iteration. [`SipUri::parameter`]
+rejects ambiguous lookup rather than selecting one occurrence.
+
+An omitted port stays omitted. A present port retains all its digits, and
+[`SipUri::port_u16`] checks whether it fits a network port. No transport or
+port defaults, DNS lookup, normalization or URI-header application is implied.
+Parsing SIPS does not add TLS support. Non-SIP schemes, including tel, remain
+opaque. URI comparison and mutation are outside this API.
+
+```
+use signa::message::uri::{Scheme, SipUri};
+
+let target = SipUri::parse(
+    "sips:alice%40work@[2001:db8::1]:5061;transport=tcp;lr?Subject=lunch%20plans"
+)?;
+assert_eq!(target.scheme(), Scheme::Sips);
+assert_eq!(target.user().unwrap().decode().as_ref(), b"alice@work");
+assert_eq!(target.host(), "2001:db8::1");
+assert_eq!(target.port_u16()?, Some(5061));
+assert_eq!(target.parameter("transport")?.unwrap().value().unwrap().as_str(), "tcp");
+assert!(target.parameter("lr")?.unwrap().value().is_none());
+assert_eq!(target.headers().next().unwrap().value().decode().as_ref(), b"lunch plans");
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+[RFC 3261 sections 19.1 and 25.1]: https://www.rfc-editor.org/rfc/rfc3261.html#section-19.1
+[RFC 5954]: https://www.rfc-editor.org/rfc/rfc5954.html
 */
 
 use std::{fmt, str::FromStr};
@@ -11,21 +47,17 @@ use siparse::check;
 
 use crate::message::{byte_str::ByteStr, error::InvalidUri};
 
-// TODO: Add structured access when something in signa picks a target from a
-// URI, which needs the host, port, `transport`, `maddr`, and `sips` scheme
-// (RFC 3263). Nothing in 0.2.0 does. The `Client` is bound to a next hop given
-// as an address. It is deferred because it needs its own design.
-//
-// * SIP and SIPS URIs (RFC 3261 section 19.1), tel URIs (RFC 3966), and other
-//   absolute URIs each have their own grammar.
-// * Views should be offsets into the stored text, as in `http::Uri`, so the
-//   original text stays intact for forwarding while `%`-escapes can be decoded
-//   for comparison.
-// * RFC 3261 section 19.1.4 equivalence decides what `PartialEq` means.
-//
-// Keeping the text in `Bytes` lets this be added as new methods, such as a
-// SIP URI view.
-//
+pub use self::{
+    component::{Component, DecodedBytes},
+    sip::{
+        Header, Headers, InvalidSipUri, InvalidSipUriKind, Parameter,
+        Parameters, Scheme, SipUri,
+    },
+};
+
+mod component;
+mod sip;
+
 /// A SIP `Request-URI`.
 ///
 /// [RFC 3261 section 25.1] defines `Request-URI` as `SIP-URI / SIPS-URI /
@@ -46,15 +78,15 @@ use crate::message::{byte_str::ByteStr, error::InvalidUri};
 /// request can also be built with this type, and the reverse.
 ///
 /// Accepting a URI does not establish that it is well formed for its scheme.
-/// Structured access to SIP URIs (user, host, parameters) is later work.
+/// [`Uri::sip`] validates SIP/SIPS structure on demand. Other schemes remain
+/// opaque.
 ///
 /// # Equality
 ///
 /// `Uri` does not implement `PartialEq` or `Hash`. [RFC 3261 section 19.1.4]
-/// compares SIP URIs component by component, with case-insensitive parts and
-/// rules for parameters, so comparing the text would give the wrong answer for
-/// equivalent URIs. Compare [`Uri::as_str`] when exact text is what you want.
-/// I would rather add RFC equivalence later than change what `==` means.
+/// comparison is not transitive, so it cannot implement Rust's `PartialEq`
+/// contract. Compare [`Uri::as_str`] when exact text is what you want.
+/// This module provides no RFC URI comparison operation.
 ///
 /// # Example
 ///
@@ -90,8 +122,8 @@ impl Uri {
     ///
     /// # Panics
     ///
-    /// Panics if `src` is not a valid request URI. In a `const` context this
-    /// is a compile error.
+    /// Panics if `src` is empty or contains a byte outside the accepted URI
+    /// character classes. In a `const` context this is a compile error.
     pub const fn from_static(src: &'static str) -> Uri {
         if check::request_uri_const(src.as_bytes()).is_err() {
             panic!("invalid SIP request URI");
@@ -114,6 +146,25 @@ impl Uri {
     /// Returns the URI as a string slice.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Validates and borrows the SIP/SIPS structure, without copying it.
+    ///
+    /// Returns `Ok(None)` when the text does not start with a SIP/SIPS scheme.
+    /// This does not validate another scheme. Message parsing itself never
+    /// invokes this operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidSipUri`] for malformed SIP/SIPS structure or escapes.
+    pub fn sip(&self) -> Result<Option<SipUri<'_>>, InvalidSipUri> {
+        match SipUri::parse(self.as_str()) {
+            Ok(uri) => Ok(Some(uri)),
+            Err(error) if error.kind() == InvalidSipUriKind::Scheme => {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Copies validated text so a retained URI does not pin a read buffer.
@@ -284,5 +335,112 @@ mod tests {
         let err = Uri::from_bytes(b"bad uri").unwrap_err();
         assert_eq!(err.to_string(), "invalid SIP request URI");
         assert_eq!(format!("{err:?}"), "InvalidUri");
+    }
+
+    #[test]
+    fn sip_access_distinguishes_opaque_schemes_from_bad_sip_structure() {
+        for text in ["tel:+12025550123", "urn:service:sos", "opaque"] {
+            assert!(Uri::from_bytes(text.as_bytes())
+                .unwrap()
+                .sip()
+                .unwrap()
+                .is_none());
+        }
+        let bad = Uri::from_static("sip:example.com;transport=");
+        assert_eq!(
+            bad.sip().unwrap_err().kind(),
+            InvalidSipUriKind::Parameter
+        );
+        assert_eq!(bad.as_str(), "sip:example.com;transport=");
+    }
+
+    #[test]
+    fn a_view_borrows_the_received_uri_and_all_raw_components() {
+        let input = Bytes::from_static(b"sip:alice:secret@[2001:db8::1]:5060;transport=tcp;lr?Subject=hello");
+        let uri =
+            Uri::from_parsed(&input, std::str::from_utf8(&input).unwrap());
+        let view = uri.sip().unwrap().unwrap();
+        let range = input.as_ptr_range();
+
+        assert_eq!(view.as_str().as_ptr(), input.as_ptr());
+        for text in [
+            view.user().unwrap().as_str(),
+            view.password().unwrap().as_str(),
+            view.host(),
+            view.port().unwrap(),
+        ] {
+            assert!(range.contains(&text.as_ptr()));
+        }
+        for parameter in view.parameters() {
+            assert!(range.contains(&parameter.name().as_str().as_ptr()));
+            if let Some(value) = parameter.value() {
+                assert!(range.contains(&value.as_str().as_ptr()));
+            }
+        }
+        for header in view.headers() {
+            assert!(range.contains(&header.name().as_str().as_ptr()));
+            assert!(range.contains(&header.value().as_str().as_ptr()));
+        }
+        assert!(matches!(
+            view.user().unwrap().decode(),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn escaped_components_round_trip_arbitrary_octets() {
+        fn property(octets: Vec<u8>) -> bool {
+            use std::fmt::Write;
+            let mut escaped = String::new();
+            for byte in &octets {
+                write!(escaped, "%{byte:02X}").unwrap();
+            }
+            let text = format!("sip:alice:{escaped}@example.com?x={escaped}");
+            let uri = SipUri::parse(&text).unwrap();
+
+            uri.as_str() == text
+                && uri.password().unwrap().decode().as_ref() == octets
+                && uri.headers().next().unwrap().value().decode().as_ref()
+                    == octets
+        }
+
+        // A smaller generated sample under Miri still exercises the same
+        // borrowing and decoding paths without an expensive randomized run.
+        quickcheck::QuickCheck::new()
+            .tests(if cfg!(miri) { 32 } else { 1000 })
+            .gen(quickcheck::Gen::new(if cfg!(miri) { 16 } else { 256 }))
+            .quickcheck(property as fn(Vec<u8>) -> bool);
+    }
+
+    #[test]
+    fn arbitrary_text_never_yields_invalid_component_boundaries() {
+        fn property(octets: Vec<u8>) -> bool {
+            let text = format!("sip:{}", String::from_utf8_lossy(&octets));
+            let Ok(uri) = SipUri::parse(&text) else {
+                return true;
+            };
+
+            assert_eq!(uri.as_str(), text);
+            let _ = (
+                uri.user(),
+                uri.password(),
+                uri.host(),
+                uri.port(),
+                uri.port_u16(),
+            );
+            for parameter in uri.parameters() {
+                let _ = parameter.name().decoded_bytes().count();
+                let _ = parameter.value().map(|v| v.decoded_bytes().count());
+            }
+            for header in uri.headers() {
+                let _ = header.name().decoded_bytes().count();
+                let _ = header.value().decoded_bytes().count();
+            }
+            true
+        }
+
+        quickcheck::QuickCheck::new()
+            .tests(if cfg!(miri) { 32 } else { 1000 })
+            .quickcheck(property as fn(Vec<u8>) -> bool);
     }
 }
