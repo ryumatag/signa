@@ -1,8 +1,9 @@
-//! Two endpoints on the loopback. One answers every request with a 200, and
-//! the other sends it an `OPTIONS` over UDP and over TCP and prints what came
-//! back.
-//!
-//! Run it with `cargo run --example options`.
+/*!
+Two endpoints on the loopback. One answers every request with a 200, and the
+other sends it an `OPTIONS` over UDP and over TCP and prints what came back.
+
+Run it with `cargo run --example options`.
+*/
 
 use std::convert::Infallible;
 

@@ -6,7 +6,7 @@ use std::hash::{Hash, Hasher};
 
 use bytes::Bytes;
 
-use super::super::header::{cseq::CSeq, via::Via, HeaderValue, VIA};
+use super::super::header::{cseq::CSeq, via::Via, VIA};
 use crate::{header::CSEQ, Method, Request, Response};
 
 /// The magic cookie that starts every branch an RFC 3261 element makes.
@@ -24,10 +24,15 @@ const COOKIE: &str = "z9hG4bK";
 /// made it each time. The host of `sent-by` compares without regard to ASCII
 /// case, as a hostname does. The hash covers the branch and the method only,
 /// which keeps equal keys hashing alike.
+///
+/// The branch and the host are copied out of the request. A key lives in the
+/// table for Timer J after its request is gone, and a slice of the request
+/// would keep the whole read chunk the datagram came in alive with it.
 #[derive(Clone, Debug)]
 pub struct ServerKey {
-    branch: Bytes,
-    host: Bytes,
+    /// The branch, then the host, in one allocation.
+    text: Bytes,
+    branch_len: usize,
     port: Option<u16>,
     method: Method,
 }
@@ -43,33 +48,38 @@ impl ServerKey {
         let value = request.headers().get(VIA)?;
         let via = Via::top(value)?;
 
-        ServerKey::new(value, &via, request.method())
+        ServerKey::new(&via, request.method())
     }
 
     /// Returns the key for a request whose top `Via` the caller has parsed
-    /// from `value` already, or `None` if it has no RFC 3261 branch.
-    pub fn new(
-        value: &HeaderValue,
-        via: &Via<'_>,
-        method: &Method,
-    ) -> Option<ServerKey> {
-        let branch = branch(value, via)?;
+    /// already, or `None` if it has no RFC 3261 branch.
+    pub fn new(via: &Via<'_>, method: &Method) -> Option<ServerKey> {
+        let branch = branch(via)?;
+        let text = Bytes::from([branch, via.host].concat());
 
         Some(ServerKey {
-            branch,
-            host: value.as_shared().slice_ref(via.host.as_bytes()),
+            text,
+            branch_len: branch.len(),
             port: via.port,
             method: method.clone(),
         })
+    }
+
+    fn branch(&self) -> &[u8] {
+        &self.text[..self.branch_len]
+    }
+
+    fn host(&self) -> &[u8] {
+        &self.text[self.branch_len..]
     }
 }
 
 impl PartialEq for ServerKey {
     fn eq(&self, other: &ServerKey) -> bool {
-        self.branch == other.branch
+        self.branch() == other.branch()
             && self.port == other.port
             && self.method == other.method
-            && self.host.eq_ignore_ascii_case(&other.host)
+            && self.host().eq_ignore_ascii_case(other.host())
     }
 }
 
@@ -77,7 +87,7 @@ impl Eq for ServerKey {}
 
 impl Hash for ServerKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.branch.hash(state);
+        self.branch().hash(state);
         self.method.hash(state);
     }
 }
@@ -89,6 +99,10 @@ impl Hash for ServerKey {
 /// of the transaction comes from the request with [`ClientKey::from_request`],
 /// and the key to look up comes from the response with
 /// [`ClientKey::from_response`].
+///
+/// The branch is a slice of the `Via` value. The key that lives in the table
+/// comes from a request this element built, whose `Via` is a small allocation
+/// of its own, and the key from a response is dropped after the lookup.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ClientKey {
     branch: Bytes,
@@ -100,7 +114,8 @@ impl ClientKey {
     /// `Via` is missing, unreadable, or has no RFC 3261 branch.
     pub fn from_request(request: &Request<Bytes>) -> Option<ClientKey> {
         let value = request.headers().get(VIA)?;
-        let branch = branch(value, &Via::top(value)?)?;
+        let branch = branch(&Via::top(value)?)?;
+        let branch = value.as_shared().slice_ref(branch.as_bytes());
 
         Some(ClientKey { branch, method: request.method().clone() })
     }
@@ -109,25 +124,26 @@ impl ClientKey {
     /// `CSeq` is missing or unreadable, or the branch has no cookie.
     pub fn from_response(response: &Response<Bytes>) -> Option<ClientKey> {
         let value = response.headers().get(VIA)?;
-        let branch = branch(value, &Via::top(value)?)?;
+        let branch = branch(&Via::top(value)?)?;
+        let branch = value.as_shared().slice_ref(branch.as_bytes());
         let cseq = CSeq::parse(response.headers().get(CSEQ)?)?;
 
         Some(ClientKey { branch, method: cseq.method })
     }
 }
 
-/// Returns the branch of `via` as a slice of `value`, if it has the cookie.
+/// Returns the branch of `via`, if it has the cookie.
 ///
 /// The cookie is a token, which RFC 3261 section 7.3.1 compares without regard
 /// to case. The rest of the branch is kept as written.
-fn branch(value: &HeaderValue, via: &Via<'_>) -> Option<Bytes> {
+fn branch<'a>(via: &Via<'a>) -> Option<&'a str> {
     let branch = via.branch?;
     let cookie = branch.get(..COOKIE.len())?;
     if !cookie.eq_ignore_ascii_case(COOKIE) {
         return None;
     }
 
-    Some(value.as_shared().slice_ref(branch.as_bytes()))
+    Some(branch)
 }
 
 #[cfg(test)]
@@ -152,8 +168,8 @@ mod tests {
     #[test]
     fn server_keys_match_retransmissions_and_tell_transactions_apart() {
         let key = ServerKey::from_request(&request(OPTIONS)).unwrap();
-        assert_eq!(key.branch, "z9hG4bKhjhs8ass877");
-        assert_eq!(key.host, "PC33.atlanta.example.com");
+        assert_eq!(key.branch(), b"z9hG4bKhjhs8ass877");
+        assert_eq!(key.host(), b"PC33.atlanta.example.com");
         assert_eq!(key.port, Some(5060));
         assert_eq!(key.method, Method::OPTIONS);
 
@@ -241,12 +257,17 @@ mod tests {
     }
 
     #[test]
-    fn keys_share_the_message_buffer() {
+    fn a_server_key_does_not_hold_the_message_buffer() {
         let request = request(OPTIONS);
-        let key = ServerKey::from_request(&request).unwrap();
         let value = request.headers().get(VIA).unwrap();
         let range = value.as_bytes().as_ptr_range();
+
+        let key = ServerKey::from_request(&request).unwrap();
+        assert!(!range.contains(&key.branch().as_ptr()));
+        assert!(!range.contains(&key.host().as_ptr()));
+
+        // The client key is a slice, see its docs.
+        let key = ClientKey::from_request(&request).unwrap();
         assert!(range.contains(&key.branch.as_ptr()));
-        assert!(range.contains(&key.host.as_ptr()));
     }
 }

@@ -6,11 +6,12 @@ use std::time::Instant;
 
 use bytes::Bytes;
 
-use super::Timers;
 use crate::{
     header::HeaderMap,
-    response::{self, reply_headers},
-    Request, Response, StatusCode,
+    request::Request,
+    response::{self, reply_headers, Response},
+    status::StatusCode,
+    transaction::Timers,
 };
 
 /// A non-INVITE server transaction.
@@ -42,8 +43,10 @@ pub struct ServerTransaction {
     timers: Timers,
     reliable: bool,
     /// The header fields a response has to carry, copied from the request for
-    /// the 100 that the transaction may send itself.
-    headers: HeaderMap,
+    /// the 100 that the transaction may send itself. `None` once the final
+    /// response is out, since nothing is sent after it and the values would
+    /// keep the request's buffer alive for Timer J.
+    headers: Option<HeaderMap>,
     state: State,
 }
 
@@ -90,16 +93,19 @@ impl ServerTransaction {
         ServerTransaction {
             timers,
             reliable,
-            headers: reply_headers(request.headers()),
+            headers: Some(reply_headers(request.headers())),
             state: State::Trying { trying: now + timers.trying_after() },
         }
     }
 
-    /// The header fields a response to the request has to carry, as the
-    /// request had them. The caller builds a response of its own from them,
-    /// such as a 500 when the transaction user gave it nothing usable.
-    pub fn headers(&self) -> &HeaderMap {
-        &self.headers
+    /// Returns the header fields a response to the request has to carry, as
+    /// the request had them.
+    ///
+    /// The caller builds a response of its own from them, such as a 500 when
+    /// the transaction user gave it nothing usable. `None` once the final
+    /// response is out, when no response can be sent any more.
+    pub fn headers(&self) -> Option<&HeaderMap> {
+        self.headers.as_ref()
     }
 
     /// Returns when the caller should call [`on_timeout`] next, or `None` when
@@ -126,7 +132,9 @@ impl ServerTransaction {
     pub fn on_timeout(&mut self, now: Instant) -> Option<Bytes> {
         match &self.state {
             State::Trying { trying } if *trying <= now => {
-                let response = bare_response(&self.headers, TRYING);
+                let headers =
+                    self.headers.as_ref().expect("set until Completed");
+                let response = bare_response(headers, TRYING);
                 self.state = State::Proceeding { response: response.clone() };
 
                 Some(response)
@@ -180,12 +188,14 @@ impl ServerTransaction {
 
         if status == REQUEST_TIMEOUT {
             self.state = State::Terminated;
+            self.headers = None;
 
             return false;
         }
 
         // Timer J is 64 T1 over an unreliable transport, where the request may
         // still be retransmitted, and zero over a reliable one.
+        self.headers = None;
         self.state = if self.reliable {
             State::Terminated
         } else {
@@ -201,6 +211,7 @@ impl ServerTransaction {
     /// Ends the transaction because the transport could not send a response.
     pub fn on_transport_error(&mut self) {
         self.state = State::Terminated;
+        self.headers = None;
     }
 }
 

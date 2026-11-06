@@ -504,7 +504,7 @@ where
                         }
                     }
                 }
-                self.settle_server(key, before);
+                self.settle_server(&key, before);
             }
             Key::Client(key) => {
                 let Some(entry) = self.clients.get_mut(&key) else {
@@ -534,7 +534,7 @@ where
                     self.unanswered -= 1;
                 }
 
-                self.settle_client(key, before);
+                self.settle_client(&key, before);
             }
             Key::Shutdown => unreachable!("handled by the loop"),
         }
@@ -542,32 +542,44 @@ where
 
     /// Drops a server transaction that is over, or schedules its next deadline
     /// when it moved.
-    fn settle_server(&mut self, key: ServerKey, before: Option<Instant>) {
-        let Some(entry) = self.servers.get(&key) else { return };
+    ///
+    /// The timer gets the table's own key, not `key`. A key made from a
+    /// received message to look the transaction up is a slice of that message,
+    /// and in the heap it would keep the message's read chunk alive until the
+    /// timer fires.
+    fn settle_server(&mut self, key: &ServerKey, before: Option<Instant>) {
+        let Some((stored, entry)) = self.servers.get_key_value(key) else {
+            return;
+        };
         if entry.tx.is_terminated() {
-            self.servers.remove(&key);
+            self.servers.remove(key);
             return;
         }
 
         let after = entry.tx.deadline();
         if after != before {
             if let Some(at) = after {
-                self.timers.push(Timer { at, key: Key::Server(key) });
+                let key = Key::Server(stored.clone());
+                self.timers.push(Timer { at, key });
             }
         }
     }
 
-    fn settle_client(&mut self, key: ClientKey, before: Option<Instant>) {
-        let Some(entry) = self.clients.get(&key) else { return };
+    /// See [`Driver::settle_server`].
+    fn settle_client(&mut self, key: &ClientKey, before: Option<Instant>) {
+        let Some((stored, entry)) = self.clients.get_key_value(key) else {
+            return;
+        };
         if entry.tx.is_terminated() {
-            self.clients.remove(&key);
+            self.clients.remove(key);
             return;
         }
 
         let after = entry.tx.deadline();
         if after != before {
             if let Some(at) = after {
-                self.timers.push(Timer { at, key: Key::Client(key) });
+                let key = Key::Client(stored.clone());
+                self.timers.push(Timer { at, key });
             }
         }
     }
@@ -829,7 +841,7 @@ where
             | ClientEvent::Retransmit(_)
             | ClientEvent::Timeout => {}
         }
-        self.settle_client(key, before);
+        self.settle_client(&key, before);
     }
 
     fn on_request(&mut self, mut request: Request<Bytes>, link: Link) {
@@ -839,7 +851,7 @@ where
         let Some(via) = Via::top(value) else { return };
         let reply = reply_flow(&via, &link.flow);
         let marked = mark_via(value, &via, &link.flow);
-        let key = ServerKey::new(value, &via, request.method());
+        let key = ServerKey::new(&via, request.method());
 
         // The `Via` the request goes up with, and that every response carries,
         // has `received` and `rport` filled in (RFC 3261 section 18.2.1,
@@ -938,10 +950,14 @@ where
                 let Some(entry) = self.servers.get_mut(&key) else { return };
                 let (status, bytes) = match &response {
                     Some(response) => (response.status(), response.to_bytes()),
-                    None => (
-                        SERVER_ERROR,
-                        bare_response(entry.tx.headers(), SERVER_ERROR),
-                    ),
+                    None => match entry.tx.headers() {
+                        Some(headers) => (
+                            SERVER_ERROR,
+                            bare_response(headers, SERVER_ERROR),
+                        ),
+                        // The final response is out, so nothing can be sent.
+                        None => return,
+                    },
                 };
                 let before = entry.tx.deadline();
                 let send = entry.tx.on_response(status, bytes.clone(), now());
@@ -951,7 +967,7 @@ where
                         entry.tx.on_transport_error();
                     }
                 }
-                self.settle_server(key, before);
+                self.settle_server(&key, before);
             }
             Slot::Stateless(link) => {
                 if let Some(response) = response {

@@ -41,11 +41,19 @@ foldhash = { version = "0.2", optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true }
 
+[dev-dependencies]
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.5", features = ["limit", "util"] }
+
 # The example runs an endpoint, which needs the `tokio` feature.
 [[example]]
 name = "options"
 required-features = ["tokio"]
 
-[dev-dependencies]
-tokio = { version = "1.47", features = ["macros", "rt-multi-thread"] }
-tower = { version = "0.5", features = ["limit", "util"] }
+# Temporary. Runs many round trips on RFC timers so that the tables grow for
+# the whole run, and prints how long each took.
+#
+# Run under `/usr/bin/time -l` for the maximum RSS.
+[[example]]
+name = "tables"
+required-features = ["tokio"]
