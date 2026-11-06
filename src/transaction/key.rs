@@ -27,7 +27,11 @@ const COOKIE: &str = "z9hG4bK";
 ///
 /// The branch and the host are copied out of the request. A key lives in the
 /// table for Timer J after its request is gone, and a slice of the request
-/// would keep the whole read chunk the datagram came in alive with it.
+/// would keep the whole read chunk the datagram came in alive with it. [A note
+/// in the repository] goes through what else held memory past the final
+/// response and what the change measured.
+///
+/// [A note in the repository]: https://github.com/ryumatag/signa/blob/main/docs/notes/pr38-memory-retention-in-completed-transaction.md
 #[derive(Clone, Debug)]
 pub struct ServerKey {
     /// The branch, then the host, in one allocation.
