@@ -53,10 +53,11 @@ pub enum ClientEvent {
     Timeout,
 }
 
-/// What the transaction keeps is what its next step needs. The encoded
-/// request lives in the states that retransmit it, so that it is freed with
-/// the final response rather than with the transaction, and the timers are
-/// the caller's, passed in with each event that uses them.
+/// What the transaction keeps is what its next step needs.
+///
+/// The encoded request lives in the states that retransmit it, so that it is
+/// freed with the final response rather than with the transaction, and the
+/// timers are the caller's, passed in with each event that uses them.
 #[derive(Debug)]
 enum State {
     /// No response yet. `e` is the next retransmission, `None` over a reliable
@@ -93,7 +94,7 @@ impl ClientTransaction {
         timers: &Timers,
         now: Instant,
     ) -> ClientTransaction {
-        let e = if reliable { None } else { Some(now + timers.t1) };
+        let e = if reliable { None } else { Some(now + timers.t1()) };
         let f = now + timers.transaction_timeout();
 
         ClientTransaction {
@@ -155,7 +156,7 @@ impl ClientTransaction {
                 // In Proceeding, every retransmission waits T2.
                 match e {
                     Some(due) if *due <= now => {
-                        *due = now + timers.t2;
+                        *due = now + timers.t2();
                         ClientEvent::Retransmit(request.clone())
                     }
                     _ => ClientEvent::None,
@@ -196,7 +197,7 @@ impl ClientTransaction {
             // retransmitted response may still arrive, and zero over a
             // reliable one. The request goes with the old state.
             self.state = match e {
-                Some(_) => State::Completed { k: now + timers.t4 },
+                Some(_) => State::Completed { k: now + timers.t4() },
                 None => State::Terminated,
             };
 
@@ -220,8 +221,8 @@ impl ClientTransaction {
 
     /// Ends the transaction because the transport could not send the request.
     ///
-    /// RFC 3261 section 8.1.3.1 treats this as a 503. The caller reports
-    /// it, since the error happened in the caller's hands.
+    /// RFC 3261 section 8.1.3.1 treats this as a 503. The caller reports it,
+    /// since the error happened in the caller's hands.
     pub fn on_transport_error(&mut self) {
         self.state = State::Terminated;
     }
@@ -235,18 +236,21 @@ impl ClientTransaction {
 fn interval(timers: &Timers, doublings: u8) -> Duration {
     let factor = 1u32.checked_shl(u32::from(doublings)).unwrap_or(u32::MAX);
 
-    timers.t1.checked_mul(factor).map_or(timers.t2, |gap| gap.min(timers.t2))
+    timers
+        .t1()
+        .checked_mul(factor)
+        .map_or(timers.t2(), |gap| gap.min(timers.t2()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::StatusCode;
+    use crate::status::StatusCode;
 
     const T1: Duration = Duration::from_millis(500);
     const T2: Duration = Duration::from_secs(4);
     const T4: Duration = Duration::from_secs(5);
-    const TIMERS: Timers = Timers { t1: T1, t2: T2, t4: T4 };
+    const TIMERS: Timers = Timers::new();
 
     fn request() -> Bytes {
         Bytes::from_static(b"OPTIONS sip:a@b SIP/2.0\r\n\r\n")
@@ -279,7 +283,9 @@ mod tests {
             now = deadline;
             let event = tx.on_timeout(&TIMERS, now);
             assert!(
-                matches!(event, ClientEvent::Retransmit(ref b) if *b == request()),
+                matches!(
+                    event, ClientEvent::Retransmit(ref b) if *b == request()
+                ),
                 "{event:?}"
             );
             sent.push(now - start);
@@ -303,6 +309,7 @@ mod tests {
     fn calling_on_timeout_early_does_nothing() {
         let start = Instant::now();
         let mut tx = ClientTransaction::new(request(), false, &TIMERS, start);
+
         assert!(matches!(tx.on_timeout(&TIMERS, start), ClientEvent::None));
         assert!(matches!(
             tx.on_timeout(&TIMERS, start + T1 - Duration::from_millis(1)),
@@ -419,6 +426,7 @@ mod tests {
     fn a_transport_error_ends_it() {
         let start = Instant::now();
         let mut tx = ClientTransaction::new(request(), false, &TIMERS, start);
+
         tx.on_transport_error();
         assert!(tx.is_terminated());
         assert_eq!(tx.deadline(), None);

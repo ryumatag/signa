@@ -184,6 +184,7 @@ pub mod bench {
     #[doc(hidden)]
     pub use crate::frame::{DecodeError, Decoder, Frame, Limits, Role};
     pub use crate::header::{cseq::CSeq, via::Via};
+    pub use crate::transaction::invite;
     pub use crate::transaction::{
         ClientEvent, ClientKey, ClientTransaction, ServerKey,
         ServerTransaction, Timers,

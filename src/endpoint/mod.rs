@@ -115,7 +115,7 @@ pub use self::{
 };
 pub use crate::{
     frame::Limits,
-    transaction::Timers,
+    transaction::{InvalidTimers, Timers, TimersBuilder},
     transport::{Flow, Transport},
 };
 
@@ -241,7 +241,7 @@ impl fmt::Debug for Endpoint {
 /// # let _guard = rt.enter();
 /// let endpoint = Endpoint::builder()
 ///     .udp("0.0.0.0:5060".parse().unwrap())
-///     .timers(Timers { t1: Duration::from_millis(200), ..Timers::default() })
+///     .timers(Timers::builder().t1(Duration::from_millis(200)).build().unwrap())
 ///     .max_pending_requests(256)
 ///     .serve(service())?;
 /// # Ok(())

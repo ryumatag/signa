@@ -39,11 +39,14 @@ const LOCALHOST: SocketAddr =
 
 /// Timers that make a test wait milliseconds instead of seconds. Timer F is
 /// 640 ms, and the 100 goes out after 70 ms.
-const FAST: Timers = Timers {
-    t1: Duration::from_millis(10),
-    t2: Duration::from_millis(40),
-    t4: Duration::from_millis(50),
-};
+fn short_timers() -> Timers {
+    Timers::builder()
+        .t1(Duration::from_millis(10))
+        .t2(Duration::from_millis(40))
+        .t4(Duration::from_millis(50))
+        .build()
+        .unwrap()
+}
 
 fn request(method: &str) -> Request<Bytes> {
     Request::builder()
@@ -101,7 +104,7 @@ where
     Endpoint::builder()
         .udp(LOCALHOST)
         .tcp(LOCALHOST)
-        .timers(FAST)
+        .timers(short_timers())
         .serve(service)
         .unwrap()
 }
@@ -516,7 +519,7 @@ async fn overload_gets_a_stateless_503() {
     };
     let server = Endpoint::builder()
         .udp(LOCALHOST)
-        .timers(FAST)
+        .timers(short_timers())
         .max_pending_requests(1)
         .serve(service)
         .unwrap();
@@ -739,7 +742,7 @@ async fn refused_requests_and_connections_are_errors() {
     let peer = Peer::new().await;
     let limited = Endpoint::builder()
         .udp(LOCALHOST)
-        .timers(FAST)
+        .timers(short_timers())
         .max_client_transactions(1)
         .serve(Counting::default())
         .unwrap();

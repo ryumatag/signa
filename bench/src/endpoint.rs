@@ -26,11 +26,14 @@ const LOCALHOST: SocketAddr =
 // rate of this benchmark the tables and the timer heap would grow for its
 // whole run and the numbers would depend on how long it ran. Short timers keep
 // them at a steady size. The round trip itself does not wait on any timer.
-const SHORT_TIMERS: Timers = Timers {
-    t1: Duration::from_millis(10),
-    t2: Duration::from_millis(40),
-    t4: Duration::from_millis(50),
-};
+fn short_timers() -> Timers {
+    Timers::builder()
+        .t1(Duration::from_millis(10))
+        .t2(Duration::from_millis(40))
+        .t4(Duration::from_millis(50))
+        .build()
+        .unwrap()
+}
 
 /// Answers every request with a 200 at once.
 #[derive(Clone)]
@@ -72,14 +75,14 @@ pub(super) fn round_trip(c: &mut Criterion) {
         let server = Endpoint::builder()
             .udp(LOCALHOST)
             .tcp(LOCALHOST)
-            .timers(SHORT_TIMERS)
+            .timers(short_timers())
             .serve(Ok200)
             .unwrap();
         // Even with Timer K at 50 ms, more than the default 4096 client
         // transactions are open at once.
         let client_end = Endpoint::builder()
             .udp(LOCALHOST)
-            .timers(SHORT_TIMERS)
+            .timers(short_timers())
             .max_client_transactions(1 << 20)
             .serve(Ok200)
             .unwrap();

@@ -253,11 +253,7 @@ mod tests {
     use super::*;
 
     const T1: Duration = Duration::from_millis(500);
-    const TIMERS: Timers = Timers {
-        t1: T1,
-        t2: Duration::from_secs(4),
-        t4: Duration::from_secs(5),
-    };
+    const TIMERS: Timers = Timers::new();
 
     const REQUEST: &[u8] = b"OPTIONS sip:carol@chicago.example.com SIP/2.0\r\n\
         Via: SIP/2.0/UDP proxy.example.com;branch=z9hG4bKnashds8\r\n\
@@ -289,8 +285,8 @@ mod tests {
     #[test]
     fn sends_a_100_itself_when_nothing_was_sent_in_time() {
         let start = Instant::now();
-        let mut tx = transaction(false, start);
 
+        let mut tx = transaction(false, start);
         // Retransmissions before any response are absorbed.
         assert_eq!(tx.on_retransmission(), None);
         assert_eq!(tx.deadline(), Some(start + 7 * T1));
@@ -331,6 +327,7 @@ mod tests {
     #[test]
     fn a_response_in_time_cancels_the_100() {
         let start = Instant::now();
+
         let mut tx = transaction(false, start);
         assert!(tx.on_response(
             status(200),
@@ -346,6 +343,7 @@ mod tests {
     #[test]
     fn a_100_from_the_user_is_sent_and_other_provisionals_are_not() {
         let start = Instant::now();
+
         let mut tx = transaction(false, start);
         assert!(!tx.on_response(status(180), response(180), &TIMERS, start));
         assert_eq!(tx.on_retransmission(), None);
@@ -359,6 +357,7 @@ mod tests {
     #[test]
     fn the_final_response_is_resent_until_timer_j() {
         let start = Instant::now();
+
         let mut tx = transaction(false, start);
         assert!(tx.on_response(
             status(100),
@@ -388,6 +387,7 @@ mod tests {
     #[test]
     fn a_reliable_transport_ends_with_the_final_response() {
         let start = Instant::now();
+
         let mut tx = transaction(true, start);
         // The 100 rule holds on every transport.
         assert_eq!(tx.deadline(), Some(start + 7 * T1));
@@ -405,6 +405,7 @@ mod tests {
     #[test]
     fn a_408_is_dropped_and_ends_it() {
         let start = Instant::now();
+
         let mut tx = transaction(false, start);
         assert!(!tx.on_response(
             status(408),
@@ -419,6 +420,7 @@ mod tests {
     #[test]
     fn a_transport_error_ends_it() {
         let start = Instant::now();
+
         let mut tx = transaction(false, start);
         tx.on_transport_error();
         assert!(tx.is_terminated());

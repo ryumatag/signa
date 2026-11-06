@@ -35,6 +35,7 @@ criterion::criterion_group! {
         via::parse,
         header_map::prepend,
         transaction::non_invite,
+        transaction::invite,
         // Loopback round trips through the transports, on a current-thread
         // runtime. These include the syscalls.
         transport::udp,

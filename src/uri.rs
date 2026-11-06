@@ -115,6 +115,11 @@ impl Uri {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Copies validated text so a retained URI does not pin a read buffer.
+    pub(crate) fn copy(&self) -> Uri {
+        Uri(ByteStr::from(self.as_str()))
+    }
 }
 
 impl AsRef<str> for Uri {
