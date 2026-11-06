@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+
+# Measures what the transaction tables cost.
+#
+# Runs `examples/tables`, which does many round trips on RFC timers so that
+# every transaction is still in the tables at the end, under `/usr/bin/time`
+# for the maximum RSS and the time per round trip. On macOS, `-H` also samples
+# the heap with `heap -s` right after the last round trip, while Timer K and
+# Timer J still hold every transaction, and prints the size histogram.
+#
+#   scripts/tables                this checkout, three runs
+#   scripts/tables -c main        a copy of `main` against this checkout
+#   scripts/tables -H -c 0.2.1    and the heap histograms
+#
+# The runs alternate between the trees, so that a drift of the machine shows
+# in both. A copy of a ref is made with `git archive` under `tmp/tables/` and
+# keeps its `target/`, so the next comparison against the same ref rebuilds
+# only what changed.
+#
+# You'll need Bash, Cargo, Git, and GNU or BSD time at `/usr/bin/time`. On
+# Debian and Ubuntu that is the `time` package.
+
+set -euo pipefail
+
+usage() {
+  cat >&2 <<EOF
+Usage: $(basename "$0") [-n ROUND_TRIPS] [-r RUNS] [-c REF]... [-H] [TREE]...
+
+  -n  round trips per run, 200000 by default
+  -r  runs per tree, 3 by default
+  -c  measure a copy of the Git ref REF too, made under tmp/tables/
+  -H  sample the heap once per tree with the tables full (macOS)
+
+Each TREE is a checkout of signa. Without one, this checkout is measured.
+EOF
+  exit 2
+}
+
+die() {
+  printf '%s\n' "$*" >&2
+  exit 1
+}
+
+repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+round_trips=200000
+runs=3
+heap=false
+refs=()
+while getopts 'n:r:c:H' opt; do
+  case "$opt" in
+    n) round_trips="$OPTARG" ;;
+    r) runs="$OPTARG" ;;
+    c) refs+=("$OPTARG") ;;
+    H) heap=true ;;
+    *) usage ;;
+  esac
+done
+shift $((OPTIND - 1))
+[[ "$round_trips" =~ ^[0-9]+$ && "$runs" =~ ^[0-9]+$ ]] || usage
+
+# BSD time prints the maximum RSS in bytes, GNU time in kilobytes.
+case "$(uname -s)" in
+  Darwin)
+    time_flag=-l
+    rss_line='maximum resident set size'
+    rss_unit=1
+    ;;
+  Linux)
+    time_flag=-v
+    rss_line='Maximum resident set size'
+    rss_unit=1024
+    ;;
+  *) die "$(uname -s) is not supported" ;;
+esac
+[[ -x /usr/bin/time ]] || die '/usr/bin/time is missing'
+if $heap && [[ "$(uname -s)" != Darwin ]]; then
+  die 'heap is a macOS tool'
+fi
+
+# The trees to measure, as directories, and a label for each. The copies of
+# refs come first, so that a comparison reads base, then head.
+dirs=()
+labels=()
+for ref in ${refs[@]+"${refs[@]}"}; do
+  commit="$(git -C "$repo" rev-parse --short "$ref^{commit}")" \
+    || die "$ref is not a commit"
+  git -C "$repo" cat-file -e "$ref:examples/tables.rs" 2>/dev/null \
+    || die "$ref has no examples/tables.rs"
+  dir="$repo/tmp/tables/${ref//\//-}"
+  mkdir -p "$dir"
+  find "$dir" -mindepth 1 -maxdepth 1 ! -name target -exec rm -rf {} +
+  git -C "$repo" archive "$ref" | tar -xf - -C "$dir"
+  dirs+=("$dir")
+  labels+=("$ref ($commit)")
+done
+if [[ $# == 0 ]]; then
+  dirs+=("$repo")
+  labels+=('working tree')
+fi
+for tree in "$@"; do
+  [[ -f "$tree/examples/tables.rs" ]] \
+    || die "$tree is not a checkout with examples/tables.rs"
+  dirs+=("$(cd -- "$tree" && pwd)")
+  labels+=("$tree")
+done
+
+# Each tree builds into its own `target/`, whatever `CARGO_TARGET_DIR` says,
+# so the binary is where this script looks for it.
+bins=()
+for dir in "${dirs[@]}"; do
+  CARGO_TARGET_DIR="$dir/target" \
+    cargo build -q --release --example tables --manifest-path "$dir/Cargo.toml"
+  bins+=("$dir/target/release/examples/tables")
+done
+
+# Prints the time per round trip in microseconds and the maximum RSS in
+# megabytes of one run of `$1`.
+measure() {
+  local out
+  out="$( { /usr/bin/time "$time_flag" "$1" "$round_trips"; } 2>&1 )" \
+    || die "$out"
+  awk -v line="$rss_line" -v unit="$rss_unit" '
+    /round trips/ { us = $(NF - 2) }
+    index($0, line) {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^[0-9]+$/) { rss = $i; break }
+      }
+    }
+    END { printf "%s %.0f\n", us, rss * unit / 1e6 }
+  ' <<<"$out"
+}
+
+# Runs `$1` with the tables full and prints its heap by allocation size.
+sample_heap() {
+  local out child pid
+  out="$(mktemp)"
+  "$1" "$round_trips" wait >"$out" 2>&1 &
+  child=$!
+  # shellcheck disable=SC2064
+  trap "kill $child 2>/dev/null; rm -f '$out'" EXIT
+  until grep -q '^pid ' "$out"; do
+    kill -0 "$child" 2>/dev/null || die "$(cat "$out")"
+    sleep 0.2
+  done
+  pid="$(sed -n 's/^pid //p' "$out")"
+  heap -s "$pid" | grep '^All zones'
+  kill "$child"
+  wait "$child" 2>/dev/null || true
+  rm -f "$out"
+  trap - EXIT
+}
+
+printf '%s round trips, 16 in flight, RFC 3261 timers\n\n' "$round_trips"
+printf '%-24s %4s %16s %9s\n' tree run 'us/round trip' 'max RSS'
+for ((run = 1; run <= runs; run++)); do
+  for i in "${!bins[@]}"; do
+    read -r us rss < <(measure "${bins[i]}")
+    printf '%-24s %4d %16s %6s MB\n' "${labels[i]}" "$run" "$us" "$rss"
+  done
+done
+
+if $heap; then
+  for i in "${!bins[@]}"; do
+    printf '\n%s, heap with the tables full\n' "${labels[i]}"
+    sample_heap "${bins[i]}"
+  done
+fi

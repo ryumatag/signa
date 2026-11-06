@@ -1,8 +1,8 @@
 /*!
-Temporary. Runs many round trips on RFC timers so that the tables grow for the
-whole run, and prints how long each took.
-
-Run under `/usr/bin/time -l` for the maximum RSS.
+Runs many round trips on RFC timers, so that every transaction is still in the
+tables at the end, and prints how long each took. `scripts/tables` runs it
+under `/usr/bin/time` for the maximum RSS, and with a second argument it waits
+with the tables full for `heap -s`.
 */
 
 #![allow(unreachable_code)]

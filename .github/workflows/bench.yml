@@ -123,3 +123,22 @@ jobs:
             critcmp -t 5 base head || true
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
+      # Memory is a goal too. The tables example fills both tables with 200k
+      # transactions, and the maximum RSS says what each one costs. The time
+      # per round trip is as noisy as the benchmarks above, and the RSS moves
+      # by a few percent between runs, with where the allocator puts the
+      # tables as they grow. The script skips nothing, so a base without the
+      # example fails the step, which `continue-on-error` keeps from failing
+      # the job.
+      - name: Measure the tables
+        if: steps.base.outputs.ran == 'true'
+        continue-on-error: true
+        run: |
+          [[ -x /usr/bin/time ]] || sudo apt-get install -y time
+          {
+            echo "## Tables against $BASE_LABEL"
+            echo
+            echo '```'
+            scripts/tables -c "$BASE_SHA"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"

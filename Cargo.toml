@@ -60,10 +60,7 @@ tower = { version = "0.5", features = ["limit", "util"] }
 name = "options"
 required-features = ["tokio"]
 
-# Temporary. Runs many round trips on RFC timers so that the tables grow for
-# the whole run, and prints how long each took.
-#
-# Run under `/usr/bin/time -l` for the maximum RSS.
+# What the transaction tables cost. `scripts/tables` runs it.
 [[example]]
 name = "tables"
 required-features = ["tokio"]
