@@ -7,10 +7,12 @@ use std::time::Instant;
 use bytes::Bytes;
 
 use crate::{
-    header::HeaderMap,
-    request::Request,
-    response::{self, reply_headers, Response},
-    status::StatusCode,
+    message::{
+        header::HeaderMap,
+        request::Request,
+        response::{bare_response, reply_headers},
+        StatusCode,
+    },
     transaction::Timers,
 };
 
@@ -35,7 +37,7 @@ use crate::{
 /// same time anyway. The transaction user therefore has no reason to send
 /// anything but the final response.
 ///
-/// [`ServerKey`]: super::ServerKey
+/// [`ServerKey`]: crate::transaction::key::ServerKey
 /// [`deadline`]: ServerTransaction::deadline
 /// [`is_terminated`]: ServerTransaction::is_terminated
 #[derive(Debug)]
@@ -237,20 +239,12 @@ impl ServerTransaction {
     }
 }
 
-/// Encodes a response with `status`, `headers`, and no body. This is what the
-/// transaction layer sends on its own, such as the 100 and the 500.
-pub(crate) fn bare_response(headers: &HeaderMap, status: StatusCode) -> Bytes {
-    let mut parts = response::Parts::new(status);
-    parts.headers = headers.clone();
-
-    Response::from_parts(parts, Bytes::new()).to_bytes()
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::message::Response;
 
     const T1: Duration = Duration::from_millis(500);
     const TIMERS: Timers = Timers::new();

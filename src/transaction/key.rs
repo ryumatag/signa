@@ -6,8 +6,12 @@ use std::hash::{Hash, Hasher};
 
 use bytes::Bytes;
 
-use super::super::header::{cseq::CSeq, via::Via, VIA};
-use crate::{header::CSEQ, Method, Request, Response};
+use crate::message::{
+    header::{cseq::CSeq, via::Via, CSEQ, VIA},
+    request::Request,
+    response::Response,
+    Method,
+};
 
 /// The magic cookie that starts every branch an RFC 3261 element makes.
 const COOKIE: &str = "z9hG4bK";

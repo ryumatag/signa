@@ -1,7 +1,7 @@
 ### Serving requests
 
 A UAS that answers every request with a 200. The service gets the request with
-the [`Flow`](endpoint::Flow) it arrived on in its extensions, and
+the [`Flow`](transport::Flow) it arrived on in its extensions, and
 [`Response::reply_to`] starts the response with the header fields the
 [`Endpoint`](endpoint::Endpoint) routes it by.
 
@@ -38,7 +38,7 @@ response.
 
 ```no_run
 use bytes::Bytes;
-use signa::{endpoint::{Endpoint, Transport}, Request, StatusCode};
+use signa::{endpoint::Endpoint, transport::Transport, Request, StatusCode};
 use tower_service::Service;
 
 # async fn run(endpoint: Endpoint) -> Result<(), Box<dyn std::error::Error>> {

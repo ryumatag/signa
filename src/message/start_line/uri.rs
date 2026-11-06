@@ -9,7 +9,7 @@ use std::{fmt, str::FromStr};
 use bytes::Bytes;
 use siparse::check;
 
-use crate::{error::InvalidUri, util::ByteStr};
+use crate::message::{byte_str::ByteStr, error::InvalidUri};
 
 // TODO: Add structured access when something in signa picks a target from a
 // URI, which needs the host, port, `transport`, `maddr`, and `sips` scheme
@@ -65,7 +65,7 @@ use crate::{error::InvalidUri, util::ByteStr};
 /// assert_eq!(uri.as_str(), "sip:bob@biloxi.example.com;transport=tcp");
 ///
 /// assert!("sip:bob@biloxi.example.com bad".parse::<Uri>().is_err());
-/// # Ok::<(), signa::error::InvalidUri>(())
+/// # Ok::<(), signa::message::error::InvalidUri>(())
 /// ```
 ///
 /// [siparse]: https://docs.rs/siparse
@@ -117,6 +117,7 @@ impl Uri {
     }
 
     /// Copies validated text so a retained URI does not pin a read buffer.
+    #[cfg(any(feature = "tokio", feature = "__bench", test))]
     pub(crate) fn copy(&self) -> Uri {
         Uri(ByteStr::from(self.as_str()))
     }

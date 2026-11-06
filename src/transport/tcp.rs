@@ -45,11 +45,11 @@ use tokio::{
     time::{sleep, timeout},
 };
 
-use crate::{
-    frame::{Decoder, Frame, Limits, Role},
-    message::Message,
-    transport::{Flow, Transport},
+use super::{
+    framing::{Decoder, Frame, Role},
+    Flow, MessageLimits, Transport,
 };
+use crate::message::Message;
 
 /// How much to reserve before each read. A head is a few KiB at most, so this
 /// is a message or two per read without a large buffer per idle connection.
@@ -70,7 +70,7 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     /// The decoder's limits.
-    pub limits: Limits,
+    pub limits: MessageLimits,
     /// How long a connection may go without receiving anything.
     pub idle_timeout: Duration,
     /// How many connections a listener keeps open at once.
@@ -87,7 +87,7 @@ impl Default for Config {
     /// a client between keepalives, with room for a missed one.
     fn default() -> Config {
         Config {
-            limits: Limits::default(),
+            limits: MessageLimits::default(),
             idle_timeout: Duration::from_secs(300),
             max_connections: 1024,
             write_queue: 64,
@@ -379,7 +379,7 @@ async fn read_loop(
     mut read: OwnedReadHalf,
     flow: Flow,
     role: Role,
-    limits: Limits,
+    limits: MessageLimits,
     idle_timeout: Duration,
     inbound: mpsc::Sender<Inbound>,
     writer: Writer,
@@ -525,7 +525,7 @@ mod tests {
     use tokio::{net::TcpStream, time::sleep};
 
     use super::*;
-    use crate::{method::Method, status::StatusCode};
+    use crate::message::{Method, StatusCode};
 
     struct FailsAfter(usize);
 

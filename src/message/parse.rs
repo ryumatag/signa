@@ -14,16 +14,12 @@ use siparse::{
     ResponseHead, StartLine, Status, StatusLine,
 };
 
-use crate::{
+use crate::message::{
     error::{InvalidMessage, InvalidMessageKind},
     header::{HeaderMap, HeaderName, HeaderValue, CONTENT_LENGTH},
-    message::Message,
-    method::Method,
-    reason::ReasonPhrase,
     request::{self, Request},
     response::{self, Response},
-    status::StatusCode,
-    uri::Uri,
+    Message, Method, ReasonPhrase, StatusCode, Uri,
 };
 
 /// The most header rows a message can have.
@@ -78,11 +74,13 @@ pub(crate) fn message(src: Bytes) -> Result<Message<Bytes>, InvalidMessage> {
 /// The parts of a request or response whose head has been parsed, before its
 /// body is known.
 #[derive(Debug)]
+#[cfg(any(feature = "tokio", feature = "__bench", test))]
 pub(crate) enum Head {
     Request(request::Parts),
     Response(response::Parts),
 }
 
+#[cfg(any(feature = "tokio", feature = "__bench", test))]
 impl Head {
     pub(crate) fn headers(&self) -> &HeaderMap {
         match self {
@@ -109,6 +107,7 @@ impl Head {
 /// On `Complete`, the parts share `src`, and the offset is where the head
 /// ends, so the body starts there. `Partial` means `src` ends before the head
 /// does.
+#[cfg(any(feature = "tokio", feature = "__bench", test))]
 pub(crate) fn head(
     src: &Bytes,
 ) -> Result<Status<(Head, usize)>, InvalidMessage> {
@@ -273,232 +272,4 @@ fn parse_content_length(value: &HeaderValue) -> Option<usize> {
         return None;
     }
     digits.parse().ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::header::{CALL_ID, VIA};
-
-    const OPTIONS: &[u8] = b"OPTIONS sip:carol@chicago.example.com SIP/2.0\r\n\
-        Via: SIP/2.0/UDP pc33.atlanta.example.com;branch=z9hG4bKhjhs8ass877\r\n\
-        i: a84b4c76e66710\r\n\
-        X-Custom: one\r\n\
-        x-custom: two\r\n\
-        Content-Length: 4\r\n\
-        \r\n\
-        body";
-
-    const RINGING: &[u8] = b"SIP/2.0 180 Ringing\r\n\
-        Call-ID: a84b4c76e66710\r\n\
-        \r\n";
-
-    fn kind(err: InvalidMessage) -> InvalidMessageKind {
-        err.kind()
-    }
-
-    #[test]
-    fn parses_a_request() {
-        let request = Request::from_bytes(OPTIONS).unwrap();
-
-        assert_eq!(request.method(), Method::OPTIONS);
-        assert_eq!(request.uri().as_str(), "sip:carol@chicago.example.com");
-        assert_eq!(
-            request.headers().get(VIA).unwrap(),
-            "SIP/2.0/UDP pc33.atlanta.example.com;branch=z9hG4bKhjhs8ass877"
-        );
-        // The compact form `i` is `Call-ID`.
-        assert_eq!(request.headers().get(CALL_ID).unwrap(), "a84b4c76e66710");
-
-        let custom: Vec<_> = request.headers().get_all("x-custom").collect();
-        assert_eq!(custom, ["one", "two"]);
-        assert_eq!(request.body(), "body");
-    }
-
-    #[test]
-    fn parses_a_response() {
-        let response = Response::from_bytes(RINGING).unwrap();
-
-        assert_eq!(response.status(), StatusCode::RINGING);
-        assert_eq!(response.reason().unwrap().as_str(), "Ringing");
-        assert_eq!(response.headers().get(CALL_ID).unwrap(), "a84b4c76e66710");
-        assert!(response.body().is_empty());
-    }
-
-    #[test]
-    fn keeps_an_empty_reason_phrase() {
-        let response = Response::from_bytes(b"SIP/2.0 200 \r\n\r\n").unwrap();
-
-        assert_eq!(response.reason().unwrap().as_str(), "");
-    }
-
-    #[test]
-    fn parses_either_kind_as_a_message() {
-        let Message::Request(request) = Message::from_bytes(OPTIONS).unwrap()
-        else {
-            panic!("expected a request");
-        };
-        assert_eq!(request.method(), Method::OPTIONS);
-
-        let Message::Response(response) =
-            Message::from_bytes(RINGING).unwrap()
-        else {
-            panic!("expected a response");
-        };
-        assert_eq!(response.status(), StatusCode::RINGING);
-    }
-
-    #[test]
-    fn shares_the_input_instead_of_copying() {
-        let src = Bytes::from_static(OPTIONS);
-        let range = src.as_ptr_range();
-        let within = |bytes: &[u8]| range.contains(&bytes.as_ptr());
-
-        let request = Request::from_shared(src.clone()).unwrap();
-
-        assert!(within(request.uri().as_str().as_bytes()));
-        assert!(within(request.headers().get(VIA).unwrap().as_bytes()));
-        assert!(within(request.body()));
-    }
-
-    #[test]
-    fn body_without_content_length_is_the_rest() {
-        let request = Request::from_bytes(
-            b"MESSAGE sip:bob@biloxi.example.com SIP/2.0\r\n\r\nhello",
-        )
-        .unwrap();
-
-        assert_eq!(request.body(), "hello");
-    }
-
-    #[test]
-    fn content_length_cuts_off_trailing_bytes() {
-        let request = Request::from_bytes(
-            b"MESSAGE sip:bob@biloxi.example.com SIP/2.0\r\n\
-              l: 3 \r\n\
-              \r\n\
-              hello",
-        )
-        .unwrap();
-
-        assert_eq!(request.body(), "hel");
-    }
-
-    #[test]
-    fn rejects_a_body_shorter_than_content_length() {
-        let err = Request::from_bytes(
-            b"MESSAGE sip:bob@biloxi.example.com SIP/2.0\r\n\
-              Content-Length: 6\r\n\
-              \r\n\
-              hello",
-        )
-        .unwrap_err();
-
-        assert_eq!(
-            err.to_string(),
-            "SIP message body shorter than Content-Length"
-        );
-    }
-
-    #[test]
-    fn content_length_must_be_digits() {
-        for value in ["", "+5", "-1", "5 5", "0x5", "99999999999999999999999"]
-        {
-            let mut src = b"MESSAGE sip:bob@biloxi.example.com SIP/2.0\r\n\
-                Content-Length: "
-                .to_vec();
-            src.extend_from_slice(value.as_bytes());
-            src.extend_from_slice(b"\r\n\r\n");
-
-            let err = Request::from_bytes(&src).unwrap_err();
-            assert_eq!(
-                kind(err),
-                InvalidMessageKind::ContentLength,
-                "{value:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn repeated_content_length_must_agree() {
-        let request = Request::from_bytes(
-            b"MESSAGE sip:bob@biloxi.example.com SIP/2.0\r\n\
-              Content-Length: 2\r\n\
-              l: 2\r\n\
-              \r\n\
-              hi",
-        )
-        .unwrap();
-        assert_eq!(request.body(), "hi");
-
-        let err = Request::from_bytes(
-            b"MESSAGE sip:bob@biloxi.example.com SIP/2.0\r\n\
-              Content-Length: 2\r\n\
-              Content-Length: 1\r\n\
-              \r\n\
-              hi",
-        )
-        .unwrap_err();
-        assert_eq!(kind(err), InvalidMessageKind::ContentLength);
-    }
-
-    #[test]
-    fn rejects_an_incomplete_head() {
-        let err = Request::from_bytes(&OPTIONS[..40]).unwrap_err();
-
-        assert_eq!(kind(err), InvalidMessageKind::IncompleteHead);
-        assert_eq!(
-            Request::from_bytes(b"").unwrap_err().to_string(),
-            "incomplete SIP message head"
-        );
-    }
-
-    #[test]
-    fn reports_what_siparse_rejected() {
-        let err = Request::from_bytes(
-            b"OPTIONS sip:carol@chicago.example.com SIP/2.0\r\n\
-              Call ID: a84b4c76e66710\r\n\
-              \r\n",
-        )
-        .unwrap_err();
-        assert_eq!(err.to_string(), "missing colon after SIP header name");
-
-        // A request-line parser sees a status-line as a bad method.
-        let err = Request::from_bytes(RINGING).unwrap_err();
-        assert_eq!(kind(err), InvalidMessageKind::Head(ErrorKind::Method));
-
-        let err = Response::from_bytes(OPTIONS).unwrap_err();
-        assert_eq!(kind(err), InvalidMessageKind::Head(ErrorKind::Version));
-    }
-
-    #[test]
-    fn rejects_status_codes_outside_the_sip_classes() {
-        for code in ["000", "099", "700", "999"] {
-            let src = format!("SIP/2.0 {code} Odd\r\n\r\n");
-            let err = Response::from_bytes(src.as_bytes()).unwrap_err();
-            assert_eq!(kind(err), InvalidMessageKind::StatusCode, "{code}");
-        }
-    }
-
-    #[test]
-    fn limits_the_number_of_header_rows() {
-        let head = |rows: usize| {
-            let mut src =
-                b"OPTIONS sip:carol@chicago.example.com SIP/2.0\r\n".to_vec();
-            for _ in 0..rows {
-                src.extend_from_slice(b"X-Row: 1\r\n");
-            }
-            src.extend_from_slice(b"\r\n");
-            src
-        };
-
-        let request = Request::from_bytes(&head(MAX_HEADERS)).unwrap();
-        assert_eq!(request.headers().len(), MAX_HEADERS);
-
-        let err = Request::from_bytes(&head(MAX_HEADERS + 1)).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "more than 100 header fields in SIP message"
-        );
-    }
 }

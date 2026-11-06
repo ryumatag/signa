@@ -33,7 +33,7 @@ pub use self::as_header_name::AsHeaderName;
 /// # Example
 ///
 /// ```
-/// use signa::header::{HeaderMap, HeaderValue, CALL_ID, VIA};
+/// use signa::message::header::{CALL_ID, HeaderMap, HeaderValue, VIA};
 ///
 /// let mut headers = HeaderMap::new();
 /// headers.append(VIA, HeaderValue::from_static("SIP/2.0/UDP a.example.com"));
@@ -177,7 +177,7 @@ impl HeaderMap {
     /// # Example
     ///
     /// ```
-    /// use signa::header::{HeaderMap, HeaderValue, MAX_FORWARDS, VIA};
+    /// use signa::message::header::{HeaderMap, HeaderValue, MAX_FORWARDS, VIA};
     ///
     /// let mut headers = HeaderMap::new();
     /// headers.append(MAX_FORWARDS, HeaderValue::from_static("70"));

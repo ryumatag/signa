@@ -10,7 +10,7 @@ use std::{fmt, str::FromStr};
 use bytes::Bytes;
 use siparse::check;
 
-use crate::{error::InvalidReasonPhrase, util::ByteStr};
+use crate::message::{byte_str::ByteStr, error::InvalidReasonPhrase};
 
 /// The reason phrase of a SIP status-line.
 ///
@@ -52,7 +52,7 @@ use crate::{error::InvalidReasonPhrase, util::ByteStr};
 ///
 /// assert!("Say \"hi\"".parse::<ReasonPhrase>().is_err());
 /// assert!("Say %22hi%22".parse::<ReasonPhrase>().is_ok());
-/// # Ok::<(), signa::error::InvalidReasonPhrase>(())
+/// # Ok::<(), signa::message::error::InvalidReasonPhrase>(())
 /// ```
 ///
 /// [siparse]: https://docs.rs/siparse

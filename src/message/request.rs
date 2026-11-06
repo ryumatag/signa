@@ -8,13 +8,11 @@ use std::fmt;
 
 use bytes::{Bytes, BytesMut};
 
-use crate::{
-    error::{Error, InvalidMessage},
+use crate::message::{
+    error::{BuildError, InvalidMessage},
     extensions::Extensions,
     header::{HeaderMap, HeaderName, HeaderValue},
-    method::Method,
-    uri::Uri,
-    version::Version,
+    Method, Uri, Version,
 };
 
 /// A SIP request: a request-line, header fields, and a body.
@@ -28,7 +26,7 @@ use crate::{
 /// [`Request::builder`] builds a request step by step:
 ///
 /// ```
-/// use signa::{header::CALL_ID, Method, Request};
+/// use signa::{Method, Request, message::header::CALL_ID};
 ///
 /// let request = Request::builder()
 ///     .method("OPTIONS")
@@ -40,7 +38,7 @@ use crate::{
 /// assert_eq!(request.method(), Method::OPTIONS);
 /// assert_eq!(request.uri().as_str(), "sip:carol@chicago.example.com");
 /// assert_eq!(request.headers().get(CALL_ID).unwrap(), "a84b4c76e66710");
-/// # Ok::<(), signa::Error>(())
+/// # Ok::<(), signa::message::BuildError>(())
 /// ```
 ///
 /// The builder is the only way to create a request from scratch. A request
@@ -82,7 +80,7 @@ pub struct Parts {
 /// if either was never set.
 #[derive(Debug)]
 pub struct Builder {
-    inner: Result<Head, Error>,
+    inner: Result<Head, BuildError>,
 }
 
 // What a `Builder` has collected so far. The method and URI start out unset
@@ -131,7 +129,7 @@ impl Request<Bytes> {
     ///
     /// ```
     /// use bytes::Bytes;
-    /// use signa::{header::CALL_ID, Method, Request};
+    /// use signa::{Method, Request, message::header::CALL_ID};
     ///
     /// let request = Request::from_shared(Bytes::from_static(
     ///     b"MESSAGE sip:bob@biloxi.example.com SIP/2.0\r\n\
@@ -144,7 +142,7 @@ impl Request<Bytes> {
     /// assert_eq!(request.method(), Method::MESSAGE);
     /// assert_eq!(request.headers().get(CALL_ID).unwrap(), "a84b4c76e66710");
     /// assert_eq!(request.body(), "hello");
-    /// # Ok::<(), signa::error::InvalidMessage>(())
+    /// # Ok::<(), signa::message::error::InvalidMessage>(())
     /// ```
     ///
     /// # Errors
@@ -157,7 +155,7 @@ impl Request<Bytes> {
     ///   different values;
     /// * the body is shorter than `Content-Length`.
     pub fn from_shared(src: Bytes) -> Result<Request<Bytes>, InvalidMessage> {
-        crate::parse::request(src)
+        crate::message::parse::request(src)
     }
 }
 
@@ -197,10 +195,10 @@ impl<T: AsRef<[u8]>> Request<T> {
     ///        Content-Length: 0\r\n\
     ///        \r\n"[..]
     /// );
-    /// # Ok::<(), signa::Error>(())
+    /// # Ok::<(), signa::message::BuildError>(())
     /// ```
     pub fn encode(&self, dst: &mut BytesMut) {
-        crate::encode::request(self, dst);
+        crate::message::encode::request(self, dst);
     }
 
     /// Returns the request as the bytes of one complete message.
@@ -298,7 +296,7 @@ impl<T> Request<T> {
     ///
     /// let request = request.map(|body| body.len());
     /// assert_eq!(*request.body(), 18);
-    /// # Ok::<(), signa::Error>(())
+    /// # Ok::<(), signa::message::BuildError>(())
     /// ```
     pub fn map<U, F>(self, f: F) -> Request<U>
     where
@@ -355,7 +353,7 @@ impl Builder {
     pub fn method<M>(self, method: M) -> Builder
     where
         Method: TryFrom<M>,
-        <Method as TryFrom<M>>::Error: Into<Error>,
+        <Method as TryFrom<M>>::Error: Into<BuildError>,
     {
         self.and_then(|mut head| {
             head.method = Some(Method::try_from(method).map_err(Into::into)?);
@@ -374,7 +372,7 @@ impl Builder {
     pub fn uri<U>(self, uri: U) -> Builder
     where
         Uri: TryFrom<U>,
-        <Uri as TryFrom<U>>::Error: Into<Error>,
+        <Uri as TryFrom<U>>::Error: Into<BuildError>,
     {
         self.and_then(|mut head| {
             head.uri = Some(Uri::try_from(uri).map_err(Into::into)?);
@@ -396,9 +394,9 @@ impl Builder {
     pub fn header<K, V>(self, name: K, value: V) -> Builder
     where
         HeaderName: TryFrom<K>,
-        <HeaderName as TryFrom<K>>::Error: Into<Error>,
+        <HeaderName as TryFrom<K>>::Error: Into<BuildError>,
         HeaderValue: TryFrom<V>,
-        <HeaderValue as TryFrom<V>>::Error: Into<Error>,
+        <HeaderValue as TryFrom<V>>::Error: Into<BuildError>,
     {
         self.and_then(|mut head| {
             let name = HeaderName::try_from(name).map_err(Into::into)?;
@@ -453,10 +451,12 @@ impl Builder {
     ///
     /// Returns the first error from an earlier call, or an error if the method
     /// or Request-URI was never set.
-    pub fn body<T>(self, body: T) -> Result<Request<T>, Error> {
+    pub fn body<T>(self, body: T) -> Result<Request<T>, BuildError> {
         let head = self.inner?;
-        let method = head.method.ok_or_else(|| Error::missing("method"))?;
-        let uri = head.uri.ok_or_else(|| Error::missing("Request-URI"))?;
+        let method =
+            head.method.ok_or_else(|| BuildError::missing("method"))?;
+        let uri =
+            head.uri.ok_or_else(|| BuildError::missing("Request-URI"))?;
 
         let mut parts = Parts::new(method, uri);
         parts.headers = head.headers;
@@ -466,7 +466,7 @@ impl Builder {
 
     fn and_then<F>(self, f: F) -> Builder
     where
-        F: FnOnce(Head) -> Result<Head, Error>,
+        F: FnOnce(Head) -> Result<Head, BuildError>,
     {
         Builder { inner: self.inner.and_then(f) }
     }
@@ -480,7 +480,7 @@ impl Default for Builder {
 
 #[cfg(test)]
 mod tests {
-    use crate::header::{HeaderValue, CSEQ, VIA};
+    use crate::message::header::{HeaderValue, CSEQ, VIA};
 
     use super::*;
 
@@ -595,7 +595,7 @@ mod tests {
         assert!(builder.method_ref().is_none());
         assert!(builder.headers_mut().is_none());
         let err = builder.body(()).unwrap_err();
-        assert!(err.is::<crate::error::InvalidUri>());
+        assert!(err.is::<crate::message::error::InvalidUri>());
     }
 
     #[test]
@@ -606,7 +606,7 @@ mod tests {
             .header("Subject", "bare\nlf")
             .body(())
             .unwrap_err();
-        assert!(err.is::<crate::error::InvalidHeaderValue>());
+        assert!(err.is::<crate::message::error::InvalidHeaderValue>());
     }
 
     #[test]

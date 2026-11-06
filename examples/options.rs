@@ -9,7 +9,8 @@ use std::convert::Infallible;
 
 use bytes::Bytes;
 use signa::{
-    endpoint::{Endpoint, Flow, Transport},
+    endpoint::Endpoint,
+    transport::{Flow, Transport},
     Request, Response, StatusCode,
 };
 use tower_service::Service;

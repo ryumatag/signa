@@ -10,7 +10,7 @@ use std::{
     str::{self, FromStr},
 };
 
-use crate::error::InvalidStatusCode;
+use crate::message::error::InvalidStatusCode;
 
 /// A SIP response status code.
 ///
@@ -99,7 +99,7 @@ impl StatusCode {
     ///
     /// assert_eq!(StatusCode::RINGING.canonical_reason(), Some("Ringing"));
     /// assert_eq!(StatusCode::from_u16(299)?.canonical_reason(), None);
-    /// # Ok::<(), signa::error::InvalidStatusCode>(())
+    /// # Ok::<(), signa::message::error::InvalidStatusCode>(())
     /// ```
     ///
     /// [RFC 3261 section 7.2]: https://www.rfc-editor.org/rfc/rfc3261#section-7.2

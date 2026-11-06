@@ -6,10 +6,13 @@ use std::{
 use bytes::Bytes;
 
 use crate::{
-    header::HeaderMap,
-    response::reply_headers,
-    transaction::{bare_response, Timers},
-    Request, StatusCode,
+    message::{
+        header::HeaderMap,
+        request::Request,
+        response::{bare_response, reply_headers},
+        StatusCode,
+    },
+    transaction::Timers,
 };
 
 /// The INVITE server machine, including RFC 6026's Accepted state.
@@ -211,6 +214,229 @@ impl ServerTransaction {
             ServerEvent::None
         } else {
             ServerEvent::TransportError
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{request, response, T1, TIMERS};
+    use super::ServerEvent as S;
+    use super::*;
+    use crate::message::Response;
+    fn server(reliable: bool) -> ServerTransaction {
+        let (tx, trying) = ServerTransaction::new(&request(), reliable);
+        let trying = Response::from_shared(trying.clone()).unwrap();
+
+        assert_eq!(trying.status(), StatusCode::TRYING);
+        assert!(trying.body().is_empty());
+        assert_eq!(tx.on_retransmission(), S::Send(trying.to_bytes()));
+
+        tx
+    }
+
+    fn send(tx: &mut ServerTransaction, code: u16, now: Instant) -> S {
+        let response = response(code, "bob");
+        tx.on_response(response.status(), response.to_bytes(), &TIMERS, now)
+            .unwrap()
+    }
+
+    #[test]
+    fn server_proceeding_retransmits_the_latest_provisional() {
+        let start = Instant::now();
+        for reliable in [false, true] {
+            let mut tx = server(reliable);
+
+            assert!(tx.headers().is_some());
+            assert_eq!(tx.deadline(), None);
+            assert_eq!(tx.on_ack(&TIMERS, start), S::None);
+
+            for code in [100, 180, 183, 199] {
+                let sent = send(&mut tx, code, start);
+
+                assert_eq!(tx.on_retransmission(), sent);
+                assert_eq!(tx.deadline(), None);
+            }
+
+            assert_eq!(tx.on_timeout(&TIMERS, start + 1000 * T1), S::None);
+        }
+    }
+
+    // RFC 3261 17.2.1. H wins over G, and G caps at T2.
+    #[test]
+    fn server_g_caps_at_t2_and_h_times_out() {
+        let start = Instant::now();
+        let mut tx = server(false);
+        let sent = send(&mut tx, 486, start);
+
+        assert!(tx.headers().is_none());
+        assert_eq!(tx.on_retransmission(), sent);
+
+        for multiple in [1, 3, 7, 15, 23, 31, 39, 47, 55, 63] {
+            let at = start + multiple * T1;
+
+            assert_eq!(tx.deadline(), Some(at));
+            assert_eq!(
+                tx.on_timeout(&TIMERS, at - Duration::from_nanos(1)),
+                S::None
+            );
+            assert_eq!(tx.on_timeout(&TIMERS, at), sent);
+        }
+
+        assert_eq!(tx.deadline(), Some(start + 64 * T1));
+        assert_eq!(tx.on_timeout(&TIMERS, start + 64 * T1), S::Timeout);
+        assert!(tx.is_terminated());
+        assert_eq!(tx.on_retransmission(), S::None);
+
+        let mut late = server(false);
+        send(&mut late, 486, start);
+
+        assert_eq!(late.on_timeout(&TIMERS, start + 64 * T1), S::Timeout);
+    }
+
+    #[test]
+    fn reliable_server_waits_for_ack_or_h_without_g() {
+        let start = Instant::now();
+        let mut tx = server(true);
+        let sent = send(&mut tx, 486, start);
+
+        assert_eq!(tx.deadline(), Some(start + 64 * T1));
+        assert_eq!(tx.on_timeout(&TIMERS, start + T1), S::None);
+        assert_eq!(tx.on_retransmission(), sent);
+        assert_eq!(tx.on_timeout(&TIMERS, start + 64 * T1), S::Timeout);
+
+        let mut tx = server(true);
+        send(&mut tx, 486, start);
+
+        assert_eq!(tx.on_ack(&TIMERS, start + T1), S::Terminated);
+        assert!(tx.is_terminated());
+    }
+
+    #[test]
+    fn non_success_ack_starts_i_and_repeated_ack_does_not_extend_it() {
+        let start = Instant::now();
+        let mut tx = server(false);
+        send(&mut tx, 486, start);
+
+        assert_eq!(tx.on_ack(&TIMERS, start + T1), S::None);
+
+        let end = start + T1 + TIMERS.t4();
+
+        assert_eq!(tx.deadline(), Some(end));
+        assert_eq!(tx.on_retransmission(), S::None);
+        assert_eq!(tx.on_ack(&TIMERS, start + 2 * T1), S::None);
+        assert_eq!(tx.deadline(), Some(end));
+        assert_eq!(
+            tx.on_timeout(&TIMERS, end - Duration::from_nanos(1)),
+            S::None
+        );
+        assert_eq!(tx.on_timeout(&TIMERS, end), S::Terminated);
+        assert_eq!(tx.on_ack(&TIMERS, end), S::None);
+    }
+
+    // RFC 6026 8.7/8.8. L remains live across ACK and response transport
+    // errors.
+    #[test]
+    fn accepted_server_absorbs_invites_and_passes_ack_without_restarting_l() {
+        let start = Instant::now();
+        for reliable in [false, true] {
+            let mut tx = server(reliable);
+
+            for offset in 0..3 {
+                assert!(matches!(
+                    send(
+                        &mut tx,
+                        200 + offset,
+                        start + u32::from(offset) * T1
+                    ),
+                    S::Send(_)
+                ));
+                assert_eq!(tx.on_retransmission(), S::None);
+                assert_eq!(
+                    tx.on_ack(&TIMERS, start + u32::from(offset) * T1),
+                    S::Ack
+                );
+                assert_eq!(tx.on_transport_error(), S::TransportError);
+                assert_eq!(tx.deadline(), Some(start + 64 * T1));
+            }
+
+            assert_eq!(tx.on_timeout(&TIMERS, start + 63 * T1), S::None);
+            assert_eq!(tx.on_timeout(&TIMERS, start + 64 * T1), S::Terminated);
+            assert_eq!(tx.on_transport_error(), S::None);
+            assert!(tx.is_terminated());
+        }
+    }
+
+    #[test]
+    fn server_transport_failure_preserves_each_live_state() {
+        let start = Instant::now();
+        for state in 0..4 {
+            let mut tx = server(false);
+
+            match state {
+                1 => {
+                    send(&mut tx, 486, start);
+                }
+                2 => {
+                    send(&mut tx, 486, start);
+                    tx.on_ack(&TIMERS, start);
+                }
+                3 => {
+                    send(&mut tx, 200, start);
+                }
+                _ => {}
+            }
+            let deadline = tx.deadline();
+            let retransmission = tx.on_retransmission();
+
+            assert_eq!(tx.on_transport_error(), S::TransportError);
+            assert_eq!(tx.deadline(), deadline);
+            assert_eq!(tx.on_retransmission(), retransmission);
+            assert!(!tx.is_terminated());
+        }
+    }
+
+    #[test]
+    fn server_rejects_responses_outside_the_current_state() {
+        let start = Instant::now();
+        for initial in [200, 486] {
+            let mut tx = server(false);
+
+            send(&mut tx, initial, start);
+            let deadline = tx.deadline();
+
+            for code in [100, 180, 300, 486, 699] {
+                assert!(tx
+                    .on_response(
+                        StatusCode::from_u16(code).unwrap(),
+                        Bytes::new(),
+                        &TIMERS,
+                        start
+                    )
+                    .is_err());
+                assert_eq!(tx.deadline(), deadline);
+            }
+
+            if initial == 486 {
+                assert!(tx
+                    .on_response(StatusCode::OK, Bytes::new(), &TIMERS, start)
+                    .is_err());
+                tx.on_ack(&TIMERS, start);
+                assert!(tx
+                    .on_response(StatusCode::OK, Bytes::new(), &TIMERS, start)
+                    .is_err());
+            }
+
+            tx.on_timeout(&TIMERS, start + 64 * T1);
+
+            assert!(tx
+                .on_response(
+                    StatusCode::OK,
+                    Bytes::new(),
+                    &TIMERS,
+                    start + 64 * T1
+                )
+                .is_err());
         }
     }
 }

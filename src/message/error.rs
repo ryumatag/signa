@@ -1,8 +1,8 @@
 /*!
-Error types.
+Message construction and parsing errors.
 
 Each conversion into a SIP message part has its own error, such as
-[`InvalidMethod`] for [`Method`]. They all convert into [`Error`], which
+[`InvalidMethod`] for [`Method`]. They all convert into [`BuildError`], which
 builders and other code that takes several kinds of input report.
 
 [`Method`]: crate::Method
@@ -16,13 +16,13 @@ use std::{convert::Infallible, error, fmt};
 /// convert into this one, so builders and other code that takes several kinds
 /// of input can report any of them through `?`.
 ///
-/// [`Error::get_ref`] returns the underlying error, and [`Error::is`] checks
-/// its type.
+/// [`BuildError::get_ref`] returns the underlying error, and
+/// [`BuildError::is`] checks its type.
 ///
 /// # Example
 ///
 /// ```
-/// use signa::{error::InvalidMethod, Request};
+/// use signa::{message::error::InvalidMethod, Request};
 ///
 /// let err = Request::builder()
 ///     .method("IN VITE")
@@ -32,7 +32,7 @@ use std::{convert::Infallible, error, fmt};
 ///
 /// assert!(err.is::<InvalidMethod>());
 /// ```
-pub struct Error {
+pub struct BuildError {
     inner: ErrorKind,
 }
 
@@ -49,10 +49,10 @@ enum ErrorKind {
 /// A required part was never given to a builder.
 ///
 /// This is not public. Callers can tell it apart from the other kinds because
-/// [`Error::is`] matches none of the public error types.
+/// [`BuildError::is`] matches none of the public error types.
 struct Missing(&'static str);
 
-impl Error {
+impl BuildError {
     /// Returns `true` if the underlying error has type `T`.
     pub fn is<T: error::Error + 'static>(&self) -> bool {
         self.get_ref().is::<T>()
@@ -73,25 +73,27 @@ impl Error {
 
     /// Returns the error for a builder that never got `what`, such as
     /// `"method"`.
-    pub(crate) fn missing(what: &'static str) -> Error {
-        Error { inner: ErrorKind::Missing(Missing(what)) }
+    pub(crate) fn missing(what: &'static str) -> BuildError {
+        BuildError { inner: ErrorKind::Missing(Missing(what)) }
     }
 }
 
-impl fmt::Debug for Error {
+impl fmt::Debug for BuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Show the underlying error without the private `ErrorKind` noise.
-        f.debug_tuple("signa::Error").field(&self.get_ref()).finish()
+        f.debug_tuple("signa::message::BuildError")
+            .field(&self.get_ref())
+            .finish()
     }
 }
 
-impl fmt::Display for Error {
+impl fmt::Display for BuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self.get_ref(), f)
     }
 }
 
-impl error::Error for Error {
+impl error::Error for BuildError {
     // The underlying error is what `Display` shows, so it is not reported
     // again as the source. Its own source, if any, is.
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
@@ -101,8 +103,8 @@ impl error::Error for Error {
 
 // Builders accept values that are already of the target type, whose `TryFrom`
 // error is `Infallible`.
-impl From<Infallible> for Error {
-    fn from(err: Infallible) -> Error {
+impl From<Infallible> for BuildError {
+    fn from(err: Infallible) -> BuildError {
         match err {}
     }
 }
@@ -122,7 +124,7 @@ impl fmt::Display for Missing {
 impl error::Error for Missing {}
 
 // Defines an error that only says the input was invalid, along with its
-// conversion into `Error`.
+// conversion into `BuildError`.
 macro_rules! invalid_errors {
     ($(
         $(#[$attr:meta])*
@@ -154,9 +156,9 @@ macro_rules! invalid_errors {
 
             impl error::Error for $name {}
 
-            impl From<$name> for Error {
-                fn from(err: $name) -> Error {
-                    Error { inner: ErrorKind::$kind(err) }
+            impl From<$name> for BuildError {
+                fn from(err: $name) -> BuildError {
+                    BuildError { inner: ErrorKind::$kind(err) }
                 }
             }
         )+
@@ -222,9 +224,9 @@ impl fmt::Display for InvalidHeaderValue {
 
 impl error::Error for InvalidHeaderValue {}
 
-impl From<InvalidHeaderValue> for Error {
-    fn from(err: InvalidHeaderValue) -> Error {
-        Error { inner: ErrorKind::HeaderValue(err) }
+impl From<InvalidHeaderValue> for BuildError {
+    fn from(err: InvalidHeaderValue) -> BuildError {
+        BuildError { inner: ErrorKind::HeaderValue(err) }
     }
 }
 
@@ -233,7 +235,7 @@ impl From<InvalidHeaderValue> for Error {
 /// Its `Display` output says which part of the message was wrong. Like
 /// [`InvalidHeaderValue`], it does not keep any of the rejected bytes.
 ///
-/// It does not convert into [`Error`], which is for building messages.
+/// It does not convert into [`BuildError`], which is for building messages.
 pub struct InvalidMessage {
     kind: InvalidMessageKind,
 }
@@ -274,7 +276,7 @@ impl fmt::Display for InvalidMessage {
             InvalidMessageKind::TooManyHeaders => write!(
                 f,
                 "more than {} header fields in SIP message",
-                crate::parse::MAX_HEADERS
+                crate::message::parse::MAX_HEADERS
             ),
             InvalidMessageKind::IncompleteHead => {
                 f.write_str("incomplete SIP message head")
@@ -297,22 +299,28 @@ impl error::Error for InvalidMessage {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::method::Method;
+    use crate::message::Method;
 
     #[test]
     fn wraps_specific_errors() {
-        let err: Error = Method::from_bytes(b"").unwrap_err().into();
+        let err: BuildError = Method::from_bytes(b"").unwrap_err().into();
         assert!(err.is::<InvalidMethod>());
         assert!(!err.is::<InvalidUri>());
         assert_eq!(err.to_string(), "invalid SIP method");
-        assert_eq!(format!("{err:?}"), "signa::Error(InvalidMethod)");
+        assert_eq!(
+            format!("{err:?}"),
+            "signa::message::BuildError(InvalidMethod)"
+        );
     }
 
     #[test]
     fn missing_parts() {
-        let err = Error::missing("method");
+        let err = BuildError::missing("method");
         assert_eq!(err.to_string(), "builder has no method");
         assert!(!err.is::<InvalidMethod>());
-        assert_eq!(format!("{err:?}"), "signa::Error(Missing(\"method\"))");
+        assert_eq!(
+            format!("{err:?}"),
+            "signa::message::BuildError(Missing(\"method\"))"
+        );
     }
 }

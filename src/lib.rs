@@ -40,9 +40,23 @@ code through a [Tower] `Service`. Its design draws heavily on the [`http`] and
 
 # Features
 
-The `tokio` feature, on by default, pulls in tokio for the `endpoint` module.
-With `default-features = false` only the message layer is built, and the
-examples below that use the endpoint are left out of these docs.
+The `tokio` feature, on by default, enables the endpoint and socket I/O.
+Without it, message types, transaction timer configuration, and transport
+metadata and receive limits remain available without a runtime. Endpoint
+examples are omitted when this feature is disabled.
+
+# Modules
+
+- [`message`] owns message values, builders, parsing and encoding. The crate
+  root re-exports the principal types. Parts, header constants and construction
+  errors use paths such as [`message::request::Parts`], [`message::header`]
+  and [`message::BuildError`].
+- [`transaction`] exposes transaction timer configuration. Its state machines
+  are internal protocol machinery.
+- [`transport`] exposes [`transport::Flow`], [`transport::Transport`] and
+  [`transport::MessageLimits`]. Socket and framing implementations are private.
+- The `endpoint` module, enabled by `tokio`, provides running protocol
+  operations and their handles.
 
 # Examples
 */
@@ -122,79 +136,37 @@ in a higher layer.
 #![warn(missing_docs, missing_debug_implementations)]
 
 #[doc(inline)]
-pub use self::{
-    error::Error,
-    extensions::Extensions,
-    header::{HeaderMap, HeaderName, HeaderValue},
-    message::Message,
-    method::Method,
-    reason::ReasonPhrase,
-    request::Request,
-    response::Response,
-    status::StatusCode,
-    uri::Uri,
-    version::Version,
+pub use self::message::{
+    Extensions, HeaderMap, HeaderName, HeaderValue, Message, Method,
+    ReasonPhrase, Request, Response, StatusCode, Uri, Version,
 };
 
-mod encode;
 #[cfg(feature = "tokio")]
 pub mod endpoint;
-pub mod error;
-mod extensions;
-// Everything `pub` in `frame` exists for the `__bench` feature, which
-// re-exports it. Without the feature nothing reaches it, which
-// `unreachable_pub` would otherwise flag. The TCP transport is the only
-// user, so without `tokio` the module is dead.
-#[cfg_attr(not(feature = "__bench"), allow(unreachable_pub))]
-#[cfg_attr(not(any(feature = "__bench", feature = "tokio")), allow(dead_code))]
-mod frame;
-pub mod header;
-mod message;
-mod method;
-mod parse;
-mod reason;
-pub mod request;
-pub mod response;
-mod status;
-// The machines are crate-private, driven by the endpoint. `pub` items exist
-// for the `__bench` feature, as in `frame`. Without `tokio` nothing drives
-// them, so the module is dead.
-#[cfg_attr(not(feature = "__bench"), allow(unreachable_pub))]
-#[cfg_attr(
-    not(any(feature = "__bench", feature = "tokio")),
-    allow(dead_code, unused_imports)
-)]
-mod transaction;
-// The transports run on tokio and are crate-private, driven by the endpoint,
-// with `pub` items for the `__bench` feature, as in `frame`.
-#[cfg(feature = "tokio")]
-#[cfg_attr(not(feature = "__bench"), allow(unreachable_pub))]
-mod transport;
-mod uri;
-mod util;
-mod version;
+pub mod message;
+pub mod transaction;
+pub mod transport;
 
-/// Entry points for the `signa-bench` crate, behind the `__bench` feature.
-///
-/// Nothing here is part of the public API, and the feature can change or go
-/// away in any release.
+/// Entry points for signa-bench. Unstable and not part of the public API.
 #[cfg(feature = "__bench")]
 #[doc(hidden)]
 pub mod bench {
     #[cfg(feature = "tokio")]
-    #[doc(hidden)]
     pub use crate::{
         endpoint::reply_driver,
-        transport::{tcp, udp, Flow, Transport},
+        transport::{tcp, udp},
     };
-    #[doc(hidden)]
     pub use crate::{
-        frame::{DecodeError, Decoder, Frame, Limits, Role},
-        header::{cseq::CSeq, via::Via},
-        transaction::invite,
+        message::header::{cseq::CSeq, via::Via},
         transaction::{
-            ClientEvent, ClientKey, ClientTransaction, ServerKey,
-            ServerTransaction, Timers,
+            invite,
+            key::{ClientKey, ServerKey},
+            non_invite::{ClientEvent, ClientTransaction, ServerTransaction},
+            Timers,
+        },
+        transport::{
+            framing::{DecodeError, Decoder, Frame, Role},
+            Flow, MessageLimits, Transport,
         },
     };
 }

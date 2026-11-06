@@ -13,18 +13,13 @@ use std::{
 /// [RFC 6026]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.4
 ///
 /// ```
-/// # #[cfg(feature = "tokio")]
-/// # fn example() -> Result<(), signa::endpoint::InvalidTimers> {
 /// use std::time::Duration;
-/// use signa::endpoint::Timers;
+/// use signa::transaction::Timers;
 ///
 /// let timers = Timers::builder().t1(Duration::from_millis(200)).build()?;
 /// assert_eq!(timers.t1(), Duration::from_millis(200));
 /// assert_eq!(timers.d(), Duration::from_secs(32));
-/// # Ok(())
-/// # }
-/// # #[cfg(feature = "tokio")]
-/// # example().unwrap();
+/// # Ok::<(), signa::transaction::InvalidTimers>(())
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timers {
@@ -70,12 +65,14 @@ impl Timers {
         self.d
     }
 
+    #[cfg(any(feature = "tokio", feature = "__bench", test))]
     pub(super) fn transaction_timeout(&self) -> Duration {
         self.t1 * 64
     }
 
     /// RFC 4320's deadline for an automatic 100 is the sum of the E
     /// intervals before E reaches T2. Construction checked this arithmetic.
+    #[cfg(any(feature = "tokio", feature = "__bench", test))]
     pub(super) fn trying_after(&self) -> Duration {
         trying_after(self.t1, self.t2).expect("validated timer sum")
     }

@@ -8,16 +8,14 @@ use std::fmt;
 
 use bytes::{Bytes, BytesMut};
 
-use crate::{
-    error::{Error, InvalidMessage},
+use crate::message::{
+    error::{BuildError, InvalidMessage},
     extensions::Extensions,
     header::{
         HeaderMap, HeaderName, HeaderValue, CALL_ID, CSEQ, FROM, TO, VIA,
     },
-    reason::ReasonPhrase,
     request::Request,
-    status::StatusCode,
-    version::Version,
+    ReasonPhrase, StatusCode, Version,
 };
 
 /// A SIP response: a status-line, header fields, and a body.
@@ -46,7 +44,7 @@ use crate::{
 ///
 /// assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 /// assert_eq!(response.reason().unwrap(), "Maintenance");
-/// # Ok::<(), signa::Error>(())
+/// # Ok::<(), signa::message::BuildError>(())
 /// ```
 ///
 /// The builder is the only way to create a response from scratch. A response
@@ -88,7 +86,7 @@ pub struct Parts {
 /// was never set.
 #[derive(Debug)]
 pub struct Builder {
-    inner: Result<Head, Error>,
+    inner: Result<Head, BuildError>,
 }
 
 // What a `Builder` has collected so far. The status starts out unset because,
@@ -121,7 +119,7 @@ impl Response<()> {
     ///
     /// ```
     /// use bytes::Bytes;
-    /// use signa::{header::{CSEQ, TO, VIA}, Request, Response, StatusCode};
+    /// use signa::{Request, Response, StatusCode, message::header::{CSEQ, TO, VIA}};
     ///
     /// let request = Request::from_bytes(
     ///     b"OPTIONS sip:carol@chicago.example.com SIP/2.0\r\n\
@@ -169,6 +167,16 @@ pub(crate) fn reply_headers(request: &HeaderMap) -> HeaderMap {
     headers
 }
 
+/// Encodes a response with `status`, `headers`, and no body. This is what the
+/// transaction layer sends on its own, such as the 100 and the 500.
+#[cfg(any(feature = "tokio", feature = "__bench", test))]
+pub(crate) fn bare_response(headers: &HeaderMap, status: StatusCode) -> Bytes {
+    let mut parts = Parts::new(status);
+    parts.headers = headers.clone();
+
+    Response::from_parts(parts, Bytes::new()).to_bytes()
+}
+
 impl Response<Bytes> {
     /// Parses a response from the bytes of one complete message, copying
     /// them.
@@ -201,7 +209,7 @@ impl Response<Bytes> {
     ///
     /// assert_eq!(response.status(), StatusCode::BUSY_HERE);
     /// assert_eq!(response.reason().unwrap().as_str(), "Busy Here");
-    /// # Ok::<(), signa::error::InvalidMessage>(())
+    /// # Ok::<(), signa::message::error::InvalidMessage>(())
     /// ```
     ///
     /// # Errors
@@ -212,7 +220,7 @@ impl Response<Bytes> {
     ///
     /// [`Request::from_shared`]: crate::Request::from_shared
     pub fn from_shared(src: Bytes) -> Result<Response<Bytes>, InvalidMessage> {
-        crate::parse::response(src)
+        crate::message::parse::response(src)
     }
 }
 
@@ -238,10 +246,10 @@ impl<T: AsRef<[u8]>> Response<T> {
     ///     response.to_bytes(),
     ///     &b"SIP/2.0 180 Ringing\r\nContent-Length: 0\r\n\r\n"[..]
     /// );
-    /// # Ok::<(), signa::Error>(())
+    /// # Ok::<(), signa::message::BuildError>(())
     /// ```
     pub fn encode(&self, dst: &mut BytesMut) {
-        crate::encode::response(self, dst);
+        crate::message::encode::response(self, dst);
     }
 
     /// Returns the response as the bytes of one complete message.
@@ -381,7 +389,7 @@ impl Builder {
     pub fn status<S>(self, status: S) -> Builder
     where
         StatusCode: TryFrom<S>,
-        <StatusCode as TryFrom<S>>::Error: Into<Error>,
+        <StatusCode as TryFrom<S>>::Error: Into<BuildError>,
     {
         self.and_then(|mut head| {
             head.status =
@@ -403,7 +411,7 @@ impl Builder {
     pub fn reason<R>(self, reason: R) -> Builder
     where
         ReasonPhrase: TryFrom<R>,
-        <ReasonPhrase as TryFrom<R>>::Error: Into<Error>,
+        <ReasonPhrase as TryFrom<R>>::Error: Into<BuildError>,
     {
         self.and_then(|mut head| {
             head.reason =
@@ -426,9 +434,9 @@ impl Builder {
     pub fn header<K, V>(self, name: K, value: V) -> Builder
     where
         HeaderName: TryFrom<K>,
-        <HeaderName as TryFrom<K>>::Error: Into<Error>,
+        <HeaderName as TryFrom<K>>::Error: Into<BuildError>,
         HeaderValue: TryFrom<V>,
-        <HeaderValue as TryFrom<V>>::Error: Into<Error>,
+        <HeaderValue as TryFrom<V>>::Error: Into<BuildError>,
     {
         self.and_then(|mut head| {
             let name = HeaderName::try_from(name).map_err(Into::into)?;
@@ -483,9 +491,10 @@ impl Builder {
     ///
     /// Returns the first error from an earlier call, or an error if the status
     /// was never set.
-    pub fn body<T>(self, body: T) -> Result<Response<T>, Error> {
+    pub fn body<T>(self, body: T) -> Result<Response<T>, BuildError> {
         let head = self.inner?;
-        let status = head.status.ok_or_else(|| Error::missing("status"))?;
+        let status =
+            head.status.ok_or_else(|| BuildError::missing("status"))?;
 
         let mut parts = Parts::new(status);
         parts.reason = head.reason;
@@ -496,7 +505,7 @@ impl Builder {
 
     fn and_then<F>(self, f: F) -> Builder
     where
-        F: FnOnce(Head) -> Result<Head, Error>,
+        F: FnOnce(Head) -> Result<Head, BuildError>,
     {
         Builder { inner: self.inner.and_then(f) }
     }
@@ -510,7 +519,7 @@ impl Default for Builder {
 
 #[cfg(test)]
 mod tests {
-    use crate::header::{HeaderValue, TO};
+    use crate::message::header::{HeaderValue, TO};
 
     use super::*;
 
@@ -601,14 +610,14 @@ mod tests {
             .status(StatusCode::OK)
             .body(())
             .unwrap_err();
-        assert!(err.is::<crate::error::InvalidStatusCode>());
+        assert!(err.is::<crate::message::error::InvalidStatusCode>());
 
         let err = Response::builder()
             .status(200)
             .reason("<bad>")
             .body(())
             .unwrap_err();
-        assert!(err.is::<crate::error::InvalidReasonPhrase>());
+        assert!(err.is::<crate::message::error::InvalidReasonPhrase>());
     }
 
     #[test]

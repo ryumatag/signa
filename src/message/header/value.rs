@@ -9,7 +9,7 @@ use std::{
 use bytes::Bytes;
 use siparse::check;
 
-use crate::error::InvalidHeaderValue;
+use crate::message::error::InvalidHeaderValue;
 
 /// A SIP header field value.
 ///
@@ -141,7 +141,7 @@ impl HeaderValue {
     /// )))?;
     ///
     /// assert_eq!(value, "<sip:alice@atlanta.example.com>;tag=1928301774");
-    /// # Ok::<(), signa::error::InvalidHeaderValue>(())
+    /// # Ok::<(), signa::message::error::InvalidHeaderValue>(())
     /// ```
     ///
     /// # Errors
@@ -360,6 +360,7 @@ impl HeaderValue {
     /// Panics if `value` does not lie within `src`.
     /// Returns the value's bytes as the shared buffer they live in, so a
     /// part of the value can be kept without copying it.
+    #[cfg(any(feature = "tokio", feature = "__bench", test))]
     pub(crate) fn as_shared(&self) -> &Bytes {
         &self.raw
     }

@@ -3,7 +3,7 @@ use std::hint::black_box as bb;
 use criterion::Criterion;
 use signa::{
     bench::{CSeq, Via},
-    header::HeaderValue,
+    message::header::HeaderValue,
     Method,
 };
 

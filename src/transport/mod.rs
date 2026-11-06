@@ -1,21 +1,55 @@
 /*!
-The transports, on tokio.
+Transport metadata and received-message limits.
 
-[`udp::Socket`] carries datagrams and [`tcp`] carries streams. Each hands the
-endpoint what arrived together with the [`Flow`] it arrived on, and takes
-encoded bytes to send. The endpoint parses datagrams itself with
-`Message::from_shared`. The TCP reader runs the stream decoder, because a
-stream has to be framed before anything can be done with it.
-
-Nothing here is public yet. The two transports are written to one shape so that
-a trait can be extracted once a transport outside signa exists to validate it,
-such as one on a raw socket that carries Ethernet-level data.
+[`Flow`], [`Transport`] and [`MessageLimits`] are runtime independent. Socket
+I/O and stream framing remain implementation details used by the endpoint. TCP
+connections are framed by Content-Length before messages reach the driver; UDP
+datagrams already carry their boundaries.
 */
 
 use std::{fmt, net::SocketAddr};
 
+#[cfg(all(feature = "tokio", feature = "__bench"))]
+#[doc(hidden)]
 pub mod tcp;
+#[cfg(all(feature = "tokio", not(feature = "__bench")))]
+#[allow(unreachable_pub)]
+pub(crate) mod tcp;
+#[cfg(all(feature = "tokio", feature = "__bench"))]
+#[doc(hidden)]
 pub mod udp;
+#[cfg(all(feature = "tokio", not(feature = "__bench")))]
+#[allow(unreachable_pub)]
+pub(crate) mod udp;
+
+#[cfg(any(feature = "tokio", feature = "__bench", test))]
+#[cfg_attr(not(feature = "__bench"), allow(unreachable_pub))]
+pub(crate) mod framing;
+
+/// Receive limits for one SIP message on a stream transport.
+///
+/// Both limits bound what one message can make the decoder hold. A head is
+/// buffered whole before it is parsed, and a body is buffered whole before the
+/// message is returned.
+#[derive(Clone, Copy, Debug)]
+pub struct MessageLimits {
+    /// The most bytes a head may take, including its empty line.
+    pub head: usize,
+    /// The most bytes a body may take.
+    pub body: usize,
+}
+
+impl Default for MessageLimits {
+    /// Allows 64 KiB for a head and 1 MiB for a body.
+    ///
+    /// A head is rarely more than a few KiB even after a long chain of
+    /// proxies, and hyper buffers at most about 400 KiB of HTTP/1 head. A body
+    /// is usually a small SDP or text, but SIP holds it in memory whole, so it
+    /// needs a limit too.
+    fn default() -> MessageLimits {
+        MessageLimits { head: 64 * 1024, body: 1024 * 1024 }
+    }
+}
 
 /// The protocol a message travels over.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]

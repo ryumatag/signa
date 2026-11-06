@@ -39,7 +39,7 @@ use std::{
 
 use siparse::check;
 
-use crate::error::InvalidMethod;
+use crate::message::error::InvalidMethod;
 
 use self::{
     extension::{AllocatedExtension, InlineExtension},

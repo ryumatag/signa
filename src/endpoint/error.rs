@@ -7,7 +7,7 @@ The error of a request sent through a [`Client`].
 use std::{error, fmt, io};
 
 use super::driver::MAX_UDP_REQUEST;
-use crate::HeaderName;
+use crate::message::HeaderName;
 
 /// Why a request sent through a [`Client`] got no final response.
 ///

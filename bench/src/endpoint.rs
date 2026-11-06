@@ -12,8 +12,9 @@ use bytes::Bytes;
 use criterion::Criterion;
 use signa::{
     bench::{reply_driver, tcp, udp, Flow},
-    endpoint::ReplyRoute,
-    endpoint::{Endpoint, Timers, Transport},
+    endpoint::{Endpoint, ReplyRoute},
+    transaction::Timers,
+    transport::Transport,
     Request, Response, StatusCode,
 };
 use tokio::runtime;

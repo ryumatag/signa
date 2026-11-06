@@ -12,8 +12,9 @@ that sends requests to one next hop.
 # Serving
 
 Every request that arrives and matches no transaction goes to the service as
-a `Request<Bytes>`, with the [`Flow`] it arrived on in its extensions. The
-service answers with the final response, built with [`Response::reply_to`]
+a `Request<Bytes>`, with the [`Flow`](crate::transport::Flow) it arrived on
+in its extensions. The service answers with the final response, built with
+[`Response::reply_to`]
 so that it carries the `Via` the endpoint routes it by. RFC 4320 leaves a
 non-INVITE request no provisional response worth sending, and the endpoint
 sends the one 100 the RFC asks for itself when the service is slow, so the
@@ -57,8 +58,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use signa::{
-    endpoint::{Endpoint, Transport},
-    Request, Response, StatusCode,
+    endpoint::Endpoint, transport::Transport, Request, Response, StatusCode,
 };
 use tower_service::Service;
 
@@ -70,7 +70,7 @@ let endpoint = Endpoint::builder()
         let response = Response::reply_to(&request)
             .status(StatusCode::OK)
             .body(Bytes::new())?;
-        Ok::<_, signa::Error>(response)
+        Ok::<_, signa::message::BuildError>(response)
     }))?;
 
 let mut client = endpoint.client(Transport::Udp, "192.0.2.4:5060".parse()?);
@@ -93,6 +93,14 @@ endpoint.shutdown(Duration::from_secs(10)).await;
 ```
 
 [`Service`]: tower_service::Service
+
+Transaction timer configuration is owned by [`crate::transaction`], and
+transport metadata by [`crate::transport`]. They are not public members of
+this module. The following cannot compile because this import is private:
+
+```compile_fail
+use signa::endpoint::Timers;
+```
 */
 
 use std::{fmt, io, net::SocketAddr, time::Duration};
@@ -103,9 +111,9 @@ use tower_service::Service;
 
 use self::driver::{Command, Config, Driver, TCP_INBOUND};
 use crate::{
-    request::Request,
-    response::Response,
-    transport::{tcp, udp},
+    message::{request::Request, response::Response},
+    transaction::Timers,
+    transport::{tcp, udp, MessageLimits, Transport},
 };
 
 pub use self::{
@@ -113,12 +121,6 @@ pub use self::{
     error::Error,
     reply::{ReplyError, ReplyRoute},
     shutdown::Shutdown,
-};
-// Umm...
-pub use crate::{
-    frame::Limits,
-    transaction::{InvalidTimers, Timers, TimersBuilder},
-    transport::{Flow, Transport},
 };
 
 mod client;
@@ -223,7 +225,7 @@ impl fmt::Debug for Endpoint {
 /// ```no_run
 /// use std::time::Duration;
 ///
-/// use signa::endpoint::{Endpoint, Timers};
+/// use signa::{endpoint::Endpoint, transaction::Timers};
 /// # use bytes::Bytes;
 /// # use signa::{Request, Response};
 ///
@@ -305,7 +307,7 @@ impl Builder {
     ///
     /// A larger one closes the connection. The default allows 64 KiB and
     /// 1 MiB.
-    pub fn limits(mut self, limits: Limits) -> Builder {
+    pub fn limits(mut self, limits: MessageLimits) -> Builder {
         self.config.tcp.limits = limits;
         self
     }
@@ -402,7 +404,7 @@ impl Builder {
 pub fn reply_driver<S>(
     service: S,
     request: Request<Bytes>,
-    flow: Flow,
+    flow: crate::transport::Flow,
     writer: Option<tcp::Writer>,
     udp: Option<udp::Socket>,
     tcp: mpsc::Receiver<tcp::Inbound>,
@@ -466,10 +468,12 @@ mod tests {
             error::Error,
             Endpoint, ReplyError,
         },
-        header::{HeaderValue, CSEQ, TO, VIA},
-        request::Request,
-        response::Response,
-        status::StatusCode,
+        message::{
+            header::{HeaderValue, CSEQ, TO, VIA},
+            request::Request,
+            response::Response,
+            StatusCode,
+        },
         transaction::Timers,
         transport::{tcp, udp, Flow, Transport},
     };
@@ -1113,7 +1117,7 @@ mod tests {
         let service = service_fn(|request: Request<Bytes>| async move {
             let cseq = request.headers().get(CSEQ).unwrap().as_str();
             match cseq.as_bytes()[0] {
-                b'1' => Err(crate::Error::missing("anything")),
+                b'1' => Err(crate::message::BuildError::missing("anything")),
                 b'2' => Ok(Response::reply_to(&request)
                     .status(StatusCode::TRYING)
                     .body(Bytes::new())
@@ -1183,7 +1187,7 @@ mod tests {
         for i in 0..3 {
             let mut request = request("OPTIONS");
             request.headers_mut().insert(
-                crate::header::CALL_ID,
+                crate::message::header::CALL_ID,
                 crate::HeaderValue::from_bytes(format!("call-{i}").as_bytes())
                     .unwrap(),
             );

@@ -1,0 +1,159 @@
+/*!
+Conversion from messages to the bytes of one complete SIP message.
+
+Every part of a message was checked when it was built or parsed, so writing it
+out cannot fail.
+*/
+
+use bytes::{BufMut, BytesMut};
+
+use crate::message::{
+    header::{HeaderMap, CONTENT_LENGTH},
+    request::Request,
+    response::Response,
+};
+
+pub(crate) fn request<T: AsRef<[u8]>>(
+    request: &Request<T>,
+    dst: &mut BytesMut,
+) {
+    let method = request.method().as_str();
+    let uri = request.uri().as_str();
+    let version = request.version();
+    let version = version.as_str();
+    let body = request.body().as_ref();
+
+    // `METHOD SP URI SP VERSION CRLF`
+    let line_len = method.len() + uri.len() + version.len() + 4;
+    let len = line_len + head_fields_len(request.headers(), body) + body.len();
+    let start = dst.len();
+    dst.reserve(len);
+
+    dst.put_slice(method.as_bytes());
+    dst.put_u8(b' ');
+    dst.put_slice(uri.as_bytes());
+    dst.put_u8(b' ');
+    dst.put_slice(version.as_bytes());
+    dst.put_slice(b"\r\n");
+
+    fields_and_body(request.headers(), body, dst);
+    debug_assert_eq!(dst.len() - start, len, "reserved length is off");
+}
+
+pub(crate) fn response<T: AsRef<[u8]>>(
+    response: &Response<T>,
+    dst: &mut BytesMut,
+) {
+    let version = response.version();
+    let version = version.as_str();
+    let status = response.status();
+    // Without a reason of its own, a response uses the one RFC 3261 or the
+    // IANA registry gives its code. An extension code with neither gets an
+    // empty reason, which the status-line grammar allows.
+    let reason = match response.reason() {
+        Some(reason) => reason.as_str(),
+        None => status.canonical_reason().unwrap_or(""),
+    };
+    let body = response.body().as_ref();
+
+    // `VERSION SP CODE SP REASON CRLF`, where the code is three digits.
+    let line_len = version.len() + reason.len() + 7;
+    let len =
+        line_len + head_fields_len(response.headers(), body) + body.len();
+    let start = dst.len();
+    dst.reserve(len);
+
+    dst.put_slice(version.as_bytes());
+    dst.put_u8(b' ');
+    dst.put_slice(status.as_str().as_bytes());
+    dst.put_u8(b' ');
+    dst.put_slice(reason.as_bytes());
+    dst.put_slice(b"\r\n");
+
+    fields_and_body(response.headers(), body, dst);
+    debug_assert_eq!(dst.len() - start, len, "reserved length is off");
+}
+
+/// Returns the length of the header fields, the `Content-Length` field, and
+/// the empty line, so the whole message can be reserved at once.
+fn head_fields_len(headers: &HeaderMap, body: &[u8]) -> usize {
+    let fields: usize = headers
+        .iter()
+        .filter(|(name, _)| **name != CONTENT_LENGTH)
+        // `NAME: VALUE CRLF`
+        .map(|(name, value)| name.as_str().len() + value.len() + 4)
+        .sum();
+    let content_length =
+        "Content-Length: \r\n".len() + Digits::new(body.len()).len();
+
+    fields + content_length + 2
+}
+
+/// Writes the header fields, the empty line, and the body.
+///
+/// `Content-Length` always comes from the body. Any `Content-Length` rows in
+/// the map are skipped, so the length on the wire cannot disagree with the
+/// body. RFC 3261 section 20.14 requires the field on stream transports, and
+/// it does no harm on datagrams.
+fn fields_and_body(headers: &HeaderMap, body: &[u8], dst: &mut BytesMut) {
+    for (name, value) in headers {
+        if *name == CONTENT_LENGTH {
+            continue;
+        }
+        dst.put_slice(name.as_str().as_bytes());
+        dst.put_slice(b": ");
+        // The value is written as stored, folds included.
+        dst.put_slice(value.as_bytes());
+        dst.put_slice(b"\r\n");
+    }
+
+    dst.put_slice(b"Content-Length: ");
+    dst.put_slice(Digits::new(body.len()).as_bytes());
+    dst.put_slice(b"\r\n\r\n");
+    dst.put_slice(body);
+}
+
+/// The decimal digits of a `usize`, formatted on the stack.
+struct Digits {
+    buf: [u8; 20],
+    start: usize,
+}
+
+impl Digits {
+    fn new(mut n: usize) -> Digits {
+        // `usize::MAX` has at most 20 decimal digits.
+        let mut buf = [0; 20];
+        let mut start = buf.len();
+        loop {
+            start -= 1;
+            buf[start] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        Digits { buf, start }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[self.start..]
+    }
+
+    fn len(&self) -> usize {
+        self.buf.len() - self.start
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Digits;
+
+    #[test]
+    fn digits() {
+        for n in [0, 7, 10, 4096, usize::MAX] {
+            let digits = Digits::new(n);
+            assert_eq!(digits.as_bytes(), n.to_string().as_bytes());
+            assert_eq!(digits.len(), n.to_string().len());
+        }
+    }
+}

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
-use crate::{response::Response, transaction::Timers};
+use crate::{message::response::Response, transaction::Timers};
 
 /// A non-INVITE client transaction.
 ///
@@ -23,7 +23,7 @@ use crate::{response::Response, transaction::Timers};
 /// response. A reliable transport has no retransmissions and ends the
 /// transaction with the final response.
 ///
-/// [`ClientKey`]: super::ClientKey
+/// [`ClientKey`]: crate::transaction::key::ClientKey
 /// [`deadline`]: ClientTransaction::deadline
 /// [`is_terminated`]: ClientTransaction::is_terminated
 #[derive(Debug)]
@@ -245,7 +245,7 @@ fn interval(timers: &Timers, doublings: u8) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::status::StatusCode;
+    use crate::message::StatusCode;
 
     const T1: Duration = Duration::from_millis(500);
     const T2: Duration = Duration::from_secs(4);

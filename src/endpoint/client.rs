@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, oneshot};
 use tower_service::Service;
 
 use super::{driver::Command, Error, Transport};
-use crate::{Request, Response};
+use crate::message::{request::Request, response::Response};
 
 /// Sends requests to one next hop and returns their final responses.
 ///

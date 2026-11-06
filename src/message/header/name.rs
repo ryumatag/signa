@@ -5,7 +5,7 @@ use std::{
 
 use siparse::check;
 
-use crate::{error::InvalidHeaderName, util::ByteStr};
+use crate::message::{byte_str::ByteStr, error::InvalidHeaderName};
 
 /// A SIP header field name.
 ///

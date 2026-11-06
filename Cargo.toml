@@ -21,8 +21,8 @@ include = [
 
 [features]
 default = ["tokio"]
-# The transports and the endpoint run on tokio. Without this feature only the
-# message layer is built.
+# The endpoint and sockets run on tokio. Without this feature, messages,
+# timer configuration and transport metadata remain runtime independent.
 tokio = [
   "dep:tokio",
   "dep:libc",

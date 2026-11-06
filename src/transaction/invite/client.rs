@@ -3,13 +3,15 @@ use std::{fmt, time::Instant};
 use bytes::Bytes;
 
 use crate::{
-    header::{
-        cseq::CSeq, via::Via, HeaderName, HeaderValue, CALL_ID, CSEQ, FROM,
-        MAX_FORWARDS, ROUTE, TO, VIA,
+    message::{
+        header::{
+            cseq::CSeq, via::Via, HeaderName, HeaderValue, CALL_ID, CSEQ,
+            FROM, MAX_FORWARDS, ROUTE, TO, VIA,
+        },
+        request::{self, Request},
+        response::Response,
+        Method,
     },
-    method::Method,
-    request::{self, Request},
-    response::Response,
     transaction::Timers,
 };
 
@@ -325,7 +327,12 @@ fn ack_template(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use super::super::tests::{request, response, T1, TIMERS};
+    use super::ClientEvent as C;
     use super::*;
+    use crate::message::header::CONTENT_TYPE;
 
     #[test]
     fn proceeding_does_not_retain_the_request_buffer() {
@@ -357,5 +364,336 @@ mod tests {
         }
         drop(request);
         assert!(input.is_unique());
+    }
+    fn client(reliable: bool, now: Instant) -> ClientTransaction {
+        ClientTransaction::new(&request(), reliable, &TIMERS, now).unwrap()
+    }
+
+    // RFC 3261 17.1.1.2. A doubles past T2, and B wins at 64 T1.
+    #[test]
+    fn client_retransmits_invite_without_a_t2_cap() {
+        let start = Instant::now();
+        let mut tx = client(false, start);
+
+        assert_eq!(tx.deadline(), Some(start + T1));
+        assert!(matches!(tx.on_timeout(&TIMERS, start), C::None));
+
+        for multiple in [1, 3, 7, 15, 31, 63] {
+            let at = start + multiple * T1;
+            assert_eq!(tx.deadline(), Some(at));
+
+            match tx.on_timeout(&TIMERS, at) {
+                C::Send(bytes) => assert_eq!(bytes, request().to_bytes()),
+                event => {
+                    panic!("expected INVITE retransmission, got {event:?}")
+                }
+            }
+        }
+
+        assert_eq!(tx.deadline(), Some(start + 64 * T1));
+        assert!(matches!(tx.on_timeout(&TIMERS, start + 64 * T1), C::Timeout));
+        assert!(tx.is_terminated());
+        assert_eq!(tx.deadline(), None);
+        assert!(matches!(tx.on_timeout(&TIMERS, start + 65 * T1), C::None));
+    }
+
+    #[test]
+    fn client_b_wins_over_a_and_reliable_calling_still_times_out() {
+        for reliable in [false, true] {
+            let start = Instant::now();
+            let mut tx = client(reliable, start);
+
+            if reliable {
+                assert_eq!(tx.deadline(), Some(start + 64 * T1));
+                assert!(matches!(tx.on_timeout(&TIMERS, start + T1), C::None));
+            }
+
+            assert!(matches!(
+                tx.on_timeout(&TIMERS, start + 64 * T1),
+                C::Timeout
+            ));
+            assert!(matches!(
+                tx.on_response(response(200, "bob"), &TIMERS, start + 64 * T1),
+                C::None
+            ));
+        }
+    }
+
+    #[test]
+    fn proceeding_stops_a_and_has_no_timer_b() {
+        for reliable in [false, true] {
+            let start = Instant::now();
+            let mut tx = client(reliable, start);
+
+            for code in 100..200 {
+                assert!(matches!(
+                    tx.on_response(response(code, "bob"), &TIMERS, start),
+                    C::Provisional(r) if r.status().as_u16() == code
+                ));
+            }
+            assert_eq!(tx.deadline(), None);
+            assert!(matches!(
+                tx.on_timeout(&TIMERS, start + 1000 * T1),
+                C::None
+            ));
+            assert!(!tx.is_terminated());
+        }
+    }
+
+    // RFC 3261 17.1.1.3. Only the top Via value is used, not its whole row.
+    #[test]
+    fn non_success_ack_uses_request_routing_and_response_to() {
+        let start = Instant::now();
+        for reliable in [false, true] {
+            let mut tx = client(reliable, start);
+
+            let final_response = response(486, "busy-branch");
+            let ack =
+                match tx.on_response(final_response.clone(), &TIMERS, start) {
+                    C::Final { response, ack: Some(ack) } => {
+                        assert_eq!(
+                            response.headers().get(TO),
+                            final_response.headers().get(TO)
+                        );
+                        ack
+                    }
+                    event => panic!("expected final and ACK, got {event:?}"),
+                };
+            let ack = Request::from_shared(ack).unwrap();
+            let invite = request();
+
+            assert_eq!(ack.method(), Method::ACK);
+            assert_eq!(ack.uri().as_str(), invite.uri().as_str());
+            assert_eq!(
+                ack.headers().get(CALL_ID),
+                invite.headers().get(CALL_ID)
+            );
+            assert_eq!(ack.headers().get(FROM), invite.headers().get(FROM));
+            assert_eq!(
+                ack.headers().get(TO),
+                final_response.headers().get(TO)
+            );
+            assert_eq!(ack.headers().get(CSEQ).unwrap(), "314159 ACK");
+            assert_eq!(ack.headers().get(MAX_FORWARDS).unwrap(), "70");
+            assert_eq!(
+                ack.headers().get(VIA).unwrap(),
+                "SIP/2.0/UDP atlanta.example.com:5060;branch=z9hG4bKfirst;x=\"a,b\""
+            );
+            assert_eq!(ack.headers().get_all(VIA).count(), 1);
+            assert_eq!(
+                ack.headers().get_all(ROUTE).collect::<Vec<_>>(),
+                invite.headers().get_all(ROUTE).collect::<Vec<_>>()
+            );
+            assert!(!ack.headers().contains_key(CONTENT_TYPE));
+            assert!(ack.body().is_empty());
+            assert_eq!(tx.is_terminated(), reliable);
+        }
+    }
+
+    #[test]
+    fn client_d_resends_the_cached_ack_and_never_redelivers_final() {
+        let start = Instant::now();
+        let mut tx = client(false, start);
+
+        let ack = match tx.on_response(response(486, "first"), &TIMERS, start)
+        {
+            C::Final { ack: Some(ack), .. } => ack,
+            event => panic!("{event:?}"),
+        };
+        let deadline = start + Duration::from_secs(32);
+
+        for code in [300, 486, 503, 699] {
+            assert!(matches!(
+                tx.on_response(
+                    response(code, "different"), &TIMERS, start + T1
+                ),
+                C::Send(bytes) if bytes == ack,
+            ));
+            assert_eq!(tx.deadline(), Some(deadline));
+        }
+        for code in [100, 180, 200, 299] {
+            assert!(matches!(
+                tx.on_response(response(code, "bob"), &TIMERS, start + T1),
+                C::None
+            ));
+        }
+        assert!(matches!(
+            tx.on_timeout(&TIMERS, deadline - Duration::from_nanos(1)),
+            C::None
+        ));
+        assert!(matches!(tx.on_timeout(&TIMERS, deadline), C::Terminated));
+        assert!(matches!(
+            tx.on_response(response(486, "first"), &TIMERS, deadline),
+            C::None
+        ));
+    }
+
+    // RFC 6026 8.4. M survives forks, retransmissions, and reliable transport.
+    #[test]
+    fn accepted_delivers_every_success_without_restarting_m() {
+        for reliable in [false, true] {
+            for proceeding in [false, true] {
+                let start = Instant::now();
+                let mut tx = client(reliable, start);
+
+                if proceeding {
+                    tx.on_response(response(180, "early"), &TIMERS, start);
+                }
+
+                for (offset, tag) in
+                    [(0, "first"), (1, "second"), (2, "first")]
+                {
+                    assert!(
+                        matches!(tx.on_response(response(200, tag), &TIMERS, start + offset * T1), C::Final { response: r, ack: None } if r.headers().get(TO) == response(200, tag).headers().get(TO))
+                    );
+                    assert_eq!(tx.deadline(), Some(start + 64 * T1));
+                }
+                for code in [100, 180, 300, 486, 699] {
+                    assert!(matches!(
+                        tx.on_response(
+                            response(code, "late"),
+                            &TIMERS,
+                            start + 3 * T1
+                        ),
+                        C::None
+                    ));
+                }
+                assert!(matches!(tx.on_transport_error(), C::None));
+                assert!(matches!(
+                    tx.on_timeout(&TIMERS, start + 63 * T1),
+                    C::None
+                ));
+                assert!(matches!(
+                    tx.on_timeout(&TIMERS, start + 64 * T1),
+                    C::Terminated
+                ));
+                assert!(matches!(
+                    tx.on_response(
+                        response(200, "late"),
+                        &TIMERS,
+                        start + 64 * T1
+                    ),
+                    C::None
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn every_final_class_transitions_from_calling_and_proceeding() {
+        let start = Instant::now();
+        // Class boundaries exercise both final-response paths under Miri
+        // without repeating parsing and ACK encoding for all 2,000 cases.
+        #[cfg(miri)]
+        let codes = [200, 299, 300, 399, 400, 499, 500, 599, 600, 699];
+        #[cfg(not(miri))]
+        let codes = 200..700;
+
+        for reliable in [false, true] {
+            for proceeding in [false, true] {
+                for code in codes.clone() {
+                    let mut tx = client(reliable, start);
+
+                    if proceeding {
+                        tx.on_response(response(180, "early"), &TIMERS, start);
+                    }
+
+                    assert!(matches!(
+                        tx.on_response(
+                            response(code, "bob"), &TIMERS, start
+                        ),
+                        C::Final { ack, .. } if ack.is_some() == (code >= 300)
+                    ));
+                    assert_eq!(tx.is_terminated(), reliable && code >= 300);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transport_errors_end_calling_proceeding_and_completed() {
+        let start = Instant::now();
+        for code in [None, Some(180), Some(486)] {
+            let mut tx = client(false, start);
+
+            if let Some(code) = code {
+                tx.on_response(response(code, "bob"), &TIMERS, start);
+            }
+
+            assert!(matches!(tx.on_transport_error(), C::TransportError));
+            assert!(tx.is_terminated());
+            assert!(matches!(tx.on_transport_error(), C::None));
+            assert_eq!(tx.deadline(), None);
+        }
+    }
+
+    #[test]
+    fn malformed_ack_inputs_leave_no_partial_transition() {
+        let start = Instant::now();
+        let mut tx = client(false, start);
+
+        let mut bad = response(486, "bob");
+        bad.headers_mut().remove(TO);
+
+        assert!(matches!(
+            tx.on_response(bad, &TIMERS, start),
+            C::InvalidResponse
+        ));
+        assert_eq!(tx.deadline(), Some(start + T1));
+        assert!(matches!(
+            tx.on_response(response(486, "bob"), &TIMERS, start),
+            C::Final { ack: Some(_), .. }
+        ));
+        for name in [FROM, TO, CALL_ID, CSEQ, VIA] {
+            let mut bad = request();
+            bad.headers_mut().remove(&name);
+
+            assert_eq!(
+                ClientTransaction::new(&bad, false, &TIMERS, start)
+                    .unwrap_err(),
+                InvalidInvite::Missing(name)
+            );
+        }
+        for cseq in ["broken", "1 OPTIONS", "2147483648 INVITE"] {
+            let mut bad = request();
+            bad.headers_mut().insert(CSEQ, HeaderValue::from_static(cseq));
+
+            assert_eq!(
+                ClientTransaction::new(&bad, false, &TIMERS, start)
+                    .unwrap_err(),
+                InvalidInvite::CSeq
+            );
+        }
+
+        let mut bad = request();
+        *bad.method_mut() = Method::OPTIONS;
+
+        assert_eq!(
+            ClientTransaction::new(&bad, false, &TIMERS, start).unwrap_err(),
+            InvalidInvite::Method
+        );
+
+        *bad.method_mut() = Method::INVITE;
+        bad.headers_mut().insert(VIA, HeaderValue::from_static("bad"));
+
+        assert_eq!(
+            ClientTransaction::new(&bad, false, &TIMERS, start).unwrap_err(),
+            InvalidInvite::Via
+        );
+    }
+
+    #[test]
+    fn configurable_d_is_independent_of_t1() {
+        let start = Instant::now();
+        let timers = Timers::builder()
+            .t1(Duration::from_millis(10))
+            .d(Duration::from_secs(60))
+            .build()
+            .unwrap();
+        let mut tx =
+            ClientTransaction::new(&request(), false, &timers, start).unwrap();
+        tx.on_response(response(486, "bob"), &timers, start);
+
+        assert_eq!(tx.deadline(), Some(start + Duration::from_secs(60)));
     }
 }

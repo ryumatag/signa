@@ -9,10 +9,15 @@ use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 
 use crate::{
     endpoint::driver::{Command, Link},
-    header::{HeaderMap, HeaderValue, CALL_ID, CSEQ, FROM, TO, VIA},
-    method::Method,
-    request::Request,
-    response::Response,
+    message::{
+        header::{
+            address::has_tag, HeaderMap, HeaderValue, CALL_ID, CSEQ, FROM, TO,
+            VIA,
+        },
+        request::Request,
+        response::Response,
+        Method,
+    },
 };
 
 /// An opaque capability for sending responses to one received request.
@@ -187,38 +192,6 @@ impl ReplyRoute {
     }
 }
 
-// Only identify the header's tag. The message parser owns head syntax, and
-// siparse's lexer skips quoted text. URI parameters inside <> are not tags.
-fn has_tag(mut rest: &str) -> bool {
-    while let Some(ch) = rest.chars().next() {
-        match ch {
-            '"' => match siparse::scan::quoted_string(rest) {
-                Some((_, tail)) => rest = tail,
-                None => return true,
-            },
-            '<' => match rest.split_once('>') {
-                Some((_, tail)) => rest = tail,
-                None => return true,
-            },
-            ';' => {
-                match siparse::scan::token(siparse::scan::sws(&rest[1..])) {
-                    Some((name, tail)) => {
-                        if name.eq_ignore_ascii_case("tag") {
-                            return true;
-                        }
-
-                        rest = tail;
-                    }
-                    None => return true,
-                }
-            }
-            _ => rest = &rest[ch.len_utf8()..],
-        }
-    }
-
-    false
-}
-
 impl fmt::Debug for ReplyRoute {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ReplyRoute").finish_non_exhaustive()
@@ -289,25 +262,6 @@ impl Drop for Admission {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn only_header_parameters_count_as_to_tags() {
-        for value in [
-            "<sip:bob@example.com>;tag=bob",
-            "sip:bob@example.com; TAG = bob",
-            "\"Bob\" <sip:bob@example.com>;x=\"a;b\";tag=bob",
-        ] {
-            assert!(has_tag(value), "{value}");
-        }
-
-        for value in [
-            "<sip:bob@example.com;tag=uri>",
-            "\";tag=display\" <sip:bob@example.com>",
-            "<sip:bob@example.com>;x=\";tag=value\"",
-        ] {
-            assert!(!has_tag(value), "{value}");
-        }
-    }
 
     fn request() -> Request<Bytes> {
         Request::builder()

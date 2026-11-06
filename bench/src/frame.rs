@@ -2,7 +2,7 @@ use std::hint::black_box as bb;
 
 use bytes::BytesMut;
 use criterion::{BatchSize, Criterion};
-use signa::bench::{Decoder, Frame, Limits, Role};
+use signa::bench::{Decoder, Frame, MessageLimits, Role};
 
 use crate::{
     benchmark,
@@ -20,7 +20,7 @@ pub(super) fn stream(c: &mut Criterion) {
     // One message per read.
     let input = REQUEST_TYPICAL;
     benchmark(c, format!("{NAME}/typical"), input.len() as u64, |b| {
-        let mut decoder = Decoder::new(Role::Server, Limits::default());
+        let mut decoder = Decoder::new(Role::Server, MessageLimits::default());
         b.iter_batched(
             || BytesMut::from(input),
             |mut buf| {
@@ -38,7 +38,7 @@ pub(super) fn stream(c: &mut Criterion) {
         input.extend_from_slice(message);
     }
     benchmark(c, format!("{NAME}/pipelined"), input.len() as u64, |b| {
-        let mut decoder = Decoder::new(Role::Server, Limits::default());
+        let mut decoder = Decoder::new(Role::Server, MessageLimits::default());
         b.iter_batched(
             || BytesMut::from(&input[..]),
             |mut buf| {
@@ -57,7 +57,7 @@ pub(super) fn stream(c: &mut Criterion) {
     // decoder is called after every read.
     let input = REQUEST_TYPICAL;
     benchmark(c, format!("{NAME}/fragmented"), input.len() as u64, |b| {
-        let mut decoder = Decoder::new(Role::Server, Limits::default());
+        let mut decoder = Decoder::new(Role::Server, MessageLimits::default());
         b.iter_batched(
             BytesMut::new,
             |mut buf| {

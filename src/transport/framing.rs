@@ -17,10 +17,11 @@ use std::{error, fmt, mem};
 use bytes::{Buf, Bytes, BytesMut};
 use siparse::{find_head_end, parse_ping, parse_pong, Status};
 
-use crate::{
+use super::MessageLimits;
+use crate::message::{
     error::{InvalidMessage, InvalidMessageKind},
-    message::Message,
     parse::{self, Head},
+    Message,
 };
 
 /// Splits a byte stream into messages and RFC 5626 keepalives.
@@ -35,7 +36,7 @@ use crate::{
 #[derive(Debug)]
 pub struct Decoder {
     role: Role,
-    limits: Limits,
+    limits: MessageLimits,
     state: State,
 }
 
@@ -52,31 +53,6 @@ pub enum Role {
     Client,
     /// This end accepted the connection and may receive pings.
     Server,
-}
-
-/// Sizes beyond which the decoder gives up on a connection.
-///
-/// Both limits bound what one message can make the decoder hold. A head is
-/// buffered whole before it is parsed, and a body is buffered whole before the
-/// message is returned.
-#[derive(Clone, Copy, Debug)]
-pub struct Limits {
-    /// The most bytes a head may take, including its empty line.
-    pub head: usize,
-    /// The most bytes a body may take.
-    pub body: usize,
-}
-
-impl Default for Limits {
-    /// Allows 64 KiB for a head and 1 MiB for a body.
-    ///
-    /// A head is rarely more than a few KiB even after a long chain of
-    /// proxies, and hyper buffers at most about 400 KiB of HTTP/1 head. A
-    /// body is usually a small SDP or text, but SIP holds it in memory whole,
-    /// so it needs a limit too.
-    fn default() -> Limits {
-        Limits { head: 64 * 1024, body: 1024 * 1024 }
-    }
 }
 
 /// One item from the stream.
@@ -98,9 +74,9 @@ pub enum DecodeError {
     /// The head has no `Content-Length`, which a stream needs to find the end
     /// of the body.
     MissingContentLength,
-    /// The head is larger than [`Limits::head`] allows.
+    /// The head is larger than [`MessageLimits::head`] allows.
     HeadTooLarge,
-    /// The body is larger than [`Limits::body`] allows.
+    /// The body is larger than [`MessageLimits::body`] allows.
     BodyTooLarge,
 }
 
@@ -118,7 +94,7 @@ enum State {
 
 impl Decoder {
     /// Creates a decoder for one connection.
-    pub fn new(role: Role, limits: Limits) -> Decoder {
+    pub fn new(role: Role, limits: MessageLimits) -> Decoder {
         Decoder { role, limits, state: State::Head { scanned: 0 } }
     }
 
@@ -265,7 +241,7 @@ impl error::Error for DecodeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
+    use crate::message::{
         header::{CALL_ID, VIA},
         Method, StatusCode,
     };
@@ -289,7 +265,7 @@ mod tests {
         \r\n";
 
     fn decoder(role: Role) -> Decoder {
-        Decoder::new(role, Limits::default())
+        Decoder::new(role, MessageLimits::default())
     }
 
     /// Decodes every frame in `buf` with a fresh decoder.
@@ -577,7 +553,7 @@ mod tests {
 
     #[test]
     fn limits_the_head_size() {
-        let limits = Limits { head: RINGING.len(), body: 0 };
+        let limits = MessageLimits { head: RINGING.len(), body: 0 };
 
         let mut decoder = Decoder::new(Role::Server, limits);
         let mut buf = BytesMut::from(RINGING);
@@ -601,7 +577,7 @@ mod tests {
 
     #[test]
     fn limits_the_body_size() {
-        let limits = Limits { head: usize::MAX, body: 7 };
+        let limits = MessageLimits { head: usize::MAX, body: 7 };
         let mut decoder = Decoder::new(Role::Server, limits);
         let mut buf = BytesMut::from(&INVITE[..INVITE.len() - 8]);
 

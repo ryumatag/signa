@@ -15,8 +15,7 @@ use std::{
 
 use bytes::Bytes;
 use signa::{
-    endpoint::{Endpoint, Transport},
-    Request, Response, StatusCode,
+    endpoint::Endpoint, transport::Transport, Request, Response, StatusCode,
 };
 use tower_service::Service;
 

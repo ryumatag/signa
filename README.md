@@ -30,6 +30,19 @@ are later work. The [crate docs] say what is covered in detail.
 [siparse]: https://docs.rs/siparse
 [crate docs]: https://docs.rs/signa
 
+### Modules
+
+`message` contains the SIP message model, construction, parsing and encoding.
+The main types remain available at the crate root, such as `signa::Request`.
+Use `signa::message::request::Parts`, `signa::message::header::VIA` and
+`signa::message::BuildError` for detailed message APIs.
+
+`transaction::Timers` configures transaction deadlines.
+`transport::{Flow, Transport, MessageLimits}` describes transport metadata and
+stream receive limits. These APIs are runtime independent. The `tokio` feature
+enables the endpoint and sockets. State machines, sockets and framing remain
+internal implementation details.
+
 ### Example
 
 A UAS that answers every request with a 200:
