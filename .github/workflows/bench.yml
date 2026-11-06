@@ -139,6 +139,6 @@ jobs:
             echo "## Tables against $BASE_LABEL"
             echo
             echo '```'
-            scripts/tables -c "$BASE_SHA"
+            scripts/tables -c "$BASE_LABEL"
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"

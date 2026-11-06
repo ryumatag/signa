@@ -91,7 +91,12 @@ for ref in ${refs[@]+"${refs[@]}"}; do
   find "$dir" -mindepth 1 -maxdepth 1 ! -name target -exec rm -rf {} +
   git -C "$repo" archive "$ref" | tar -xf - -C "$dir"
   dirs+=("$dir")
-  labels+=("$ref ($commit)")
+  # A ref that is a hash already is shown short, as `git log` would.
+  if [[ "$ref" =~ ^[0-9a-f]{7,40}$ ]]; then
+    labels+=("$commit")
+  else
+    labels+=("$ref ($commit)")
+  fi
 done
 if [[ $# == 0 ]]; then
   dirs+=("$repo")
@@ -150,12 +155,19 @@ sample_heap() {
   trap - EXIT
 }
 
+# The tree column is as wide as the widest label.
+width=4
+for label in "${labels[@]}"; do
+  (( ${#label} > width )) && width=${#label}
+done
+
 printf '%s round trips, 16 in flight, RFC 3261 timers\n\n' "$round_trips"
-printf '%-24s %4s %16s %9s\n' tree run 'us/round trip' 'max RSS'
+printf '%-*s %4s %16s %9s\n' "$width" tree run 'us/round trip' 'max RSS'
 for ((run = 1; run <= runs; run++)); do
   for i in "${!bins[@]}"; do
     read -r us rss < <(measure "${bins[i]}")
-    printf '%-24s %4d %16s %6s MB\n' "${labels[i]}" "$run" "$us" "$rss"
+    printf '%-*s %4d %16s %6s MB\n' \
+      "$width" "${labels[i]}" "$run" "$us" "$rss"
   done
 done
 
