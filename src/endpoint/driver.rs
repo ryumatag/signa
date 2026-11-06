@@ -26,22 +26,18 @@ connections.
 
 use std::{
     cmp::Ordering,
-    collections::{
-        hash_map::RandomState as StdRandomState, BinaryHeap, HashMap, VecDeque,
-    },
+    collections::{BinaryHeap, HashMap, VecDeque},
     convert::Infallible,
-    fmt::Write as _,
     future::{poll_fn, Future},
-    hash::{BuildHasher, Hasher},
     io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
     time::{Duration, Instant},
 };
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use foldhash::fast::RandomState;
 use tokio::{
     sync::{mpsc, oneshot, Semaphore},
@@ -51,12 +47,18 @@ use tower_service::Service;
 
 use crate::{
     endpoint::{
+        builder::Config,
+        datagram::Datagram,
         error::Error,
         reply::{Admission, Completion, ReplyError, ReplyRoute},
+        routing::{
+            mark_via, reply_flow, sent_by_is, source_toward, via_value,
+            Branches, Link,
+        },
         table::{Id, Table},
     },
     message::{
-        header::{via::Via, HeaderValue, CSEQ, VIA},
+        header::{via::Via, CSEQ, VIA},
         request::Request,
         response::{bare_response, reply_headers, Response},
         Message, Method, StatusCode,
@@ -64,7 +66,6 @@ use crate::{
     transaction::{
         key::{ClientKey, ServerKey},
         non_invite::{ClientEvent, ClientTransaction, ServerTransaction},
-        Timers,
     },
     transport::{tcp, udp, Flow, Transport},
 };
@@ -79,13 +80,6 @@ pub(super) const MAX_UDP_REQUEST: usize = 1300;
 /// falls behind, the readers stop and TCP flow control holds the peers back.
 pub(super) const TCP_INBOUND: usize = 256;
 
-/// The port `sent-by` means when it names none (RFC 3261 section 18.2.2).
-const DEFAULT_PORT: u16 = 5060;
-
-/// How many datagrams may wait for the UDP socket to be writable. Beyond
-/// that a send fails, and the transaction retransmits later if it does.
-const UDP_BACKLOG: usize = 1024;
-
 /// One-shot replies hold a slot through command, connect, and local write.
 const REPLY_OPERATIONS: usize = 64;
 
@@ -99,15 +93,6 @@ const fn status(code: u16) -> StatusCode {
         Ok(status) => status,
         Err(_) => panic!("a status code"),
     }
-}
-
-/// Settings from the builder.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct Config {
-    pub(super) timers: Timers,
-    pub(super) tcp: tcp::Config,
-    pub(super) max_pending_requests: usize,
-    pub(super) max_client_transactions: usize,
 }
 
 /// What a client sends.
@@ -145,13 +130,6 @@ pub(super) enum Slot {
     Stateless(Link),
 }
 
-/// A way to send: the flow, and the connection when the flow is TCP.
-#[derive(Clone)]
-pub(super) struct Link {
-    pub(super) flow: Flow,
-    pub(super) writer: Option<tcp::Writer>,
-}
-
 struct ServerEntry {
     tx: ServerTransaction,
     /// Where responses go. Its remote address is the one RFC 3261 section
@@ -168,7 +146,8 @@ struct ClientEntry {
     respond: Option<Responder>,
 }
 
-/// What the driver knows about one next hop.
+/// What the driver knows about one next hop. Pending connects stay here
+/// because their requests start transactions only after a writer is ready.
 #[derive(Default)]
 struct Route {
     /// The address the UDP socket sends from to this hop, found once.
@@ -231,35 +210,6 @@ impl Ord for Timer {
     }
 }
 
-/// Makes branches. Each is the magic cookie, a random prefix taken once, and
-/// a counter, so no two transactions of this endpoint share one, and no two
-/// endpoints do either, in all likelihood. Neither a syscall nor a random
-/// number is needed per request.
-struct Branches {
-    prefix: String,
-    next: u64,
-}
-
-impl Branches {
-    fn new() -> Branches {
-        // The standard library seeds its hasher randomly. Hashing nothing with
-        // a fresh one gives 64 random bits without another dependency.
-        let mut seed = StdRandomState::new().build_hasher().finish();
-        let mut prefix = String::from("z9hG4bK");
-        for _ in 0..10 {
-            let digit = (seed % 36) as u8;
-            seed /= 36;
-            prefix.push(char::from(if digit < 10 {
-                b'0' + digit
-            } else {
-                b'a' + digit - 10
-            }));
-        }
-
-        Branches { prefix, next: 0 }
-    }
-}
-
 /// What one turn of the loop acts on.
 enum Event {
     Timer(Key),
@@ -284,7 +234,7 @@ pub(super) struct Driver<S> {
     /// `commands`, because the driver holds the sender for them.
     internal: mpsc::UnboundedReceiver<Command>,
     internal_tx: mpsc::UnboundedSender<Command>,
-    udp: Option<Udp>,
+    udp: Option<Datagram>,
     tcp: mpsc::Receiver<tcp::Inbound>,
     /// For the connections the driver opens.
     tcp_tx: mpsc::Sender<tcp::Inbound>,
@@ -336,7 +286,7 @@ where
             commands,
             internal,
             internal_tx,
-            udp: udp.map(Udp::new),
+            udp: udp.map(Datagram::new),
             tcp,
             tcp_tx,
             config,
@@ -430,7 +380,7 @@ where
 
         if let Some(udp) = &mut self.udp {
             udp.poll_flush(cx);
-            match udp.socket.poll_recv(cx, &mut udp.buf) {
+            match udp.poll_recv(cx) {
                 Poll::Ready(Ok((datagram, flow))) => {
                     return Poll::Ready(Event::Datagram(datagram, flow))
                 }
@@ -464,7 +414,7 @@ where
             && self.queue.is_empty()
             && self.pending == 0
             && self.unanswered == 0
-            && self.udp.as_ref().map_or(true, |udp| udp.backlog.is_empty())
+            && self.udp.as_ref().map_or(true, |udp| udp.is_idle())
             && !self
                 .routes
                 .values()
@@ -639,7 +589,7 @@ where
                     let _ = respond.send(Err(Error::transport(err)));
                     return;
                 };
-                let port = udp.socket.local_addr().port();
+                let port = udp.local_addr().port();
                 let source = match self.udp_source(next_hop) {
                     Ok(source) => source,
                     Err(err) => {
@@ -810,7 +760,6 @@ where
             .udp
             .as_ref()
             .expect("checked by the caller")
-            .socket
             .local_addr()
             .ip();
         if !bound.is_unspecified() {
@@ -1121,93 +1070,12 @@ fn now() -> Instant {
     tokio::time::Instant::now().into_std()
 }
 
-/// The UDP socket, its read buffer, and the datagrams waiting for it to be
-/// writable.
-struct Udp {
-    socket: udp::Socket,
-    buf: BytesMut,
-    backlog: VecDeque<(Bytes, Flow, Option<Completion>)>,
-}
-
-impl Udp {
-    fn new(socket: udp::Socket) -> Udp {
-        Udp { socket, buf: BytesMut::new(), backlog: VecDeque::new() }
-    }
-
-    /// Sends `bytes` on `flow` now, or queues it when the socket is not
-    /// writable at the moment.
-    ///
-    /// A datagram that waits and then fails is dropped. UDP loses datagrams
-    /// anyway, and the transactions retransmit over it.
-    fn send(&mut self, bytes: &Bytes, flow: &Flow) -> io::Result<()> {
-        if self.backlog.is_empty() {
-            match self.socket.try_send(bytes, flow) {
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
-                result => return result,
-            }
-        }
-        if self.backlog.len() >= UDP_BACKLOG {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "the UDP send backlog is full",
-            ));
-        }
-        self.backlog.push_back((bytes.clone(), *flow, None));
-
-        Ok(())
-    }
-
-    fn submit(&mut self, bytes: Bytes, flow: Flow, completion: Completion) {
-        let before = self.backlog.len();
-
-        match self.send(&bytes, &flow) {
-            Ok(()) if self.backlog.len() > before => {
-                self.backlog.back_mut().expect("just enqueued").2 =
-                    Some(completion);
-            }
-            result => completion.finish(result.map_err(|error| {
-                if error.kind() == io::ErrorKind::WouldBlock {
-                    ReplyError::Busy
-                } else {
-                    ReplyError::Transport(error)
-                }
-            })),
-        }
-    }
-
-    fn finish_front(&mut self, result: io::Result<()>) {
-        if let Some((_, _, Some(completion))) = self.backlog.pop_front() {
-            completion.finish(result.map_err(ReplyError::Transport));
-        }
-    }
-
-    /// Sends what waits, as far as the socket takes it.
-    fn poll_flush(&mut self, cx: &mut Context<'_>) {
-        while let Some((bytes, flow, _)) = self.backlog.front() {
-            match self.socket.poll_send_ready(cx) {
-                Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(error)) => {
-                    self.finish_front(Err(error));
-                    continue;
-                }
-                Poll::Pending => return,
-            }
-
-            match self.socket.try_send(bytes, flow) {
-                // Readiness is cleared, and the next poll waits for it.
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
-                result => self.finish_front(result),
-            }
-        }
-    }
-}
-
 /// Sends `bytes` along `link` without waiting.
 ///
 /// Over TCP a full write queue is an error here. The connection is in trouble,
 /// and a transaction that retransmits will try again.
 fn send_on(
-    udp: Option<&mut Udp>,
+    udp: Option<&mut Datagram>,
     link: &Link,
     bytes: &Bytes,
 ) -> io::Result<()> {
@@ -1224,109 +1092,16 @@ fn send_on(
     }
 }
 
-/// Asks the kernel which address it would send to `remote` from.
-fn source_toward(remote: SocketAddr) -> io::Result<IpAddr> {
-    let any = match remote {
-        SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-        SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-    };
-    let probe = std::net::UdpSocket::bind(SocketAddr::new(any, 0))?;
-    probe.connect(remote)?;
-
-    Ok(probe.local_addr()?.ip())
-}
-
-/// The `Via` this endpoint puts on a request it sends on `flow`.
-///
-/// `rport` asks the server to answer the port the request came from
-/// (RFC 3581), which is what a NAT lets through.
-fn via_value(flow: &Flow, branches: &mut Branches) -> HeaderValue {
-    let mut value = String::with_capacity(80);
-    let n = branches.next;
-    branches.next += 1;
-    let _ = write!(
-        value,
-        "SIP/2.0/{} {};rport;branch={}{n:x}",
-        flow.transport, flow.local, branches.prefix
-    );
-
-    HeaderValue::from_built(value)
-}
-
-/// Returns `true` if the `sent-by` of `via` is `local`.
-fn sent_by_is(via: &Via<'_>, local: SocketAddr) -> bool {
-    via.host.parse::<IpAddr>().is_ok_and(|ip| ip == local.ip())
-        && via.port.unwrap_or(DEFAULT_PORT) == local.port()
-}
-
-/// Where a response to a request received on `flow` with the top `via` goes
-/// (RFC 3261 section 18.2.2, RFC 3581 section 4).
-///
-/// It goes to the address the request came from, which is what `received`
-/// would say, since the endpoint adds that parameter whenever `sent-by` says
-/// otherwise. Nothing here trusts a `received` the request came with, so a
-/// request cannot have its response sent to a third party.
-///
-/// Over UDP the port is the source port with `rport`, and the `sent-by` port
-/// without it. Over TCP the response goes back on the connection, and the
-/// flow's remote address is where a new connection goes when that one has
-/// closed. That is the `sent-by` port, since RFC 3581 applies `rport` to
-/// unreliable transports only.
-fn reply_flow(via: &Via<'_>, flow: &Flow) -> Flow {
-    let port = match via.rport {
-        Some(_) if !flow.transport.is_reliable() => flow.remote.port(),
-        _ => via.port.unwrap_or(DEFAULT_PORT),
-    };
-
-    Flow { remote: SocketAddr::new(flow.remote.ip(), port), ..*flow }
-}
-
-/// Returns the top `Via` with `received` and `rport` filled in, or `None` when
-/// neither is called for.
-///
-/// `received` is added at the end of the first `via-parm` when `sent-by` names
-/// a host other than the source address (RFC 3261 section 18.2.1). A valueless
-/// `rport` is given the source port in place (RFC 3581 section 4). An `rport`
-/// that came with a value is left alone. The response goes to the source port
-/// either way, see [`reply_flow`].
-fn mark_via(
-    value: &HeaderValue,
-    via: &Via<'_>,
-    flow: &Flow,
-) -> Option<HeaderValue> {
-    let source = flow.remote;
-    let received =
-        via.host.parse::<IpAddr>().map_or(true, |host| host != source.ip());
-    if !received && via.rport_at.is_none() {
-        return None;
-    }
-
-    let src = value.as_str();
-    let mut marked = String::with_capacity(src.len() + 40);
-    let mut copied = 0;
-    if let Some(at) = via.rport_at {
-        marked.push_str(&src[..at]);
-        let _ = write!(marked, "={}", source.port());
-        copied = at;
-    }
-    marked.push_str(&src[copied..via.end]);
-    if received {
-        let _ = write!(marked, ";received={}", source.ip());
-    }
-    marked.push_str(&src[via.end..]);
-
-    Some(HeaderValue::from_built(marked))
-}
-
 // These private driver tests use sockets, which Miri cannot provide.
 #[cfg(all(test, not(miri)))]
 mod tests {
-    use super::super::tests::{
+    use tokio::{net::UdpSocket, time::timeout};
+
+    use super::*;
+    use crate::endpoint::tests::{
         reply_driver, route_request, route_response, udp_reply_link,
         REPLY_LOCAL,
     };
-    use super::*;
-    use tokio::{net::UdpSocket, time::timeout};
 
     #[tokio::test]
     async fn cancellation_before_enqueue_has_no_effect_and_after_enqueue_keeps_the_write(
@@ -1358,13 +1133,6 @@ mod tests {
 
         drop(all);
 
-        // Force the backlog path without relying on kernel send-buffer pressure.
-        driver.udp.as_mut().unwrap().backlog.push_back((
-            Bytes::from_static(b"first"),
-            link.flow,
-            None,
-        ));
-
         {
             let mut send = std::pin::pin!(route.send(response.clone()));
             poll_fn(|cx| {
@@ -1377,21 +1145,12 @@ mod tests {
         let command = driver.commands.try_recv().unwrap();
         driver.on_command(command);
 
-        assert_eq!(capacity.available_permits(), 63);
-        assert_eq!(driver.udp.as_ref().unwrap().backlog.len(), 2);
-
         drop(route);
         drop(commands);
 
         let task = tokio::spawn(driver.run());
 
         let mut buf = [0; 2048];
-        let (n, _) = timeout(Duration::from_secs(1), peer.recv_from(&mut buf))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(&buf[..n], b"first");
-
         let (n, _) = timeout(Duration::from_secs(1), peer.recv_from(&mut buf))
             .await
             .unwrap()
@@ -1429,77 +1188,5 @@ mod tests {
         drop(commands);
 
         assert!(matches!(send.await, Err(ReplyError::Closed)));
-    }
-
-    #[tokio::test]
-    async fn a_queued_udp_error_is_observed_with_its_io_source() {
-        let (mut driver, _commands, local) = reply_driver();
-        let link = udp_reply_link(local, "127.0.0.1:9".parse().unwrap());
-        let (request, route) = driver
-            .prepare_reply(
-                route_request(
-                    "SIP/2.0/UDP example.com:9;branch=z9hG4bKroute;rport",
-                ),
-                link.clone(),
-            )
-            .unwrap();
-
-        driver.udp.as_mut().unwrap().backlog.push_back((
-            Bytes::new(),
-            link.flow,
-            None,
-        ));
-
-        let mut send = std::pin::pin!(route.send(route_response(&request)));
-        poll_fn(|cx| {
-            assert!(send.as_mut().poll(cx).is_pending());
-            Poll::Ready(())
-        })
-        .await;
-
-        let command = driver.commands.try_recv().unwrap();
-        driver.on_command(command);
-        let udp = driver.udp.as_mut().unwrap();
-        udp.finish_front(Ok(()));
-        udp.finish_front(Err(io::Error::from_raw_os_error(5)));
-
-        let Err(ReplyError::Transport(error)) = send.await else {
-            panic!("expected datagram error");
-        };
-
-        assert_eq!(error.raw_os_error(), Some(5));
-        assert_eq!(driver.reply_admission.0.available_permits(), 64);
-    }
-
-    #[tokio::test]
-    async fn route_identity_is_owned_and_all_via_rows_are_preserved() {
-        let (driver, _commands, local) = reply_driver();
-        let link = udp_reply_link(local, "127.0.0.1:9".parse().unwrap());
-        let mut original = route_request(
-            "SIP/2.0/UDP example.com:9;branch=z9hG4bKroute;rport",
-        );
-        original.headers_mut().append(
-            VIA,
-            HeaderValue::from_static(
-                "SIP/2.0/UDP older.example.com;branch=z9hG4bKolder",
-            ),
-        );
-
-        let input = original.to_bytes();
-        let original = Request::from_shared(input.clone()).unwrap();
-        let (corrected, route) = driver.prepare_reply(original, link).unwrap();
-
-        assert_eq!(corrected.headers().get_all(VIA).count(), 2);
-        let encoded = route_response(&corrected).to_bytes();
-        drop(corrected);
-
-        assert!(input.is_unique());
-
-        // The route remains usable after dropping the received message.
-
-        let task = tokio::spawn(driver.run());
-        route.send(Response::from_shared(encoded).unwrap()).await.unwrap();
-
-        task.abort();
     }
 }

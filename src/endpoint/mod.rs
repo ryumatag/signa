@@ -96,37 +96,47 @@ endpoint.shutdown(Duration::from_secs(10)).await;
 
 Transaction timer configuration is owned by [`crate::transaction`], and
 transport metadata by [`crate::transport`]. They are not public members of
-this module. The following cannot compile because this import is private:
+this module. The following cannot compile because `Timers` belongs to
+`transaction`:
 
 ```compile_fail
 use signa::endpoint::Timers;
 ```
 */
 
-use std::{fmt, io, net::SocketAddr, time::Duration};
+use std::{fmt, net::SocketAddr, time::Duration};
 
+#[cfg(feature = "__bench")]
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
+#[cfg(feature = "__bench")]
 use tower_service::Service;
 
-use self::driver::{Command, Config, Driver, TCP_INBOUND};
+use self::driver::Command;
+#[cfg(feature = "__bench")]
+use self::{builder::Config, driver::Driver};
+use crate::transport::Transport;
+#[cfg(feature = "__bench")]
 use crate::{
-    message::{request::Request, response::Response},
-    transaction::Timers,
-    transport::{tcp, udp, MessageLimits, Transport},
+    message::{Request, Response},
+    transport::{tcp, udp},
 };
 
 pub use self::{
+    builder::Builder,
     client::{Client, ResponseFuture},
     error::Error,
     reply::{ReplyError, ReplyRoute},
     shutdown::Shutdown,
 };
 
+mod builder;
 mod client;
+mod datagram;
 mod driver;
 mod error;
 mod reply;
+mod routing;
 mod shutdown;
 mod table;
 
@@ -218,187 +228,10 @@ impl fmt::Debug for Endpoint {
     }
 }
 
-/// Builds an [`Endpoint`].
-///
-/// # Example
-///
-/// ```no_run
-/// use std::time::Duration;
-///
-/// use signa::{endpoint::Endpoint, transaction::Timers};
-/// # use bytes::Bytes;
-/// # use signa::{Request, Response};
-///
-/// # fn service() -> impl tower_service::Service<
-/// #     Request<Bytes>,
-/// #     Response = Response<Bytes>,
-/// #     Future = std::future::Ready<
-/// #         Result<Response<Bytes>, std::convert::Infallible>,
-/// #     >,
-/// # > + Send
-/// #        + 'static {
-/// #     tower::service_fn(|_| unreachable!())
-/// # }
-/// # fn main() -> std::io::Result<()> {
-/// # let rt = tokio::runtime::Runtime::new()?;
-/// # let _guard = rt.enter();
-/// let endpoint = Endpoint::builder()
-///     .udp("0.0.0.0:5060".parse().unwrap())
-///     .timers(Timers::builder().t1(Duration::from_millis(200)).build().unwrap())
-///     .max_pending_requests(256)
-///     .serve(service())?;
-/// # Ok(())
-/// # }
-/// ```
-#[derive(Debug)]
-pub struct Builder {
-    udp: Option<SocketAddr>,
-    tcp: Option<SocketAddr>,
-    config: Config,
-}
-
-impl Default for Builder {
-    fn default() -> Builder {
-        Builder::new()
-    }
-}
-
-impl Builder {
-    /// Creates a builder with no sockets and the defaults below.
-    pub fn new() -> Builder {
-        Builder {
-            udp: None,
-            tcp: None,
-            config: Config {
-                timers: Timers::default(),
-                tcp: tcp::Config::default(),
-                max_pending_requests: 1024,
-                max_client_transactions: 4096,
-            },
-        }
-    }
-
-    /// Binds a UDP socket to `addr`.
-    ///
-    /// On Linux, Android, and Apple platforms a socket bound to a wildcard
-    /// address answers each request from the address it came to. Elsewhere the
-    /// kernel picks the source address, so bind to one address there when the
-    /// host has several.
-    pub fn udp(mut self, addr: SocketAddr) -> Builder {
-        self.udp = Some(addr);
-        self
-    }
-
-    /// Binds a TCP listener to `addr`.
-    pub fn tcp(mut self, addr: SocketAddr) -> Builder {
-        self.tcp = Some(addr);
-        self
-    }
-
-    /// Sets the transaction timers. The default is RFC 3261's, with T1 at
-    /// 500 ms.
-    pub fn timers(mut self, timers: Timers) -> Builder {
-        self.config.timers = timers;
-        self
-    }
-
-    /// Sets how large the head and the body of a message received over TCP may
-    /// be.
-    ///
-    /// A larger one closes the connection. The default allows 64 KiB and
-    /// 1 MiB.
-    pub fn limits(mut self, limits: MessageLimits) -> Builder {
-        self.config.tcp.limits = limits;
-        self
-    }
-
-    /// Sets how long a TCP connection may go without receiving anything before
-    /// it is closed. The default is five minutes, which outlasts the RFC 5626
-    /// keepalive interval.
-    pub fn idle_timeout(mut self, timeout: Duration) -> Builder {
-        self.config.tcp.idle_timeout = timeout;
-        self
-    }
-
-    /// Sets how many TCP connections the listener keeps open at once. More
-    /// wait in the OS backlog. The default is 1024.
-    pub fn max_connections(mut self, limit: usize) -> Builder {
-        self.config.tcp.max_connections = limit;
-        self
-    }
-
-    /// Sets how many requests may wait for the service or be in its hands at
-    /// once. A request beyond that gets a stateless 503. The default is 1024.
-    pub fn max_pending_requests(mut self, limit: usize) -> Builder {
-        self.config.max_pending_requests = limit;
-        self
-    }
-
-    /// Sets how many client transactions may be open at once. A request
-    /// beyond that fails with [`Error::is_busy`]. The default is 4096.
-    ///
-    /// Over UDP a transaction stays open for Timer K, which is T4 or 5 s,
-    /// after its final response, to absorb retransmissions of it. So the limit
-    /// bounds the requests of the last five seconds, not the ones still
-    /// waiting for an answer.
-    pub fn max_client_transactions(mut self, limit: usize) -> Builder {
-        self.config.max_client_transactions = limit;
-        self
-    }
-
-    /// Binds the sockets, starts the endpoint with `service` answering its
-    /// requests, and returns a handle to it.
-    ///
-    /// Must be called from within a tokio runtime, since the endpoint runs as
-    /// a task on it.
-    ///
-    /// # Errors
-    ///
-    /// Returns the error of binding a socket.
-    pub fn serve<S>(self, service: S) -> io::Result<Endpoint>
-    where
-        S: Service<Request<Bytes>, Response = Response<Bytes>>
-            + Send
-            + 'static,
-        S::Future: Send + 'static,
-    {
-        let udp = self.udp.map(udp::Socket::bind).transpose()?;
-        let (tcp_tx, tcp_rx) = mpsc::channel(TCP_INBOUND);
-        let listener = self
-            .tcp
-            .map(|addr| {
-                tcp::Listener::bind(addr, self.config.tcp, tcp_tx.clone())
-            })
-            .transpose()?;
-        let (commands, commands_rx) = mpsc::unbounded_channel();
-        let endpoint = Endpoint {
-            commands,
-            udp: udp.as_ref().map(udp::Socket::local_addr),
-            tcp: listener.as_ref().map(tcp::Listener::local_addr),
-        };
-
-        if let Some(listener) = listener {
-            tokio::spawn(listener.run());
-        }
-        let driver = Driver::new(
-            service,
-            self.config,
-            udp,
-            tcp_rx,
-            tcp_tx,
-            commands_rx,
-            endpoint.commands.downgrade(),
-        );
-        tokio::spawn(driver.run());
-
-        Ok(endpoint)
-    }
-}
-
 /// Connects a benchmark-supplied request and transports to the real driver.
 ///
-/// Called inside a tokio runtime. Fixture messages, services, sockets and
-/// task ownership belong to the external benchmark crate.
+/// Called inside a tokio runtime. Fixture messages, services, sockets and task
+/// ownership belong to the external benchmark crate.
 #[cfg(feature = "__bench")]
 #[doc(hidden)]
 pub fn reply_driver<S>(
@@ -417,12 +250,12 @@ where
     S: Service<Request<Bytes>, Response = Response<Bytes>> + Send + 'static,
     S::Future: Send + 'static,
 {
-    use self::driver::Link;
+    use self::routing::Link;
 
     let (commands, rx) = mpsc::unbounded_channel();
     let driver = Driver::new(
         service,
-        Builder::new().config,
+        Config::default(),
         udp,
         tcp,
         tcp_tx,
@@ -464,8 +297,10 @@ mod tests {
 
     use crate::{
         endpoint::{
-            driver::{Command, Config, Driver, Link, TCP_INBOUND},
+            builder::Config,
+            driver::{Command, Driver, TCP_INBOUND},
             error::Error,
+            routing::Link,
             Endpoint, ReplyError,
         },
         message::{
@@ -481,8 +316,8 @@ mod tests {
     const LOCALHOST: SocketAddr =
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 
-    /// Timers that make a test wait milliseconds instead of seconds. Timer F is
-    /// 640 ms, and the 100 goes out after 70 ms.
+    /// Timers that make a test wait milliseconds instead of seconds. Timer F
+    /// is 640 ms, and the 100 goes out after 70 ms.
     fn short_timers() -> Timers {
         Timers::builder()
             .t1(Duration::from_millis(10))
@@ -1354,8 +1189,8 @@ mod tests {
         let mut pending: Pin<
             Box<dyn Future<Output = Result<Response<Bytes>, Error>>>,
         > = Box::pin(client.call(request("OPTIONS")));
-        // The peer never answers. Stop the driver by closing its command channel,
-        // which drops the transaction that waits.
+        // The peer never answers. Stop the driver by closing its command
+        // channel, which drops the transaction that waits.
         drop(client);
         drop(client_end);
         let err = (&mut pending).await.unwrap_err();
@@ -1395,7 +1230,8 @@ mod tests {
     }
 
     impl Peer {
-        /// Receives datagrams until a final response, or `None` when none comes.
+        /// Receives datagrams until a final response, or `None` when none
+        /// comes.
         async fn recv_final(&mut self) -> Option<String> {
             loop {
                 let message = self.recv().await?;
@@ -1475,7 +1311,8 @@ mod tests {
             .await
             .is_err());
 
-        // A request after the call is refused. The one in flight is waited for.
+        // A request after the call is refused. The one in flight is waited
+        // for.
         let mut late =
             other.client(Transport::Udp, peer.socket.local_addr().unwrap());
         let err = late.call(request("OPTIONS")).await.unwrap_err();
@@ -1544,8 +1381,8 @@ mod tests {
         let response = read_final(&mut stream).await;
         assert!(response.starts_with("SIP/2.0 200 OK\r\n"), "{response}");
 
-        // The endpoint is gone, so the connection ends at once rather than at the
-        // idle timeout.
+        // The endpoint is gone, so the connection ends at once rather than at
+        // the idle timeout.
         drop(server);
         let mut buf = [0; 1];
         let n = timeout(Duration::from_secs(1), stream.read(&mut buf))
@@ -1785,6 +1622,37 @@ mod tests {
         let source =
             error.get_ref().unwrap().downcast_ref::<Arc<io::Error>>().unwrap();
         assert!(source.raw_os_error().is_some());
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn route_identity_is_owned_and_all_via_rows_are_preserved() {
+        let (driver, _commands, local) = reply_driver();
+        let link = udp_reply_link(local, "127.0.0.1:9".parse().unwrap());
+        let mut original = route_request(
+            "SIP/2.0/UDP example.com:9;branch=z9hG4bKroute;rport",
+        );
+        original.headers_mut().append(
+            VIA,
+            HeaderValue::from_static(
+                "SIP/2.0/UDP older.example.com;branch=z9hG4bKolder",
+            ),
+        );
+
+        let input = original.to_bytes();
+        let original = Request::from_shared(input.clone()).unwrap();
+        let (corrected, route) = driver.prepare_reply(original, link).unwrap();
+
+        assert_eq!(corrected.headers().get_all(VIA).count(), 2);
+        let encoded = route_response(&corrected).to_bytes();
+        drop(corrected);
+
+        assert!(input.is_unique());
+
+        // The route remains usable after dropping the received message.
+        let task = tokio::spawn(driver.run());
+        route.send(Response::from_shared(encoded).unwrap()).await.unwrap();
 
         task.abort();
     }

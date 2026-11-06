@@ -8,7 +8,7 @@ use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 
 use crate::{
-    endpoint::driver::{Command, Link},
+    endpoint::{driver::Command, routing::Link},
     message::{
         header::{
             address::has_tag, HeaderMap, HeaderValue, CALL_ID, CSEQ, FROM, TO,
