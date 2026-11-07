@@ -157,4 +157,25 @@ pub(super) fn tcp(c: &mut Criterion) {
             });
         });
     });
+
+    // Exceed each inbound channel's capacity. A reader waiting on the
+    // consumer must not prevent the same connection's writer from running.
+    benchmark(c, "transport/tcp/burst", len * 8, |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                for _ in 0..8 {
+                    client.send(bb(request.clone())).unwrap();
+                }
+                for _ in 0..8 {
+                    let inbound = server_rx.recv().await.unwrap();
+                    assert!(matches!(inbound.message, Message::Request(_)));
+                    inbound.writer.send(bb(response.clone())).unwrap();
+                }
+                for _ in 0..8 {
+                    let inbound = client_rx.recv().await.unwrap();
+                    assert!(matches!(inbound.message, Message::Response(_)));
+                }
+            });
+        });
+    });
 }

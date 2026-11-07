@@ -39,6 +39,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{tcp::OwnedReadHalf, TcpListener, TcpStream},
     sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore},
+    task::JoinHandle,
     time::{sleep, timeout},
 };
 
@@ -388,7 +389,7 @@ fn start(
     }));
     let permit = Arc::new(permit.into());
     let writer_permit = permit.clone();
-    let mut writing = tokio::spawn(async move {
+    let writing = tokio::spawn(async move {
         write_loop(write, pending).await;
         drop(writer_permit);
     });
@@ -402,28 +403,47 @@ fn start(
         writer.clone(),
     );
 
-    tokio::spawn(async move {
-        match reading.await {
-            // The connection is over. A write still in flight is lost, which
-            // is no worse than the peer having gone away.
-            End::Peer => {
-                writing.abort();
-                let _ = writing.await;
-            }
-            // The endpoint stopped. What it queued last, such as the final
-            // responses before a shutdown, still goes out. The queue closes
-            // with the endpoint's last `Writer`, and the writer ends with it.
-            End::Endpoint => {
-                if timeout(DRAIN_TIMEOUT, &mut writing).await.is_err() {
-                    writing.abort();
-                    let _ = writing.await;
-                }
-            }
-        }
-        drop(permit);
-    });
+    tokio::spawn(run_connection(reading, writing, permit));
 
     Ok(writer)
+}
+
+/// Owns connection teardown and keeps admission charged until both halves end.
+async fn run_connection(
+    reading: impl Future<Output = End>,
+    mut writing: JoinHandle<()>,
+    permit: Arc<Option<OwnedSemaphorePermit>>,
+) {
+    let end = {
+        let mut reading = pin!(reading);
+        poll_fn(|cx| {
+            // A failed writer cannot serve this connection any more. Check
+            // it even when the reader is blocked on a full inbound channel.
+            if std::pin::Pin::new(&mut writing).poll(cx).is_ready() {
+                return Poll::Ready(None);
+            }
+            reading.as_mut().poll(cx).map(Some)
+        })
+        .await
+    };
+    // Drop the reader, including its socket half and pending inbound send,
+    // before releasing admission or waiting for the writer to drain.
+    let abort = match end {
+        None => false,
+        // The connection is over. A write still in flight is lost, which
+        // is no worse than the peer having gone away.
+        Some(End::Peer) => true,
+        // The endpoint's last responses still get a chance to drain. Dropping
+        // the reader above releases its Writer so it cannot keep the queue open.
+        Some(End::Endpoint) => {
+            timeout(DRAIN_TIMEOUT, &mut writing).await.is_err()
+        }
+    };
+    if abort {
+        writing.abort();
+        let _ = writing.await;
+    }
+    drop(permit);
 }
 
 /// Why the reader ended.
@@ -710,6 +730,75 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn writer_failure_cancels_idle_and_backpressured_readers() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct ReaderGuard(Arc<AtomicBool>);
+
+        impl Drop for ReaderGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                for backpressured in [false, true] {
+                    let slots = Arc::new(Semaphore::new(1));
+                    let permit = Arc::new(Some(
+                        slots.clone().try_acquire_owned().unwrap(),
+                    ));
+                    let dropped = Arc::new(AtomicBool::new(false));
+                    let guard = ReaderGuard(dropped.clone());
+                    let (started, ready) = oneshot::channel();
+                    let (inbound, mut receiver) = mpsc::channel(1);
+                    inbound.send(()).await.unwrap();
+                    let reading = async move {
+                        let _guard = guard;
+                        started.send(()).unwrap();
+                        if backpressured {
+                            inbound.send(()).await.unwrap();
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                        End::Peer
+                    };
+                    let (writer, pending) = test_writer(2, 6);
+                    let writer_permit = permit.clone();
+                    let writing = tokio::spawn(async move {
+                        write_loop(FailsAfter(1), pending).await;
+                        drop(writer_permit);
+                    });
+                    let connection =
+                        tokio::spawn(run_connection(reading, writing, permit));
+                    ready.await.unwrap();
+                    assert_eq!(slots.available_permits(), 0);
+                    let partial =
+                        writer.submit(Bytes::from_static(b"abc")).unwrap();
+                    let queued =
+                        writer.submit(Bytes::from_static(b"def")).unwrap();
+
+                    assert!(partial.await.is_err());
+                    assert!(queued.await.is_err());
+                    timeout(Duration::from_secs(1), connection)
+                        .await
+                        .expect("writer failure must end the reader")
+                        .unwrap();
+
+                    assert!(dropped.load(Ordering::SeqCst));
+                    assert!(writer.is_closed());
+                    assert_eq!(slots.available_permits(), 1);
+                    assert!(writer.0.capacity.acquire(6).is_some());
+                    assert_eq!(receiver.recv().await, Some(()));
+                    assert_eq!(receiver.recv().await, None);
+                }
+            });
     }
 
     #[test]
