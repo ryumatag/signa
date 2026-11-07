@@ -36,7 +36,7 @@ __bench = []
 
 [dependencies]
 bytes = { version = "1.12.1", default-features = false, features = ["std"] }
-siparse = "0.4.0"
+siparse = "0.4.3"
 tokio = { version = "1.47", default-features = false, features = ["io-util", "net", "rt", "sync", "time"], optional = true }
 tower-service = { version = "0.3.3", optional = true }
 # Keys the transaction tables. Branches come from the network, so the hasher
