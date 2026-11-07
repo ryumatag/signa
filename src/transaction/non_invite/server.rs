@@ -45,6 +45,15 @@ pub struct ServerTransaction {
     state: State,
 }
 
+/// Why a TU response cannot be admitted without changing transaction state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResponseRejection {
+    TooEarly,
+    ProhibitedStatus,
+    FinalAlreadySent,
+    Terminated,
+}
+
 /// What the transaction keeps is what its next step needs, so that a
 /// transaction in `Completed` for Timer J holds only its response. The timers
 /// are the caller's, passed in with each event that uses them.
@@ -177,12 +186,56 @@ impl ServerTransaction {
         }
     }
 
+    /// Checks TU submission before encoding or changing the machine.
+    ///
+    /// [RFC 4320 section 4] forbids early 100 over unreliable transports,
+    /// other provisional statuses, and 408. Reliable hops may send 100 at
+    /// once.
+    ///
+    /// The driver can map these reasons to explicit TU submission errors.
+    ///
+    /// [RFC 4320 section 4]: https://www.rfc-editor.org/rfc/rfc4320.html#section-4
+    pub(crate) fn check_response(
+        &self,
+        status: StatusCode,
+        now: Instant,
+    ) -> Result<(), ResponseRejection> {
+        match &self.state {
+            State::Completed { .. } => {
+                return Err(ResponseRejection::FinalAlreadySent);
+            }
+            State::Terminated => {
+                return Err(ResponseRejection::Terminated);
+            }
+            _ => {}
+        }
+
+        match status {
+            REQUEST_TIMEOUT => Err(ResponseRejection::ProhibitedStatus),
+            TRYING => match &self.state {
+                State::Trying { trying, reliable: false, .. }
+                    if now < *trying =>
+                {
+                    Err(ResponseRejection::TooEarly)
+                }
+
+                _ => Ok(()),
+            },
+            _ if !status.is_final() => {
+                Err(ResponseRejection::ProhibitedStatus)
+            }
+
+            _ => Ok(()),
+        }
+    }
+
     /// Takes a response from the transaction user, encoded by the caller, and
     /// returns `true` if the caller sends it.
     ///
     /// A provisional response other than 100 and a 408 are not sent (RFC 4320
     /// section 4). The 408 still ends the transaction. Anything after the
-    /// final response is not sent either.
+    /// final response is not sent either. An unreliable transport rejects a
+    /// TU 100 before the automatic 100 deadline without changing state.
     pub fn on_response(
         &mut self,
         status: StatusCode,
@@ -194,12 +247,15 @@ impl ServerTransaction {
             State::Trying { .. } | State::Proceeding { .. } => {}
             State::Completed { .. } | State::Terminated => return false,
         }
-        if !status.is_final() && status != TRYING {
-            return false;
-        }
+        // The Service adapter historically uses 408 to abandon a transaction.
+        // Keep that policy here. TU callers check admission first and receive
+        // ProhibitedStatus without terminating their machine.
         if status == REQUEST_TIMEOUT {
             self.state = State::Terminated;
+            return false;
+        }
 
+        if self.check_response(status, now).is_err() {
             return false;
         }
 
@@ -335,13 +391,68 @@ mod tests {
     }
 
     #[test]
-    fn a_100_from_the_user_is_sent_and_other_provisionals_are_not() {
+    fn early_udp_100_rejection_keeps_the_automatic_deadline() {
+        let start = Instant::now();
+
+        let mut tx = transaction(false, start);
+        let due = start + TIMERS.trying_after();
+        for at in [start, due - Duration::from_nanos(1)] {
+            assert_eq!(
+                tx.check_response(status(100), at),
+                Err(ResponseRejection::TooEarly)
+            );
+            assert!(!tx.on_response(status(100), response(100), &TIMERS, at));
+            assert_eq!(tx.deadline(), Some(due));
+            assert_eq!(tx.on_retransmission(), None);
+        }
+        assert_eq!(tx.check_response(status(100), due), Ok(()));
+        assert!(tx.on_timeout(due).is_some());
+        assert_eq!(tx.check_response(status(100), due), Ok(()));
+    }
+
+    #[test]
+    fn reliable_100_is_allowed_immediately_and_admission_is_non_mutating() {
+        let start = Instant::now();
+
+        let mut tx = transaction(true, start);
+        assert_eq!(tx.check_response(status(100), start), Ok(()));
+        assert!(tx.on_response(status(100), response(100), &TIMERS, start));
+        assert_eq!(tx.on_retransmission(), Some(response(100)));
+        for code in [180, 183, 408] {
+            assert_eq!(
+                tx.check_response(status(code), start),
+                Err(ResponseRejection::ProhibitedStatus)
+            );
+            assert_eq!(tx.on_retransmission(), Some(response(100)));
+            assert!(!tx.is_terminated());
+        }
+        assert!(tx.on_response(status(200), response(200), &TIMERS, start));
+        assert_eq!(
+            tx.check_response(status(200), start),
+            Err(ResponseRejection::Terminated)
+        );
+
+        let mut udp = transaction(false, start);
+        assert!(udp.on_response(status(200), response(200), &TIMERS, start));
+        assert_eq!(
+            udp.check_response(status(200), start),
+            Err(ResponseRejection::FinalAlreadySent)
+        );
+    }
+
+    #[test]
+    fn a_due_100_from_the_user_is_sent_and_other_provisionals_are_not() {
         let start = Instant::now();
 
         let mut tx = transaction(false, start);
         assert!(!tx.on_response(status(180), response(180), &TIMERS, start));
         assert_eq!(tx.on_retransmission(), None);
-        assert!(tx.on_response(status(100), response(100), &TIMERS, start));
+        assert!(tx.on_response(
+            status(100),
+            response(100),
+            &TIMERS,
+            start + TIMERS.trying_after()
+        ));
         assert_eq!(tx.on_retransmission(), Some(response(100)));
         assert_eq!(tx.deadline(), None);
         assert!(!tx.on_response(status(183), response(183), &TIMERS, start));
@@ -357,9 +468,10 @@ mod tests {
             status(100),
             response(100),
             &TIMERS,
-            start + T1
+            start + TIMERS.trying_after()
         ));
-        let at = start + 2 * T1;
+
+        let at = start + TIMERS.trying_after() + T1;
         assert!(tx.on_response(status(486), response(486), &TIMERS, at));
         assert!(!tx.is_terminated());
         assert_eq!(tx.deadline(), Some(at + 64 * T1));

@@ -52,6 +52,38 @@ pub(super) fn non_invite(c: &mut Criterion) {
         });
     });
 
+    let final_bytes = Bytes::from_static(RESPONSE_TYPICAL);
+    benchmark(c, "transaction/non_invite/server_response/final", len, |b| {
+        b.iter_batched(
+            || ServerTransaction::new(&request, false, &timers, now),
+            |mut tx| {
+                assert!(tx.on_response(
+                    response.status(),
+                    bb(final_bytes.clone()),
+                    &timers,
+                    now
+                ));
+                assert!(tx.on_retransmission().is_some());
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    let mut waiting = ServerTransaction::new(&request, false, &timers, now);
+    let trying = signa::StatusCode::from_u16(100).unwrap();
+    benchmark(c, "transaction/non_invite/server_response/early_100", 1, |b| {
+        b.iter(|| {
+            assert!(!waiting.on_response(
+                trying,
+                Bytes::new(),
+                &timers,
+                bb(now)
+            ));
+            assert!(waiting.deadline().is_some());
+            assert!(waiting.on_retransmission().is_none());
+        });
+    });
+
     // A client transaction from the request to its final response, as over UDP
     // when the response arrives before the first retransmission. The response
     // is cloned in setup, so only the transaction is measured.
