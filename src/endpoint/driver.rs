@@ -69,7 +69,7 @@ use crate::{
         key::{ClientKey, ServerKey},
         non_invite::{ClientEvent, ClientTransaction, ServerTransaction},
     },
-    transport::{tcp, udp, Flow, Transport},
+    transport::{budget::Budget, tcp, udp, Flow, Transport, WriteLimits},
 };
 
 /// The most bytes of a request that go over UDP. RFC 3261 section 18.1.1
@@ -194,6 +194,7 @@ pub(super) struct Driver<S> {
     client_admission: AdmissionOwner,
     command_sender: mpsc::WeakUnboundedSender<Command>,
     reply_admission: Admission,
+    reply_bytes: Budget,
     writes: Vec<(tcp::Receipt, Completion)>,
     /// `poll_ready` failed, so the service takes nothing any more.
     service_failed: bool,
@@ -255,12 +256,17 @@ where
             reply_admission: Admission(Arc::new(Semaphore::new(
                 REPLY_OPERATIONS,
             ))),
+            reply_bytes: Budget::new(WriteLimits {
+                messages: REPLY_OPERATIONS,
+                bytes: config.max_reply_bytes,
+            }),
             writes: Vec::new(),
             service_failed: false,
             commands,
             internal,
             internal_tx,
-            udp: udp.map(Datagram::new),
+            udp: udp
+                .map(|socket| Datagram::new(socket, config.udp_write_limits)),
             tcp,
             tcp_tx,
             config,
@@ -699,6 +705,7 @@ where
             link,
             self.command_sender.upgrade().ok_or(ReplyError::Closed)?,
             self.reply_admission.0.clone(),
+            self.reply_bytes.clone(),
         );
 
         Ok((request, route))
@@ -706,6 +713,7 @@ where
 
     fn on_reply(&mut self, link: Link, bytes: Bytes, completion: Completion) {
         if self.shutting_down {
+            drop(bytes);
             completion.finish(Err(ReplyError::Closed));
             return;
         }
@@ -714,6 +722,7 @@ where
             match writer.submit(bytes.clone()) {
                 Ok(receipt) => self.writes.push((receipt, completion)),
                 Err(tcp::SendError::Full) => {
+                    drop(bytes);
                     completion.finish(Err(ReplyError::Busy))
                 }
                 Err(tcp::SendError::Closed) => self.send_over_tcp(
@@ -724,6 +733,7 @@ where
         } else if let Some(udp) = self.udp.as_mut() {
             udp.submit(bytes, link.flow, completion);
         } else {
+            drop(bytes);
             completion.finish(Err(ReplyError::Transport(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "no UDP socket",

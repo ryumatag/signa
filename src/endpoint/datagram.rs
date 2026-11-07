@@ -12,11 +12,7 @@ use std::{
 use bytes::{Bytes, BytesMut};
 
 use super::reply::{Completion, ReplyError};
-use crate::transport::{udp, Flow};
-
-/// How many datagrams may wait for the UDP socket to be writable. Beyond that
-/// a send fails, and the transaction retransmits later if it does.
-const UDP_BACKLOG: usize = 1024;
+use crate::transport::{udp, Flow, WriteLimits};
 
 /// The UDP socket, its read buffer, and the datagrams waiting for it to be
 /// writable.
@@ -24,11 +20,44 @@ pub(super) struct Datagram {
     socket: udp::Socket,
     buf: BytesMut,
     backlog: VecDeque<(Bytes, Flow, Option<Completion>)>,
+    limits: WriteLimits,
+    queued_bytes: usize,
 }
 
 impl Datagram {
-    pub(super) fn new(socket: udp::Socket) -> Datagram {
-        Datagram { socket, buf: BytesMut::new(), backlog: VecDeque::new() }
+    pub(super) fn new(socket: udp::Socket, limits: WriteLimits) -> Datagram {
+        Datagram {
+            socket,
+            buf: BytesMut::new(),
+            backlog: VecDeque::new(),
+            limits,
+            queued_bytes: 0,
+        }
+    }
+
+    fn admit(&self, bytes: usize) -> io::Result<()> {
+        if self.backlog.len() >= self.limits.messages
+            || self
+                .queued_bytes
+                .checked_add(bytes)
+                .map_or(true, |total| total > self.limits.bytes)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "the UDP write budget is full",
+            ));
+        }
+        Ok(())
+    }
+
+    // Only the driver owns this queue, and a socket send attempt is
+    // synchronous. Unlike TCP batches, no work leaves it while still pending.
+    fn enqueue(&mut self, bytes: Bytes, flow: Flow) -> io::Result<()> {
+        self.admit(bytes.len())?;
+        let len = bytes.len();
+        self.backlog.push_back((bytes, flow, None));
+        self.queued_bytes += len;
+        Ok(())
     }
 
     pub(super) fn local_addr(&self) -> SocketAddr {
@@ -57,20 +86,13 @@ impl Datagram {
         flow: &Flow,
     ) -> io::Result<()> {
         if self.backlog.is_empty() {
+            self.admit(bytes.len())?;
             match self.socket.try_send(bytes, flow) {
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
                 result => return result,
             }
         }
-        if self.backlog.len() >= UDP_BACKLOG {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "the UDP send backlog is full",
-            ));
-        }
-        self.backlog.push_back((bytes.clone(), *flow, None));
-
-        Ok(())
+        self.enqueue(bytes.clone(), *flow)
     }
 
     pub(super) fn submit(
@@ -86,19 +108,26 @@ impl Datagram {
                 self.backlog.back_mut().expect("just enqueued").2 =
                     Some(completion);
             }
-            result => completion.finish(result.map_err(|error| {
-                if error.kind() == io::ErrorKind::WouldBlock {
-                    ReplyError::Busy
-                } else {
-                    ReplyError::Transport(error)
-                }
-            })),
+            result => {
+                drop(bytes);
+                completion.finish(result.map_err(|error| {
+                    if error.kind() == io::ErrorKind::WouldBlock {
+                        ReplyError::Busy
+                    } else {
+                        ReplyError::Transport(error)
+                    }
+                }));
+            }
         }
     }
 
     fn finish_front(&mut self, result: io::Result<()>) {
-        if let Some((_, _, Some(completion))) = self.backlog.pop_front() {
-            completion.finish(result.map_err(ReplyError::Transport));
+        if let Some((bytes, _, completion)) = self.backlog.pop_front() {
+            self.queued_bytes -= bytes.len();
+            drop(bytes);
+            if let Some(completion) = completion {
+                completion.finish(result.map_err(ReplyError::Transport));
+            }
         }
     }
 
@@ -139,6 +168,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::transport::budget::Budget;
     use crate::{
         endpoint::{
             driver::Command,
@@ -166,17 +196,83 @@ mod tests {
         );
         let (commands, receiver) = mpsc::unbounded_channel();
         let capacity = Arc::new(Semaphore::new(1));
-        let route =
-            ReplyRoute::new(&request, link, commands, capacity.clone());
+        let route = ReplyRoute::new(
+            &request,
+            link,
+            commands,
+            capacity.clone(),
+            Budget::new(WriteLimits::default()),
+        );
         let response = route_response(&request);
 
         Fixture {
-            datagram: Datagram::new(socket),
+            datagram: Datagram::new(
+                socket,
+                WriteLimits { messages: 1024, ..WriteLimits::default() },
+            ),
             route,
             response,
             commands: receiver,
             capacity,
         }
+    }
+
+    #[tokio::test]
+    async fn queued_datagrams_keep_count_and_bytes_until_the_send_attempt() {
+        let Fixture { mut datagram, .. } =
+            fixture("127.0.0.1:9".parse().unwrap());
+        datagram.limits = WriteLimits { messages: 2, bytes: 3 };
+        let flow = udp_reply_link(
+            datagram.local_addr(),
+            "127.0.0.1:9".parse().unwrap(),
+        )
+        .flow;
+        datagram.enqueue(Bytes::from_static(b"abc"), flow).unwrap();
+
+        assert_eq!(
+            datagram
+                .send(&Bytes::from_static(b"d"), &flow)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        datagram.send(&Bytes::new(), &flow).unwrap();
+        assert_eq!(
+            datagram.send(&Bytes::new(), &flow).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+
+        datagram.finish_front(Err(io::Error::from_raw_os_error(5)));
+        datagram.send(&Bytes::from_static(b"def"), &flow).unwrap();
+
+        assert_eq!(datagram.backlog.len(), 2);
+        datagram.finish_front(Ok(()));
+        datagram.finish_front(Ok(()));
+        assert_eq!(datagram.queued_bytes, 0);
+        assert!(datagram.admit(3).is_ok());
+    }
+
+    #[tokio::test]
+    async fn even_an_immediate_datagram_must_fit_its_budget() {
+        let Fixture { mut datagram, .. } =
+            fixture("127.0.0.1:9".parse().unwrap());
+        datagram.limits = WriteLimits { messages: 1, bytes: 2 };
+        let flow = udp_reply_link(
+            datagram.local_addr(),
+            "127.0.0.1:9".parse().unwrap(),
+        )
+        .flow;
+
+        assert_eq!(
+            datagram
+                .send(&Bytes::from_static(b"abc"), &flow)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+
+        assert!(datagram.backlog.is_empty());
+        assert!(datagram.admit(2).is_ok());
     }
 
     #[tokio::test]
@@ -190,7 +286,7 @@ mod tests {
         .flow;
 
         // Keep the reply queued without relying on kernel send-buffer pressure.
-        datagram.backlog.push_back((Bytes::new(), flow, None));
+        datagram.enqueue(Bytes::new(), flow).unwrap();
         let mut send = std::pin::pin!(route.send(response));
         poll_fn(|cx| {
             assert!(send.as_mut().poll(cx).is_pending());
@@ -228,7 +324,7 @@ mod tests {
                 .flow;
         let expected = response.to_bytes();
 
-        datagram.backlog.push_back((Bytes::from_static(b"first"), flow, None));
+        datagram.enqueue(Bytes::from_static(b"first"), flow).unwrap();
 
         {
             let mut send = std::pin::pin!(route.send(response));

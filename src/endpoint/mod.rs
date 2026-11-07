@@ -51,6 +51,16 @@ entry keeps its count until Timer K ends. Saturation returns Busy without a
 command or send. Dropping a response future releases neither reservation.
 See [`Builder::max_client_transactions`] and [`Builder::max_client_request_bytes`].
 
+[`Builder::tcp_write_limits`] and [`Builder::udp_write_limits`] bound message
+counts and encoded bytes through local write completion, including TCP batches
+and partial writes. [`Builder::max_reply_bytes`] separately reserves one-shot
+reply bytes before encoding and holds them through command, connect and write.
+Output saturation never blocks the driver. Client sends and one-shot replies
+report errors. An immediate failure to enqueue a Service response retires its
+transaction, without a later callback to the service. A later UDP send failure
+drops the datagram and lets peer retransmissions recover it. These limits do
+not cap application response allocations or operating-system socket buffers.
+
 # Shutdown
 
 [`Endpoint::shutdown`] stops the endpoint once what it has in hand is done, or
@@ -1812,5 +1822,46 @@ mod tests {
         // Only one request fits in 50 content bytes, so the second response
         // proves bytes were released. Both Completed slots remain occupied.
         assert!(client.call(request).await.unwrap_err().is_busy());
+    }
+
+    #[tokio::test]
+    async fn exhausted_write_bytes_report_transport_errors_without_leaking_client_admission(
+    ) {
+        use crate::transport::WriteLimits;
+
+        let service = Counting::default();
+        let server = serve(service.clone());
+        let limits = WriteLimits { messages: 1, bytes: 1 };
+        let endpoint = Endpoint::builder()
+            .udp(LOCALHOST)
+            .max_client_transactions(1)
+            .tcp_write_limits(limits)
+            .udp_write_limits(limits)
+            .serve(Counting::default())
+            .unwrap();
+
+        for (transport, remote) in [
+            (Transport::Tcp, server.tcp_addr().unwrap()),
+            (Transport::Udp, server.udp_addr().unwrap()),
+        ] {
+            let mut client = endpoint.client(transport, remote);
+            for _ in 0..2 {
+                let error = timeout(
+                    Duration::from_secs(3),
+                    client.call(request("OPTIONS")),
+                )
+                .await
+                .unwrap()
+                .unwrap_err();
+                assert!(error.is_transport());
+                let source = std::error::Error::source(&error)
+                    .unwrap()
+                    .downcast_ref::<io::Error>()
+                    .unwrap();
+                assert_eq!(source.kind(), io::ErrorKind::WouldBlock);
+            }
+        }
+
+        assert_eq!(service.requests.load(Ordering::SeqCst), 0);
     }
 }

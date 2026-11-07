@@ -40,6 +40,7 @@ criterion::criterion_group! {
         // runtime. These include the syscalls.
         transport::udp,
         transport::tcp,
+        transport::write_admission,
         // The same round trips between two endpoints, which adds the
         // transactions, the service, and the message layer on both sides.
         endpoint::round_trip,

@@ -1,13 +1,16 @@
 /*!
-Transport metadata and received-message limits.
+Transport metadata and message/write limits.
 
-[`Flow`], [`Transport`] and [`MessageLimits`] are runtime independent. Socket
-I/O and stream framing remain implementation details used by the endpoint. TCP
-connections are framed by Content-Length before messages reach the driver; UDP
-datagrams already carry their boundaries.
+[`Flow`], [`Transport`], [`MessageLimits`] and [`WriteLimits`] are runtime
+independent. Socket I/O and stream framing remain implementation details used
+by the endpoint. TCP connections are framed by Content-Length before messages
+reach the driver; UDP datagrams already carry their boundaries.
 */
 
 use std::{fmt, net::SocketAddr};
+
+#[cfg(feature = "tokio")]
+pub(crate) mod budget;
 
 #[cfg(all(feature = "tokio", feature = "__bench"))]
 #[doc(hidden)]
@@ -48,6 +51,29 @@ impl Default for MessageLimits {
     /// needs a limit too.
     fn default() -> MessageLimits {
         MessageLimits { head: 64 * 1024, body: 1024 * 1024 }
+    }
+}
+
+/// Outstanding writes on one TCP connection or an endpoint's UDP socket.
+///
+/// Both limits include writes already taken from the queue but not yet fully
+/// written to the local socket. Bytes count the complete encoded messages,
+/// including headers. Capacity is returned at completion or teardown, even
+/// when the caller drops its completion future. This does not cap shared
+/// backing allocations or buffers owned by the operating system.
+#[derive(Clone, Copy, Debug)]
+pub struct WriteLimits {
+    /// The most simultaneous writes. Zero refuses every write.
+    pub messages: usize,
+    /// The aggregate encoded bytes. Zero allows only empty writes.
+    pub bytes: usize,
+}
+
+impl Default for WriteLimits {
+    /// Allows 64 outstanding writes and 8 MiB per TCP connection.
+    /// The endpoint uses 1024 writes and 8 MiB for its UDP socket by default.
+    fn default() -> WriteLimits {
+        WriteLimits { messages: 64, bytes: 8 * 1024 * 1024 }
     }
 }
 

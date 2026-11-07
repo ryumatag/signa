@@ -38,16 +38,14 @@ use bytes::{Buf, Bytes, BytesMut};
 use tokio::{
     io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{tcp::OwnedReadHalf, TcpListener, TcpStream},
-    sync::{
-        mpsc::{self, error::TrySendError},
-        oneshot, OwnedSemaphorePermit, Semaphore,
-    },
+    sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore},
     time::{sleep, timeout},
 };
 
 use super::{
+    budget::{Budget, Permit},
     framing::{Decoder, Frame, Role},
-    Flow, MessageLimits, Transport,
+    Flow, MessageLimits, Transport, WriteLimits,
 };
 use crate::message::Message;
 
@@ -75,8 +73,8 @@ pub struct Config {
     pub idle_timeout: Duration,
     /// How many connections a listener keeps open at once.
     pub max_connections: usize,
-    /// How many messages may wait to be written on one connection.
-    pub write_queue: usize,
+    /// Outstanding writes through local completion on one connection.
+    pub write_limits: WriteLimits,
 }
 
 impl Default for Config {
@@ -90,7 +88,7 @@ impl Default for Config {
             limits: MessageLimits::default(),
             idle_timeout: Duration::from_secs(300),
             max_connections: 1024,
-            write_queue: 64,
+            write_limits: WriteLimits::default(),
         }
     }
 }
@@ -111,14 +109,22 @@ pub struct Inbound {
 /// Cheap to clone. The connection's writer task runs as long as it can
 /// write, whether or not a `Writer` exists.
 #[derive(Clone, Debug)]
-pub struct Writer {
-    queue: mpsc::Sender<Write>,
+pub struct Writer(Arc<WriteSender>);
+
+// Every live transaction keeps a Writer in its Link. Keep that clone one
+// pointer wide, with queue and quota state allocated once per connection.
+// Write permits share only the quota, never this sender. Sharing the sender
+// would let queued writes keep their own queue alive.
+#[derive(Debug)]
+struct WriteSender {
+    queue: mpsc::UnboundedSender<Write>,
+    capacity: Budget,
 }
 
 /// Why a message could not be queued.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SendError {
-    /// The write queue is full. The peer is not reading fast enough.
+    /// Outstanding writes have exhausted the message count or byte budget.
     Full,
     /// The connection has ended.
     Closed,
@@ -127,12 +133,13 @@ pub enum SendError {
 impl Writer {
     /// Returns `true` once the connection has ended.
     pub fn is_closed(&self) -> bool {
-        self.queue.is_closed()
+        self.0.queue.is_closed()
     }
 
     /// Queues `bytes` to be written. Returns at once.
     pub fn send(&self, bytes: Bytes) -> Result<(), SendError> {
-        self.enqueue(Write { bytes, done: None })
+        let permit = self.reserve(bytes.len())?;
+        self.enqueue(Write { bytes, done: None, permit: Some(permit) })
     }
 
     /// Queues a write and returns its local completion receipt.
@@ -143,16 +150,27 @@ impl Writer {
     /// a partial write. Connection teardown fails outstanding receipts.
     #[allow(dead_code)] // Used by the reply-route integration.
     pub fn submit(&self, bytes: Bytes) -> Result<Receipt, SendError> {
+        let permit = self.reserve(bytes.len())?;
         let (done, result) = oneshot::channel();
-        self.enqueue(Write { bytes, done: Some(done) })?;
+        self.enqueue(Write { bytes, done: Some(done), permit: Some(permit) })?;
         Ok(Receipt(result))
     }
 
-    fn enqueue(&self, write: Write) -> Result<(), SendError> {
-        self.queue.try_send(write).map_err(|err| match err {
-            TrySendError::Full(_) => SendError::Full,
-            TrySendError::Closed(_) => SendError::Closed,
+    fn reserve(&self, bytes: usize) -> Result<Permit, SendError> {
+        if self.is_closed() {
+            return Err(SendError::Closed);
+        }
+        self.0.capacity.acquire(bytes).ok_or_else(|| {
+            if self.is_closed() {
+                SendError::Closed
+            } else {
+                SendError::Full
+            }
         })
+    }
+
+    fn enqueue(&self, write: Write) -> Result<(), SendError> {
+        self.0.queue.send(write).map_err(|_| SendError::Closed)
     }
 }
 
@@ -182,12 +200,19 @@ impl Future for Receipt {
 
 #[derive(Debug)]
 struct Write {
+    // Declaration order also governs task teardown. Release the buffer and
+    // quota before dropping the sender wakes the receipt's owner.
     bytes: Bytes,
+    permit: Option<Permit>,
     done: Option<oneshot::Sender<io::Result<()>>>,
 }
 
 impl Write {
     fn complete(&mut self, result: io::Result<()>) {
+        // The caller may send again from its completion waker. Release the
+        // buffer and its reservation before making that next write possible.
+        self.bytes = Bytes::new();
+        drop(self.permit.take());
         if let Some(done) = self.done.take() {
             let _ = done.send(result);
         }
@@ -196,14 +221,14 @@ impl Write {
 
 impl From<Bytes> for Write {
     fn from(bytes: Bytes) -> Self {
-        Write { bytes, done: None }
+        Write { bytes, done: None, permit: None }
     }
 }
 
 impl fmt::Display for SendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            SendError::Full => "the write queue of the connection is full",
+            SendError::Full => "the connection's write capacity is exhausted",
             SendError::Closed => "the connection is closed",
         })
     }
@@ -332,8 +357,12 @@ fn start(
     // adds latency.
     stream.set_nodelay(true)?;
     let (read, write) = stream.into_split();
-    let (queue, pending) = mpsc::channel(config.write_queue);
-    let writer = Writer { queue };
+    // The reservation bounds both this queue and the writer's active batch.
+    let (queue, pending) = mpsc::unbounded_channel();
+    let writer = Writer(Arc::new(WriteSender {
+        queue,
+        capacity: Budget::new(config.write_limits),
+    }));
     let mut writing = tokio::spawn(write_loop(write, pending));
     let reading = read_loop(
         read,
@@ -437,7 +466,7 @@ async fn read_loop(
 /// Writes queued messages until the queue closes or a write fails.
 async fn write_loop(
     mut write: impl AsyncWrite + Unpin,
-    mut pending: mpsc::Receiver<Write>,
+    mut pending: mpsc::UnboundedReceiver<Write>,
 ) {
     let mut queue = Queue::default();
     while pending.recv_many(&mut queue.items, WRITE_BATCH).await > 0 {
@@ -527,6 +556,20 @@ mod tests {
     use super::*;
     use crate::message::{Method, StatusCode};
 
+    fn test_writer(
+        messages: usize,
+        bytes: usize,
+    ) -> (Writer, mpsc::UnboundedReceiver<Write>) {
+        let (queue, pending) = mpsc::unbounded_channel();
+        (
+            Writer(Arc::new(WriteSender {
+                queue,
+                capacity: Budget::new(WriteLimits { messages, bytes }),
+            })),
+            pending,
+        )
+    }
+
     struct FailsAfter(usize);
 
     impl AsyncWrite for FailsAfter {
@@ -582,9 +625,9 @@ mod tests {
         }
     }
 
-    // The receipt tests build runtimes without an I/O driver to run under
-    // Miri. #[tokio::test] initializes kqueue, which Miri does not support.
-    // Channels and mock writers need no I/O driver.
+    // The async receipt tests build runtimes without an I/O driver to run
+    // under Miri. #[tokio::test] initializes kqueue, which Miri does not
+    // support. Channels and mock writers need no I/O driver.
 
     #[test]
     fn receipts_distinguish_complete_partial_and_unwritten_messages() {
@@ -592,8 +635,8 @@ mod tests {
             .build()
             .unwrap()
             .block_on(async {
-                let (queue, pending) = mpsc::channel(WRITE_BATCH + 3);
-                let writer = Writer { queue };
+                let (writer, pending) =
+                    test_writer(WRITE_BATCH + 3, usize::MAX);
                 let complete =
                     writer.submit(Bytes::from_static(b"abc")).unwrap();
                 let partial =
@@ -627,8 +670,7 @@ mod tests {
             .build()
             .unwrap()
             .block_on(async {
-                let (queue, pending) = mpsc::channel(3);
-                let writer = Writer { queue };
+                let (writer, pending) = test_writer(3, usize::MAX);
                 let empty = writer.submit(Bytes::new()).unwrap();
                 let complete =
                     writer.submit(Bytes::from_static(b"abc")).unwrap();
@@ -641,8 +683,7 @@ mod tests {
                 complete.await.unwrap();
                 trailing.await.unwrap();
 
-                let (queue, pending) = mpsc::channel(2);
-                let writer = Writer { queue };
+                let (writer, pending) = test_writer(2, usize::MAX);
                 let empty = writer.submit(Bytes::new()).unwrap();
                 let failure =
                     writer.submit(Bytes::from_static(b"abc")).unwrap();
@@ -659,8 +700,7 @@ mod tests {
             .build()
             .unwrap()
             .block_on(async {
-                let (queue, pending) = mpsc::channel(2);
-                let writer = Writer { queue };
+                let (writer, pending) = test_writer(2, usize::MAX);
 
                 drop(writer.submit(Bytes::from_static(b"abc")).unwrap());
 
@@ -683,8 +723,7 @@ mod tests {
             .build()
             .unwrap()
             .block_on(async {
-                let (queue, pending) = mpsc::channel(1);
-                let writer = Writer { queue };
+                let (writer, pending) = test_writer(1, usize::MAX);
                 let receipt =
                     writer.submit(Bytes::from_static(b"abc")).unwrap();
                 assert_eq!(
@@ -702,6 +741,143 @@ mod tests {
                     writer.submit(Bytes::new()).unwrap_err(),
                     SendError::Closed
                 );
+            });
+    }
+
+    #[test]
+    fn batch_and_partial_writes_keep_both_reservations() {
+        let (writer, mut pending) = test_writer(2, 3);
+        assert_eq!(
+            writer.send(Bytes::from_static(b"long")).unwrap_err(),
+            SendError::Full
+        );
+        drop(writer.submit(Bytes::from_static(b"abc")).unwrap());
+        drop(writer.submit(Bytes::new()).unwrap());
+        let mut batch = Queue {
+            items: vec![
+                pending.try_recv().unwrap(),
+                pending.try_recv().unwrap(),
+            ],
+            remaining: 3,
+            next: 0,
+        };
+
+        assert!(pending.is_empty());
+        assert_eq!(writer.send(Bytes::new()).unwrap_err(), SendError::Full);
+        batch.advance(2);
+        assert_eq!(
+            writer.send(Bytes::from_static(b"a")).unwrap_err(),
+            SendError::Full
+        );
+        batch.advance(1);
+
+        // Completion also passes the trailing empty write. Keeping the batch
+        // vector alive must retain neither buffers nor reservations.
+        assert!(batch.items.iter().all(|item| item.bytes.is_empty()));
+        assert!(writer.send(Bytes::from_static(b"abc")).is_ok());
+        assert!(writer.send(Bytes::new()).is_ok());
+    }
+
+    #[test]
+    fn completion_and_teardown_return_capacity_before_waking_the_next_writer()
+    {
+        use std::{
+            sync::atomic::{AtomicBool, Ordering},
+            task::{Context, Wake, Waker},
+        };
+
+        struct SendNext(Writer, AtomicBool);
+
+        impl Wake for SendNext {
+            fn wake(self: Arc<Self>) {
+                self.1.store(
+                    self.0.send(Bytes::from_static(b"next")).is_ok(),
+                    Ordering::Relaxed,
+                );
+            }
+        }
+
+        for complete in [true, false] {
+            let (writer, mut pending) = test_writer(1, 4);
+            let mut receipt =
+                writer.submit(Bytes::from_static(b"done")).unwrap();
+            let next = Arc::new(SendNext(writer, AtomicBool::new(false)));
+            let waker: Waker = next.clone().into();
+            assert!(std::pin::Pin::new(&mut receipt)
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending());
+            let mut batch = Queue {
+                items: vec![pending.try_recv().unwrap()],
+                remaining: 4,
+                next: 0,
+            };
+
+            if complete {
+                batch.advance(4);
+            } else {
+                drop(batch);
+            }
+
+            assert!(next.1.load(Ordering::Relaxed));
+            assert_eq!(pending.try_recv().unwrap().bytes, "next");
+        }
+    }
+
+    #[test]
+    fn failed_and_aborted_writes_return_their_full_budget() {
+        struct Stalled(Option<oneshot::Sender<()>>);
+
+        impl AsyncWrite for Stalled {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                if let Some(started) = self.0.take() {
+                    let _ = started.send(());
+                }
+                Poll::Pending
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Pending
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Pending
+            }
+        }
+
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (writer, pending) = test_writer(1, 3);
+                let failed =
+                    writer.submit(Bytes::from_static(b"abc")).unwrap();
+                write_loop(FailsAfter(1), pending).await;
+
+                assert!(failed.await.is_err());
+                assert!(writer.0.capacity.acquire(3).is_some());
+
+                let (writer, pending) = test_writer(1, 3);
+                let (started, waiting) = oneshot::channel();
+                let aborted =
+                    writer.submit(Bytes::from_static(b"abc")).unwrap();
+                let task =
+                    tokio::spawn(write_loop(Stalled(Some(started)), pending));
+                waiting.await.unwrap();
+                assert!(writer.0.capacity.acquire(0).is_none());
+
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+
+                assert!(aborted.await.is_err());
+                assert!(writer.0.capacity.acquire(3).is_some());
             });
     }
 

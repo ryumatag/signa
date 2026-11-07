@@ -252,6 +252,25 @@ impl<T: AsRef<[u8]>> Response<T> {
         crate::message::encode::response(self, dst);
     }
 
+    /// Wire length for transport admission before encoding a second copy.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn encoded_len(&self) -> Option<usize> {
+        crate::message::encode::response_len(self, self.body().as_ref().len())
+    }
+
+    /// Encodes an unchanged response after admission reserved its wire length.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn to_bytes_reserved(&self, len: usize) -> Bytes {
+        let mut dst = BytesMut::with_capacity(len);
+        crate::message::encode::response_with_len(
+            self,
+            self.body().as_ref(),
+            len,
+            &mut dst,
+        );
+        dst.freeze()
+    }
+
     /// Returns the response as the bytes of one complete message.
     ///
     /// This is [`Response::encode`] into a new buffer.

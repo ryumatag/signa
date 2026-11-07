@@ -44,34 +44,80 @@ pub(crate) fn response<T: AsRef<[u8]>>(
     response: &Response<T>,
     dst: &mut BytesMut,
 ) {
-    let version = response.version();
-    let version = version.as_str();
-    let status = response.status();
-    // Without a reason of its own, a response uses the one RFC 3261 or the
-    // IANA registry gives its code. An extension code with neither gets an
-    // empty reason, which the status-line grammar allows.
+    let body = response.body().as_ref();
     let reason = match response.reason() {
         Some(reason) => reason.as_str(),
-        None => status.canonical_reason().unwrap_or(""),
+        None => response.status().canonical_reason().unwrap_or(""),
     };
-    let body = response.body().as_ref();
-
-    // `VERSION SP CODE SP REASON CRLF`, where the code is three digits.
-    let line_len = version.len() + reason.len() + 7;
+    // Ordinary encoding keeps the same infallible sizing path as requests.
+    // Admission uses the checked preflight below to reject before allocation.
+    let line_len = response.version().as_str().len() + reason.len() + 7;
     let len =
         line_len + head_fields_len(response.headers(), body) + body.len();
+    response_with_len(response, body, len, dst);
+}
+
+/// Encodes after wire-byte admission, reusing its checked length. The caller
+/// keeps the response and body unchanged between sizing and encoding.
+#[inline(always)]
+pub(super) fn response_with_len<T>(
+    response: &Response<T>,
+    body: &[u8],
+    len: usize,
+    dst: &mut BytesMut,
+) {
+    let version = response.version();
+    let version = version.as_str();
+    // Extension status codes may have no canonical reason. The status-line
+    // grammar allows an empty reason in that case.
+    let reason = match response.reason() {
+        Some(reason) => reason.as_str(),
+        None => response.status().canonical_reason().unwrap_or(""),
+    };
     let start = dst.len();
     dst.reserve(len);
 
     dst.put_slice(version.as_bytes());
     dst.put_u8(b' ');
-    dst.put_slice(status.as_str().as_bytes());
+    dst.put_slice(response.status().as_str().as_bytes());
     dst.put_u8(b' ');
     dst.put_slice(reason.as_bytes());
     dst.put_slice(b"\r\n");
 
     fields_and_body(response.headers(), body, dst);
     debug_assert_eq!(dst.len() - start, len, "reserved length is off");
+}
+
+/// Checked wire length for admission before allocating an encoded response.
+#[cfg(any(feature = "tokio", test))]
+pub(crate) fn response_len<T>(
+    response: &Response<T>,
+    body_len: usize,
+) -> Option<usize> {
+    let reason = response.reason().map_or_else(
+        || response.status().canonical_reason().unwrap_or(""),
+        |reason| reason.as_str(),
+    );
+    // `VERSION SP CODE SP REASON CRLF`, where the code is three digits.
+    let line = response
+        .version()
+        .as_str()
+        .len()
+        .checked_add(reason.len())?
+        .checked_add(7)?;
+    let fields = response
+        .headers()
+        .iter()
+        .filter(|(name, _)| **name != CONTENT_LENGTH)
+        .try_fold(0usize, |len, (name, value)| {
+            len.checked_add(name.as_str().len())?
+                .checked_add(value.len())?
+                .checked_add(4)
+        })?;
+    line.checked_add(fields)?
+        .checked_add("Content-Length: \r\n\r\n".len())?
+        .checked_add(Digits::new(body_len).len())?
+        .checked_add(body_len)
 }
 
 /// Returns the length of the header fields, the `Content-Length` field, and
@@ -146,7 +192,30 @@ impl Digits {
 
 #[cfg(test)]
 mod tests {
-    use super::Digits;
+    use super::*;
+
+    #[test]
+    fn checked_response_length_matches_normalized_wire_output() {
+        fn property(body: Vec<u8>, custom_reason: bool) -> bool {
+            let mut response = Response::builder()
+                .status(299)
+                .header("X-Trace", "kept")
+                .header("Content-Length", "999")
+                .header("Content-Length", "0")
+                .body(body)
+                .unwrap();
+            if custom_reason {
+                *response.reason_mut() =
+                    Some(crate::message::ReasonPhrase::from_static("Custom"));
+            }
+            response_len(&response, response.body().len())
+                == Some(response.to_bytes().len())
+        }
+
+        quickcheck::QuickCheck::new()
+            .tests(if cfg!(miri) { 8 } else { 100 })
+            .quickcheck(property as fn(Vec<u8>, bool) -> bool);
+    }
 
     #[test]
     fn digits() {

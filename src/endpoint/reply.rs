@@ -18,6 +18,7 @@ use crate::{
         response::Response,
         Method,
     },
+    transport::budget::{Budget, Permit},
 };
 
 /// An opaque capability for sending responses to one received request.
@@ -42,6 +43,7 @@ struct Route {
     ack: bool,
     commands: mpsc::UnboundedSender<Command>,
     capacity: Arc<Semaphore>,
+    bytes: Budget,
 }
 
 impl ReplyRoute {
@@ -50,6 +52,7 @@ impl ReplyRoute {
         link: Link,
         commands: mpsc::UnboundedSender<Command>,
         capacity: Arc<Semaphore>,
+        bytes: Budget,
     ) -> ReplyRoute {
         // Selected fields must not pin the received body or TCP read chunk.
         let mut headers = HeaderMap::new();
@@ -69,6 +72,7 @@ impl ReplyRoute {
             ack: request.method() == Method::ACK,
             commands,
             capacity,
+            bytes,
         }))
     }
 
@@ -81,6 +85,8 @@ impl ReplyRoute {
     /// Routing and identity values are compared byte for byte. Reformatting
     /// equivalent fields is deliberately rejected. The endpoint currently
     /// admits at most 64 one-shot replies through their local completion.
+    /// [`super::Builder::max_reply_bytes`] also bounds their aggregate encoded
+    /// bytes before allocation and enqueue, including pending connects.
     ///
     /// An unpolled future has no effect. Waiting for capacity is cancellation
     /// safe. Enqueue commits the operation. Dropping the future after enqueue
@@ -109,6 +115,7 @@ impl ReplyRoute {
         response: Response<Bytes>,
     ) -> Result<(), ReplyError> {
         self.validate(&response)?;
+        let len = response.encoded_len().ok_or(ReplyError::Busy)?;
 
         let permit = self
             .0
@@ -117,18 +124,24 @@ impl ReplyRoute {
             .acquire_owned()
             .await
             .map_err(|_| ReplyError::Closed)?;
+        let reservation = self.0.bytes.acquire(len).ok_or(ReplyError::Busy)?;
 
+        let bytes = response.to_bytes_reserved(len);
+        // The command owns its encoded bytes. Do not keep the original body
+        // and application Extensions alive while waiting for the socket.
+        drop(response);
         let (done, result) = oneshot::channel();
 
         self.0
             .commands
             .send(Command::Reply {
                 link: self.0.link.clone(),
-                bytes: response.to_bytes(),
+                bytes,
                 completion: Completion {
                     done,
                     _permit: permit,
                     _endpoint: self.0.commands.clone(),
+                    reservation,
                 },
             })
             .map_err(|_| ReplyError::Closed)?;
@@ -206,7 +219,7 @@ pub enum ReplyError {
     InvalidResponse,
     /// This request or routing mode does not support a response.
     Unsupported,
-    /// The transport queue is full.
+    /// A transport or one-shot reply write budget is exhausted.
     Busy,
     /// The endpoint has ended or is shutting down.
     Closed,
@@ -221,7 +234,7 @@ impl fmt::Display for ReplyError {
                 f.write_str("response does not preserve reply-route identity")
             }
             Self::Unsupported => f.write_str("cannot respond to ACK"),
-            Self::Busy => f.write_str("transport queue is full"),
+            Self::Busy => f.write_str("write capacity is exhausted"),
             Self::Closed => f.write_str("endpoint is closed"),
             Self::Transport(error) => {
                 write!(f, "response transport failed: {error}")
@@ -243,11 +256,16 @@ pub(super) struct Completion {
     done: oneshot::Sender<Result<(), ReplyError>>,
     _permit: OwnedSemaphorePermit,
     _endpoint: mpsc::UnboundedSender<Command>,
+    reservation: Permit,
 }
 
 impl Completion {
     pub(super) fn finish(self, result: Result<(), ReplyError>) {
-        let _ = self.done.send(result);
+        let Completion { done, _permit, _endpoint, reservation } = self;
+        drop(reservation);
+        drop(_permit);
+        drop(_endpoint);
+        let _ = done.send(result);
     }
 }
 
@@ -296,6 +314,16 @@ mod tests {
     fn route(
         request: &Request<Bytes>,
     ) -> (ReplyRoute, mpsc::UnboundedReceiver<Command>) {
+        route_with_budget(
+            request,
+            Budget::new(crate::transport::WriteLimits::default()),
+        )
+    }
+
+    fn route_with_budget(
+        request: &Request<Bytes>,
+        budget: Budget,
+    ) -> (ReplyRoute, mpsc::UnboundedReceiver<Command>) {
         let (commands, received) = mpsc::unbounded_channel();
         let link = Link {
             flow: crate::transport::Flow {
@@ -312,12 +340,180 @@ mod tests {
                 link,
                 commands,
                 Arc::new(Semaphore::new(1)),
+                budget,
             ),
             received,
         )
     }
 
     // No I/O driver is needed. Keeping it disabled also permits Miri on macOS.
+    #[test]
+    fn enqueue_drops_the_original_response_before_waiting_for_io() {
+        use std::{
+            future::{poll_fn, Future},
+            sync::atomic::{AtomicBool, Ordering},
+            task::Poll,
+        };
+
+        #[derive(Clone)]
+        struct Dropped(Arc<AtomicBool>);
+
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let request = request();
+                let (route, mut commands) = route(&request);
+                let dropped = Arc::new(AtomicBool::new(false));
+                let mut response = response(&request);
+                response.extensions_mut().insert(Dropped(dropped.clone()));
+                *response.body_mut() = Bytes::from_static(b"reply body");
+                let expected = response.to_bytes();
+                let mut send = std::pin::pin!(route.send(response));
+
+                poll_fn(|cx| {
+                    assert!(send.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+
+                assert!(dropped.load(Ordering::Relaxed));
+                let Command::Reply { bytes, completion, .. } =
+                    commands.try_recv().unwrap()
+                else {
+                    panic!("reply command")
+                };
+                assert_eq!(bytes, expected);
+                completion.finish(Ok(()));
+                send.await.unwrap();
+            });
+    }
+
+    #[test]
+    fn shared_reply_bytes_remain_charged_after_the_future_is_dropped() {
+        use crate::transport::WriteLimits;
+        use std::{
+            future::{poll_fn, Future},
+            task::Poll,
+        };
+
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let request = request();
+                let response = response(&request);
+                let len = response.encoded_len().unwrap();
+                let budget =
+                    Budget::new(WriteLimits { messages: 64, bytes: len });
+                let (first, mut commands) =
+                    route_with_budget(&request, budget.clone());
+                let (second, mut more_commands) =
+                    route_with_budget(&request, budget.clone());
+
+                {
+                    let mut send =
+                        std::pin::pin!(first.send(response.clone()));
+                    poll_fn(|cx| {
+                        assert!(send.as_mut().poll(cx).is_pending());
+                        Poll::Ready(())
+                    })
+                    .await;
+                }
+                let mut rejected =
+                    std::pin::pin!(second.send(response.clone()));
+                poll_fn(|cx| {
+                    assert!(matches!(
+                        rejected.as_mut().poll(cx),
+                        Poll::Ready(Err(ReplyError::Busy))
+                    ));
+                    Poll::Ready(())
+                })
+                .await;
+                assert!(more_commands.is_empty());
+                let Command::Reply { completion, .. } =
+                    commands.try_recv().unwrap()
+                else {
+                    panic!("reply command")
+                };
+                completion.finish(Ok(()));
+
+                let mut send = std::pin::pin!(second.send(response));
+                poll_fn(|cx| {
+                    assert!(send.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                let Command::Reply { completion, .. } =
+                    more_commands.try_recv().unwrap()
+                else {
+                    panic!("reply command")
+                };
+                completion.finish(Ok(()));
+
+                send.await.unwrap();
+                assert!(budget.acquire(len).is_some());
+            });
+    }
+
+    #[test]
+    fn oversized_reply_returns_busy_without_consuming_the_operation_slot() {
+        use crate::transport::WriteLimits;
+        use std::{
+            future::{poll_fn, Future},
+            task::Poll,
+        };
+
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let request = request();
+                let response = response(&request);
+                let len = response.encoded_len().unwrap();
+                let budget =
+                    Budget::new(WriteLimits { messages: 64, bytes: len });
+                let (route, mut commands) =
+                    route_with_budget(&request, budget);
+                let mut large = response.clone();
+                *large.body_mut() = Bytes::from(vec![0; len]);
+
+                let mut rejected = std::pin::pin!(route.send(large));
+                poll_fn(|cx| {
+                    assert!(matches!(
+                        rejected.as_mut().poll(cx),
+                        Poll::Ready(Err(ReplyError::Busy))
+                    ));
+                    Poll::Ready(())
+                })
+                .await;
+                assert!(commands.is_empty());
+                assert_eq!(route.0.capacity.available_permits(), 1);
+
+                let mut send = std::pin::pin!(route.send(response));
+                poll_fn(|cx| {
+                    assert!(send.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                let Command::Reply { completion, .. } =
+                    commands.try_recv().unwrap()
+                else {
+                    panic!("reply command")
+                };
+                completion.finish(Ok(()));
+
+                send.await.unwrap();
+                assert_eq!(route.0.capacity.available_permits(), 1);
+            });
+    }
+
     #[test]
     fn invalid_identity_and_ack_are_rejected_before_enqueue() {
         tokio::runtime::Builder::new_current_thread()

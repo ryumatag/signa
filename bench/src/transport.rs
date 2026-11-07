@@ -7,6 +7,7 @@ use bytes::{Bytes, BytesMut};
 use criterion::Criterion;
 use signa::{
     bench::{tcp, udp, Flow, Transport},
+    transport::WriteLimits,
     Message,
 };
 use tokio::{runtime, sync::mpsc};
@@ -21,6 +22,50 @@ const LOCALHOST: SocketAddr =
 
 fn runtime() -> runtime::Runtime {
     runtime::Builder::new_current_thread().enable_all().build().unwrap()
+}
+
+pub(super) fn write_admission(c: &mut Criterion) {
+    let rt = runtime();
+    for (variant, messages) in [("messages", 1), ("bytes", 2)] {
+        let (writer, _peer) = rt.block_on(async {
+            let listener =
+                tokio::net::TcpListener::bind(LOCALHOST).await.unwrap();
+            let (inbound, _received) = mpsc::channel(4);
+            let config = tcp::Config {
+                write_limits: WriteLimits { messages, bytes: 3 },
+                ..tcp::Config::default()
+            };
+            let (_, writer) = tcp::connect(
+                listener.local_addr().unwrap(),
+                &config,
+                &inbound,
+            )
+            .await
+            .unwrap();
+            let (peer, _) = listener.accept().await.unwrap();
+            // Keep the inbound receiver with the peer so the reader stays
+            // open.
+            (writer, (peer, _received))
+        });
+        writer.send(Bytes::from_static(b"abc")).unwrap();
+
+        // No runtime progress during measurement. The first write remains
+        // queued, making count and byte saturation independent of socket
+        // timing.
+        benchmark(
+            c,
+            format!("reject/transport/tcp_write/{variant}"),
+            1,
+            |b| {
+                b.iter(|| {
+                    assert_eq!(
+                        writer.send(bb(Bytes::from_static(b"d"))),
+                        Err(tcp::SendError::Full)
+                    );
+                });
+            },
+        );
+    }
 }
 
 // A request and its response over the loopback, through the transport alone.

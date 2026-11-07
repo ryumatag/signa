@@ -15,7 +15,7 @@ use super::{
 use crate::{
     message::{request::Request, response::Response},
     transaction::Timers,
-    transport::{tcp, udp, MessageLimits},
+    transport::{tcp, udp, MessageLimits, WriteLimits},
 };
 
 /// Settings shared by endpoint startup and the protocol driver.
@@ -27,6 +27,8 @@ pub(super) struct Config {
     pub(super) max_server_transactions: usize,
     pub(super) max_client_transactions: usize,
     pub(super) max_client_request_bytes: usize,
+    pub(super) udp_write_limits: WriteLimits,
+    pub(super) max_reply_bytes: usize,
 }
 
 impl Default for Config {
@@ -38,6 +40,11 @@ impl Default for Config {
             max_server_transactions: 4096,
             max_client_transactions: 4096,
             max_client_request_bytes: 64 * 1024 * 1024,
+            udp_write_limits: WriteLimits {
+                messages: 1024,
+                ..WriteLimits::default()
+            },
+            max_reply_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -139,6 +146,66 @@ impl Builder {
     /// wait in the OS backlog. The default is 1024.
     pub fn max_connections(mut self, limit: usize) -> Builder {
         self.config.tcp.max_connections = limit;
+        self
+    }
+
+    /// Sets outstanding write limits for each TCP connection.
+    ///
+    /// The defaults are 64 messages and 8 MiB. Counts and encoded bytes stay
+    /// charged while queued, batched and partially written, until local
+    /// completion or teardown. A saturated connection refuses new writes
+    /// without waiting. Client sends report a transport error and one-shot
+    /// replies report [`super::ReplyError::Busy`].
+    ///
+    /// ```
+    /// use signa::{endpoint::Endpoint, transport::WriteLimits};
+    /// let builder = Endpoint::builder().tcp_write_limits(WriteLimits {
+    ///     messages: 128,
+    ///     bytes: 16 * 1024 * 1024,
+    /// });
+    /// # drop(builder);
+    /// ```
+    pub fn tcp_write_limits(mut self, limits: WriteLimits) -> Builder {
+        self.config.tcp.write_limits = limits;
+        self
+    }
+
+    /// Sets outstanding write limits for the endpoint's UDP socket.
+    ///
+    /// The defaults are 1024 datagrams and 8 MiB of encoded bytes. A saturated
+    /// socket refuses new writes without waiting. Capacity is returned after
+    /// the local send attempt, including failures. These limits also apply
+    /// to immediately writable sends, so a single datagram cannot exceed
+    /// the byte budget. They do not promise delivery to a peer.
+    ///
+    /// ```
+    /// use signa::{endpoint::Endpoint, transport::WriteLimits};
+    /// let builder = Endpoint::builder().udp_write_limits(WriteLimits {
+    ///     messages: 512,
+    ///     bytes: 4 * 1024 * 1024,
+    /// });
+    /// # drop(builder);
+    /// ```
+    pub fn udp_write_limits(mut self, limits: WriteLimits) -> Builder {
+        self.config.udp_write_limits = limits;
+        self
+    }
+
+    /// Sets the aggregate encoded bytes of admitted one-shot replies.
+    ///
+    /// The default is 64 MiB. Reservation precedes encoding and command
+    /// enqueue and lasts through connect setup and local write completion.
+    /// Saturation returns [`super::ReplyError::Busy`] without enqueue.
+    /// The existing limit of 64 outstanding one-shot replies also applies.
+    /// A dropped completion future does not return either reservation.
+    ///
+    /// ```
+    /// use signa::endpoint::Endpoint;
+    /// let builder = Endpoint::builder().max_reply_bytes(16 * 1024 * 1024);
+    /// # drop(builder);
+    /// ```
+    pub fn max_reply_bytes(mut self, limit: usize) -> Builder {
+        self.config.max_reply_bytes = limit;
         self
     }
 
