@@ -3,8 +3,8 @@ The transaction tables.
 
 A table keeps its entries in a `Vec` of slots and finds them through a
 hashbrown `HashTable` of slot numbers, so each key is stored once, in its slot.
-Everything else that refers to a transaction, the timer heap and the response
-slot of a request at the service, holds an [`Id`], which is two `u32` and
+Everything else that refers to a transaction, the timer heap and the server
+transaction handles held by the TU, holds an [`Id`], which is two `u32` and
 `Copy`. A `HashMap` would keep the key in the bucket, and a clone of it in each
 of those places.
 
@@ -12,8 +12,10 @@ A slot is reused once its entry is removed, and its generation goes up each
 time, so the `Id` of a transaction that is gone finds nothing, even when a new
 transaction has the slot by then. The generation wraps at `u32::MAX`, which
 takes that many transactions through one slot while a stale `Id` is still
-around. A timer entry, the longest-lived `Id`, is out of the heap within a
-transaction timeout.
+around. Driver-owned timer references expire within a transaction timeout.
+Long-lived TU capabilities additionally match their original shared allocation
+before changing an entry, so generation wrap cannot redirect one to a new
+transaction.
 */
 
 use std::hash::{BuildHasher, Hash};

@@ -128,7 +128,7 @@ fn reserve(
 }
 
 /// Stored input bytes, without encoding a second copy before admission.
-fn request_bytes(request: &Request<Bytes>) -> Option<usize> {
+pub(super) fn request_bytes(request: &Request<Bytes>) -> Option<usize> {
     let mut bytes = request.body().len();
     for part in [
         request.method().as_str(),

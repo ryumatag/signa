@@ -27,11 +27,17 @@ use crate::{
 /// writer and its fallback target ([RFC 3261 section 18.2.2]). Clones share
 /// the same capability. They cannot substitute a socket or destination.
 ///
-/// Routes will be issued by the incoming TU envelopes. The current Service
-/// interface does not expose them. This primitive precedes that API change.
+/// [`ReceivedRequest`](super::ReceivedRequest) carries a route, and
+/// [`Responder::reply_route`](super::Responder::reply_route) clones one. A
+/// route counts against [`Builder::max_responder_handles`] and
+/// [`Builder::max_responder_bytes`] until its last clone drops.
+///
 /// Sending through a route does not advance a server transaction. A stateful
 /// proxy must use its live server responder. The TU can use the route for
 /// its own UAS 2xx retransmissions.
+///
+/// [`Builder::max_responder_handles`]: super::Builder::max_responder_handles
+/// [`Builder::max_responder_bytes`]: super::Builder::max_responder_bytes
 ///
 /// [RFC 3261 section 18.2.2]: https://www.rfc-editor.org/rfc/rfc3261.html#section-18.2.2
 #[derive(Clone)]
@@ -44,6 +50,12 @@ struct Route {
     commands: mpsc::UnboundedSender<Command>,
     capacity: Arc<Semaphore>,
     bytes: Budget,
+    // The copied identity values above, held for the route's lifetime.
+    _identity: Option<Permit>,
+    // Untracked application work, which ends at the first accepted final
+    // rather than with the last clone. A route kept for logging or later
+    // sends must not hold `max_pending_requests` or graceful shutdown.
+    work: Option<super::server::Work>,
 }
 
 impl ReplyRoute {
@@ -73,7 +85,21 @@ impl ReplyRoute {
             commands,
             capacity,
             bytes,
+            _identity: None,
+            work: None,
         }))
+    }
+
+    pub(super) fn with_reservations(
+        mut self,
+        identity: Permit,
+        work: Option<super::server::Work>,
+    ) -> ReplyRoute {
+        let route =
+            Arc::get_mut(&mut self.0).expect("new route is not shared");
+        route._identity = Some(identity);
+        route.work = work;
+        self
     }
 
     /// Sends a response once and waits for its local write result.
@@ -83,21 +109,30 @@ impl ReplyRoute {
     /// parameter. Other UA-core response semantics remain the TU's concern.
     /// ACK routes reject responses. Non-100 responses require a To tag.
     /// Routing and identity values are compared byte for byte. Reformatting
-    /// equivalent fields is deliberately rejected. The endpoint currently
-    /// admits at most 64 one-shot replies through their local completion.
-    /// [`super::Builder::max_reply_bytes`] also bounds their aggregate encoded
-    /// bytes before allocation and enqueue, including pending connects.
+    /// equivalent fields is deliberately rejected. At most 64 one-shot replies
+    /// are in flight at once, and a further send waits for one to finish.
+    /// [`Builder::max_reply_bytes`] bounds their encoded bytes, including
+    /// replies waiting for a connection.
     ///
     /// An unpolled future has no effect. Waiting for capacity is cancellation
     /// safe. Enqueue commits the operation. Dropping the future after enqueue
-    /// does not undo it, so the caller must not blindly retry. A TCP error may
-    /// follow a partial write. Success does not promise delivery to the peer.
+    /// does not undo it, so the caller must not blindly retry. Enqueueing a
+    /// final response for an untracked request also ends its place in
+    /// [`Builder::max_pending_requests`]. A TCP error may follow a partial
+    /// write. Success does not promise delivery to the peer.
     ///
     /// # Errors
     ///
-    /// Returns an invalid-response error before enqueue for changed identity
-    /// fields, busy for a full transport queue, closed when the endpoint ends,
-    /// or a transport error retaining the I/O source.
+    /// * [`ReplyError::InvalidResponse`] before enqueue, for changed identity
+    ///   fields or an encoded length that overflows.
+    /// * [`ReplyError::Unsupported`] for a route of an ACK.
+    /// * [`ReplyError::Busy`] when [`Builder::max_reply_bytes`] or the
+    ///   transport queue is full.
+    /// * [`ReplyError::Closed`] once the endpoint has stopped or started to
+    ///   shut down.
+    /// * [`ReplyError::Transport`] for a local I/O error, with its source.
+    ///
+    /// # Example
     ///
     /// ```
     /// use bytes::Bytes;
@@ -110,12 +145,15 @@ impl ReplyRoute {
     ///     route.send(response).await
     /// }
     /// ```
+    ///
+    /// [`Builder::max_reply_bytes`]: super::Builder::max_reply_bytes
+    /// [`Builder::max_pending_requests`]: super::Builder::max_pending_requests
     pub async fn send(
         &self,
         response: Response<Bytes>,
     ) -> Result<(), ReplyError> {
         self.validate(&response)?;
-        let len = response.encoded_len().ok_or(ReplyError::Busy)?;
+        let len = response.encoded_len().ok_or(ReplyError::InvalidResponse)?;
 
         let permit = self
             .0
@@ -126,6 +164,7 @@ impl ReplyRoute {
             .map_err(|_| ReplyError::Closed)?;
         let reservation = self.0.bytes.acquire(len).ok_or(ReplyError::Busy)?;
 
+        let final_response = response.status().is_final();
         let bytes = response.to_bytes_reserved(len);
         // The command owns its encoded bytes. Do not keep the original body
         // and application Extensions alive while waiting for the socket.
@@ -145,11 +184,21 @@ impl ReplyRoute {
                 },
             })
             .map_err(|_| ReplyError::Closed)?;
+        // Enqueue commits the final, so the untracked request is answered
+        // even if this future is dropped now.
+        if final_response {
+            if let Some(work) = &self.0.work {
+                work.finish();
+            }
+        }
 
         result.await.map_err(|_| ReplyError::Closed)?
     }
 
-    fn validate(&self, response: &Response<Bytes>) -> Result<(), ReplyError> {
+    pub(super) fn validate(
+        &self,
+        response: &Response<Bytes>,
+    ) -> Result<(), ReplyError> {
         if self.0.ack {
             return Err(ReplyError::Unsupported);
         }

@@ -2,18 +2,15 @@
 Endpoint configuration, socket binding and task startup.
 */
 
-use std::{io, net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, time::Duration};
 
-use bytes::Bytes;
 use tokio::sync::mpsc;
-use tower_service::Service;
 
 use super::{
     driver::{Driver, TCP_INBOUND},
-    Endpoint,
+    BindError, Endpoint, Incoming,
 };
 use crate::{
-    message::{request::Request, response::Response},
     transaction::Timers,
     transport::{tcp, udp, MessageLimits, WriteLimits},
 };
@@ -29,6 +26,10 @@ pub(super) struct Config {
     pub(super) max_client_request_bytes: usize,
     pub(super) udp_write_limits: WriteLimits,
     pub(super) max_reply_bytes: usize,
+    pub(super) max_server_request_bytes: usize,
+    pub(super) max_server_response_bytes: usize,
+    pub(super) max_responder_bytes: usize,
+    pub(super) max_responder_handles: usize,
     pub(super) max_outbound_connections: usize,
     pub(super) max_pending_connects: usize,
     pub(super) max_routes: usize,
@@ -50,6 +51,10 @@ impl Default for Config {
                 ..WriteLimits::default()
             },
             max_reply_bytes: 64 * 1024 * 1024,
+            max_server_request_bytes: 64 * 1024 * 1024,
+            max_server_response_bytes: 64 * 1024 * 1024,
+            max_responder_bytes: 64 * 1024 * 1024,
+            max_responder_handles: 4096,
             max_outbound_connections: 1024,
             max_pending_connects: 64,
             max_routes: 4096,
@@ -62,35 +67,17 @@ impl Default for Config {
     }
 }
 
-/// Builds an [`Endpoint`].
+/// Configures and binds an [`Endpoint`] with one incoming event receiver.
 ///
 /// # Example
 ///
 /// ```no_run
-/// use std::time::Duration;
-///
-/// use signa::{endpoint::Endpoint, transaction::Timers};
-/// # use bytes::Bytes;
-/// # use signa::{Request, Response};
-///
-/// # fn service() -> impl tower_service::Service<
-/// #     Request<Bytes>,
-/// #     Response = Response<Bytes>,
-/// #     Future = std::future::Ready<
-/// #         Result<Response<Bytes>, std::convert::Infallible>,
-/// #     >,
-/// # > + Send
-/// #        + 'static {
-/// #     tower::service_fn(|_| unreachable!())
-/// # }
-/// # fn main() -> std::io::Result<()> {
-/// # let rt = tokio::runtime::Runtime::new()?;
-/// # let _guard = rt.enter();
-/// let endpoint = Endpoint::builder()
-///     .udp("0.0.0.0:5060".parse().unwrap())
-///     .timers(Timers::builder().t1(Duration::from_millis(200)).build().unwrap())
+/// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+/// let (_endpoint, mut incoming) = signa::endpoint::Endpoint::builder()
+///     .udp("127.0.0.1:5060".parse()?)
 ///     .max_pending_requests(256)
-///     .serve(service())?;
+///     .bind()?;
+/// let _event = incoming.recv().await;
 /// # Ok(())
 /// # }
 /// ```
@@ -299,8 +286,16 @@ impl Builder {
         self
     }
 
-    /// Sets how many requests may wait for the service or be in its hands at
-    /// once. A request beyond that gets a stateless 503. The default is 1024.
+    /// Sets how many received requests the application may have unanswered.
+    ///
+    /// The default is 1024, and it must be positive. A request counts from
+    /// admission until its responder's final response is accepted or its
+    /// transaction ends. An untracked request counts until its reply route
+    /// sends a final response or every clone of the route is dropped. Taking
+    /// the event with [`Incoming::recv`] does not end the count, so slow
+    /// handlers hold capacity. A request still waiting in [`Incoming`] counts
+    /// even after its transaction ends. A new request beyond the limit gets a
+    /// stateless 503.
     pub fn max_pending_requests(mut self, limit: usize) -> Builder {
         self.config.max_pending_requests = limit;
         self
@@ -308,16 +303,16 @@ impl Builder {
 
     /// Sets how many server transactions may be retained at once.
     ///
-    /// The default is 4096. The limit includes requests waiting for the
-    /// service, requests in its hands and Completed entries. Over UDP a
+    /// The default is 4096. Each tracked request holds an entry until its
+    /// transaction ends. Over TCP that is the final response. Over UDP a
     /// non-INVITE final response stays in the table for Timer J (64 T1,
     /// normally 32 seconds) to answer retransmissions, as required by
     /// [RFC 3261 section 17.2.2]. A full table refuses new transactions with
-    /// a stateless 503. Existing retransmissions still match their transaction.
+    /// a stateless 503. Existing retransmissions still match their
+    /// transaction.
     ///
     /// Zero refuses all new stateful requests. Requests without an RFC 3261
-    /// transaction key still use only [`Builder::max_pending_requests`].
-    /// Neither limit caps response sizes or application-owned allocations.
+    /// transaction key do not count against this limit.
     ///
     /// # Example
     ///
@@ -380,30 +375,126 @@ impl Builder {
         self
     }
 
-    /// Binds the sockets, starts the endpoint with `service` answering its
-    /// requests, and returns a handle to it.
+    /// Sets how many bytes of request content the unanswered requests of
+    /// [`Builder::max_pending_requests`] may hold.
     ///
-    /// Must be called from within a tokio runtime, since the endpoint runs as
-    /// a task on it.
+    /// The default is 64 MiB, and it must be positive. It counts the request
+    /// line, header names and values, and body of each request, not the
+    /// allocations behind them. A request still waiting in [`Incoming`] counts
+    /// even after its transaction ends. A new request beyond the limit gets a
+    /// stateless 503.
+    pub fn max_server_request_bytes(mut self, bytes: usize) -> Builder {
+        self.config.max_server_request_bytes = bytes;
+        self
+    }
+
+    /// Sets how many responders and reply routes the application may hold.
+    ///
+    /// The default is 4096, and it must be positive. Each admitted request
+    /// creates one route, which its responder holds. Clones of a route share
+    /// it, and it counts until the last clone drops, even after the request
+    /// is answered. Keep routes only as long as needed, for example for UAS
+    /// 2xx retransmission. A new request beyond the limit gets a stateless 503.
+    pub fn max_responder_handles(mut self, limit: usize) -> Builder {
+        self.config.max_responder_handles = limit;
+        self
+    }
+
+    /// Sets how many bytes the routes of [`Builder::max_responder_handles`]
+    /// may hold.
+    ///
+    /// The default is 64 MiB, and it must be positive. A route copies the
+    /// request's Via, From, To, Call-ID and CSeq values to validate responses
+    /// against them, without keeping the rest of the request. A new request
+    /// beyond the limit gets a stateless 503.
+    pub fn max_responder_bytes(mut self, bytes: usize) -> Builder {
+        self.config.max_responder_bytes = bytes;
+        self
+    }
+
+    /// Sets two separate byte limits on server responses.
+    ///
+    /// The default is 64 MiB, and it must be positive. One limit covers
+    /// submitted responses waiting for the driver, together with a fixed
+    /// count of 64. Beyond it, `respond` returns [`SubmitError::Busy`]. The
+    /// other covers responses that server transactions keep for
+    /// retransmission, which a Completed UDP transaction holds until Timer J.
+    /// Beyond it, `respond` returns [`SubmitError::RetentionFull`].
+    ///
+    /// Neither changes the transaction. `Busy` clears as the driver takes
+    /// queued responses, and `RetentionFull` as other transactions end, up to
+    /// Timer J later. A single response larger than the limit always gets
+    /// `Busy`. The 500 sent after a responder drop also needs retention, and
+    /// without it the abandoned transaction ends unanswered.
+    ///
+    /// [`SubmitError::Busy`]: super::SubmitError::Busy
+    /// [`SubmitError::RetentionFull`]: super::SubmitError::RetentionFull
+    pub fn max_server_response_bytes(mut self, bytes: usize) -> Builder {
+        self.config.max_server_response_bytes = bytes;
+        self
+    }
+
+    /// Binds sockets and starts the protocol driver, returning its command
+    /// handle and incoming event receiver. The endpoint spawns no handler
+    /// tasks.
+    ///
+    /// Dropping the returned [`Incoming`] starts an immediate shutdown, so
+    /// keep it for as long as the endpoint runs.
+    ///
+    /// # Panics
+    ///
+    /// Panics outside a tokio runtime, since the endpoint runs as a task on
+    /// it.
     ///
     /// # Errors
     ///
-    /// Returns the error of binding a socket.
-    pub fn serve<S>(self, service: S) -> io::Result<Endpoint>
-    where
-        S: Service<Request<Bytes>, Response = Response<Bytes>>
-            + Send
-            + 'static,
-        S::Future: Send + 'static,
-    {
-        let udp = self.udp.map(udp::Socket::bind).transpose()?;
+    /// Returns a [`BindError`] for a socket that fails to bind, or an invalid
+    /// configuration: a zero `max_pending_requests`,
+    /// `max_server_request_bytes`, `max_responder_handles`,
+    /// `max_responder_bytes` or `max_server_response_bytes`. Zero client,
+    /// table and transport limits are valid and refuse that work instead.
+    pub fn bind(self) -> Result<(Endpoint, Incoming), BindError> {
+        for (reason, value) in [
+            (
+                "max_pending_requests must be positive",
+                self.config.max_pending_requests,
+            ),
+            (
+                "max_server_request_bytes must be positive",
+                self.config.max_server_request_bytes,
+            ),
+            (
+                "max_responder_handles must be positive",
+                self.config.max_responder_handles,
+            ),
+            (
+                "max_responder_bytes must be positive",
+                self.config.max_responder_bytes,
+            ),
+            (
+                "max_server_response_bytes must be positive",
+                self.config.max_server_response_bytes,
+            ),
+        ] {
+            if value == 0 {
+                return Err(BindError::invalid_config(reason));
+            }
+        }
+
+        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let udp = self
+            .udp
+            .map(udp::Socket::bind)
+            .transpose()
+            .map_err(BindError::io)?;
         let (tcp_tx, tcp_rx) = mpsc::channel(TCP_INBOUND);
         let listener = self
             .tcp
             .map(|addr| {
                 tcp::Listener::bind(addr, self.config.tcp, tcp_tx.clone())
             })
-            .transpose()?;
+            .transpose()
+            .map_err(BindError::io)?;
         let (commands, commands_rx) = mpsc::unbounded_channel();
         let udp_addr = udp.as_ref().map(udp::Socket::local_addr);
         let tcp_addr = listener.as_ref().map(tcp::Listener::local_addr);
@@ -412,7 +503,7 @@ impl Builder {
             tokio::spawn(listener.run());
         }
         let driver = Driver::new(
-            service,
+            incoming_tx,
             self.config,
             udp,
             tcp_rx,
@@ -430,8 +521,13 @@ impl Builder {
             udp: udp_addr,
             tcp: tcp_addr,
         };
+        let incoming = Incoming::new(
+            incoming_rx,
+            driver.shutdown_control.clone(),
+            driver.control.clone(),
+        );
         tokio::spawn(driver.run());
 
-        Ok(endpoint)
+        Ok((endpoint, incoming))
     }
 }

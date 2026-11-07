@@ -6,12 +6,16 @@ use std::{
     collections::VecDeque,
     io,
     net::SocketAddr,
+    sync::Arc,
     task::{Context, Poll},
 };
 
 use bytes::{Bytes, BytesMut};
 
-use super::reply::{Completion, ReplyError};
+use super::{
+    reply::{Completion, ReplyError},
+    server::{Shared, WriteObservation},
+};
 use crate::transport::{udp, Flow, WriteLimits};
 
 /// The UDP socket, its read buffer, and the datagrams waiting for it to be
@@ -19,9 +23,11 @@ use crate::transport::{udp, Flow, WriteLimits};
 pub(super) struct Datagram {
     socket: udp::Socket,
     buf: BytesMut,
-    backlog: VecDeque<(Bytes, Flow, Option<Completion>)>,
+    backlog:
+        VecDeque<(Bytes, Flow, Option<Completion>, Option<WriteObservation>)>,
     limits: WriteLimits,
     queued_bytes: usize,
+    failures: VecDeque<Arc<Shared>>,
 }
 
 impl Datagram {
@@ -32,7 +38,14 @@ impl Datagram {
             backlog: VecDeque::new(),
             limits,
             queued_bytes: 0,
+            failures: VecDeque::new(),
         }
+    }
+
+    // Only the driver owns this quota. It does not await between checking
+    // admission and committing the server response, so capacity cannot race.
+    pub(super) fn admit_response(&self, bytes: usize) -> io::Result<()> {
+        self.admit(bytes)
     }
 
     fn admit(&self, bytes: usize) -> io::Result<()> {
@@ -55,6 +68,7 @@ impl Datagram {
                 "the UDP write budget is full",
             ));
         }
+
         Ok(())
     }
 
@@ -63,8 +77,9 @@ impl Datagram {
     fn enqueue(&mut self, bytes: Bytes, flow: Flow) -> io::Result<()> {
         self.admit(bytes.len())?;
         let len = bytes.len();
-        self.backlog.push_back((bytes, flow, None));
+        self.backlog.push_back((bytes, flow, None, None));
         self.queued_bytes += len;
+
         Ok(())
     }
 
@@ -141,10 +156,49 @@ impl Datagram {
         }
     }
 
+    pub(super) fn take_failure(&mut self) -> Option<Arc<Shared>> {
+        self.failures.pop_front()
+    }
+
+    /// Commits the driver's earlier admission check without yielding between
+    /// phases. No other task owns this queue or can change its quota.
+    pub(super) fn send_admitted(
+        &mut self,
+        bytes: Bytes,
+        flow: Flow,
+        observation: WriteObservation,
+    ) -> bool {
+        debug_assert!(self.admit(bytes.len()).is_ok());
+        if self.backlog.is_empty() {
+            match self.socket.try_send(&bytes, &flow) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                result => {
+                    let success = result.is_ok();
+                    observation.complete(result);
+                    return success;
+                }
+            }
+        }
+
+        self.queued_bytes += bytes.len();
+        self.backlog.push_back((bytes, flow, None, Some(observation)));
+
+        true
+    }
+
     fn finish_front(&mut self, result: io::Result<()>) {
-        if let Some((bytes, _, completion)) = self.backlog.pop_front() {
+        if let Some((bytes, _, completion, observation)) =
+            self.backlog.pop_front()
+        {
             self.queued_bytes -= bytes.len();
             drop(bytes);
+            if let Some(observation) = observation {
+                if result.is_err() {
+                    self.failures.push_back(observation.shared().clone());
+                }
+                observation.complete(result);
+                return;
+            }
             if let Some(completion) = completion {
                 completion.finish(result.map_err(ReplyError::Transport));
             }
@@ -154,7 +208,10 @@ impl Datagram {
     /// Sends what waits, as far as the socket takes it.
     pub(super) fn poll_flush(&mut self, cx: &mut Context<'_>) {
         for _ in 0..32 {
-            let Some((bytes, flow, _)) = self.backlog.front() else { return };
+            let Some((bytes, flow, _, _)) = self.backlog.front() else {
+                return;
+            };
+
             match self.socket.poll_send_ready(cx) {
                 Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(error)) => {

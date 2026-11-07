@@ -12,23 +12,26 @@ A fast and correct low-level SIP library in Rust.
 
 <br>
 
-signa does for SIP roughly what `hyper` does for HTTP. It carries messages over
-UDP and TCP, runs the RFC 3261 transactions, and hands requests to application
-code through a Tower `Service`. Its design draws heavily on the [`http`] and
-[`hyper`] crates.
+signa does for SIP roughly what **hyper** does for HTTP. It carries messages
+over UDP and TCP, runs the RFC 3261 transactions, and hands requests to
+application code through owned transaction-user events.
 
-The current release has request and response types modeled on the `http` crate,
-parsing with [siparse] and encoding, and an endpoint that carries messages over
-UDP and TCP, runs the non-INVITE transactions, and serves requests through a
-Tower `Service`. Its client sends requests to one next hop and is a `Service`
-too, and the endpoint shuts down gracefully. INVITE, ACK, and CANCEL
-transactions are planned for the next release, and TLS and next-hop selection
-are later work. The [crate docs] say what is covered in detail.
+Its design draws heavily on the [hyper] and [http] crates.
 
-[`http`]: https://docs.rs/http
-[`hyper`]: https://docs.rs/hyper
-[siparse]: https://docs.rs/siparse
-[crate docs]: https://docs.rs/signa
+The current development API has request and response types modeled on the http
+crate, parsing with [**siparse**] and encoding, and an endpoint that carries
+messages over UDP and TCP, runs non-INVITE transactions, and exposes incoming
+requests, responders and independent transaction observation. Its client still
+sends requests through a Tower `Service` until a later release. The
+endpoint supports graceful shutdown. INVITE, ACK, and CANCEL transactions are
+planned for the next release, and TLS and next-hop selection are later work.
+
+The [API documentation on docs.rs] says what is covered in detail.
+
+[hyper]: https://docs.rs/hyper
+[http]: https://docs.rs/http
+[**siparse**]: https://docs.rs/siparse
+[API documentation on docs.rs]: https://docs.rs/signa
 
 ### Modules
 
@@ -47,38 +50,49 @@ internal implementation details.
 
 ### Example
 
-A UAS that answers every request with a 200:
+A non-INVITE UAS receives owned requests and responds through their
+transaction. `to_tag` adds a fresh To tag to an initial request's response and
+keeps the tag of a request within a dialog. A failed submission is logged
+rather than returned, since leaving the loop would drop `incoming` and shut the
+endpoint down.
 
 ```rust
-use std::convert::Infallible;
-
 use bytes::Bytes;
-use signa::{endpoint::Endpoint, Request, Response, StatusCode};
+use signa::{endpoint::{Endpoint, IncomingEvent}, message::header::Tag, Response};
 
 #[tokio::main]
-async fn main() -> std::io::Result<()> {
-    let endpoint = Endpoint::builder()
-        .udp("0.0.0.0:5060".parse().unwrap())
-        .tcp("0.0.0.0:5060".parse().unwrap())
-        .serve(tower::service_fn(|request: Request<Bytes>| async move {
-            // The response carries the header fields the endpoint routes
-            // it by, copied from the request.
-            let response = Response::reply_to(&request)
-                .status(StatusCode::OK)
-                .body(Bytes::new())
-                .expect("the status is set");
-            Ok::<_, Infallible>(response)
-        }))?;
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let (_endpoint, mut incoming) = Endpoint::builder()
+        .udp("0.0.0.0:5060".parse()?)
+        .tcp("0.0.0.0:5060".parse()?)
+        .bind()?;
 
-    // The endpoint runs as long as a handle to it exists.
-    std::future::pending::<()>().await;
-    drop(endpoint);
+    while let Some(event) = incoming.recv().await {
+        if let IncomingEvent::Request(envelope) = event {
+            let (responder, _) = envelope.transaction.into_parts();
+            let response = Response::reply_to(&envelope.request)
+                .status(200)
+                .to_tag(Tag::random())
+                .body(Bytes::new())?;
+
+            if let Err(error) = responder.respond(response).await {
+                eprintln!("response not accepted: {error}");
+            }
+        }
+    }
+
     Ok(())
 }
 ```
 
-`examples/options.rs` has both sides, a server and a client that sends it an
-`OPTIONS` over UDP and over TCP.
+`examples/options.rs` runs both endpoints over UDP and TCP.
+
+`examples/server_adapter.rs` demonstrates a responder wrapper and bounded,
+application-owned Tower dispatch with a non-Clone service. The endpoint starts
+no application handler tasks. Response acceptance is distinct from local write
+completion and transaction termination. Dropping an unanswered responder
+requests a 500. A stateless endpoint mode and INVITE/ACK/CANCEL integration
+remain planned.
 
 ### License
 

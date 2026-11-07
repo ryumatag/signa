@@ -12,7 +12,8 @@ use crate::message::{
     error::{BuildError, InvalidMessage},
     extensions::Extensions,
     header::{
-        HeaderMap, HeaderName, HeaderValue, CALL_ID, CSEQ, FROM, TO, VIA,
+        address::has_tag, HeaderMap, HeaderName, HeaderValue, Tag, CALL_ID,
+        CSEQ, FROM, TO, VIA,
     },
     request::Request,
     ReasonPhrase, StatusCode, Version,
@@ -110,10 +111,12 @@ impl Response<()> {
     ///
     /// RFC 3261 section 8.2.6.2 requires `Via`, `From`, `To`, `Call-ID`, and
     /// `CSeq` to be copied from the request. The endpoint routes the response
-    /// by the `Via`, and it answers a response without one with a 500 instead
-    /// of sending it, so this is the way to start a response in a service.
-    /// Adding a tag to `To` where the request has none is left to the caller,
-    /// since it belongs to the dialog layer.
+    /// by the `Via` and refuses a response that changes these fields
+    /// (`SubmitError::InvalidResponse` or `ReplyError::InvalidResponse`), so
+    /// this is the way to start a response to a received request.
+    /// The request's `To` usually has no tag. Every response other than 100
+    /// needs one (RFC 3261 section 8.2.6.2), and [`Builder::to_tag`] adds it.
+    /// Choosing the tag belongs to the caller, since it identifies the dialog.
     ///
     /// # Example
     ///
@@ -465,6 +468,78 @@ impl Builder {
         })
     }
 
+    /// Adds `tag` to the single `To` header field unless it already has one.
+    ///
+    /// This follows [RFC 3261 section 8.2.6.2]. A response to a request
+    /// whose `To` has no tag must add one, and a response to a request whose
+    /// `To` has a tag must copy it unchanged. So the same call suits both the
+    /// initial request and a request within a dialog, after
+    /// [`Response::reply_to`] copied the `To`. Use [`Tag::random`] for a new
+    /// tag, or the one already chosen for this request so that its responses
+    /// agree.
+    ///
+    /// # Errors
+    ///
+    /// [`Builder::body`] reports [`InvalidTag`] for a tag that is not a SIP
+    /// token. It also returns a [`BuildError`] if there is not exactly one
+    /// `To` header field.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bytes::Bytes;
+    /// use signa::{message::header::{Tag, TO}, Request, Response};
+    ///
+    /// let request = Request::from_bytes(
+    ///     b"OPTIONS sip:carol@chicago.example.com SIP/2.0\r\n\
+    ///       Via: SIP/2.0/UDP pc33.atlanta.example.com;branch=z9hG4bKhjhs8ass877\r\n\
+    ///       To: <sip:carol@chicago.example.com>\r\n\
+    ///       From: Alice <sip:alice@atlanta.example.com>;tag=1928301774\r\n\
+    ///       Call-ID: a84b4c76e66710\r\n\
+    ///       CSeq: 63104 OPTIONS\r\n\
+    ///       Content-Length: 0\r\n\
+    ///       \r\n",
+    /// )?;
+    /// let local_tag: Tag = "a6c85cf".parse()?;
+    ///
+    /// let response = Response::reply_to(&request)
+    ///     .status(200)
+    ///     .to_tag(local_tag)
+    ///     .body(Bytes::new())?;
+    ///
+    /// assert_eq!(
+    ///     response.headers().get(TO).unwrap(),
+    ///     "<sip:carol@chicago.example.com>;tag=a6c85cf"
+    /// );
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// [RFC 3261 section 8.2.6.2]: https://www.rfc-editor.org/rfc/rfc3261.html#section-8.2.6.2
+    /// [`InvalidTag`]: crate::message::error::InvalidTag
+    pub fn to_tag<T>(self, tag: T) -> Builder
+    where
+        Tag: TryFrom<T>,
+        <Tag as TryFrom<T>>::Error: Into<BuildError>,
+    {
+        self.and_then(|mut head| {
+            let tag = Tag::try_from(tag).map_err(Into::into)?;
+            let mut values = head.headers.get_all(TO);
+            let (Some(to), None) = (values.next(), values.next()) else {
+                return Err(BuildError::missing("single To header"));
+            };
+            if has_tag(to.as_str()) {
+                return Ok(head);
+            }
+
+            // A token after `;tag=` keeps a valid header value valid. Without
+            // angle brackets, a parameter after the URI is a header parameter
+            // too (RFC 3261 section 20), so no rewriting is needed.
+            let tagged = format!("{};tag={tag}", to.as_str());
+            head.headers.insert(TO, HeaderValue::from_built(tagged));
+            Ok(head)
+        })
+    }
+
     /// Returns the header fields set so far.
     ///
     /// Returns `None` after an error.
@@ -554,6 +629,62 @@ mod tests {
         assert_eq!(response.version(), Version::SIP_2_0);
         assert!(response.headers().is_empty());
         assert!(response.extensions().is_empty());
+    }
+
+    #[test]
+    fn to_tag_appends_one_header_parameter() {
+        for (to, tagged) in [
+            ("<sip:bob@b>", "<sip:bob@b>;tag=uas"),
+            (
+                "Bob <sip:bob@b;transport=tcp>",
+                "Bob <sip:bob@b;transport=tcp>;tag=uas",
+            ),
+            ("sip:bob@b", "sip:bob@b;tag=uas"),
+        ] {
+            let response = Response::builder()
+                .status(StatusCode::OK)
+                .header(TO, to)
+                .to_tag("uas")
+                .body(())
+                .unwrap();
+
+            assert_eq!(response.headers().get(TO).unwrap(), tagged);
+        }
+    }
+
+    #[test]
+    fn to_tag_keeps_the_tag_of_a_request_within_a_dialog() {
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(TO, "<sip:bob@b>;tag=dialog")
+            .to_tag("uas")
+            .body(())
+            .unwrap();
+
+        assert_eq!(
+            response.headers().get(TO).unwrap(),
+            "<sip:bob@b>;tag=dialog"
+        );
+    }
+
+    #[test]
+    fn to_tag_rejects_invalid_or_ambiguous_input() {
+        let invalid = Response::builder()
+            .status(StatusCode::OK)
+            .header(TO, "<sip:bob@b>")
+            .to_tag("not a token")
+            .body(())
+            .unwrap_err();
+        assert!(invalid.is::<crate::message::error::InvalidTag>());
+
+        for headers in [&[][..], &["<sip:bob@b>", "<sip:carol@c>"][..]] {
+            let mut builder = Response::builder().status(StatusCode::OK);
+            for to in headers {
+                builder = builder.header(TO, *to);
+            }
+
+            assert!(builder.to_tag("uas").body(()).is_err(), "{headers:?}");
+        }
     }
 
     #[test]

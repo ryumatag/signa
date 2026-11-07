@@ -33,6 +33,10 @@ impl Budget {
         }))
     }
 
+    pub(crate) fn is_idle(&self) -> bool {
+        self.0.messages.load(Ordering::Relaxed) == 0
+    }
+
     pub(crate) fn acquire(&self, bytes: usize) -> Option<Permit> {
         self.acquire_with_limits(bytes, self.0.limits)
     }
@@ -67,6 +71,27 @@ pub(crate) fn request_limits(limits: WriteLimits) -> WriteLimits {
 pub(crate) struct Permit {
     budget: Budget,
     bytes: usize,
+}
+
+impl Permit {
+    /// Replaces the charged size without releasing the message slot.
+    /// A failed growth leaves the original reservation intact.
+    pub(crate) fn resize(&mut self, bytes: usize) -> Option<()> {
+        if bytes > self.bytes {
+            reserve(
+                &self.budget.0.bytes,
+                bytes - self.bytes,
+                self.budget.0.limits.bytes,
+            )?;
+        } else {
+            self.budget
+                .0
+                .bytes
+                .fetch_sub(self.bytes - bytes, Ordering::Relaxed);
+        }
+        self.bytes = bytes;
+        Some(())
+    }
 }
 
 impl Drop for Permit {
@@ -110,6 +135,21 @@ mod tests {
         drop(empty);
         assert_eq!(budget.0.messages.load(Ordering::Relaxed), 0);
         assert_eq!(budget.0.bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn resize_keeps_the_slot_and_failed_growth_keeps_the_bytes() {
+        let budget = Budget::new(WriteLimits { messages: 1, bytes: 10 });
+        let mut permit = budget.acquire(6).unwrap();
+        assert_eq!(permit.resize(10), Some(()));
+        assert_eq!(permit.resize(11), None);
+        assert_eq!(budget.0.bytes.load(Ordering::Relaxed), 10);
+        assert_eq!(permit.resize(3), Some(()));
+        assert_eq!(budget.0.bytes.load(Ordering::Relaxed), 3);
+        assert!(budget.acquire(0).is_none());
+        drop(permit);
+        assert!(budget.acquire(10).is_some());
+        assert!(budget.is_idle());
     }
 
     #[test]

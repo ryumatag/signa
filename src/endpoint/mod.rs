@@ -1,159 +1,121 @@
 /*!
-The endpoint, which runs the transports and the transactions and connects
-them to application code through Tower.
+The endpoint's transaction-user (TU) interface.
 
-An [`Endpoint`] owns a UDP socket, a TCP listener, or both, and the
-non-INVITE transactions on them. SIP sends and receives requests on the same
-socket, so one endpoint is both the server and the client side, where hyper
-has one type for each. [`Endpoint::builder`] binds the sockets and takes the
-[`Service`] that answers requests. [`Endpoint::client`] makes a [`Client`]
-that sends requests to one next hop.
+Binding returns a cloneable [`Endpoint`] and one cancellation-safe [`Incoming`]
+receiver. The driver runs transport and transaction work. Application code owns
+its receive loop and handler tasks. Incoming requests carry their
+[`Flow`](crate::transport::Flow) in the envelope, and `Extensions` stays for
+application data.
 
-# Serving
+# Non-INVITE reception
 
-Every request that arrives and matches no transaction goes to the service as
-a `Request<Bytes>`, with the [`Flow`](crate::transport::Flow) it arrived on
-in its extensions. The service answers with the final response, built with
-[`Response::reply_to`](crate::Response::reply_to) so that it carries the `Via`
-the endpoint routes it by. RFC 4320 leaves a
-non-INVITE request no provisional response worth sending, and the endpoint
-sends the one 100 the RFC asks for itself when the service is slow, so the
-service never deals with provisional responses.
+[`IncomingEvent::Request`] owns a request and its [`ServerTransaction`]. Split the
+transaction into a non-cloneable [`Responder`] and independent [`ServerEvents`].
+`respond` returns once the driver accepts the response, not when the peer gets
+it. A final response may leave a UDP transaction in Completed until Timer J.
+Every response other than 100 needs a To tag, which
+[`response::Builder::to_tag`](crate::message::response::Builder::to_tag) adds.
 
-[`Builder::max_pending_requests`] bounds requests waiting for or held by the
-service until their response command is processed. The separate
-[`Builder::max_server_transactions`] counts every live server entry, including
-UDP Completed entries retained for Timer J. A full table refuses new stateful
-requests with a stateless 503 while still handling existing retransmissions.
-These are count limits. They do not bound application-owned response sizes.
+Dropping an unanswered responder makes the driver send a 500. It reuses a To tag
+already sent in a provisional response, or adds a random one. If the 500 cannot
+be admitted, the transaction ends, and a retransmission arrives as a new
+request. This is signa's abandonment policy, not an RFC rule.
 
-The service is polled for readiness before each request and called on the
-same instance, and each call runs in its own task. Requests wait for the
-service up to a limit, and a request beyond it is answered with a stateless
-503. A service error, a response that is not final, or one without a `Via`
-turns into a 500, since the endpoint has nothing else to send.
+[`IncomingEvent::Untracked`] carries a one-shot [`ReplyRoute`] instead, for a
+request without an RFC 3261 branch. Each retransmission of it arrives as a new
+event.
 
-0.2.0 has no INVITE transactions. An INVITE gets a 501, an ACK is dropped,
-and a CANCEL gets a 481, none of which reach the service.
+The driver absorbs retransmissions and sends RFC 4320's automatic 100. INVITE
+gets 501, CANCEL gets 481 and ACK is discarded until INVITE support lands. A
+request without exactly one From, To, Call-ID and CSeq, or whose CSeq method
+differs from its own, gets a stateless 400 and never reaches the application. A
+request whose top Via has `maddr` is dropped, since its response would go to a
+multicast group, which signa does not support.
 
-# Sending
+Dropping [`Incoming`] starts an immediate shutdown. An application that only
+sends requests keeps it anyway, because peers can still send it requests, such
+as a BYE within a dialog.
 
-A [`Client`] implements [`Service`] for one next hop. The endpoint adds the
-topmost `Via`, runs the client transaction with its retransmissions and
-Timer F, and resolves the future with the final response or an [`Error`].
-Over TCP the endpoint opens a connection to the next hop on the first
-request and keeps it for the next ones.
+# Admission and completion
 
-Client admission reserves a shared request count and logical content bytes
-before enqueue. Queued commands, pending connects and live transactions all
-consume that count. A final response frees request bytes, while a UDP Completed
-entry keeps its count until Timer K ends. Saturation returns Busy without a
-command or send. Dropping a response future releases neither reservation.
-See [`Builder::max_client_transactions`] and [`Builder::max_client_request_bytes`].
+Each limit below refuses a new request with a stateless 503 while existing
+transactions go on:
 
-[`Builder::tcp_write_limits`] and [`Builder::udp_write_limits`] bound message
-counts and encoded bytes through local write completion, including TCP batches
-and partial writes. [`Builder::max_reply_bytes`] separately reserves one-shot
-reply bytes before encoding and holds them through command, connect and write.
-Output saturation never blocks the driver. Client sends and one-shot replies
-report errors. An immediate failure to enqueue a Service response retires its
-transaction, without a later callback to the service. A later UDP send failure
-drops the datagram and lets peer retransmissions recover it. These limits do
-not cap application response allocations or operating-system socket buffers.
+* [`Builder::max_pending_requests`] and [`Builder::max_server_request_bytes`]
+  bound unanswered requests and their content. A request counts until it has a
+  final response or its transaction ends, not merely until `recv`.
+* [`Builder::max_responder_handles`] and [`Builder::max_responder_bytes`] bound
+  reply routes. A responder holds its request's route, and a route counts until
+  its last clone drops.
+* [`Builder::max_server_transactions`] bounds the transaction table, including
+  Completed UDP entries kept for Timer J.
 
-Connection and route admission is also finite. Accepted connections use
-[`Builder::max_connections`], while outbound client connections use
-[`Builder::max_outbound_connections`] and [`Builder::max_pending_connects`].
-Responses have 64 independent outbound connection and attempt slots.
-[`Builder::max_routes`] bounds cached next hops, with 64 extra response
-entries. UDP source selection continues without caching when it cannot retain
-an entry. TCP attempts have a [`Builder::connect_timeout`]. All connection
-slots include writer drain and abort completion.
+[`Builder::max_server_response_bytes`] bounds submitted and retained responses.
+`respond` reports a full submission queue as [`SubmitError::Busy`], full
+retention as [`SubmitError::RetentionFull`] and full transport output as
+[`SubmitError::TransportBusy`], without changing the transaction. These limits
+count message content, not allocations or memory the application keeps.
 
-[`Builder::fallback_limits`] bounds ordinary responses waiting for a new
-connection through local write completion. [`Endpoint::connection_stats`]
-reports refusals and fallback drops, including unfinished fallbacks discarded
-when the driver stops. One-shot reply failures go to their completion futures.
-New client writes leave a quarter of each socket's write counts and bytes for
-existing transaction output and responses, rounded down. These reserves do not
-promise delivery when response traffic itself exhausts capacity.
+[`ServerEvents`] reports write failures, including those after a reliable final
+response ends the transaction, and driver-generated output that local capacity
+refused. A refused automatic 100 or retransmitted response leaves the
+transaction live, so the peer's next retransmission can recover it. Missed
+events are counted, and termination is never lost to them.
+[`ServerEvent::Terminated`] marks the end of the transaction, and the stream
+ends once its accepted writes finish. Dropping the observer has no protocol
+effect. A responder drop is ordered after the submissions it already queued,
+and a queued submission may still run after its waiting future is dropped.
 
-The connection count and per-connection write limits together bound aggregate
-TCP output. There is no additional shared TCP output counter on every write.
-UDP, one-shot replies and ordinary fallback have their own endpoint budgets.
-These are logical encoded-byte limits, not backing allocation or RSS limits.
-Application response allocations remain outside these transport limits.
+# Client operations and shutdown
 
-# Shutdown
+[`Client`] still implements [`tower_service::Service`] for one explicit next hop
+until a later release. Client admission bounds commands, connects and live
+transactions. Initial sends leave a quarter of output capacity for transaction
+output and responses. See [`Builder::tcp_write_limits`],
+[`Builder::udp_write_limits`] and [`Builder::fallback_limits`].
 
-Shutdown calls share one completion signal and coalesce their earliest deadline
-into a separate bounded control queue. Client command saturation cannot occupy
-that queue. The driver rotates input sources, limits dispatch and UDP flush to
-32 items per turn, and yields after 64 events. Receipt polling also takes at
-most 32 items from each write class per turn.
+[`Endpoint::shutdown`] closes new admission and drains current work until the
+earliest requested deadline. Once shutdown starts, new requests get a 503 and
+[`ReplyRoute::send`] returns [`ReplyError::Closed`]. Responders keep working.
 
-[`Endpoint::shutdown`] stops the endpoint once what it has in hand is done, or
-at a deadline. From the call on, a new request gets a stateless 503 and a new
-request through a [`Client`] fails with [`Error::is_closed`]. The endpoint goes
-on answering the requests the service has, sending the final responses, and
-waiting for the responses to its own requests. Once none of that is left, or at
-the deadline, it stops. Stopping closes the sockets and every TCP connection,
-drops the transactions that only linger to absorb retransmissions, and fails
-whatever was still waiting with [`Error::is_closed`].
-
-Dropping the last `Endpoint` and `Client` stops the endpoint at once, without
-the grace.
-
-# Example
-
-```no_run
-use std::time::Duration;
-
-use bytes::Bytes;
-use signa::{
-    endpoint::Endpoint, transport::Transport, Request, Response, StatusCode,
-};
-use tower_service::Service;
-
-# async fn run() -> Result<(), Box<dyn std::error::Error>> {
-let endpoint = Endpoint::builder()
-    .udp("0.0.0.0:5060".parse()?)
-    .tcp("0.0.0.0:5060".parse()?)
-    .serve(tower::service_fn(|request: Request<Bytes>| async move {
-        let response = Response::reply_to(&request)
-            .status(StatusCode::OK)
-            .body(Bytes::new())?;
-        Ok::<_, signa::message::BuildError>(response)
-    }))?;
-
-let mut client = endpoint.client(Transport::Udp, "192.0.2.4:5060".parse()?);
-let request = Request::builder()
-    .method("OPTIONS")
-    .uri("sip:bob@192.0.2.4")
-    .header("From", "<sip:alice@192.0.2.1>;tag=1928301774")
-    .header("To", "<sip:bob@192.0.2.4>")
-    .header("Call-ID", "a84b4c76e66710")
-    .header("CSeq", "1 OPTIONS")
-    .header("Max-Forwards", "70")
-    .body(Bytes::new())?;
-let response = client.call(request).await?;
-assert_eq!(response.status(), StatusCode::OK);
-
-// Stop taking requests, and give the ones in hand up to ten seconds.
-endpoint.shutdown(Duration::from_secs(10)).await;
-# Ok(())
-# }
-```
-
-[`Service`]: tower_service::Service
-
-Transaction timer configuration is owned by [`crate::transaction`], and
-transport metadata by [`crate::transport`]. They are not public members of
-this module. The following cannot compile because `Timers` belongs to
-`transaction`:
+Transaction timers remain under [`crate::transaction`], without an endpoint alias:
 
 ```compile_fail
 use signa::endpoint::Timers;
+```
+
+# Example
+
+This UAS answers each request with a 200. `to_tag` adds a fresh To tag to an
+initial request's response and keeps the tag of a request within a dialog. It
+ignores untracked requests, which then get no answer. A failed submission is
+logged rather than returned, since leaving the loop would drop `incoming` and
+shut the endpoint down.
+
+```no_run
+use bytes::Bytes;
+use signa::{endpoint::{Endpoint, IncomingEvent}, message::header::Tag, Response};
+
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+let (_endpoint, mut incoming) = Endpoint::builder()
+    .udp("127.0.0.1:5060".parse()?)
+    .bind()?;
+
+while let Some(event) = incoming.recv().await {
+    if let IncomingEvent::Request(envelope) = event {
+        let (responder, _) = envelope.transaction.into_parts();
+        let response = Response::reply_to(&envelope.request)
+            .status(200)
+            .to_tag(Tag::random())
+            .body(Bytes::new())?;
+
+        if let Err(error) = responder.respond(response).await {
+            eprintln!("response not accepted: {error}");
+        }
+    }
+}
+# Ok(())
+# }
 ```
 */
 
@@ -162,8 +124,6 @@ use std::{fmt, net::SocketAddr, time::Duration};
 #[cfg(feature = "__bench")]
 use bytes::Bytes;
 use tokio::sync::mpsc;
-#[cfg(feature = "__bench")]
-use tower_service::Service;
 
 use self::{admission::ClientAdmission, driver::Command};
 #[cfg(feature = "__bench")]
@@ -171,15 +131,20 @@ use self::{builder::Config, driver::Driver};
 use crate::transport::Transport;
 #[cfg(feature = "__bench")]
 use crate::{
-    message::{Request, Response},
+    message::Request,
     transport::{tcp, udp},
 };
 
 pub use self::{
     builder::Builder,
     client::{Client, ResponseFuture},
-    error::Error,
+    error::{BindError, Error},
     reply::{ReplyError, ReplyRoute},
+    server::{
+        Incoming, IncomingEvent, ReceivedRequest, Responder, ResponseId,
+        ResponseSubmission, ServerEvent, ServerEvents, ServerRequest,
+        ServerTransaction, ServerTransactionId, SubmitError,
+    },
     shutdown::Shutdown,
 };
 
@@ -191,15 +156,18 @@ mod driver;
 mod error;
 mod reply;
 mod routing;
+mod server;
 mod shutdown;
 mod table;
 mod timer;
 
 /// A handle to a running endpoint.
 ///
-/// The endpoint runs in a task of its own as long as an `Endpoint`, a
-/// [`Client`] of it, or a [`Shutdown`] exists. When the last one is dropped it
-/// stops at once, closes its sockets and connections, and drops its
+/// The endpoint runs while an `Endpoint`, [`Client`], [`Responder`],
+/// [`ReplyRoute`] or [`Shutdown`] exists, and while a one-shot reply is in
+/// flight. [`ServerEvents`] and [`Incoming`] do not keep it running, and
+/// dropping `Incoming` starts an immediate shutdown. When the last of those
+/// handles drops, the driver stops, closes its sockets and drops its
 /// transactions. [`Endpoint::shutdown`] stops it with a grace period instead.
 ///
 /// See the [module docs](self) for what it does.
@@ -224,9 +192,11 @@ pub struct Endpoint {
 pub struct ConnectionStats {
     /// TCP submissions refused by route, connection or connect-attempt limits.
     pub rejected: u64,
-    /// Ordinary fallback responses lost to admission, connect or write failure.
-    /// Includes unfinished fallbacks discarded when the driver stops.
-    /// One-shot replies report their own error and are not included.
+    /// Ordinary fallback responses lost to admission, connect or write
+    /// failure.
+    ///
+    /// Includes unfinished fallbacks discarded when the driver stops. One-shot
+    /// replies report their own error and are not included.
     pub dropped: u64,
 }
 
@@ -285,10 +255,11 @@ impl Endpoint {
     ///
     /// From this call on, the endpoint answers a new request with a 503 and
     /// fails a new request through a [`Client`] with [`Error::is_closed`].
-    /// It waits for the requests the service has, the responses to its own
-    /// requests, and the connections it is opening, then stops. At `timeout`
-    /// it stops regardless, and whatever still waits fails with
-    /// [`Error::is_closed`]. See the [module docs](self#shutdown).
+    /// It waits until every admitted request has a final response, its own
+    /// requests have theirs, and pending writes and connects finish, then
+    /// stops. It does not wait out Timer J. At `timeout` it stops regardless,
+    /// and whatever still waits fails with [`Error::is_closed`]. See the
+    /// [module docs](self#client-operations-and-shutdown).
     ///
     /// Other handles to the endpoint go on working until it stops, and calling
     /// this on more than one of them is fine. The earliest deadline wins.
@@ -329,8 +300,7 @@ impl fmt::Debug for Endpoint {
 /// ownership belong to the external benchmark crate.
 #[cfg(feature = "__bench")]
 #[doc(hidden)]
-pub fn reply_driver<S>(
-    service: S,
+pub fn reply_driver(
     request: Request<Bytes>,
     flow: crate::transport::Flow,
     writer: Option<tcp::Writer>,
@@ -340,16 +310,13 @@ pub fn reply_driver<S>(
 ) -> Result<
     (Request<Bytes>, ReplyRoute, impl std::future::Future<Output = ()> + Send),
     ReplyError,
->
-where
-    S: Service<Request<Bytes>, Response = Response<Bytes>> + Send + 'static,
-    S::Future: Send + 'static,
-{
+> {
     use self::routing::Link;
 
     let (commands, rx) = mpsc::unbounded_channel();
+    let (incoming, _receiver) = mpsc::unbounded_channel();
     let driver = Driver::new(
-        service,
+        incoming,
         Config::default(),
         udp,
         tcp,
@@ -396,7 +363,8 @@ mod tests {
             driver::{Command, Driver, TCP_INBOUND},
             error::Error,
             routing::Link,
-            Endpoint, ReplyError,
+            Builder, Endpoint, Incoming, IncomingEvent, ReplyError,
+            ServerRequest,
         },
         message::{
             header::{HeaderValue, CSEQ, TO, VIA},
@@ -466,6 +434,86 @@ mod tests {
             let flow = *request.extensions().get::<Flow>().expect("a flow");
             self.flows.lock().unwrap().push(flow);
             future::ready(Ok(ok(&request)))
+        }
+    }
+
+    /// Application-side compatibility fixture for transport and client tests.
+    pub(super) trait TestServe {
+        fn serve<S>(self, service: S) -> std::io::Result<Endpoint>
+        where
+            S: Service<Request<Bytes>, Response = Response<Bytes>>
+                + Send
+                + 'static,
+            S::Future: Send + 'static;
+    }
+
+    impl TestServe for Builder {
+        fn serve<S>(self, mut service: S) -> std::io::Result<Endpoint>
+        where
+            S: Service<Request<Bytes>, Response = Response<Bytes>>
+                + Send
+                + 'static,
+            S::Future: Send + 'static,
+        {
+            let (endpoint, mut incoming) = self.bind()?;
+            tokio::spawn(async move {
+                while let Some(event) = incoming.recv().await {
+                    let (mut request, flow, responder, route) = match event {
+                        IncomingEvent::Request(envelope) => {
+                            let (responder, _) =
+                                envelope.transaction.into_parts();
+                            (
+                                envelope.request,
+                                envelope.flow,
+                                Some(responder),
+                                None,
+                            )
+                        }
+                        IncomingEvent::Untracked(envelope) => (
+                            envelope.request,
+                            envelope.flow,
+                            None,
+                            Some(envelope.reply),
+                        ),
+                    };
+                    request.extensions_mut().insert(flow);
+                    if std::future::poll_fn(|cx| service.poll_ready(cx))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    let future = service.call(request);
+
+                    tokio::spawn(async move {
+                        let response = future.await.ok();
+                        if let Some(mut response) = response {
+                            if let Some(to) = response.headers().get(TO) {
+                                if !crate::message::header::address::has_tag(
+                                    to.as_str(),
+                                ) {
+                                    let value =
+                                        format!("{};tag=test", to.as_str());
+                                    response.headers_mut().insert(
+                                        TO,
+                                        HeaderValue::from_bytes(
+                                            value.as_bytes(),
+                                        )
+                                        .unwrap(),
+                                    );
+                                }
+                            }
+                            if let Some(responder) = responder {
+                                let _ = responder.respond(response).await;
+                            } else if let Some(route) = route {
+                                let _ = route.send(response).await;
+                            }
+                        }
+                    });
+                }
+            });
+
+            Ok(endpoint)
         }
     }
 
@@ -561,9 +609,44 @@ mod tests {
         }
     }
 
+    pub(super) struct DriverFixture {
+        pub(super) driver: Driver,
+        pub(super) incoming: Incoming,
+    }
+
+    impl std::ops::Deref for DriverFixture {
+        type Target = Driver;
+
+        fn deref(&self) -> &Driver {
+            &self.driver
+        }
+    }
+
+    impl std::ops::DerefMut for DriverFixture {
+        fn deref_mut(&mut self) -> &mut Driver {
+            &mut self.driver
+        }
+    }
+
+    impl DriverFixture {
+        pub(super) async fn run(self) {
+            let Self { driver, incoming } = self;
+            let _incoming = incoming;
+            driver.run().await;
+        }
+
+        pub(super) fn take_request(&mut self) -> ServerRequest {
+            let IncomingEvent::Request(request) =
+                self.incoming.receiver.try_recv().unwrap().event
+            else {
+                panic!("tracked request");
+            };
+            request
+        }
+    }
+
     pub(super) fn reply_driver(
-    ) -> (Driver<RouteService>, mpsc::UnboundedSender<Command>, SocketAddr)
-    {
+    ) -> (DriverFixture, mpsc::UnboundedSender<Command>, SocketAddr) {
         reply_driver_with(Config {
             timers: Timers::default(),
             tcp: tcp::Config::default(),
@@ -575,26 +658,28 @@ mod tests {
 
     pub(super) fn reply_driver_with(
         config: Config,
-    ) -> (Driver<RouteService>, mpsc::UnboundedSender<Command>, SocketAddr)
-    {
+    ) -> (DriverFixture, mpsc::UnboundedSender<Command>, SocketAddr) {
         let (commands, rx) = mpsc::unbounded_channel();
         let (tx, tcp) = mpsc::channel(TCP_INBOUND);
         let socket = udp::Socket::bind("0.0.0.0:0".parse().unwrap()).unwrap();
         let local = socket.local_addr();
 
-        (
-            Driver::new(
-                RouteService,
-                config,
-                Some(socket),
-                tcp,
-                tx,
-                rx,
-                commands.downgrade(),
-            ),
-            commands,
-            local,
-        )
+        let (incoming, events) = mpsc::unbounded_channel();
+        let driver = Driver::new(
+            incoming,
+            config,
+            Some(socket),
+            tcp,
+            tx,
+            rx,
+            commands.downgrade(),
+        );
+        let incoming = Incoming::new(
+            events,
+            driver.shutdown_control.clone(),
+            driver.control.clone(),
+        );
+        (DriverFixture { driver, incoming }, commands, local)
     }
 
     pub(super) fn route_request(via: &str) -> Request<Bytes> {
@@ -611,17 +696,11 @@ mod tests {
     }
 
     pub(super) fn route_response(request: &Request<Bytes>) -> Response<Bytes> {
-        let mut response = Response::reply_to(request)
+        Response::reply_to(request)
             .status(200)
+            .to_tag("bob")
             .body(Bytes::new())
-            .unwrap();
-        let to = response.headers().get(TO).unwrap().as_str().to_owned()
-            + ";tag=bob";
-        response
-            .headers_mut()
-            .insert(TO, HeaderValue::from_bytes(to.as_bytes()).unwrap());
-
-        response
+            .unwrap()
     }
 
     pub(super) fn udp_reply_link(local: SocketAddr, peer: SocketAddr) -> Link {
@@ -1856,21 +1935,27 @@ mod tests {
             .udp(LOCALHOST)
             .serve(Counting::default())
             .unwrap();
-        let endpoint = Endpoint::builder()
-            .udp(LOCALHOST)
-            .timers(timers)
-            .max_client_transactions(2)
-            .max_client_request_bytes(50)
-            .serve(Counting::default())
-            .unwrap();
-        let mut client =
-            endpoint.client(Transport::Udp, server.udp_addr().unwrap());
         let request = Request::builder()
             .method("OPTIONS")
             .uri("sip:example.com")
             .header("CSeq", "1 OPTIONS")
+            .header("From", "<sip:alice@example.com>;tag=alice")
+            .header("To", "<sip:bob@example.com>")
+            .header("Call-ID", "bytes-lifetime")
             .body(Bytes::from_static(b"request"))
             .unwrap();
+        let content_bytes =
+            crate::endpoint::admission::request_bytes(&request).unwrap();
+
+        let endpoint = Endpoint::builder()
+            .udp(LOCALHOST)
+            .timers(timers)
+            .max_client_transactions(2)
+            .max_client_request_bytes(content_bytes)
+            .serve(Counting::default())
+            .unwrap();
+        let mut client =
+            endpoint.client(Transport::Udp, server.udp_addr().unwrap());
 
         for _ in 0..2 {
             let response =
@@ -1881,7 +1966,7 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
         }
 
-        // Only one request fits in 50 content bytes, so the second response
+        // Only one request fits the content budget, so the second response
         // proves bytes were released. Both Completed slots remain occupied.
         assert!(client.call(request).await.unwrap_err().is_busy());
     }
