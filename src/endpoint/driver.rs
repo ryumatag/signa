@@ -47,6 +47,7 @@ use tower_service::Service;
 
 use crate::{
     endpoint::{
+        admission::{AdmissionOwner, ClientAdmission, Permit},
         builder::Config,
         datagram::Datagram,
         error::Error,
@@ -58,7 +59,7 @@ use crate::{
         table::{Id, Table},
     },
     message::{
-        header::{via::Via, CSEQ, VIA},
+        header::{via::Via, VIA},
         request::Request,
         response::{bare_response, reply_headers, Response},
         Message, Method, StatusCode,
@@ -106,6 +107,7 @@ pub(super) enum Command {
         transport: Transport,
         next_hop: SocketAddr,
         respond: Responder,
+        permit: Permit,
     },
     /// A route sends one response without a transaction.
     Reply { link: Link, bytes: Bytes, completion: Completion },
@@ -144,6 +146,7 @@ struct ClientEntry {
     link: Link,
     /// Taken when the final response, or the error, is delivered.
     respond: Option<Responder>,
+    permit: Permit,
 }
 
 /// What the driver knows about one next hop. Pending connects stay here
@@ -167,7 +170,7 @@ enum TcpState {
 /// Something waiting for a TCP connection to open.
 enum Pending {
     /// A client's request, which starts a transaction once it can be sent.
-    Request(Request<Bytes>, Responder),
+    Request(Request<Bytes>, Responder, Permit),
     /// An encoded response whose request came on a connection that has closed
     /// since. It goes to `sent-by` on a new connection
     /// (RFC 3261 section 18.2.2).
@@ -222,6 +225,7 @@ enum Event {
 
 pub(super) struct Driver<S> {
     service: S,
+    client_admission: AdmissionOwner,
     command_sender: mpsc::WeakUnboundedSender<Command>,
     reply_admission: Admission,
     writes: Vec<(tcp::Receipt, Completion)>,
@@ -277,6 +281,10 @@ where
 
         Driver {
             service,
+            client_admission: AdmissionOwner(ClientAdmission::new(
+                config.max_client_transactions,
+                config.max_client_request_bytes,
+            )),
             command_sender,
             reply_admission: Admission(Arc::new(Semaphore::new(
                 REPLY_OPERATIONS,
@@ -302,6 +310,10 @@ where
             shutdown_done: Vec::new(),
             branches: Branches::new(),
         }
+    }
+
+    pub(super) fn client_admission(&self) -> ClientAdmission {
+        self.client_admission.0.clone()
     }
 
     pub(super) async fn run(mut self) {
@@ -458,8 +470,14 @@ where
             Command::Reply { link, bytes, completion } => {
                 self.on_reply(link, bytes, completion)
             }
-            Command::Send { request, transport, next_hop, respond } => {
-                self.on_send(request, transport, next_hop, respond);
+            Command::Send {
+                request,
+                transport,
+                next_hop,
+                respond,
+                permit,
+            } => {
+                self.on_send(request, transport, next_hop, respond, permit);
             }
             Command::Respond { slot, response } => {
                 self.pending -= 1;
@@ -469,6 +487,7 @@ where
                 self.on_connected(remote, result);
             }
             Command::Shutdown { timeout, done } => {
+                self.client_admission.0.close();
                 self.shutting_down = true;
                 self.shutdown_done.push(done);
                 // The earliest deadline wins when several handles ask. A
@@ -500,11 +519,11 @@ where
             Key::Client(id) => {
                 let Some(entry) = self.clients.get_mut(id) else { return };
                 let before = entry.tx.deadline();
-                let answered = match entry.tx.on_timeout(&timers, now) {
+                let completion = match entry.tx.on_timeout(&timers, now) {
                     ClientEvent::Retransmit(request) => {
                         match send_on(self.udp.as_mut(), &entry.link, &request)
                         {
-                            Ok(()) => false,
+                            Ok(()) => None,
                             Err(err) => {
                                 entry.tx.on_transport_error();
                                 entry.answer(Err(Error::transport(err)))
@@ -516,14 +535,17 @@ where
                     }
                     ClientEvent::None
                     | ClientEvent::Provisional(_)
-                    | ClientEvent::Final(_) => false,
+                    | ClientEvent::Final(_) => None,
                 };
 
-                if answered {
+                if completion.is_some() {
                     self.unanswered -= 1;
                 }
 
                 self.settle_client(id, before);
+                if let Some((respond, result)) = completion {
+                    let _ = respond.send(result);
+                }
             }
             Key::Shutdown => unreachable!("handled by the loop"),
         }
@@ -568,14 +590,12 @@ where
         transport: Transport,
         next_hop: SocketAddr,
         respond: Responder,
+        permit: Permit,
     ) {
         if self.shutting_down {
+            drop(request);
+            drop(permit);
             let _ = respond.send(Err(Error::closed()));
-            return;
-        }
-
-        if !request.headers().contains_key(CSEQ) {
-            let _ = respond.send(Err(Error::missing(CSEQ)));
             return;
         }
 
@@ -586,6 +606,8 @@ where
                         io::ErrorKind::Unsupported,
                         "the endpoint has no UDP socket",
                     );
+                    drop(request);
+                    drop(permit);
                     let _ = respond.send(Err(Error::transport(err)));
                     return;
                 };
@@ -593,6 +615,8 @@ where
                 let source = match self.udp_source(next_hop) {
                     Ok(source) => source,
                     Err(err) => {
+                        drop(request);
+                        drop(permit);
                         let _ = respond.send(Err(Error::transport(err)));
                         return;
                     }
@@ -606,12 +630,13 @@ where
                     request,
                     Link { flow, writer: None },
                     respond,
+                    permit,
                 );
             }
             Transport::Tcp => {
                 self.send_over_tcp(
                     next_hop,
-                    Pending::Request(request, respond),
+                    Pending::Request(request, respond, permit),
                 );
             }
         }
@@ -646,9 +671,9 @@ where
     /// Sends `pending` on an open connection.
     fn deliver(&mut self, pending: Pending, flow: Flow, writer: tcp::Writer) {
         match pending {
-            Pending::Request(request, respond) => {
+            Pending::Request(request, respond, permit) => {
                 let link = Link { flow, writer: Some(writer) };
-                self.start_client(request, link, respond);
+                self.start_client(request, link, respond, permit);
             }
             // A response that cannot be queued is lost. The connection is full
             // or gone again, and a server transaction over TCP has nothing to
@@ -783,12 +808,12 @@ where
         mut request: Request<Bytes>,
         link: Link,
         respond: Responder,
+        permit: Permit,
     ) {
-        if self.clients.len() >= self.config.max_client_transactions {
-            let _ = respond.send(Err(Error::busy()));
-            return;
-        }
-
+        // The command owns capacity reserved before enqueue and connect.
+        debug_assert!(
+            self.clients.len() < self.config.max_client_transactions
+        );
         let via = via_value(&link.flow, &mut self.branches);
         request.headers_mut().prepend(VIA, via);
         let key = ClientKey::from_request(&request)
@@ -797,11 +822,18 @@ where
         if link.flow.transport == Transport::Udp
             && bytes.len() > MAX_UDP_REQUEST
         {
-            let _ = respond.send(Err(Error::too_large(bytes.len())));
+            let error = Error::too_large(bytes.len());
+            drop(request);
+            drop(bytes);
+            drop(permit);
+            let _ = respond.send(Err(error));
             return;
         }
 
         if let Err(err) = send_on(self.udp.as_mut(), &link, &bytes) {
+            drop(request);
+            drop(bytes);
+            drop(permit);
             let _ = respond.send(Err(Error::transport(err)));
             return;
         }
@@ -814,7 +846,7 @@ where
             now(),
         );
         let deadline = tx.deadline();
-        let entry = ClientEntry { tx, link, respond: Some(respond) };
+        let entry = ClientEntry { tx, link, respond: Some(respond), permit };
         let id = self.clients.insert(key, entry);
         if let Some(at) = deadline {
             self.timers.push(Timer { at, key: Key::Client(id) });
@@ -848,11 +880,13 @@ where
 
                 for pending in pending {
                     match pending {
-                        Pending::Request(_, respond) => {
+                        Pending::Request(request, respond, permit) => {
                             let err = io::Error::new(
                                 source.kind(),
                                 Arc::clone(&source),
                             );
+                            drop(request);
+                            drop(permit);
                             let _ = respond.send(Err(Error::transport(err)));
                         }
                         // See `send_reply`.
@@ -893,20 +927,22 @@ where
         }
 
         let before = entry.tx.deadline();
-        match entry.tx.on_response(response, &self.config.timers, now()) {
-            ClientEvent::Final(response) => {
-                if entry.answer(Ok(response)) {
-                    self.unanswered -= 1;
-                }
-            }
-            // Provisional responses are not handed up in 0.2.0. A non-INVITE
-            // request gets at most a 100, which says nothing.
-            ClientEvent::Provisional(_)
-            | ClientEvent::None
-            | ClientEvent::Retransmit(_)
-            | ClientEvent::Timeout => {}
+        let completion =
+            match entry.tx.on_response(response, &self.config.timers, now()) {
+                ClientEvent::Final(response) => entry.answer(Ok(response)),
+                // A non-INVITE provisional response is not handed up.
+                ClientEvent::Provisional(_)
+                | ClientEvent::None
+                | ClientEvent::Retransmit(_)
+                | ClientEvent::Timeout => None,
+            };
+        if completion.is_some() {
+            self.unanswered -= 1;
         }
         self.settle_client(id, before);
+        if let Some((respond, result)) = completion {
+            let _ = respond.send(result);
+        }
     }
 
     fn on_request(&mut self, mut request: Request<Bytes>, link: Link) {
@@ -1051,17 +1087,16 @@ where
 }
 
 impl ClientEntry {
-    /// Delivers the final response or the error to the client. Returns `false`
-    /// when the transaction was answered before, so the caller counts each
-    /// transaction once.
-    fn answer(&mut self, result: Result<Response<Bytes>, Error>) -> bool {
-        match self.respond.take() {
-            Some(respond) => {
-                let _ = respond.send(result);
-                true
-            }
-            None => false,
-        }
+    /// Takes a completion once, after the machine has dropped its request.
+    /// The driver settles the table before delivering it. Otherwise a reliable
+    /// final can wake a new call while its last slot is still charged.
+    fn answer(
+        &mut self,
+        result: Result<Response<Bytes>, Error>,
+    ) -> Option<(Responder, Result<Response<Bytes>, Error>)> {
+        let respond = self.respond.take()?;
+        self.permit.release_bytes();
+        Some((respond, result))
     }
 }
 
@@ -1095,13 +1130,34 @@ fn send_on(
 // These private driver tests use sockets, which Miri cannot provide.
 #[cfg(all(test, not(miri)))]
 mod tests {
+    use std::{
+        sync::Mutex,
+        task::{Wake, Waker},
+    };
+
     use tokio::{net::UdpSocket, time::timeout};
 
     use super::*;
-    use crate::endpoint::tests::{
-        reply_driver, route_request, route_response, udp_reply_link,
-        REPLY_LOCAL,
+    use crate::endpoint::{
+        tests::{
+            reply_driver, reply_driver_with, route_request, route_response,
+            udp_reply_link, REPLY_LOCAL,
+        },
+        Client,
     };
+
+    struct SendNext {
+        client: Mutex<Client>,
+        request: Request<Bytes>,
+    }
+
+    impl Wake for SendNext {
+        fn wake(self: Arc<Self>) {
+            // Run at the exact wakeup point, before the driver callback
+            // returns, rather than relying on a scheduler race.
+            drop(self.client.lock().unwrap().call(self.request.clone()));
+        }
+    }
 
     #[tokio::test]
     async fn cancellation_before_enqueue_has_no_effect_and_after_enqueue_keeps_the_write(
@@ -1188,5 +1244,260 @@ mod tests {
         drop(commands);
 
         assert!(matches!(send.await, Err(ReplyError::Closed)));
+    }
+
+    #[tokio::test]
+    async fn connect_waiters_hold_capacity_until_connection_failure() {
+        let (mut driver, commands, _local) = reply_driver();
+        let remote = "127.0.0.1:9".parse().unwrap();
+        let mut client = Client::new(
+            commands,
+            driver.client_admission(),
+            Transport::Tcp,
+            remote,
+        );
+        driver.routes.insert(
+            remote,
+            Route {
+                tcp: TcpState::Connecting(Vec::new()),
+                ..Route::default()
+            },
+        );
+        let mut responses = Vec::new();
+
+        for _ in 0..8 {
+            responses.push(
+                client.call(route_request("SIP/2.0/UDP example.com:9;rport")),
+            );
+            let command = driver.commands.try_recv().unwrap();
+            driver.on_command(command);
+        }
+        assert_eq!(driver.clients.len(), 0);
+        drop(responses.pop().unwrap());
+        assert!(client
+            .call(route_request("SIP/2.0/UDP example.com:9;rport"))
+            .await
+            .unwrap_err()
+            .is_busy());
+        assert!(driver.commands.is_empty());
+        let TcpState::Connecting(pending) = &driver.routes[&remote].tcp else {
+            panic!("connect is still pending");
+        };
+        assert_eq!(pending.len(), 8);
+
+        driver.on_connected(
+            remote,
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "connect failed",
+            )),
+        );
+
+        for response in responses {
+            assert!(response.await.unwrap_err().is_transport());
+        }
+        drop(client.call(route_request("SIP/2.0/UDP example.com:9;rport")));
+        assert_eq!(driver.commands.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn completed_clients_keep_count_until_timer_k() {
+        let (mut driver, commands, _local) = reply_driver_with(Config {
+            max_client_transactions: 1,
+            ..Config::default()
+        });
+        let peer = UdpSocket::bind(REPLY_LOCAL).await.unwrap();
+        let mut client = Client::new(
+            commands,
+            driver.client_admission(),
+            Transport::Udp,
+            peer.local_addr().unwrap(),
+        );
+        let response =
+            client.call(route_request("SIP/2.0/UDP example.com:9;rport"));
+        let command = driver.commands.try_recv().unwrap();
+        driver.on_command(command);
+
+        timeout(
+            Duration::from_secs(3),
+            poll_fn(|cx| {
+                let udp = driver.udp.as_mut().unwrap();
+                udp.poll_flush(cx);
+                if udp.is_idle() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut buf = [0; 2048];
+        let (n, _) = timeout(Duration::from_secs(1), peer.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let request = Request::from_bytes(&buf[..n]).unwrap();
+        let key = ClientKey::from_request(&request).unwrap();
+        let (id, _) = driver.clients.find(&key).unwrap();
+        driver.on_received_response(route_response(&request));
+
+        assert!(response.await.is_ok());
+        assert_eq!(driver.clients.len(), 1);
+        assert!(!driver.clients.get(id).unwrap().tx.is_terminated());
+        assert!(client
+            .call(route_request("SIP/2.0/UDP example.com:9;rport"))
+            .await
+            .unwrap_err()
+            .is_busy());
+        let timers = driver.config.timers;
+        let entry = driver.clients.get_mut(id).unwrap();
+        let deadline = entry.tx.deadline().unwrap();
+
+        // Drive the machine at K directly instead of waiting on a wall clock.
+        entry.tx.on_timeout(&timers, deadline);
+        driver.settle_client(id, Some(deadline));
+
+        assert_eq!(driver.clients.len(), 0);
+        drop(client.call(route_request("SIP/2.0/UDP example.com:9;rport")));
+        assert_eq!(driver.commands.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pre_transaction_errors_release_admission_before_waking_the_caller(
+    ) {
+        #[derive(Debug)]
+        enum Failure {
+            Connect,
+            MissingUdp,
+            Oversized,
+        }
+
+        for case in [Failure::Connect, Failure::MissingUdp, Failure::Oversized]
+        {
+            let (mut driver, commands, local) = reply_driver_with(Config {
+                max_client_transactions: 1,
+                ..Config::default()
+            });
+            let transport = if matches!(case, Failure::Connect) {
+                Transport::Tcp
+            } else {
+                Transport::Udp
+            };
+            let mut client = Client::new(
+                commands,
+                driver.client_admission(),
+                transport,
+                local,
+            );
+            let next = route_request("SIP/2.0/UDP example.com:9;rport");
+            let mut request = next.clone();
+            match case {
+                Failure::Connect => {
+                    driver.routes.insert(
+                        local,
+                        Route {
+                            tcp: TcpState::Connecting(Vec::new()),
+                            ..Route::default()
+                        },
+                    );
+                }
+                Failure::MissingUdp => driver.udp = None,
+                Failure::Oversized => {
+                    *request.body_mut() =
+                        Bytes::from(vec![0; MAX_UDP_REQUEST]);
+                }
+            }
+
+            let mut response = Box::pin(client.call(request));
+            let waker: Waker = Arc::new(SendNext {
+                client: Mutex::new(client),
+                request: next,
+            })
+            .into();
+            assert!(response
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending());
+
+            let command = driver.commands.try_recv().unwrap();
+            driver.on_command(command);
+            if matches!(case, Failure::Connect) {
+                driver.on_connected(
+                    local,
+                    Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "connect failed",
+                    )),
+                );
+            }
+
+            assert!(response.await.is_err());
+            assert_eq!(driver.clients.len(), 0);
+            assert_eq!(
+                driver.commands.len(),
+                1,
+                "the error waker admitted the next request in case {case:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_completion_retires_admission_before_waking_the_caller() {
+        use tokio::{io::AsyncReadExt, net::TcpListener};
+
+        let (mut driver, commands, _local) = reply_driver_with(Config {
+            max_client_transactions: 1,
+            ..Config::default()
+        });
+        let listener = TcpListener::bind(REPLY_LOCAL).await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let (flow, writer) =
+            tcp::connect(remote, &driver.config.tcp, &driver.tcp_tx)
+                .await
+                .unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        driver.routes.insert(
+            remote,
+            Route { tcp: TcpState::Open(flow, writer), ..Route::default() },
+        );
+        let mut client = Client::new(
+            commands,
+            driver.client_admission(),
+            Transport::Tcp,
+            remote,
+        );
+        let request = route_request("SIP/2.0/UDP example.com:9;rport");
+        let mut response = Box::pin(client.call(request.clone()));
+        let waker: Waker =
+            Arc::new(SendNext { client: Mutex::new(client), request }).into();
+        assert!(response
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+
+        let command = driver.commands.try_recv().unwrap();
+        driver.on_command(command);
+        let wire_request = timeout(Duration::from_secs(3), async {
+            let mut bytes = Vec::new();
+            loop {
+                assert!(peer.read_buf(&mut bytes).await.unwrap() > 0);
+                if let Ok(request) = Request::from_bytes(&bytes) {
+                    break request;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        driver.on_received_response(route_response(&wire_request));
+
+        assert!(response.await.is_ok());
+        assert_eq!(driver.clients.len(), 0);
+        assert_eq!(
+            driver.commands.len(),
+            1,
+            "the completion waker admitted the next request"
+        );
     }
 }

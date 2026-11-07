@@ -107,9 +107,11 @@ assert!(bytes.ends_with(b"Content-Length: 0\r\n\r\n"));
 
 Message token constructors accept exactly what [siparse] accepts in a head,
 using its [`check`](siparse::check) functions, except for [`StatusCode`].
-[`StatusCode`] only takes `100..=699`, the classes RFC 3261 defines, while siparse accepts any
-three digits. A message parsed from the wire can always be rebuilt from its
-parts, and a value built by hand is never one that the parser would reject.
+[`StatusCode`] only takes `100..=699`, the classes RFC 3261 defines, while
+siparse accepts any three digits. A message parsed from the wire can always be
+rebuilt from its parts, and a value built by hand is never one that the parser
+would reject.
+
 Parsing does not check a value a second time, except the method and status
 code. The [`Uri`], [`ReasonPhrase`], and header values share the input buffer
 instead of copying it. [`Uri::sip`] separately validates SIP/SIPS structure

@@ -81,13 +81,14 @@ impl Error {
         matches!(self.kind, Kind::TooLarge(_))
     }
 
-    /// Returns `true` if the endpoint has as many client transactions open
-    /// as its builder allowed.
+    /// Returns `true` if client admission has exhausted its request count or
+    /// logical request-byte budget. The request was not enqueued or sent.
     pub fn is_busy(&self) -> bool {
         matches!(self.kind, Kind::Busy)
     }
 
-    /// Returns `true` if the endpoint has stopped.
+    /// Returns `true` if the endpoint has stopped or closed client admission
+    /// for shutdown.
     pub fn is_closed(&self) -> bool {
         matches!(self.kind, Kind::Closed)
     }
@@ -123,8 +124,10 @@ impl fmt::Display for Error {
                  that go over UDP"
             ),
             Kind::Missing(name) => write!(f, "the request has no {name}"),
-            Kind::Busy => f.write_str("too many client transactions are open"),
-            Kind::Closed => f.write_str("the endpoint has stopped"),
+            Kind::Busy => {
+                f.write_str("client admission capacity is exhausted")
+            }
+            Kind::Closed => f.write_str("the endpoint is closed"),
         }
     }
 }

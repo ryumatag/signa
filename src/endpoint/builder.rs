@@ -25,6 +25,7 @@ pub(super) struct Config {
     pub(super) tcp: tcp::Config,
     pub(super) max_pending_requests: usize,
     pub(super) max_client_transactions: usize,
+    pub(super) max_client_request_bytes: usize,
 }
 
 impl Default for Config {
@@ -34,6 +35,7 @@ impl Default for Config {
             tcp: tcp::Config::default(),
             max_pending_requests: 1024,
             max_client_transactions: 4096,
+            max_client_request_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -145,8 +147,10 @@ impl Builder {
         self
     }
 
-    /// Sets how many client transactions may be open at once. A request
-    /// beyond that fails with [`super::Error::is_busy`]. The default is 4096.
+    /// Sets how many client requests may be admitted at once, including
+    /// queued commands, pending connects and live transactions. A request
+    /// beyond that fails before enqueue with [`super::Error::is_busy`].
+    /// The default is 4096. Zero refuses all client requests.
     ///
     /// Over UDP a transaction stays open for Timer K, which is T4 or 5 s,
     /// after its final response, to absorb retransmissions of it. So the limit
@@ -154,6 +158,32 @@ impl Builder {
     /// waiting for an answer.
     pub fn max_client_transactions(mut self, limit: usize) -> Builder {
         self.config.max_client_transactions = limit;
+        self
+    }
+
+    /// Sets the aggregate logical bytes of admitted client requests.
+    ///
+    /// The default is 64 MiB. Zero refuses all client requests. The budget
+    /// counts the input method, URI, version, header names/values and body.
+    /// Capacity is reserved before command enqueue,
+    /// held through connection setup and retransmissions, and released when
+    /// the transaction drops its request. Saturation returns Busy.
+    ///
+    /// This measures content lengths, not application Extensions, shared
+    /// backing allocations, generated Via metadata or allocator overhead.
+    /// The transaction count separately bounds per-entry metadata. It is
+    /// not a process memory ceiling.
+    ///
+    /// ```
+    /// use signa::endpoint::Endpoint;
+    ///
+    /// let builder = Endpoint::builder()
+    ///     .max_client_transactions(1024)
+    ///     .max_client_request_bytes(16 * 1024 * 1024);
+    /// # drop(builder);
+    /// ```
+    pub fn max_client_request_bytes(mut self, limit: usize) -> Builder {
+        self.config.max_client_request_bytes = limit;
         self
     }
 
@@ -182,11 +212,8 @@ impl Builder {
             })
             .transpose()?;
         let (commands, commands_rx) = mpsc::unbounded_channel();
-        let endpoint = Endpoint {
-            commands,
-            udp: udp.as_ref().map(udp::Socket::local_addr),
-            tcp: listener.as_ref().map(tcp::Listener::local_addr),
-        };
+        let udp_addr = udp.as_ref().map(udp::Socket::local_addr);
+        let tcp_addr = listener.as_ref().map(tcp::Listener::local_addr);
 
         if let Some(listener) = listener {
             tokio::spawn(listener.run());
@@ -198,8 +225,14 @@ impl Builder {
             tcp_rx,
             tcp_tx,
             commands_rx,
-            endpoint.commands.downgrade(),
+            commands.downgrade(),
         );
+        let endpoint = Endpoint {
+            client_admission: driver.client_admission(),
+            commands,
+            udp: udp_addr,
+            tcp: tcp_addr,
+        };
         tokio::spawn(driver.run());
 
         Ok(endpoint)

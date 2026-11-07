@@ -14,8 +14,8 @@ that sends requests to one next hop.
 Every request that arrives and matches no transaction goes to the service as
 a `Request<Bytes>`, with the [`Flow`](crate::transport::Flow) it arrived on
 in its extensions. The service answers with the final response, built with
-[`Response::reply_to`]
-so that it carries the `Via` the endpoint routes it by. RFC 4320 leaves a
+[`Response::reply_to`](crate::Response::reply_to) so that it carries the `Via`
+the endpoint routes it by. RFC 4320 leaves a
 non-INVITE request no provisional response worth sending, and the endpoint
 sends the one 100 the RFC asks for itself when the service is slow, so the
 service never deals with provisional responses.
@@ -36,6 +36,13 @@ topmost `Via`, runs the client transaction with its retransmissions and
 Timer F, and resolves the future with the final response or an [`Error`].
 Over TCP the endpoint opens a connection to the next hop on the first
 request and keeps it for the next ones.
+
+Client admission reserves a shared request count and logical content bytes
+before enqueue. Queued commands, pending connects and live transactions all
+consume that count. A final response frees request bytes, while a UDP Completed
+entry keeps its count until Timer K ends. Saturation returns Busy without a
+command or send. Dropping a response future releases neither reservation.
+See [`Builder::max_client_transactions`] and [`Builder::max_client_request_bytes`].
 
 # Shutdown
 
@@ -112,7 +119,7 @@ use tokio::sync::{mpsc, oneshot};
 #[cfg(feature = "__bench")]
 use tower_service::Service;
 
-use self::driver::Command;
+use self::{admission::ClientAdmission, driver::Command};
 #[cfg(feature = "__bench")]
 use self::{builder::Config, driver::Driver};
 use crate::transport::Transport;
@@ -130,6 +137,7 @@ pub use self::{
     shutdown::Shutdown,
 };
 
+mod admission;
 mod builder;
 mod client;
 mod datagram;
@@ -151,6 +159,7 @@ mod table;
 #[derive(Clone)]
 pub struct Endpoint {
     commands: mpsc::UnboundedSender<Command>,
+    client_admission: ClientAdmission,
     udp: Option<SocketAddr>,
     tcp: Option<SocketAddr>,
 }
@@ -181,7 +190,12 @@ impl Endpoint {
         transport: Transport,
         next_hop: SocketAddr,
     ) -> Client {
-        Client::new(self.commands.clone(), transport, next_hop)
+        Client::new(
+            self.commands.clone(),
+            self.client_admission.clone(),
+            transport,
+            next_hop,
+        )
     }
 
     /// Stops the endpoint once what it has in hand is done, or after
@@ -210,6 +224,7 @@ impl Endpoint {
     /// # }
     /// ```
     pub fn shutdown(self, timeout: Duration) -> Shutdown {
+        self.client_admission.close();
         let (done, wait) = oneshot::channel();
         // A send that fails means the endpoint has stopped already, and the
         // dropped `done` resolves the future at once.
@@ -469,16 +484,23 @@ mod tests {
     pub(super) fn reply_driver(
     ) -> (Driver<RouteService>, mpsc::UnboundedSender<Command>, SocketAddr)
     {
-        let (commands, rx) = mpsc::unbounded_channel();
-        let (tx, tcp) = mpsc::channel(TCP_INBOUND);
-        let socket = udp::Socket::bind("0.0.0.0:0".parse().unwrap()).unwrap();
-        let local = socket.local_addr();
-        let config = Config {
+        reply_driver_with(Config {
             timers: Timers::default(),
             tcp: tcp::Config::default(),
             max_pending_requests: 8,
             max_client_transactions: 8,
-        };
+            ..Config::default()
+        })
+    }
+
+    pub(super) fn reply_driver_with(
+        config: Config,
+    ) -> (Driver<RouteService>, mpsc::UnboundedSender<Command>, SocketAddr)
+    {
+        let (commands, rx) = mpsc::unbounded_channel();
+        let (tx, tcp) = mpsc::channel(TCP_INBOUND);
+        let socket = udp::Socket::bind("0.0.0.0:0".parse().unwrap()).unwrap();
+        let local = socket.local_addr();
 
         (
             Driver::new(
@@ -1655,5 +1677,44 @@ mod tests {
         route.send(Response::from_shared(encoded).unwrap()).await.unwrap();
 
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn final_responses_release_bytes_while_completed_entries_keep_count()
+    {
+        let timers =
+            Timers::builder().t4(Duration::from_secs(60)).build().unwrap();
+        let server = Endpoint::builder()
+            .udp(LOCALHOST)
+            .serve(Counting::default())
+            .unwrap();
+        let endpoint = Endpoint::builder()
+            .udp(LOCALHOST)
+            .timers(timers)
+            .max_client_transactions(2)
+            .max_client_request_bytes(50)
+            .serve(Counting::default())
+            .unwrap();
+        let mut client =
+            endpoint.client(Transport::Udp, server.udp_addr().unwrap());
+        let request = Request::builder()
+            .method("OPTIONS")
+            .uri("sip:example.com")
+            .header("CSeq", "1 OPTIONS")
+            .body(Bytes::from_static(b"request"))
+            .unwrap();
+
+        for _ in 0..2 {
+            let response =
+                timeout(Duration::from_secs(3), client.call(request.clone()))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        // Only one request fits in 50 content bytes, so the second response
+        // proves bytes were released. Both Completed slots remain occupied.
+        assert!(client.call(request).await.unwrap_err().is_busy());
     }
 }

@@ -44,6 +44,7 @@ criterion::criterion_group! {
         // transactions, the service, and the message layer on both sides.
         endpoint::round_trip,
         endpoint::reply_route,
+        endpoint::client_admission,
         // One value at a time. These cover the checks that will move to
         // siparse, so they show what the switch changes for each type.
         header_name::from_bytes,

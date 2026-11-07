@@ -269,3 +269,40 @@ async fn reply_route_fixture(
 
     Ok((route, response))
 }
+
+pub(super) fn client_admission(c: &mut Criterion) {
+    use std::{future::Future, pin::Pin, task::Waker};
+
+    let rt = runtime();
+    let _guard = rt.enter();
+    let endpoint = Endpoint::builder()
+        .max_client_transactions(1)
+        .serve(NoDispatch)
+        .unwrap();
+    let mut client = endpoint.client(Transport::Tcp, LOCALHOST);
+    let request = Request::builder()
+        .method("OPTIONS")
+        .uri("sip:example.com")
+        .header("CSeq", "1 OPTIONS")
+        .body(Bytes::new())
+        .unwrap();
+    let pending = client.call(request.clone());
+    let mut cx = Context::from_waker(Waker::noop());
+    let len = request.to_bytes().len() as u64;
+
+    // Enter the runtime without driving it. The first command stays queued,
+    // so each subsequent call must reject without depending on connect timing.
+    benchmark(c, "reject/endpoint/client_admission", len, |b| {
+        b.iter(|| {
+            let mut response = client.call(bb(request.clone()));
+            let Poll::Ready(Err(error)) =
+                Pin::new(&mut response).poll(&mut cx)
+            else {
+                panic!("admission must reject before enqueue");
+            };
+            assert!(error.is_busy());
+        });
+    });
+
+    drop(pending);
+}
