@@ -2,13 +2,13 @@
 Runs many round trips on RFC timers, so that every transaction is still in the
 tables at the end, and prints how long each took. `scripts/tables` runs it
 under `/usr/bin/time` for the maximum RSS, and with a second argument it waits
-with the tables full for `heap -s`.
+with the tables full for `heap -s`. Set `SIGNA_TABLES_OBSERVE=1` to retain
+the server event observers too, so their state is included in the measurement.
 */
 
 #![allow(unreachable_code)]
 
 use std::{
-    convert::Infallible,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Instant,
 };
@@ -41,26 +41,41 @@ async fn main() {
         std::env::args().nth(1).map_or(200_000, |n| n.parse().unwrap());
     let in_flight = 16;
 
-    let service = tower::service_fn(|request: Request<Bytes>| async move {
-        let response = Response::reply_to(&request)
-            .status(StatusCode::OK)
-            .body(Bytes::new())
-            .unwrap();
-        Ok::<_, Infallible>(response)
-    });
-
     // Retain every response for Timer J instead of measuring overload.
-    let server = Endpoint::builder()
+    let (server, mut incoming) = Endpoint::builder()
         .udp(LOCALHOST)
         .max_server_transactions(1 << 24)
-        .serve(service)
+        .max_server_response_bytes(usize::MAX)
+        .bind()
         .unwrap();
-    let client_end = Endpoint::builder()
+    let observed = std::env::var_os("SIGNA_TABLES_OBSERVE").is_some();
+    tokio::spawn(async move {
+        let mut observations =
+            if observed { Vec::with_capacity(total) } else { Vec::new() };
+        while let Some(event) = incoming.recv().await {
+            if let signa::endpoint::IncomingEvent::Request(envelope) = event {
+                let (responder, events) = envelope.transaction.into_parts();
+                if observed {
+                    observations.push(events);
+                } else {
+                    drop(events);
+                }
+                // A fixed tag keeps the random source out of the
+                // measurement. A real UAS uses `Tag::random`.
+                let response = Response::reply_to(&envelope.request)
+                    .status(StatusCode::OK)
+                    .to_tag("tables")
+                    .body(Bytes::new())
+                    .unwrap();
+
+                responder.respond(response).await.unwrap();
+            }
+        }
+    });
+    let (client_end, _incoming) = Endpoint::builder()
         .udp(LOCALHOST)
         .max_client_transactions(1 << 24)
-        .serve(tower::service_fn(|_: Request<Bytes>| async move {
-            Err::<Response<Bytes>, Infallible>(unreachable!())
-        }))
+        .bind()
         .unwrap();
     let client = client_end.client(Transport::Udp, server.udp_addr().unwrap());
 

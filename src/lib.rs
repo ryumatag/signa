@@ -3,8 +3,9 @@ signa is a fast and correct low-level SIP library.
 
 It does for SIP roughly what `hyper` does for HTTP. It carries messages over
 UDP and TCP, runs the RFC 3261 transactions, and hands requests to application
-code through a [Tower] `Service`. Its design draws heavily on the [`http`] and
-[`hyper`] crates.
+code through owned transaction-user envelopes.
+
+Its design draws heavily on the [`http`] and [`hyper`] crates.
 
 # What this release covers
 
@@ -22,10 +23,12 @@ code through a [Tower] `Service`. Its design draws heavily on the [`http`] and
 * An `Endpoint` that carries messages over UDP and TCP, splits TCP streams into
   messages by `Content-Length` and answers RFC 5626 keepalives, runs the
   non-INVITE client and server transactions of RFC 3261 section 17 as updated
-  by RFC 4320, and hands each request to a Tower `Service`. Its `Client` sends
-  requests to one next hop and is a `Service` too, so Tower middleware fits on
-  both sides. Both live in the `endpoint` module. A graceful shutdown answers
-  new requests with a 503 and waits for the ones in hand up to a deadline.
+  by RFC 4320, and exposes incoming events, server responders and independent
+  transaction observation. Its `Client` still sends requests to one next hop
+  through a Tower `Service` until the client TU migration. Application code
+  owns server dispatch and handler tasks. These operations live in `endpoint`.
+  A graceful shutdown answers new requests with a 503 and waits for the ones in
+  hand up to a deadline.
 
 # What it does not cover yet
 

@@ -247,9 +247,10 @@ impl ServerTransaction {
             State::Trying { .. } | State::Proceeding { .. } => {}
             State::Completed { .. } | State::Terminated => return false,
         }
-        // The Service adapter historically uses 408 to abandon a transaction.
-        // Keep that policy here. TU callers check admission first and receive
-        // ProhibitedStatus without terminating their machine.
+        // The endpoint checks `check_response` first, so a TU 408 gets
+        // ProhibitedStatus there and never reaches this point. A direct caller
+        // that passes 408 ends the transaction without a wire response, as
+        // RFC 4320 section 4 forbids sending it.
         if status == REQUEST_TIMEOUT {
             self.state = State::Terminated;
             return false;

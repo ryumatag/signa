@@ -43,6 +43,7 @@ enum ErrorKind {
     ReasonPhrase(InvalidReasonPhrase),
     HeaderName(InvalidHeaderName),
     HeaderValue(InvalidHeaderValue),
+    Tag(InvalidTag),
     Missing(Missing),
 }
 
@@ -67,6 +68,7 @@ impl BuildError {
             ErrorKind::ReasonPhrase(err) => err,
             ErrorKind::HeaderName(err) => err,
             ErrorKind::HeaderValue(err) => err,
+            ErrorKind::Tag(err) => err,
             ErrorKind::Missing(err) => err,
         }
     }
@@ -180,6 +182,10 @@ invalid_errors! {
 
     /// An error returned when parsing an invalid SIP header field name.
     InvalidHeaderName => HeaderName, "invalid SIP header name";
+
+    /// An error returned when parsing a `From` or `To` tag that is not a
+    /// SIP token.
+    InvalidTag => Tag, "invalid SIP tag";
 }
 
 /// An error returned when parsing an invalid SIP header field value.

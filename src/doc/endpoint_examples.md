@@ -1,31 +1,35 @@
 ### Serving requests
 
-A UAS that answers every request with a 200. The service gets the request with
-the [`Flow`](transport::Flow) it arrived on in its extensions, and
-[`Response::reply_to`] starts the response with the header fields the
-[`Endpoint`](endpoint::Endpoint) routes it by.
+A non-INVITE UAS receives owned transaction-user envelopes. The application
+chooses its To tag, submits a response, and can observe the transaction
+separately. `to_tag` adds a fresh tag to an initial request's response and
+keeps the tag of a request within a dialog. A failed submission is logged
+rather than returned, since leaving the loop would drop `incoming` and shut the
+endpoint down.
 
 ```no_run
-use std::convert::Infallible;
-
 use bytes::Bytes;
-use signa::{endpoint::Endpoint, Request, Response, StatusCode};
+use signa::{endpoint::{Endpoint, IncomingEvent}, message::header::Tag, Response};
 
-# async fn run() -> std::io::Result<()> {
-let endpoint = Endpoint::builder()
-    .udp("0.0.0.0:5060".parse().unwrap())
-    .tcp("0.0.0.0:5060".parse().unwrap())
-    .serve(tower::service_fn(|request: Request<Bytes>| async move {
-        let response = Response::reply_to(&request)
-            .status(StatusCode::OK)
-            .body(Bytes::new())
-            .expect("the status is set");
-        Ok::<_, Infallible>(response)
-    }))?;
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+let (_endpoint, mut incoming) = Endpoint::builder()
+    .udp("0.0.0.0:5060".parse()?)
+    .tcp("0.0.0.0:5060".parse()?)
+    .bind()?;
 
-// The endpoint runs as long as a handle to it exists.
-std::future::pending::<()>().await;
-# drop(endpoint);
+while let Some(event) = incoming.recv().await {
+    if let IncomingEvent::Request(envelope) = event {
+        let (responder, _) = envelope.transaction.into_parts();
+        let response = Response::reply_to(&envelope.request)
+            .status(200)
+            .to_tag(Tag::random())
+            .body(Bytes::new())?;
+
+        if let Err(error) = responder.respond(response).await {
+            eprintln!("response not accepted: {error}");
+        }
+    }
+}
 # Ok(())
 # }
 ```

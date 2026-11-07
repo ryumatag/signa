@@ -156,6 +156,15 @@ impl Writer {
         self.enqueue(Write { bytes, done: None, permit: Some(permit) })
     }
 
+    /// Reserves output before the endpoint changes a server machine.
+    pub(crate) fn prepare(
+        &self,
+        bytes: Bytes,
+    ) -> Result<PreparedWrite, SendError> {
+        let permit = self.reserve(bytes.len())?;
+        Ok(PreparedWrite { writer: self.clone(), bytes, permit })
+    }
+
     /// Queues a write and returns its local completion receipt.
     ///
     /// Successful enqueue commits the write. Dropping the receipt does not
@@ -185,6 +194,26 @@ impl Writer {
 
     fn enqueue(&self, write: Write) -> Result<(), SendError> {
         self.0.queue.send(write).map_err(|_| SendError::Closed)
+    }
+}
+
+/// A reserved write that has not yet been committed to the socket queue.
+#[derive(Debug)]
+pub(crate) struct PreparedWrite {
+    writer: Writer,
+    bytes: Bytes,
+    permit: Permit,
+}
+
+impl PreparedWrite {
+    pub(crate) fn submit(self) -> Result<Receipt, SendError> {
+        let (done, result) = oneshot::channel();
+        self.writer.enqueue(Write {
+            bytes: self.bytes,
+            done: Some(done),
+            permit: Some(self.permit),
+        })?;
+        Ok(Receipt(result))
     }
 }
 
@@ -799,6 +828,31 @@ mod tests {
                     assert_eq!(receiver.recv().await, None);
                 }
             });
+    }
+
+    #[test]
+    fn prepared_response_writes_reserve_before_enqueue_and_return_on_abort() {
+        let (writer, mut pending) = test_writer(1, 3);
+        let prepared = writer.prepare(Bytes::from_static(b"abc")).unwrap();
+
+        assert!(pending.is_empty());
+        assert_eq!(writer.send(Bytes::new()), Err(SendError::Full));
+        drop(prepared);
+        assert!(writer.0.capacity.acquire(3).is_some());
+
+        let prepared = writer.prepare(Bytes::from_static(b"abc")).unwrap();
+        let receipt = prepared.submit().unwrap();
+
+        assert_eq!(writer.send(Bytes::new()), Err(SendError::Full));
+        drop(pending.try_recv().unwrap());
+        assert!(writer.0.capacity.acquire(3).is_some());
+        drop(receipt);
+
+        let prepared = writer.prepare(Bytes::from_static(b"abc")).unwrap();
+        drop(pending);
+
+        assert_eq!(prepared.submit().unwrap_err(), SendError::Closed);
+        assert!(writer.0.capacity.acquire(3).is_some());
     }
 
     #[test]

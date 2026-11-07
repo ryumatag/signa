@@ -3,8 +3,8 @@ The task behind an endpoint.
 
 One task owns the sockets, both transaction tables, and the timers, so none of
 them needs a lock. It rotates through timers, internal completions, client
-commands, TCP, UDP and service dispatch. Shutdown has a separate coalesced
-control wakeup. Each turn bounds write-receipt polling, UDP flush and dispatch,
+commands, TCP, UDP and responder abandonment. Shutdown has a separate coalesced
+control wakeup. Each turn bounds write-receipt polling and UDP flush,
 and the task yields after 64 events so continuously ready work also shares the
 runtime with connection tasks.
 
@@ -25,7 +25,7 @@ connections.
 */
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     future::{poll_fn, Future},
     io,
     net::{IpAddr, SocketAddr},
@@ -44,7 +44,6 @@ use tokio::{
     sync::{mpsc, oneshot, watch, Semaphore},
     time::Sleep,
 };
-use tower_service::Service;
 
 use crate::{
     endpoint::{
@@ -56,6 +55,10 @@ use crate::{
         routing::{
             mark_via, reply_flow, sent_by_is, source_toward, via_value,
             Branches, Link,
+        },
+        server::{
+            self, IncomingEvent, ReceivedRequest, ServerRequest,
+            ServerTransactionId, SubmitError,
         },
         shutdown,
         table::{Id, Table},
@@ -87,6 +90,7 @@ pub(super) const TCP_INBOUND: usize = 256;
 /// One-shot replies hold a slot through command, connect, and local write.
 const REPLY_OPERATIONS: usize = 64;
 
+const BAD_REQUEST: StatusCode = status(400);
 const SERVER_ERROR: StatusCode = status(500);
 const NOT_IMPLEMENTED: StatusCode = status(501);
 const SERVICE_UNAVAILABLE: StatusCode = status(503);
@@ -114,8 +118,8 @@ pub(super) enum Command {
     },
     /// A route sends one response without a transaction.
     Reply { link: Link, bytes: Bytes, completion: Completion },
-    /// The service answered a request, or failed on it.
-    Respond { slot: Slot, response: Option<Response<Bytes>> },
+    /// A TU asks the driver to accept a response.
+    Submit(server::Submission),
     /// A connection the driver asked for is open, or could not be opened.
     Connected {
         remote: SocketAddr,
@@ -127,14 +131,14 @@ pub(super) enum Command {
     Shutdown,
 }
 
-/// Where the response to a request handed to the service goes.
+/// Admission destination before issuing an incoming capability.
 pub(super) enum Slot {
     /// A server transaction, which sends the response and answers
     /// retransmissions with it.
     Transaction(Id),
     /// No transaction, because the request had no RFC 3261 branch. The
     /// response is sent once, and a retransmission of the request reaches
-    /// the service again.
+    /// the TU again.
     Stateless(Link),
 }
 
@@ -143,6 +147,24 @@ struct ServerEntry {
     /// Where responses go. Its remote address is the one RFC 3261 section
     /// 18.2.2 picks, which is the request's source port only with `rport`.
     link: Link,
+    shared: Option<Arc<server::Shared>>,
+    identity: usize,
+    retained: Option<crate::transport::budget::Permit>,
+}
+
+impl Drop for ServerEntry {
+    fn drop(&mut self) {
+        if let Some(shared) = &self.shared {
+            shared.work.finish();
+            shared.observation.send_modify(|state| {
+                if state.end.is_none()
+                    && !shared.terminated.load(Ordering::Acquire)
+                {
+                    state.end = Some(server::End::EndpointClosed);
+                }
+            });
+        }
+    }
 }
 
 struct ClientEntry {
@@ -182,6 +204,25 @@ enum Pending {
     /// (RFC 3261 section 18.2.2).
     Response(Bytes, Fallback),
     OneShot(Bytes, Completion),
+    Server(Bytes, server::WriteObservation, crate::transport::budget::Permit),
+}
+
+/// Transport admission held while the driver commits a server response.
+enum PreparedServerOutput {
+    Tcp(tcp::PreparedWrite, Option<crate::transport::budget::Permit>),
+    Udp(Bytes, Flow),
+    Waiting {
+        remote: SocketAddr,
+        bytes: Bytes,
+        fallback: crate::transport::budget::Permit,
+    },
+    Connect {
+        remote: SocketAddr,
+        bytes: Bytes,
+        fallback: crate::transport::budget::Permit,
+        connection: tokio::sync::OwnedSemaphorePermit,
+        attempt: crate::transport::budget::Permit,
+    },
 }
 
 /// Counters shared with endpoint handles. No per-message allocation.
@@ -191,7 +232,7 @@ pub(super) struct ConnectionCounters {
     pub(super) dropped: AtomicU64,
 }
 
-fn increment(counter: &AtomicU64) {
+pub(super) fn increment(counter: &AtomicU64) {
     let mut n = counter.load(Ordering::Relaxed);
     while n != u64::MAX {
         match counter.compare_exchange_weak(
@@ -230,22 +271,42 @@ enum Event {
     Datagram(Bytes, Flow),
     /// Every handle is gone.
     Stop,
+    /// A responder was dropped before an accepted final response.
+    Abandon(Arc<server::Shared>, ReplyRoute),
 }
 
-pub(super) struct Driver<S> {
-    service: S,
+pub(super) struct Driver {
+    /// Each queued event holds an `event_admission` permit, so the channel is
+    /// bounded by that budget although it is unbounded by type.
+    incoming: mpsc::UnboundedSender<server::Queued>,
+    /// Application work, from admission to an accepted final or termination.
+    work: Budget,
+    /// Incoming events between admission and `recv`.
+    event_admission: Budget,
+    /// Identity values copied into responders and reply routes, held until
+    /// the last route clone drops.
+    routes_admission: Budget,
+    /// Encoded response submissions between enqueue and driver acceptance.
+    submissions: Budget,
+    /// Responses that server machines cache for retransmission.
+    retained: Budget,
+    /// Responder drop notices. A notice carries a clone of the responder's
+    /// route, which holds a `routes_admission` permit until the driver takes
+    /// it, so `max_responder_handles` bounds this channel. It is separate
+    /// from `commands` so that a notice is never refused while submissions
+    /// wait for capacity.
+    drops: mpsc::UnboundedReceiver<(Arc<server::Shared>, ReplyRoute)>,
+    drop_sender: mpsc::UnboundedSender<(Arc<server::Shared>, ReplyRoute)>,
     client_admission: AdmissionOwner,
     command_sender: mpsc::WeakUnboundedSender<Command>,
     reply_admission: Admission,
     reply_bytes: Budget,
     writes: Vec<(tcp::Receipt, Completion)>,
-    /// `poll_ready` failed, so the service takes nothing any more.
-    service_failed: bool,
-    /// From the `Endpoint` and `Client` handles. The driver ends when they
-    /// are all gone.
+    /// From the `Endpoint`, `Client`, `Responder` and `ReplyRoute` handles.
+    /// The driver ends when they are all gone.
     commands: mpsc::UnboundedReceiver<Command>,
-    /// From the service futures and the connect tasks. Kept apart from
-    /// `commands`, because the driver holds the sender for them.
+    /// From the connect tasks. Kept apart from `commands`, because the driver
+    /// holds the sender for them.
     internal: mpsc::UnboundedReceiver<Command>,
     internal_tx: mpsc::UnboundedSender<Command>,
     udp: Option<Datagram>,
@@ -265,10 +326,6 @@ pub(super) struct Driver<S> {
     pub(super) connection_stats: Arc<ConnectionCounters>,
     timers: TimerQueue,
     sleep: Pin<Box<Sleep>>,
-    /// Requests waiting for the service to be ready.
-    queue: VecDeque<(Slot, Request<Bytes>)>,
-    /// Requests the service has taken and not answered.
-    pending: usize,
     /// Client transactions without a final response or an error yet.
     unanswered: usize,
     /// Set by the first shutdown command. New requests get a 503 from then on,
@@ -281,30 +338,55 @@ pub(super) struct Driver<S> {
     pub(super) control: mpsc::Sender<()>,
     control_rx: mpsc::Receiver<()>,
     write_cursor: usize,
+    server_writes: Vec<(
+        tcp::Receipt,
+        server::WriteObservation,
+        Option<crate::transport::budget::Permit>,
+    )>,
+    server_cursor: usize,
     fallback_cursor: usize,
     branches: Branches,
 }
 
-impl<S> Driver<S>
-where
-    S: Service<Request<Bytes>, Response = Response<Bytes>>,
-    S::Future: Send + 'static,
-{
+impl Driver {
     /// Must be called from within a tokio runtime, for the timer.
     pub(super) fn new(
-        service: S,
+        incoming: mpsc::UnboundedSender<server::Queued>,
         config: Config,
         udp: Option<udp::Socket>,
         tcp: mpsc::Receiver<tcp::Inbound>,
         tcp_tx: mpsc::Sender<tcp::Inbound>,
         commands: mpsc::UnboundedReceiver<Command>,
         command_sender: mpsc::WeakUnboundedSender<Command>,
-    ) -> Driver<S> {
+    ) -> Driver {
         let (internal_tx, internal) = mpsc::unbounded_channel();
         let (control, control_rx) = mpsc::channel(32);
+        let (drop_sender, drops) = mpsc::unbounded_channel();
 
         Driver {
-            service,
+            incoming,
+            routes_admission: Budget::new(WriteLimits {
+                messages: config.max_responder_handles,
+                bytes: config.max_responder_bytes,
+            }),
+            event_admission: Budget::new(WriteLimits {
+                messages: config.max_pending_requests,
+                bytes: config.max_server_request_bytes,
+            }),
+            work: Budget::new(WriteLimits {
+                messages: config.max_pending_requests,
+                bytes: config.max_server_request_bytes,
+            }),
+            submissions: Budget::new(WriteLimits {
+                messages: 64,
+                bytes: config.max_server_response_bytes,
+            }),
+            retained: Budget::new(WriteLimits {
+                messages: usize::MAX,
+                bytes: config.max_server_response_bytes,
+            }),
+            drops,
+            drop_sender,
             client_admission: AdmissionOwner(ClientAdmission::new(
                 config.max_client_transactions,
                 config.max_client_request_bytes,
@@ -318,7 +400,6 @@ where
                 bytes: config.max_reply_bytes,
             }),
             writes: Vec::new(),
-            service_failed: false,
             commands,
             internal,
             internal_tx,
@@ -347,8 +428,6 @@ where
             connection_stats: Arc::default(),
             timers: TimerQueue::new(),
             sleep: Box::pin(tokio::time::sleep(std::time::Duration::ZERO)),
-            queue: VecDeque::new(),
-            pending: 0,
             unanswered: 0,
             shutting_down: false,
             shutdown_done: watch::channel(()).0,
@@ -357,6 +436,8 @@ where
             control,
             control_rx,
             write_cursor: 0,
+            server_writes: Vec::new(),
+            server_cursor: 0,
             fallback_cursor: 0,
             branches: Branches::new(),
         }
@@ -406,6 +487,7 @@ where
                         self.on_message(message, Link { flow, writer: None });
                     }
                 }
+                Event::Abandon(shared, _route) => self.abandon(&shared),
                 Event::Stop => return,
             }
         }
@@ -472,6 +554,33 @@ where
         } else {
             0
         };
+
+        let mut index = self.server_cursor.min(self.server_writes.len());
+        for _ in 0..32 {
+            if index == self.server_writes.len() {
+                break;
+            }
+            if let Poll::Ready(result) =
+                Pin::new(&mut self.server_writes[index].0).poll(cx)
+            {
+                let (_, observation, _) =
+                    self.server_writes.swap_remove(index);
+                if result.is_err() {
+                    self.fail_observed(observation.shared());
+                }
+                observation.complete(result);
+            } else {
+                index += 1;
+            }
+        }
+
+        self.server_cursor = if index < self.server_writes.len() {
+            cx.waker().wake_by_ref();
+            index
+        } else {
+            0
+        };
+
         for _ in 0..6 {
             let source = self.next_source;
             self.next_source = (source + 1) % 6;
@@ -489,7 +598,7 @@ where
                     .poll_recv(cx)
                     .map(|inbound| inbound.map(Event::Inbound)),
                 4 => {
-                    if let Some(udp) = &mut self.udp {
+                    let receive = if let Some(udp) = &mut self.udp {
                         udp.poll_flush(cx);
                         match udp.poll_recv(cx) {
                             Poll::Ready(Ok((bytes, flow))) => {
@@ -503,12 +612,19 @@ where
                         }
                     } else {
                         Poll::Pending
+                    };
+
+                    while let Some(shared) =
+                        self.udp.as_mut().and_then(Datagram::take_failure)
+                    {
+                        self.fail_observed(&shared);
                     }
+
+                    receive
                 }
-                _ => {
-                    self.poll_dispatch(cx);
-                    Poll::Pending
-                }
+                _ => self.drops.poll_recv(cx).map(|drop| {
+                    drop.map(|(id, route)| Event::Abandon(id, route))
+                }),
             };
             if let Poll::Ready(Some(event)) = event {
                 return Poll::Ready(event);
@@ -541,8 +657,8 @@ where
     /// Returns whether protocol and transport work has drained.
     fn is_drained(&self) -> bool {
         self.writes.is_empty()
-            && self.queue.is_empty()
-            && self.pending == 0
+            && self.server_writes.is_empty()
+            && self.live_work_is_drained()
             && self.fallback_writes.is_empty()
             && self.unanswered == 0
             && self.udp.as_ref().map_or(true, |udp| udp.is_idle())
@@ -550,49 +666,6 @@ where
                 .routes
                 .values()
                 .any(|route| matches!(route.tcp, TcpState::Connecting(_)))
-    }
-
-    /// Hands waiting requests to the service as long as it is ready.
-    ///
-    /// Readiness is checked and used on the same instance, and each request
-    /// runs in its own task because requests run concurrently. A service that
-    /// fails `poll_ready` is done for good. The requests waiting for it get a
-    /// 500, and every later one gets a 503 without reaching it.
-    fn poll_dispatch(&mut self, cx: &mut Context<'_>) {
-        for _ in 0..32 {
-            if self.queue.is_empty() {
-                return;
-            }
-
-            if self.service_failed {
-                let (slot, _) = self.queue.pop_front().expect("checked above");
-                self.on_response(slot, None);
-                continue;
-            }
-
-            match self.service.poll_ready(cx) {
-                Poll::Ready(Ok(())) => {
-                    let (slot, request) =
-                        self.queue.pop_front().expect("checked above");
-                    self.pending += 1;
-                    let future = self.service.call(request);
-                    let internal = self.internal_tx.clone();
-                    tokio::spawn(async move {
-                        let response = future.await.ok();
-                        let _ =
-                            internal.send(Command::Respond { slot, response });
-                    });
-                }
-                Poll::Ready(Err(_)) => {
-                    self.service_failed = true;
-                }
-                Poll::Pending => return,
-            }
-        }
-
-        if !self.queue.is_empty() {
-            cx.waker().wake_by_ref();
-        }
     }
 
     fn on_command(&mut self, command: Command) {
@@ -609,10 +682,7 @@ where
             } => {
                 self.on_send(request, transport, next_hop, respond, permit);
             }
-            Command::Respond { slot, response } => {
-                self.pending -= 1;
-                self.on_response(slot, response);
-            }
+            Command::Submit(submission) => self.on_submission(submission),
             Command::Connected { remote, result, _attempt } => {
                 self.on_connected(remote, result);
             }
@@ -633,14 +703,17 @@ where
             Key::Server(id) => {
                 let Some(entry) = self.servers.get_mut(id) else { return };
                 let before = entry.tx.deadline();
+                // The automatic 100 copies the request's Via, From, To,
+                // Call-ID and CSeq. The request's work reservation covers
+                // those bytes until a final replaces the 100, so it takes no
+                // separate `retained` reservation that could fail.
                 if let Some(trying) = entry.tx.on_timeout(now) {
                     let link = entry.link.clone();
-                    if self.send_reply(&link, &trying).is_err() {
-                        if let Some(entry) = self.servers.get_mut(id) {
-                            entry.tx.on_transport_error();
-                        }
-                    }
+                    let shared =
+                        entry.shared.as_ref().expect("TU transaction").clone();
+                    self.send_generated(id, &link, trying, &shared);
                 }
+
                 self.settle_server(id, before);
             }
             Key::Client(id) => {
@@ -687,6 +760,9 @@ where
     fn settle_server(&mut self, id: Id, before: Option<Instant>) {
         let Some(entry) = self.servers.get(id) else { return };
         if entry.tx.is_terminated() {
+            if let Some(shared) = &entry.shared {
+                shared.finish();
+            }
             self.servers.remove(id);
             return;
         }
@@ -802,28 +878,36 @@ where
                     return false;
                 };
                 route.tcp = TcpState::Connecting(vec![pending]);
-                let config = self.config.tcp;
-                let deadline = self.config.connect_timeout;
-                let inbound = self.tcp_tx.clone();
-                let internal = self.internal_tx.clone();
-                tokio::spawn(async move {
-                    let connect = tcp::connect_reserved(
-                        remote,
-                        &config,
-                        &inbound,
-                        Some(connection),
-                    );
-                    let result =
-                        connect_until(connect, &inbound, deadline).await;
-                    let _ = internal.send(Command::Connected {
-                        remote,
-                        result,
-                        _attempt: attempt,
-                    });
-                });
+                self.spawn_connect(remote, connection, attempt);
             }
         }
         true
+    }
+
+    fn spawn_connect(
+        &self,
+        remote: SocketAddr,
+        connection: tokio::sync::OwnedSemaphorePermit,
+        attempt: crate::transport::budget::Permit,
+    ) {
+        let config = self.config.tcp;
+        let deadline = self.config.connect_timeout;
+        let inbound = self.tcp_tx.clone();
+        let internal = self.internal_tx.clone();
+        tokio::spawn(async move {
+            let connect = tcp::connect_reserved(
+                remote,
+                &config,
+                &inbound,
+                Some(connection),
+            );
+            let result = connect_until(connect, &inbound, deadline).await;
+            let _ = internal.send(Command::Connected {
+                remote,
+                result,
+                _attempt: attempt,
+            });
+        });
     }
 
     // New client destinations cannot consume the response reserve. Cache
@@ -856,7 +940,7 @@ where
         self.routes.len() < limit
     }
 
-    fn reject_pending(&self, pending: Pending) {
+    fn reject_pending(&mut self, pending: Pending) {
         increment(&self.connection_stats.rejected);
         match pending {
             Pending::Request(request, respond, permit) => {
@@ -865,6 +949,10 @@ where
                 let _ = respond.send(Err(Error::busy()));
             }
             Pending::Response(..) => {}
+            // Server output reserves its route and connection before commit
+            // and never passes through `send_over_tcp`. Report a rejection
+            // rather than a transport failure if that ever changes.
+            Pending::Server(_, observation, _) => observation.reject(),
             Pending::OneShot(bytes, completion) => {
                 drop(bytes);
                 completion.finish(Err(ReplyError::Busy));
@@ -893,6 +981,22 @@ where
                     })),
                 }
             }
+            Pending::Server(bytes, observation, permit) => {
+                match writer.submit(bytes) {
+                    Ok(receipt) => self.server_writes.push((
+                        receipt,
+                        observation,
+                        Some(permit),
+                    )),
+                    Err(error) => {
+                        self.fail_observed(observation.shared());
+                        observation.complete(Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            error,
+                        )));
+                    }
+                }
+            }
             Pending::Response(bytes, permit) => {
                 if let Ok(receipt) = writer.submit(bytes) {
                     self.fallback_writes.push((receipt, permit));
@@ -901,8 +1005,9 @@ where
         }
     }
 
-    // Issued to incoming TU envelopes once that interface replaces Service.
-    #[allow(dead_code)]
+    // Builds a route outside `on_request`, for the benchmark hook and tests.
+    // Incoming envelopes get theirs when the driver admits the request.
+    #[cfg_attr(not(any(test, feature = "__bench")), allow(dead_code))]
     pub(super) fn prepare_reply(
         &self,
         mut request: Request<Bytes>,
@@ -1129,6 +1234,13 @@ where
                         }
                         // See `send_reply`.
                         Pending::Response(..) => {}
+                        Pending::Server(_, observation, _) => {
+                            self.fail_observed(observation.shared());
+                            observation.complete(Err(io::Error::new(
+                                source.kind(),
+                                source.clone(),
+                            )));
+                        }
                         Pending::OneShot(_, completion) => {
                             completion.finish(Err(ReplyError::Transport(
                                 io::Error::new(
@@ -1188,6 +1300,12 @@ where
         // is nothing to do with the request.
         let Some(value) = request.headers().get(VIA) else { return };
         let Some(via) = Via::top(value) else { return };
+        // RFC 3261 section 18.2.2 sends the response to `maddr`, normally a
+        // multicast group. Multicast is out of scope for 0.3.0, and answering
+        // the source instead would break that rule, so the request is dropped.
+        if via.maddr.is_some() {
+            return;
+        }
         let reply = reply_flow(&via, &link.flow);
         let marked = mark_via(value, &via, &link.flow);
         let key = ServerKey::new(&via, request.method());
@@ -1198,14 +1316,14 @@ where
         if let Some(marked) = marked {
             *request.headers_mut().get_mut(VIA).expect("found above") = marked;
         }
-        // The service sees where the request came from. The link keeps where
-        // the response goes, which differs in the port without `rport`.
+        // The envelope describes where the request came from. The link keeps
+        // where the response goes, which differs in the port without `rport`.
         let source = link.flow;
         let link = Link { flow: reply, writer: link.writer };
 
-        // 0.2.0 has no INVITE transactions. An ACK outside one has nothing to
-        // match and is dropped (section 17.2.3), and a CANCEL with no
-        // transaction to cancel gets a 481 (section 9.2).
+        // INVITE transactions are not wired into the endpoint yet. An ACK
+        // outside one has nothing to match and is dropped (section 17.2.3),
+        // and a CANCEL with no transaction to cancel gets a 481 (section 9.2).
         let method = request.method();
         if *method == Method::INVITE {
             self.stateless(&request, &link, NOT_IMPLEMENTED);
@@ -1220,27 +1338,64 @@ where
         }
 
         if let Some(key) = &key {
-            if let Some((_, entry)) = self.servers.find(key) {
+            if let Some((id, entry)) = self.servers.find(key) {
                 if let Some(response) = entry.tx.on_retransmission() {
-                    let _ = send_on(
-                        self.udp.as_mut(),
-                        &entry.link,
-                        &response,
-                        false,
-                    );
+                    let link = entry.link.clone();
+                    if let Some(shared) = entry.shared.clone() {
+                        self.send_generated(id, &link, response, &shared);
+                    } else {
+                        // An unobserved Completed entry has no observer to
+                        // tell. A busy budget only drops this copy, as in
+                        // `send_generated`.
+                        match self.send_reply(&link, &response) {
+                            Err(error)
+                                if error.kind()
+                                    != io::ErrorKind::WouldBlock =>
+                            {
+                                self.fail_server(id);
+                            }
+                            _ => {}
+                        }
+                    }
                 }
                 return;
             }
+        }
+
+        // Stateful TU responses need a usable identity, not only a Via route.
+        // A request without exactly one From, To, Call-ID and CSeq, or with a
+        // CSeq method other than its own, stays out of transaction and
+        // application work. It gets a stateless 400 so that a UDP client stops
+        // retransmitting instead of waiting for Timer F. The 400 copies what
+        // identity there is, and uses the same bounded reply path as the 503.
+        let identity = [
+            crate::message::header::FROM,
+            crate::message::header::TO,
+            crate::message::header::CALL_ID,
+            crate::message::header::CSEQ,
+        ]
+        .iter()
+        .all(|name| {
+            let mut values = request.headers().get_all(name);
+            values.next().is_some() && values.next().is_none()
+        });
+        if !identity
+            || !request
+                .headers()
+                .get(crate::message::header::CSEQ)
+                .and_then(crate::message::header::cseq::CSeq::parse)
+                .is_some_and(|cseq| cseq.method == request.method())
+        {
+            self.stateless(&request, &link, BAD_REQUEST);
+            return;
         }
 
         // Overload and shutdown answer with a stateless 503, so the peer stops
         // retransmitting and can try elsewhere. Not reading the socket instead
         // would stall every flow on a TCP connection, including the responses
         // to this endpoint's own requests on it.
-        let waiting = self.pending + self.queue.len();
-        if self.service_failed
+        if self.incoming.is_closed()
             || self.shutting_down
-            || waiting >= self.config.max_pending_requests
             || (key.is_some()
                 && self.servers.len() >= self.config.max_server_transactions)
         {
@@ -1248,7 +1403,42 @@ where
             return;
         }
 
-        request.extensions_mut().insert(source);
+        let Some(bytes) = super::admission::request_bytes(&request) else {
+            return;
+        };
+        let Some(event_permit) = self.event_admission.acquire(bytes) else {
+            self.stateless(&request, &link, SERVICE_UNAVAILABLE);
+            return;
+        };
+        let Some(permit) = self.work.acquire(bytes) else {
+            self.stateless(&request, &link, SERVICE_UNAVAILABLE);
+            return;
+        };
+        let identity_bytes = request
+            .headers()
+            .iter()
+            .filter(|(name, _)| {
+                [
+                    crate::message::header::VIA,
+                    crate::message::header::FROM,
+                    crate::message::header::TO,
+                    crate::message::header::CALL_ID,
+                    crate::message::header::CSEQ,
+                ]
+                .contains(name)
+            })
+            .try_fold(0usize, |total, (_, value)| {
+                total.checked_add(value.len())
+            });
+        let Some(route_permit) = identity_bytes
+            .and_then(|bytes| self.routes_admission.acquire(bytes))
+        else {
+            self.stateless(&request, &link, SERVICE_UNAVAILABLE);
+            return;
+        };
+
+        let Some(commands) = self.command_sender.upgrade() else { return };
+
         let slot = match key {
             Some(key) => {
                 let reliable = link.flow.transport.is_reliable();
@@ -1259,7 +1449,16 @@ where
                     now(),
                 );
                 let deadline = tx.deadline();
-                let id = self.servers.insert(key, ServerEntry { tx, link });
+                let id = self.servers.insert(
+                    key,
+                    ServerEntry {
+                        tx,
+                        link,
+                        shared: None,
+                        identity: 0,
+                        retained: None,
+                    },
+                );
                 if let Some(at) = deadline {
                     self.timers.push(at, Key::Server(id));
                 }
@@ -1268,7 +1467,77 @@ where
             }
             None => Slot::Stateless(link),
         };
-        self.queue.push_back((slot, request));
+        let route_link = match &slot {
+            Slot::Transaction(id) => {
+                self.servers.get(*id).expect("new transaction").link.clone()
+            }
+            Slot::Stateless(link) => link.clone(),
+        };
+        let route = ReplyRoute::new(
+            &request,
+            route_link,
+            commands.clone(),
+            self.reply_admission.0.clone(),
+            self.reply_bytes.clone(),
+        );
+        let event = match slot {
+            Slot::Transaction(id) => {
+                static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+                let (observation, receiver) =
+                    watch::channel(server::Observation::default());
+                let shared = Arc::new(server::Shared {
+                    id: ServerTransactionId(
+                        NEXT_ID.fetch_add(1, Ordering::Relaxed),
+                    ),
+                    slot: id,
+                    work: server::Work::new(permit),
+                    pending: std::sync::atomic::AtomicUsize::new(0),
+                    next_operation: AtomicU64::new(1),
+                    final_sent: std::sync::atomic::AtomicBool::new(false),
+                    abandoned: std::sync::atomic::AtomicBool::new(false),
+                    observation,
+                    transport: std::sync::atomic::AtomicUsize::new(0),
+                    terminated: std::sync::atomic::AtomicBool::new(false),
+                });
+                let entry = self.servers.get_mut(id).expect("new transaction");
+                entry.identity = Arc::as_ptr(&shared) as usize;
+                entry.shared = Some(shared.clone());
+                let responder = server::Responder {
+                    shared,
+                    route: route.with_reservations(route_permit, None),
+                    method: request.method().clone(),
+                    commands,
+                    drops: self.drop_sender.clone(),
+                    submissions: self.submissions.clone(),
+                };
+                let transaction_id = responder.id();
+                IncomingEvent::Request(ServerRequest {
+                    request,
+                    flow: source,
+                    transaction: server::ServerTransaction {
+                        responder,
+                        events: server::ServerEvents {
+                            id: transaction_id,
+                            receiver,
+                            seen: 0,
+                            ended: false,
+                            saw_termination: false,
+                        },
+                    },
+                })
+            }
+            Slot::Stateless(_) => IncomingEvent::Untracked(ReceivedRequest {
+                request,
+                flow: source,
+                reply: route.with_reservations(
+                    route_permit,
+                    Some(server::Work::new(permit)),
+                ),
+            }),
+        };
+        let _ = self
+            .incoming
+            .send(server::Queued { event, _permit: event_permit });
     }
 
     /// Sends a response the endpoint makes itself, without a transaction.
@@ -1283,50 +1552,369 @@ where
         let _ = self.send_reply(link, &response);
     }
 
-    /// Takes what the service answered. `None` when it failed.
-    ///
-    /// A response has to be final and carry a `Via`, or the endpoint could
-    /// not route it. Anything else becomes a 500 built from the request's
-    /// headers, which a stateless slot does not keep, so there it is dropped.
-    fn on_response(&mut self, slot: Slot, response: Option<Response<Bytes>>) {
-        let response = response.filter(|r| {
-            r.status().is_final() && r.headers().contains_key(VIA)
-        });
-        match slot {
-            Slot::Transaction(id) => {
-                let Some(entry) = self.servers.get_mut(id) else { return };
-                let (status, bytes) = match &response {
-                    Some(response) => (response.status(), response.to_bytes()),
-                    None => match entry.tx.headers() {
-                        Some(headers) => (
-                            SERVER_ERROR,
-                            bare_response(headers, SERVER_ERROR),
-                        ),
-                        // The final response is out, so nothing can be sent.
-                        None => return,
-                    },
+    fn prepare_server_output(
+        &mut self,
+        link: &Link,
+        bytes: Bytes,
+    ) -> Result<PreparedServerOutput, SubmitError> {
+        let Some(writer) = &link.writer else {
+            let udp = self.udp.as_ref().ok_or(SubmitError::Closed)?;
+            udp.admit_response(bytes.len())
+                .map_err(|_| SubmitError::TransportBusy)?;
+            return Ok(PreparedServerOutput::Udp(bytes, link.flow));
+        };
+        match writer.prepare(bytes.clone()) {
+            Ok(write) => return Ok(PreparedServerOutput::Tcp(write, None)),
+            Err(tcp::SendError::Full) => {
+                return Err(SubmitError::TransportBusy)
+            }
+            Err(tcp::SendError::Closed) => {}
+        }
+
+        let fallback = self
+            .fallback
+            .acquire(bytes.len())
+            .ok_or(SubmitError::TransportBusy)?;
+
+        let remote = link.flow.remote;
+        if !self.admit_route(remote, true) {
+            increment(&self.connection_stats.rejected);
+            return Err(SubmitError::TransportBusy);
+        }
+
+        match &self.routes.entry(remote).or_default().tcp {
+            TcpState::Open(_, writer) if !writer.is_closed() => {
+                let write = writer
+                    .prepare(bytes)
+                    .map_err(|_| SubmitError::TransportBusy)?;
+
+                Ok(PreparedServerOutput::Tcp(write, Some(fallback)))
+            }
+            TcpState::Connecting(_) => {
+                Ok(PreparedServerOutput::Waiting { remote, bytes, fallback })
+            }
+            _ => {
+                let connection = self
+                    .response_connections
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| {
+                        increment(&self.connection_stats.rejected);
+                        SubmitError::TransportBusy
+                    })?;
+                let attempt =
+                    self.response_connects.acquire(0).ok_or_else(|| {
+                        increment(&self.connection_stats.rejected);
+                        SubmitError::TransportBusy
+                    })?;
+                Ok(PreparedServerOutput::Connect {
+                    remote,
+                    bytes,
+                    fallback,
+                    connection,
+                    attempt,
+                })
+            }
+        }
+    }
+
+    fn commit_server_output(
+        &mut self,
+        output: PreparedServerOutput,
+        shared: &Arc<server::Shared>,
+        operation: Option<server::ResponseId>,
+    ) -> bool {
+        let observation = shared.write(operation);
+        match output {
+            PreparedServerOutput::Tcp(write, fallback) => {
+                let observation = if fallback.is_some() {
+                    observation.fallback(self.connection_stats.clone())
+                } else {
+                    observation
                 };
-                let before = entry.tx.deadline();
-                let timers = self.config.timers;
-                let send = entry.tx.on_response(
-                    status,
-                    bytes.clone(),
-                    &timers,
-                    now(),
-                );
-                let link = entry.link.clone();
-                if send && self.send_reply(&link, &bytes).is_err() {
-                    if let Some(entry) = self.servers.get_mut(id) {
-                        entry.tx.on_transport_error();
+                match write.submit() {
+                    Ok(receipt) => self.server_writes.push((
+                        receipt,
+                        observation,
+                        fallback,
+                    )),
+                    Err(error) => {
+                        observation.complete(Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            error,
+                        )));
+                        return false;
                     }
                 }
-                self.settle_server(id, before);
             }
-            Slot::Stateless(link) => {
-                if let Some(response) = response {
-                    let _ = self.send_reply(&link, &response.to_bytes());
+            PreparedServerOutput::Udp(bytes, flow) => {
+                return self
+                    .udp
+                    .as_mut()
+                    .expect("prepared UDP socket")
+                    .send_admitted(bytes, flow, observation);
+            }
+            PreparedServerOutput::Waiting { remote, bytes, fallback } => {
+                let TcpState::Connecting(waiting) = &mut self
+                    .routes
+                    .get_mut(&remote)
+                    .expect("prepared route")
+                    .tcp
+                else {
+                    unreachable!(
+                        "driver does not yield between preparation and commit"
+                    );
+                };
+                waiting.push(Pending::Server(
+                    bytes,
+                    observation.fallback(self.connection_stats.clone()),
+                    fallback,
+                ));
+            }
+            PreparedServerOutput::Connect {
+                remote,
+                bytes,
+                fallback,
+                connection,
+                attempt,
+            } => {
+                self.routes.get_mut(&remote).expect("prepared route").tcp =
+                    TcpState::Connecting(vec![Pending::Server(
+                        bytes,
+                        observation.fallback(self.connection_stats.clone()),
+                        fallback,
+                    )]);
+                self.spawn_connect(remote, connection, attempt);
+            }
+        }
+        true
+    }
+
+    /// Sends driver-generated server output: the automatic 100, or a cached
+    /// response for a request retransmission.
+    ///
+    /// Local saturation only drops this attempt. The machine keeps its cached
+    /// response, so the peer's next retransmission recovers it. Terminating
+    /// instead would let that retransmission start a new transaction and
+    /// reach the TU a second time.
+    fn send_generated(
+        &mut self,
+        id: Id,
+        link: &Link,
+        bytes: Bytes,
+        shared: &Arc<server::Shared>,
+    ) {
+        let fallback =
+            link.writer.as_ref().is_some_and(tcp::Writer::is_closed);
+        match self.prepare_server_output(link, bytes) {
+            Ok(output) => {
+                if !self.commit_server_output(output, shared, None) {
+                    self.fail_server(id);
                 }
             }
+            Err(_) => {
+                if fallback {
+                    increment(&self.connection_stats.dropped);
+                }
+                shared.rejected();
+            }
+        }
+    }
+
+    fn fail_server(&mut self, id: Id) {
+        if let Some(entry) = self.servers.get_mut(id) {
+            entry.tx.on_transport_error();
+            self.settle_server(id, None);
+        }
+    }
+
+    fn live_work_is_drained(&self) -> bool {
+        self.work.is_idle()
+    }
+
+    fn fail_observed(&mut self, shared: &Arc<server::Shared>) {
+        if self.owns_server(shared) {
+            self.fail_server(shared.slot);
+        }
+    }
+
+    // A TU capability can outlive every timer. Its Arc keeps the allocation
+    // address from being reused while this identity can still be presented.
+    // The stored address is compared only, never reconstructed or dereferenced.
+    fn owns_server(&self, shared: &Arc<server::Shared>) -> bool {
+        self.servers.get(shared.slot).is_some_and(|entry| {
+            entry.identity == Arc::as_ptr(shared) as usize
+        })
+    }
+
+    fn abandon(&mut self, shared: &Arc<server::Shared>) {
+        if !self.owns_server(shared) {
+            return;
+        }
+        shared.abandoned.store(true, Ordering::Release);
+        if shared.pending.load(Ordering::Acquire) == 0
+            && !shared.final_sent.load(Ordering::Acquire)
+        {
+            self.respond_abandoned(shared.slot);
+        }
+    }
+
+    fn on_submission(&mut self, submission: server::Submission) {
+        let server::Submission {
+            shared,
+            operation,
+            status,
+            bytes,
+            done,
+            _permit,
+        } = submission;
+        let result = if self.owns_server(&shared) {
+            if shared.final_sent.load(Ordering::Acquire) {
+                drop(bytes);
+                Err(SubmitError::FinalAlreadySent)
+            } else {
+                self.accept_response(
+                    shared.slot,
+                    status,
+                    bytes,
+                    Some(operation),
+                )
+            }
+        } else {
+            drop(bytes);
+            Err(SubmitError::Terminated)
+        };
+        shared.pending.fetch_sub(1, Ordering::Release);
+        // Return command capacity before acceptance can wake a new submitter.
+        drop(_permit);
+        let _ = done.send(result);
+
+        if shared.abandoned.load(Ordering::Acquire) {
+            self.abandon(&shared);
+        }
+    }
+
+    fn accept_response(
+        &mut self,
+        id: Id,
+        status: StatusCode,
+        bytes: Bytes,
+        operation: Option<server::ResponseId>,
+    ) -> Result<(), SubmitError> {
+        use crate::transaction::non_invite::ResponseRejection;
+
+        let entry = self.servers.get_mut(id).ok_or(SubmitError::Terminated)?;
+        entry.tx.check_response(status, now()).map_err(
+            |error| match error {
+                ResponseRejection::TooEarly => SubmitError::TooEarly,
+                ResponseRejection::ProhibitedStatus => {
+                    SubmitError::ProhibitedStatus
+                }
+                ResponseRejection::FinalAlreadySent => {
+                    SubmitError::FinalAlreadySent
+                }
+                ResponseRejection::Terminated => SubmitError::Terminated,
+            },
+        )?;
+
+        let link = entry.link.clone();
+        let shared = entry.shared.as_ref().expect("TU transaction").clone();
+        let output = self.prepare_server_output(&link, bytes.clone())?;
+
+        let entry = self
+            .servers
+            .get_mut(id)
+            .expect("validated transaction remains installed");
+        // Prepare transport first so rejection preserves the cached response's
+        // reservation. Replacement charges only the difference, allowing a final
+        // to make progress even when the provisional fills the retained budget.
+        match &mut entry.retained {
+            Some(retained) => retained
+                .resize(bytes.len())
+                .ok_or(SubmitError::RetentionFull)?,
+            None => {
+                entry.retained = Some(
+                    self.retained
+                        .acquire(bytes.len())
+                        .ok_or(SubmitError::RetentionFull)?,
+                )
+            }
+        }
+        let before = entry.tx.deadline();
+        let sent = entry.tx.on_response(
+            status,
+            bytes.clone(),
+            &self.config.timers,
+            now(),
+        );
+        debug_assert!(sent);
+
+        if status.is_final() {
+            shared.final_sent.store(true, Ordering::Release);
+            shared.work.finish();
+            // An unobserved non-INVITE UDP cache needs only its response and
+            // capability identity. No observer can reappear after count zero.
+            if !entry.tx.is_terminated()
+                && shared.observation.receiver_count() == 0
+            {
+                entry.shared = None;
+            }
+        }
+
+        if !self.commit_server_output(output, &shared, operation) {
+            if let Some(entry) = self.servers.get_mut(id) {
+                entry.tx.on_transport_error();
+            }
+        }
+        self.settle_server(id, before);
+        Ok(())
+    }
+
+    fn respond_abandoned(&mut self, id: Id) {
+        use crate::message::header::{address::has_tag, Tag, TO};
+
+        let Some(entry) = self.servers.get(id) else { return };
+        let Some(headers) = entry.tx.headers() else { return };
+        // Reuse a To tag that the TU already chose for a provisional response.
+        // Otherwise the 500 needs a fresh one (RFC 3261 section 8.2.6.2). The
+        // machine caches the encoded 500, so retransmissions keep this tag.
+        let selected = entry
+            .tx
+            .on_retransmission()
+            .and_then(|bytes| Response::from_shared(bytes).ok())
+            .and_then(|response| response.headers().get(TO).cloned())
+            .filter(|to| has_tag(to.as_str()));
+        let request_tagged =
+            headers.get(TO).is_some_and(|to| has_tag(to.as_str()));
+        let mut builder = Response::builder().status(SERVER_ERROR);
+        *builder.headers_mut().expect("new builder") = headers.clone();
+        let builder = match selected {
+            Some(to) => {
+                builder.headers_mut().expect("new builder").insert(TO, to);
+                Some(builder)
+            }
+            None if request_tagged => Some(builder),
+            None => Tag::try_random().map(|tag| builder.to_tag(tag)),
+        };
+        let response = builder
+            .and_then(|builder| builder.body(Bytes::new()).ok())
+            .map(|response| response.to_bytes());
+
+        // No TU is left to answer, and a non-INVITE Proceeding state has no
+        // timer, so a machine whose 500 cannot be built or admitted would stay forever.
+        // Terminating releases its work. A later retransmission then reaches
+        // the TU as a new request, which it can answer this time.
+        let accepted = response.map_or(Err(SubmitError::Busy), |response| {
+            self.accept_response(id, SERVER_ERROR, response, None)
+        });
+        if accepted.is_err() {
+            let entry =
+                self.servers.get_mut(id).expect("existing transaction");
+            if let Some(shared) = &entry.shared {
+                shared.rejected();
+            }
+            entry.tx.on_transport_error();
+            self.settle_server(id, None);
         }
     }
 }
@@ -1422,6 +2010,7 @@ mod tests {
     use tokio::{net::UdpSocket, time::timeout};
 
     use super::*;
+    use crate::endpoint::tests::TestServe;
     use crate::endpoint::{
         tests::{
             reply_driver, reply_driver_with, route_request, route_response,
@@ -1429,11 +2018,9 @@ mod tests {
         },
         Client,
     };
+    use tower_service::Service;
 
-    fn fallback(
-        driver: &Driver<crate::endpoint::tests::RouteService>,
-        bytes: Bytes,
-    ) -> Pending {
+    fn fallback(driver: &Driver, bytes: Bytes) -> Pending {
         let permit = driver.fallback.acquire(bytes.len()).unwrap();
         Pending::Response(
             bytes,
@@ -1788,29 +2375,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_service_dispatch_is_bounded_per_turn() {
-        let (mut driver, _commands, local) = reply_driver();
-        let request = route_request("SIP/2.0/UDP example.com:9;rport");
-        let link = udp_reply_link(local, "127.0.0.1:9".parse().unwrap());
-        for _ in 0..65 {
-            driver
-                .queue
-                .push_back((Slot::Stateless(link.clone()), request.clone()));
-        }
-        driver.service_failed = true;
-        poll_fn(|cx| {
-            driver.poll_dispatch(cx);
-            assert_eq!(driver.queue.len(), 33);
-            driver.poll_dispatch(cx);
-            assert_eq!(driver.queue.len(), 1);
-            driver.poll_dispatch(cx);
-            assert!(driver.queue.is_empty());
-            Poll::Ready(())
-        })
-        .await;
-    }
-
-    #[tokio::test]
     async fn shared_shutdown_completion_wakes_every_caller() {
         let endpoint = crate::endpoint::Endpoint::builder()
             .serve(crate::endpoint::tests::RouteService)
@@ -1826,6 +2390,333 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_terminated_machine_does_not_release_queued_event_bytes() {
+        let (mut driver, _commands, local) = reply_driver_with(Config {
+            max_pending_requests: 1,
+            ..Config::default()
+        });
+        let first = route_request(
+            "SIP/2.0/UDP example.com:9;branch=z9hG4bKqueued;rport",
+        );
+        let key = ServerKey::from_request(&first).unwrap();
+        let link = udp_reply_link(local, "127.0.0.1:9".parse().unwrap());
+        driver.on_request(first, link.clone());
+        let id = driver.servers.find(&key).unwrap().0;
+
+        driver.fail_server(id);
+        assert!(driver.work.is_idle());
+        assert!(!driver.event_admission.is_idle());
+        driver.on_request(
+            route_request(
+                "SIP/2.0/UDP example.com:9;branch=z9hG4bKrefused;rport",
+            ),
+            link.clone(),
+        );
+        assert_eq!(driver.incoming.receiver.len(), 1);
+        assert_eq!(driver.servers.len(), 0);
+
+        let _expired = driver.take_request();
+        assert!(driver.event_admission.is_idle());
+        driver.on_request(
+            route_request(
+                "SIP/2.0/UDP example.com:9;branch=z9hG4bKaccepted;rport",
+            ),
+            link,
+        );
+        assert_eq!(driver.incoming.receiver.len(), 1);
+        assert_eq!(driver.servers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn queued_submissions_keep_their_count_after_waiters_drop() {
+        let (mut driver, _commands, local) = reply_driver();
+        let link = udp_reply_link(local, "127.0.0.1:9".parse().unwrap());
+        driver.on_request(
+            route_request(
+                "SIP/2.0/UDP example.com:9;branch=z9hG4bKsubmissions;rport",
+            ),
+            link,
+        );
+        let envelope = driver.take_request();
+        let (responder, _) = envelope.transaction.into_parts();
+        let response = route_response(&envelope.request);
+        let mut waiters = Vec::new();
+
+        for _ in 0..64 {
+            let mut submission = Box::pin(responder.respond(response.clone()));
+            poll_fn(|cx| {
+                assert!(submission.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            waiters.push(submission);
+        }
+        drop(waiters);
+        assert!(driver.submissions.acquire(0).is_none());
+        assert_eq!(responder.respond(response).await, Err(SubmitError::Busy));
+        driver.abandon(&responder.shared);
+        assert!(!responder.shared.final_sent.load(Ordering::Acquire));
+
+        while let Ok(command) = driver.commands.try_recv() {
+            driver.on_command(command);
+        }
+
+        assert!(responder.shared.final_sent.load(Ordering::Acquire));
+        assert_eq!(responder.shared.pending.load(Ordering::Acquire), 0);
+        assert!(driver.submissions.acquire(0).is_some());
+        assert!(driver.work.is_idle());
+    }
+
+    #[tokio::test]
+    async fn retained_response_bytes_are_reserved_before_machine_transition() {
+        let (mut driver, _commands, local) = reply_driver();
+        let link = udp_reply_link(local, "127.0.0.1:9".parse().unwrap());
+        driver.on_request(
+            route_request(
+                "SIP/2.0/UDP example.com:9;branch=z9hG4bKfirst;rport",
+            ),
+            link.clone(),
+        );
+        let first = driver.take_request();
+        driver.on_request(
+            route_request(
+                "SIP/2.0/UDP example.com:9;branch=z9hG4bKother;rport",
+            ),
+            link,
+        );
+        let other = driver.take_request();
+        let a = first.transaction.responder.shared.slot;
+        let b = other.transaction.responder.shared.slot;
+        let response_a = route_response(&first.request).to_bytes();
+        let response_b = route_response(&other.request).to_bytes();
+        let capacity = response_a.len() + response_b.len();
+        driver.retained =
+            Budget::new(WriteLimits { messages: usize::MAX, bytes: capacity });
+        let blocker = driver.retained.acquire(response_b.len()).unwrap();
+
+        driver.accept_response(a, status(200), response_a, None).unwrap();
+        let before = driver.servers.get(b).unwrap().tx.deadline();
+        assert_eq!(
+            driver.accept_response(b, status(200), response_b.clone(), None),
+            Err(SubmitError::RetentionFull)
+        );
+        assert_eq!(driver.servers.get(b).unwrap().tx.deadline(), before);
+        assert!(driver.servers.get(b).unwrap().tx.headers().is_some());
+        assert!(!other
+            .transaction
+            .responder
+            .shared
+            .final_sent
+            .load(Ordering::Acquire));
+
+        drop(blocker);
+        driver.accept_response(b, status(200), response_b, None).unwrap();
+
+        assert!(other
+            .transaction
+            .responder
+            .shared
+            .final_sent
+            .load(Ordering::Acquire));
+        assert!(driver.work.is_idle());
+    }
+
+    #[tokio::test]
+    async fn a_reused_numeric_slot_cannot_redirect_a_tu_capability() {
+        let (mut driver, _commands, local) = reply_driver();
+        let link = udp_reply_link(local, "127.0.0.1:9".parse().unwrap());
+        driver.on_request(
+            route_request(
+                "SIP/2.0/UDP example.com:9;branch=z9hG4bKidentity;rport",
+            ),
+            link,
+        );
+        let envelope = driver.take_request();
+        let original = &envelope.transaction.responder.shared;
+        let (observation, _events) =
+            watch::channel(server::Observation::default());
+        let capacity = Budget::new(WriteLimits { messages: 1, bytes: 0 });
+        let stale = Arc::new(server::Shared {
+            id: original.id,
+            slot: original.slot,
+            work: server::Work::new(capacity.acquire(0).unwrap()),
+            pending: std::sync::atomic::AtomicUsize::new(1),
+            next_operation: AtomicU64::new(1),
+            final_sent: std::sync::atomic::AtomicBool::new(false),
+            abandoned: std::sync::atomic::AtomicBool::new(false),
+            observation,
+            transport: std::sync::atomic::AtomicUsize::new(0),
+            terminated: std::sync::atomic::AtomicBool::new(false),
+        });
+        let reply = route_response(&envelope.request);
+        let operation =
+            envelope.transaction.responder.respond(reply.clone()).id();
+        let bytes = reply.to_bytes();
+        let permit = driver.submissions.acquire(bytes.len()).unwrap();
+        let (done, accepted) = oneshot::channel();
+
+        driver.on_submission(server::Submission {
+            shared: stale.clone(),
+            operation,
+            status: status(200),
+            bytes,
+            done,
+            _permit: permit,
+        });
+        driver.abandon(&stale);
+        driver.fail_observed(&stale);
+
+        assert_eq!(accepted.await.unwrap(), Err(SubmitError::Terminated));
+        let live = driver.servers.get(original.slot).unwrap();
+        assert!(live.tx.headers().is_some());
+        assert!(!original.final_sent.load(Ordering::Acquire));
+        assert!(!original.abandoned.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn acceptance_returns_submission_capacity_before_waking_a_submitter()
+    {
+        use std::sync::atomic::AtomicBool;
+
+        struct Noop;
+        impl Wake for Noop {
+            fn wake(self: Arc<Self>) {}
+        }
+
+        struct Next {
+            responder: Arc<server::Responder>,
+            response: Response<Bytes>,
+            queued: AtomicBool,
+        }
+
+        impl Wake for Next {
+            fn wake(self: Arc<Self>) {
+                let waker = Waker::from(Arc::new(Noop));
+                let mut context = Context::from_waker(&waker);
+                let mut send = self.responder.respond(self.response.clone());
+                self.queued.store(
+                    Pin::new(&mut send).poll(&mut context).is_pending(),
+                    Ordering::Relaxed,
+                );
+            }
+        }
+
+        let (mut driver, _commands, local) = reply_driver();
+        driver.submissions =
+            Budget::new(WriteLimits { messages: 1, bytes: usize::MAX });
+        let link = udp_reply_link(local, "127.0.0.1:9".parse().unwrap());
+        driver.on_request(
+            route_request(
+                "SIP/2.0/UDP example.com:9;branch=z9hG4bKwake;rport",
+            ),
+            link,
+        );
+        let envelope = driver.take_request();
+        let (responder, _) = envelope.transaction.into_parts();
+        let response = route_response(&envelope.request);
+        let responder = Arc::new(responder);
+        let next = Arc::new(Next {
+            responder: responder.clone(),
+            response: response.clone(),
+            queued: AtomicBool::new(false),
+        });
+        let waker = Waker::from(next.clone());
+        let mut context = Context::from_waker(&waker);
+        let mut send = responder.respond(response);
+        assert!(Pin::new(&mut send).poll(&mut context).is_pending());
+
+        let command = driver.commands.try_recv().unwrap();
+        driver.on_command(command);
+
+        assert!(next.queued.load(Ordering::Relaxed));
+        assert_eq!(send.await, Ok(()));
+        let command = driver.commands.try_recv().unwrap();
+        driver.on_command(command);
+        assert!(driver.submissions.is_idle());
+    }
+
+    #[tokio::test]
+    async fn dropping_the_last_command_handle_cannot_leave_a_partial_server() {
+        let (mut driver, commands, local) = reply_driver();
+        let link = udp_reply_link(local, "127.0.0.1:9".parse().unwrap());
+        drop(commands);
+
+        driver.on_request(
+            route_request(
+                "SIP/2.0/UDP example.com:9;branch=z9hG4bKclosed;rport",
+            ),
+            link,
+        );
+
+        assert_eq!(driver.servers.len(), 0);
+        assert!(driver.work.is_idle());
+        assert!(driver.event_admission.is_idle());
+        assert!(driver.routes_admission.is_idle());
+        assert!(driver.incoming.receiver.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fallback_admission_is_reserved_before_server_commit() {
+        let (mut driver, _commands, _) = reply_driver();
+        let listener =
+            tokio::net::TcpListener::bind(REPLY_LOCAL).await.unwrap();
+        let (flow, writer) = tcp::connect(
+            listener.local_addr().unwrap(),
+            &driver.config.tcp,
+            &driver.tcp_tx,
+        )
+        .await
+        .unwrap();
+        let (peer, _) = listener.accept().await.unwrap();
+        drop(peer);
+        timeout(Duration::from_secs(1), async {
+            while !writer.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        driver.on_request(
+            route_request("SIP/2.0/TCP example.com:9;branch=z9hG4bKfallback"),
+            Link { flow, writer: Some(writer) },
+        );
+        let envelope = driver.take_request();
+        let shared = &envelope.transaction.responder.shared;
+        let response = route_response(&envelope.request);
+        let all = driver
+            .response_connections
+            .clone()
+            .try_acquire_many_owned(REPLY_OPERATIONS as u32)
+            .unwrap();
+        let before = driver.servers.get(shared.slot).unwrap().tx.deadline();
+
+        assert_eq!(
+            driver.accept_response(
+                shared.slot,
+                status(200),
+                response.to_bytes(),
+                None
+            ),
+            Err(SubmitError::TransportBusy)
+        );
+
+        assert_eq!(
+            driver.servers.get(shared.slot).unwrap().tx.deadline(),
+            before
+        );
+        assert!(!shared.final_sent.load(Ordering::Acquire));
+        assert!(!driver.work.is_idle());
+        assert!(driver.fallback.is_idle());
+        assert!(driver.retained.is_idle());
+        assert!(driver.response_connects.is_idle());
+        assert_eq!(
+            driver.connection_stats.rejected.load(Ordering::Relaxed),
+            1
+        );
+        drop(all);
     }
 
     struct SendNext {
@@ -1854,9 +2745,12 @@ mod tests {
         let link = udp_reply_link(local, "127.0.0.1:9".parse().unwrap());
 
         driver.on_request(request.clone(), link.clone());
-        let (slot, received) = driver.queue.pop_front().unwrap();
-        let Slot::Transaction(old) = slot else { panic!("stateful request") };
-        driver.on_response(slot, Some(route_response(&received)));
+        let received = driver.take_request();
+        let old = received.transaction.responder.shared.slot;
+        let response = route_response(&received.request);
+        driver
+            .accept_response(old, response.status(), response.to_bytes(), None)
+            .unwrap();
         assert_eq!(driver.servers.len(), 1);
         let entry = driver.servers.get_mut(old).unwrap();
         let at = entry.tx.deadline().unwrap();
@@ -1868,13 +2762,11 @@ mod tests {
         driver.on_timer(Key::Server(old));
 
         assert_eq!(driver.servers.len(), 1);
-        assert_eq!(driver.queue.len(), 1);
-        let (Slot::Transaction(current), _) = driver.queue.front().unwrap()
-        else {
-            panic!("stateful request");
-        };
-        assert_ne!(*current, old);
-        assert!(driver.servers.get(*current).is_some());
+        assert_eq!(driver.incoming.receiver.len(), 1);
+        let received = driver.take_request();
+        let current = received.transaction.responder.shared.slot;
+        assert_ne!(current, old);
+        assert!(driver.servers.get(current).is_some());
     }
 
     #[tokio::test]
@@ -1890,13 +2782,10 @@ mod tests {
 
         for _ in 0..1000 {
             driver.on_request(request.clone(), link.clone());
-            let (slot, received) = driver.queue.pop_front().unwrap();
-            let response = Response::reply_to(&received)
-                .status(408)
-                .body(Bytes::new())
-                .unwrap();
-            // RFC 4320 drops a TU 408 and terminates without a wire response.
-            driver.on_response(slot, Some(response));
+            let received = driver.take_request();
+            let id = received.transaction.responder.shared.slot;
+            driver.fail_server(id);
+            drop(received);
             poll_fn(|cx| {
                 if let Poll::Ready(Event::Timer(key)) = driver.poll_event(cx) {
                     driver.on_timer(key);

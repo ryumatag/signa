@@ -1,5 +1,5 @@
 /*!
-The error of a request sent through a [`Client`].
+The errors of binding an endpoint and of a request sent through a [`Client`].
 
 [`Client`]: super::Client
 */
@@ -141,6 +141,91 @@ impl error::Error for Error {
         match &self.kind {
             Kind::Transport(err) => Some(err),
             _ => None,
+        }
+    }
+}
+
+/// Why [`Builder::bind`] could not start an endpoint.
+///
+/// [`BindError::is_invalid_config`] separates a configuration that no socket
+/// could satisfy from a socket that failed to bind. It converts into an
+/// [`io::Error`] for callers that report I/O errors, with `InvalidInput` for
+/// an invalid configuration.
+///
+/// [`Builder::bind`]: super::Builder::bind
+pub struct BindError {
+    kind: BindKind,
+}
+
+enum BindKind {
+    Io(io::Error),
+    InvalidConfig(&'static str),
+}
+
+impl BindError {
+    pub(super) fn io(err: io::Error) -> BindError {
+        BindError { kind: BindKind::Io(err) }
+    }
+
+    pub(super) fn invalid_config(reason: &'static str) -> BindError {
+        BindError { kind: BindKind::InvalidConfig(reason) }
+    }
+
+    /// Returns `true` if the configuration is invalid, such as a zero
+    /// capacity where the endpoint needs a positive one. No socket was bound.
+    pub fn is_invalid_config(&self) -> bool {
+        matches!(self.kind, BindKind::InvalidConfig(_))
+    }
+
+    /// Returns `true` if binding or setting up a socket failed.
+    /// [`BindError::source`] has the I/O error.
+    ///
+    /// [`BindError::source`]: error::Error::source
+    pub fn is_io(&self) -> bool {
+        matches!(self.kind, BindKind::Io(_))
+    }
+}
+
+impl fmt::Debug for BindError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = f.debug_tuple("signa::endpoint::BindError");
+        match &self.kind {
+            BindKind::Io(err) => debug.field(err),
+            BindKind::InvalidConfig(reason) => {
+                debug.field(&format_args!("InvalidConfig({reason:?})"))
+            }
+        };
+        debug.finish()
+    }
+}
+
+impl fmt::Display for BindError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.kind {
+            BindKind::Io(err) => write!(f, "binding a socket failed: {err}"),
+            BindKind::InvalidConfig(reason) => {
+                write!(f, "invalid endpoint configuration: {reason}")
+            }
+        }
+    }
+}
+
+impl error::Error for BindError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match &self.kind {
+            BindKind::Io(err) => Some(err),
+            BindKind::InvalidConfig(_) => None,
+        }
+    }
+}
+
+impl From<BindError> for io::Error {
+    fn from(err: BindError) -> io::Error {
+        match err.kind {
+            BindKind::Io(err) => err,
+            BindKind::InvalidConfig(_) => {
+                io::Error::new(io::ErrorKind::InvalidInput, err)
+            }
         }
     }
 }

@@ -37,6 +37,9 @@ __bench = []
 [dependencies]
 bytes = { version = "1.12.1", default-features = false, features = ["std"] }
 siparse = "0.4.3"
+# RFC 3261 section 19.3 requires tags with cryptographic randomness. 0.4
+# needs Rust 1.85, above the MSRV.
+getrandom = { version = "0.3", default-features = false }
 tokio = { version = "1.47", default-features = false, features = ["io-util", "net", "rt", "sync", "time"], optional = true }
 tower-service = { version = "0.3.3", optional = true }
 # Keys the transaction tables. Branches come from the network, so the hasher
@@ -66,4 +69,9 @@ required-features = ["tokio"]
 # What the transaction tables cost. `scripts/tables` runs it.
 [[example]]
 name = "tables"
+required-features = ["tokio"]
+
+# Application-owned Tower dispatch and responder composition.
+[[example]]
+name = "server_adapter"
 required-features = ["tokio"]

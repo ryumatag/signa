@@ -12,7 +12,7 @@ use bytes::Bytes;
 use criterion::Criterion;
 use signa::{
     bench::{reply_driver, tcp, udp, Flow},
-    endpoint::{Endpoint, ReplyRoute},
+    endpoint::{Builder, Endpoint, IncomingEvent, ReplyRoute},
     transaction::Timers,
     transport::Transport,
     Request, Response, StatusCode,
@@ -256,11 +256,10 @@ async fn reply_route_fixture(
         .body(Bytes::new())
         .expect("valid fixture request");
 
-    let (request, route, driver) =
-        reply_driver(NoDispatch, request, flow, writer, udp, tcp_rx, tx)
-            .map_err(|error| {
-                io::Error::new(io::ErrorKind::InvalidInput, error)
-            })?;
+    let (request, route, driver) = reply_driver(
+        request, flow, writer, udp, tcp_rx, tx,
+    )
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let response = Response::reply_to(&request)
         .status(200)
         .body(Bytes::new())
@@ -285,6 +284,9 @@ pub(super) fn client_admission(c: &mut Criterion) {
         .method("OPTIONS")
         .uri("sip:example.com")
         .header("CSeq", "1 OPTIONS")
+        .header("From", "<sip:alice@example.com>;tag=alice")
+        .header("To", "<sip:bob@example.com>")
+        .header("Call-ID", "admission-bench")
         .body(Bytes::new())
         .unwrap();
     let pending = client.call(request.clone());
@@ -339,6 +341,9 @@ pub(super) fn server_admission(c: &mut Criterion) {
         .method("OPTIONS")
         .uri("sip:example.com")
         .header("CSeq", "1 OPTIONS")
+        .header("From", "<sip:alice@example.com>;tag=alice")
+        .header("To", "<sip:bob@example.com>")
+        .header("Call-ID", "admission-bench")
         .body(Bytes::new())
         .unwrap();
     let len = request.to_bytes().len() as u64;
@@ -370,6 +375,9 @@ pub(super) fn connection_admission(c: &mut Criterion) {
         .method("OPTIONS")
         .uri("sip:example.com")
         .header("CSeq", "1 OPTIONS")
+        .header("From", "<sip:alice@example.com>;tag=alice")
+        .header("To", "<sip:bob@example.com>")
+        .header("Call-ID", "admission-bench")
         .body(Bytes::new())
         .unwrap();
     benchmark(
@@ -400,4 +408,67 @@ pub(super) fn shutdown_coalescing(c: &mut Criterion) {
             assert!(Pin::new(&mut wait).poll(&mut cx).is_pending());
         });
     });
+}
+
+trait Serve {
+    fn serve<S>(self, service: S) -> io::Result<Endpoint>
+    where
+        S: Service<Request<Bytes>, Response = Response<Bytes>>
+            + Send
+            + 'static,
+        S::Future: Send + 'static;
+}
+
+impl Serve for Builder {
+    fn serve<S>(self, mut service: S) -> io::Result<Endpoint>
+    where
+        S: Service<Request<Bytes>, Response = Response<Bytes>>
+            + Send
+            + 'static,
+        S::Future: Send + 'static,
+    {
+        let (endpoint, mut incoming) = self.bind()?;
+        tokio::spawn(async move {
+            while let Some(event) = incoming.recv().await {
+                let (request, responder, route) = match event {
+                    IncomingEvent::Request(envelope) => {
+                        let (responder, _) = envelope.transaction.into_parts();
+                        (envelope.request, Some(responder), None)
+                    }
+                    IncomingEvent::Untracked(envelope) => {
+                        (envelope.request, None, Some(envelope.reply))
+                    }
+                    _ => continue,
+                };
+                if std::future::poll_fn(|cx| service.poll_ready(cx))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                let response = service.call(request).await.ok();
+
+                if let Some(mut response) = response {
+                    let to = response
+                        .headers()
+                        .get("To")
+                        .expect("fixture To")
+                        .as_str();
+                    let tagged = format!("{to};tag=bench");
+                    response.headers_mut().insert(
+                        signa::message::header::TO,
+                        signa::HeaderValue::from_bytes(tagged.as_bytes())
+                            .unwrap(),
+                    );
+                    if let Some(responder) = responder {
+                        responder.respond(response).await.unwrap();
+                    } else if let Some(route) = route {
+                        route.send(response).await.unwrap();
+                    }
+                }
+            }
+        });
+
+        Ok(endpoint)
+    }
 }

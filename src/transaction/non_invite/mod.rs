@@ -7,3 +7,6 @@ pub use self::{
 
 mod client;
 mod server;
+
+#[cfg(feature = "tokio")]
+pub(crate) use server::ResponseRejection;
