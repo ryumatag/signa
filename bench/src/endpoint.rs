@@ -385,3 +385,19 @@ pub(super) fn connection_admission(c: &mut Criterion) {
         },
     );
 }
+
+/// Shutdown waiters remain caller-owned while one control wakeup is queued.
+pub(super) fn shutdown_coalescing(c: &mut Criterion) {
+    use std::{future::Future, pin::Pin, task::Waker, time::Duration};
+    let rt = runtime();
+    let _guard = rt.enter();
+    let endpoint = Endpoint::builder().serve(NoDispatch).unwrap();
+    let mut cx = Context::from_waker(Waker::noop());
+    drop(endpoint.clone().shutdown(Duration::MAX));
+    benchmark(c, "control/endpoint/shutdown_coalesced", 1, |b| {
+        b.iter(|| {
+            let mut wait = endpoint.clone().shutdown(Duration::MAX);
+            assert!(Pin::new(&mut wait).poll(&mut cx).is_pending());
+        });
+    });
+}

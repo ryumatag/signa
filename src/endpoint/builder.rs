@@ -422,6 +422,9 @@ impl Builder {
         );
         let endpoint = Endpoint {
             client_admission: driver.client_admission(),
+            shutdown_control: driver.shutdown_control.clone(),
+            control: driver.control.clone(),
+            shutdown_wait: driver.shutdown_done.subscribe(),
             connection_stats: driver.connection_stats.clone(),
             commands,
             udp: udp_addr,

@@ -47,6 +47,7 @@ criterion::criterion_group! {
         endpoint::reply_route,
         endpoint::client_admission,
         endpoint::connection_admission,
+        endpoint::shutdown_coalescing,
         endpoint::server_admission,
         // One value at a time. These cover the checks that will move to
         // siparse, so they show what the switch changes for each type.

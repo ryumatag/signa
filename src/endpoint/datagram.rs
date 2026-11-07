@@ -153,7 +153,8 @@ impl Datagram {
 
     /// Sends what waits, as far as the socket takes it.
     pub(super) fn poll_flush(&mut self, cx: &mut Context<'_>) {
-        while let Some((bytes, flow, _)) = self.backlog.front() {
+        for _ in 0..32 {
+            let Some((bytes, flow, _)) = self.backlog.front() else { return };
             match self.socket.poll_send_ready(cx) {
                 Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(error)) => {
@@ -168,6 +169,10 @@ impl Datagram {
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
                 result => self.finish_front(result),
             }
+        }
+
+        if !self.backlog.is_empty() {
+            cx.waker().wake_by_ref();
         }
     }
 }

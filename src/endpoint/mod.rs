@@ -86,6 +86,12 @@ Application response allocations remain outside these transport limits.
 
 # Shutdown
 
+Shutdown calls share one completion signal and coalesce their earliest deadline
+into a separate bounded control queue. Client command saturation cannot occupy
+that queue. The driver rotates input sources, limits dispatch and UDP flush to
+32 items per turn, and yields after 64 events. Receipt polling also takes at
+most 32 items from each write class per turn.
+
 [`Endpoint::shutdown`] stops the endpoint once what it has in hand is done, or
 at a deadline. From the call on, a new request gets a stateless 503 and a new
 request through a [`Client`] fails with [`Error::is_closed`]. The endpoint goes
@@ -155,7 +161,7 @@ use std::{fmt, net::SocketAddr, time::Duration};
 
 #[cfg(feature = "__bench")]
 use bytes::Bytes;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 #[cfg(feature = "__bench")]
 use tower_service::Service;
 
@@ -201,6 +207,9 @@ mod timer;
 pub struct Endpoint {
     commands: mpsc::UnboundedSender<Command>,
     client_admission: ClientAdmission,
+    shutdown_control: std::sync::Arc<shutdown::Control>,
+    control: mpsc::Sender<()>,
+    shutdown_wait: tokio::sync::watch::Receiver<()>,
     connection_stats: std::sync::Arc<driver::ConnectionCounters>,
     udp: Option<SocketAddr>,
     tcp: Option<SocketAddr>,
@@ -298,12 +307,10 @@ impl Endpoint {
     /// ```
     pub fn shutdown(self, timeout: Duration) -> Shutdown {
         self.client_admission.close();
-        let (done, wait) = oneshot::channel();
-        // A send that fails means the endpoint has stopped already, and the
-        // dropped `done` resolves the future at once.
-        let _ = self.commands.send(Command::Shutdown { timeout, done });
-
-        Shutdown::new(self.commands, wait)
+        if self.shutdown_control.request(timeout) {
+            let _ = self.control.try_send(());
+        }
+        Shutdown::new(self.commands, self.shutdown_wait)
     }
 }
 

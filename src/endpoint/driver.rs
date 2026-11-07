@@ -2,12 +2,11 @@
 The task behind an endpoint.
 
 One task owns the sockets, both transaction tables, and the timers, so none of
-them needs a lock. Each turn it polls, in this order, the timer that is due
-first, what the service futures and connect tasks report back, the requests
-from clients, the TCP connections, the UDP socket, and, while requests wait
-for the service, the service's readiness. A request the service takes runs in
-a task of its own, since requests must run concurrently, and comes back as a
-command with its response.
+them needs a lock. It rotates through timers, internal completions, client
+commands, TCP, UDP and service dispatch. Shutdown has a separate coalesced
+control wakeup. Each turn bounds write-receipt polling, UDP flush and dispatch,
+and the task yields after 64 events so continuously ready work also shares the
+runtime with connection tasks.
 
 The tables are slabs, see [`table`], and the timers are one heap of deadlines,
 with one `Sleep` set to the earliest. An entry names its transaction by its
@@ -27,7 +26,6 @@ connections.
 
 use std::{
     collections::{HashMap, VecDeque},
-    convert::Infallible,
     future::{poll_fn, Future},
     io,
     net::{IpAddr, SocketAddr},
@@ -43,7 +41,7 @@ use std::{
 use bytes::Bytes;
 use foldhash::fast::RandomState;
 use tokio::{
-    sync::{mpsc, oneshot, Semaphore},
+    sync::{mpsc, oneshot, watch, Semaphore},
     time::Sleep,
 };
 use tower_service::Service;
@@ -59,6 +57,7 @@ use crate::{
             mark_via, reply_flow, sent_by_is, source_toward, via_value,
             Branches, Link,
         },
+        shutdown,
         table::{Id, Table},
         timer::{Key, TimerQueue},
     },
@@ -124,9 +123,8 @@ pub(super) enum Command {
         _attempt: crate::transport::budget::Permit,
     },
     /// An `Endpoint` asks the driver to stop once nothing is open, or after
-    /// `timeout`. `done` is dropped when it has, which is all the handle waits
-    /// for.
-    Shutdown { timeout: Duration, done: oneshot::Sender<Infallible> },
+    /// the shared deadline. Waiters observe the shared completion channel.
+    Shutdown,
 }
 
 /// Where the response to a request handed to the service goes.
@@ -276,8 +274,14 @@ pub(super) struct Driver<S> {
     /// Set by the first shutdown command. New requests get a 503 from then on,
     /// and the driver stops once `is_drained` says so.
     shutting_down: bool,
-    /// The handles waiting for the driver to stop, which is when these drop.
-    shutdown_done: Vec<oneshot::Sender<Infallible>>,
+    /// Closing this single sender wakes every caller-owned shutdown receiver.
+    pub(super) shutdown_done: watch::Sender<()>,
+    pub(super) shutdown_control: Arc<shutdown::Control>,
+    next_source: usize,
+    pub(super) control: mpsc::Sender<()>,
+    control_rx: mpsc::Receiver<()>,
+    write_cursor: usize,
+    fallback_cursor: usize,
     branches: Branches,
 }
 
@@ -297,6 +301,7 @@ where
         command_sender: mpsc::WeakUnboundedSender<Command>,
     ) -> Driver<S> {
         let (internal_tx, internal) = mpsc::unbounded_channel();
+        let (control, control_rx) = mpsc::channel(32);
 
         Driver {
             service,
@@ -346,7 +351,13 @@ where
             pending: 0,
             unanswered: 0,
             shutting_down: false,
-            shutdown_done: Vec::new(),
+            shutdown_done: watch::channel(()).0,
+            shutdown_control: Arc::default(),
+            next_source: 0,
+            control,
+            control_rx,
+            write_cursor: 0,
+            fallback_cursor: 0,
             branches: Branches::new(),
         }
     }
@@ -356,7 +367,24 @@ where
     }
 
     pub(super) async fn run(mut self) {
+        let mut turns = 0;
         loop {
+            if turns == 64 {
+                let mut yielded = false;
+                poll_fn(|cx| {
+                    if yielded {
+                        return Poll::Ready(());
+                    }
+                    yielded = true;
+
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                })
+                .await;
+                turns = 0;
+            }
+            turns += 1;
+
             match poll_fn(|cx| self.poll_event(cx)).await {
                 Event::Timer(Key::Shutdown) => return,
                 Event::Timer(key) => self.on_timer(key),
@@ -388,6 +416,10 @@ where
     /// The shutdown check comes last, once every source is pending, so that it
     /// sees the tables after everything that arrived has been handled.
     fn poll_event(&mut self, cx: &mut Context<'_>) -> Poll<Event> {
+        if let Poll::Ready(Some(())) = self.control_rx.poll_recv(cx) {
+            return Poll::Ready(Event::Command(Command::Shutdown));
+        }
+
         let servers = &self.servers;
         let clients = &self.clients;
         self.timers.compact(servers.len() + clients.len(), |key| match key {
@@ -398,20 +430,10 @@ where
             }
         });
 
-        if let Some(at) = self.timers.deadline() {
-            let at = tokio::time::Instant::from_std(at);
-            if self.sleep.deadline() != at {
-                self.sleep.as_mut().reset(at);
-            }
-            if self.sleep.as_mut().poll(cx).is_ready() {
-                let key = self.timers.pop().expect("peeked");
-                return Poll::Ready(Event::Timer(key));
-            }
-        }
-
-        let mut index = 0;
-
-        while index < self.writes.len() {
+        let mut index = self.write_cursor.min(self.writes.len());
+        let mut inspected = 0;
+        while index < self.writes.len() && inspected < 32 {
+            inspected += 1;
             if let Poll::Ready(result) =
                 Pin::new(&mut self.writes[index].0).poll(cx)
             {
@@ -422,8 +444,17 @@ where
             }
         }
 
-        let mut index = 0;
-        while index < self.fallback_writes.len() {
+        self.write_cursor = if index < self.writes.len() {
+            cx.waker().wake_by_ref();
+            index
+        } else {
+            0
+        };
+
+        let mut index = self.fallback_cursor.min(self.fallback_writes.len());
+        let mut inspected = 0;
+        while index < self.fallback_writes.len() && inspected < 32 {
+            inspected += 1;
             if let Poll::Ready(result) =
                 Pin::new(&mut self.fallback_writes[index].0).poll(cx)
             {
@@ -435,38 +466,54 @@ where
             }
         }
 
-        if let Poll::Ready(Some(command)) = self.internal.poll_recv(cx) {
-            return Poll::Ready(Event::Command(command));
-        }
-
-        match self.commands.poll_recv(cx) {
-            Poll::Ready(Some(command)) => {
-                return Poll::Ready(Event::Command(command))
-            }
-            Poll::Ready(None) => return Poll::Ready(Event::Stop),
-            Poll::Pending => {}
-        }
-
-        // The driver holds a sender, so the channel never ends.
-        if let Poll::Ready(Some(inbound)) = self.tcp.poll_recv(cx) {
-            return Poll::Ready(Event::Inbound(inbound));
-        }
-
-        if let Some(udp) = &mut self.udp {
-            udp.poll_flush(cx);
-            match udp.poll_recv(cx) {
-                Poll::Ready(Ok((datagram, flow))) => {
-                    return Poll::Ready(Event::Datagram(datagram, flow))
+        self.fallback_cursor = if index < self.fallback_writes.len() {
+            cx.waker().wake_by_ref();
+            index
+        } else {
+            0
+        };
+        for _ in 0..6 {
+            let source = self.next_source;
+            self.next_source = (source + 1) % 6;
+            let event = match source {
+                0 => self.poll_timer(cx),
+                1 => self
+                    .internal
+                    .poll_recv(cx)
+                    .map(|command| command.map(Event::Command)),
+                2 => self.commands.poll_recv(cx).map(|command| {
+                    Some(command.map_or(Event::Stop, Event::Command))
+                }),
+                3 => self
+                    .tcp
+                    .poll_recv(cx)
+                    .map(|inbound| inbound.map(Event::Inbound)),
+                4 => {
+                    if let Some(udp) = &mut self.udp {
+                        udp.poll_flush(cx);
+                        match udp.poll_recv(cx) {
+                            Poll::Ready(Ok((bytes, flow))) => {
+                                Poll::Ready(Some(Event::Datagram(bytes, flow)))
+                            }
+                            Poll::Ready(Err(_)) => {
+                                cx.waker().wake_by_ref();
+                                Poll::Pending
+                            }
+                            Poll::Pending => Poll::Pending,
+                        }
+                    } else {
+                        Poll::Pending
+                    }
                 }
-                // A receive error on an unconnected UDP socket is rare and
-                // says nothing about the next datagram. Try again on the
-                // next turn, without spinning on it now.
-                Poll::Ready(Err(_)) => cx.waker().wake_by_ref(),
-                Poll::Pending => {}
+                _ => {
+                    self.poll_dispatch(cx);
+                    Poll::Pending
+                }
+            };
+            if let Poll::Ready(Some(event)) = event {
+                return Poll::Ready(event);
             }
         }
-
-        self.poll_dispatch(cx);
 
         if self.shutting_down && self.is_drained() {
             return Poll::Ready(Event::Stop);
@@ -475,14 +522,23 @@ where
         Poll::Pending
     }
 
-    /// Returns `true` when nothing is left that a shutdown waits for.
-    ///
-    /// That is a request waiting for the service or in its hands, a client
-    /// transaction waiting for its final response, a connection being opened,
-    /// which carries a request or a response, and a datagram waiting for the
-    /// UDP socket. A transaction that only lingers to absorb retransmissions
-    /// is not waited for, since whatever it would answer goes unanswered once
-    /// the endpoint is gone anyway.
+    /// Polls the next transaction or shutdown deadline.
+    fn poll_timer(&mut self, cx: &mut Context<'_>) -> Poll<Option<Event>> {
+        if let Some(at) = self.timers.deadline() {
+            let at = tokio::time::Instant::from_std(at);
+            if self.sleep.deadline() != at {
+                self.sleep.as_mut().reset(at);
+            }
+            if self.sleep.as_mut().poll(cx).is_ready() {
+                let key = self.timers.pop().expect("peeked");
+                return Poll::Ready(Some(Event::Timer(key)));
+            }
+        }
+
+        Poll::Pending
+    }
+
+    /// Returns whether protocol and transport work has drained.
     fn is_drained(&self) -> bool {
         self.writes.is_empty()
             && self.queue.is_empty()
@@ -503,7 +559,17 @@ where
     /// fails `poll_ready` is done for good. The requests waiting for it get a
     /// 500, and every later one gets a 503 without reaching it.
     fn poll_dispatch(&mut self, cx: &mut Context<'_>) {
-        while !self.queue.is_empty() {
+        for _ in 0..32 {
+            if self.queue.is_empty() {
+                return;
+            }
+
+            if self.service_failed {
+                let (slot, _) = self.queue.pop_front().expect("checked above");
+                self.on_response(slot, None);
+                continue;
+            }
+
             match self.service.poll_ready(cx) {
                 Poll::Ready(Ok(())) => {
                     let (slot, request) =
@@ -519,12 +585,13 @@ where
                 }
                 Poll::Ready(Err(_)) => {
                     self.service_failed = true;
-                    while let Some((slot, _)) = self.queue.pop_front() {
-                        self.on_response(slot, None);
-                    }
                 }
                 Poll::Pending => return,
             }
+        }
+
+        if !self.queue.is_empty() {
+            cx.waker().wake_by_ref();
         }
     }
 
@@ -549,13 +616,10 @@ where
             Command::Connected { remote, result, _attempt } => {
                 self.on_connected(remote, result);
             }
-            Command::Shutdown { timeout, done } => {
+            Command::Shutdown => {
                 self.client_admission.0.close();
                 self.shutting_down = true;
-                self.shutdown_done.push(done);
-                // The earliest deadline wins when several handles ask. A
-                // timeout too long for the clock means no deadline.
-                if let Some(at) = now().checked_add(timeout) {
+                if let Some(at) = self.shutdown_control.take() {
                     self.timers.push(at, Key::Shutdown);
                 }
             }
@@ -1664,6 +1728,104 @@ mod tests {
         drop(driver);
         assert!(capacity.acquire(3).is_some());
         assert_eq!(stats.dropped.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn ready_internal_commands_do_not_starve_udp() {
+        let (mut driver, _commands, local) = reply_driver();
+        for _ in 0..100 {
+            driver.internal_tx.send(Command::Shutdown).unwrap();
+        }
+
+        let peer = UdpSocket::bind(REPLY_LOCAL).await.unwrap();
+        peer.send_to(
+            b"test",
+            SocketAddr::from(([127, 0, 0, 1], local.port())),
+        )
+        .await
+        .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let received = timeout(
+            Duration::from_secs(1),
+            poll_fn(|cx| {
+                for _ in 0..12 {
+                    if let Poll::Ready(Event::Datagram(bytes, _)) =
+                        driver.poll_event(cx)
+                    {
+                        return Poll::Ready(bytes);
+                    }
+                }
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(received.as_ref(), b"test");
+        assert!(driver.internal.len() >= 98);
+    }
+
+    #[tokio::test]
+    async fn shutdown_calls_coalesce_in_separate_control_capacity() {
+        let (mut driver, _commands, _) = reply_driver();
+        for _ in 0..10_000 {
+            if driver.shutdown_control.request(Duration::from_secs(30)) {
+                driver.control.try_send(()).unwrap();
+            }
+        }
+        assert_eq!(driver.control_rx.len(), 1);
+        assert!(driver.commands.is_empty());
+        assert!(matches!(
+            poll_fn(|cx| driver.poll_event(cx)).await,
+            Event::Command(Command::Shutdown)
+        ));
+
+        driver.on_command(Command::Shutdown);
+        assert!(driver.shutting_down);
+        assert!(!driver.shutdown_control.request(Duration::from_secs(60)));
+        assert!(driver.shutdown_control.request(Duration::ZERO));
+    }
+
+    #[tokio::test]
+    async fn failed_service_dispatch_is_bounded_per_turn() {
+        let (mut driver, _commands, local) = reply_driver();
+        let request = route_request("SIP/2.0/UDP example.com:9;rport");
+        let link = udp_reply_link(local, "127.0.0.1:9".parse().unwrap());
+        for _ in 0..65 {
+            driver
+                .queue
+                .push_back((Slot::Stateless(link.clone()), request.clone()));
+        }
+        driver.service_failed = true;
+        poll_fn(|cx| {
+            driver.poll_dispatch(cx);
+            assert_eq!(driver.queue.len(), 33);
+            driver.poll_dispatch(cx);
+            assert_eq!(driver.queue.len(), 1);
+            driver.poll_dispatch(cx);
+            assert!(driver.queue.is_empty());
+            Poll::Ready(())
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn shared_shutdown_completion_wakes_every_caller() {
+        let endpoint = crate::endpoint::Endpoint::builder()
+            .serve(crate::endpoint::tests::RouteService)
+            .unwrap();
+        let waits: Vec<_> = (0..1000)
+            .map(|_| endpoint.clone().shutdown(Duration::from_secs(1)))
+            .collect();
+        drop(endpoint);
+        timeout(Duration::from_secs(1), async {
+            for wait in waits {
+                wait.await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     struct SendNext {
