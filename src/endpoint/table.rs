@@ -22,7 +22,7 @@ use foldhash::fast::RandomState;
 use hashbrown::HashTable;
 
 /// Names an entry of a [`Table`] for as long as it is there.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Id {
     slot: u32,
     generation: u32,

@@ -49,7 +49,12 @@ async fn main() {
         Ok::<_, Infallible>(response)
     });
 
-    let server = Endpoint::builder().udp(LOCALHOST).serve(service).unwrap();
+    // Retain every response for Timer J instead of measuring overload.
+    let server = Endpoint::builder()
+        .udp(LOCALHOST)
+        .max_server_transactions(1 << 24)
+        .serve(service)
+        .unwrap();
     let client_end = Endpoint::builder()
         .udp(LOCALHOST)
         .max_client_transactions(1 << 24)

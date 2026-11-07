@@ -13,8 +13,9 @@ The tables are slabs, see [`table`], and the timers are one heap of deadlines,
 with one `Sleep` set to the earliest. An entry names its transaction by its
 table id. A transaction whose deadline moves gets a new entry, and an entry
 whose transaction has moved on is harmless, because a transaction fires nothing
-before its time, and one whose transaction is gone finds nothing. So nothing is
-ever removed from the heap except by popping.
+before its time, and one whose transaction is gone finds nothing. The timer
+queue also compacts stale entries and shrinks its allocation relative to live
+table entries, so fast transaction churn cannot retain an unbounded history.
 
 A shutdown is a deadline on the heap too. From the command on, the driver
 answers new requests with a 503 and refuses new sends, and it stops as soon as
@@ -25,8 +26,7 @@ connections.
 */
 
 use std::{
-    cmp::Ordering,
-    collections::{BinaryHeap, HashMap, VecDeque},
+    collections::{HashMap, VecDeque},
     convert::Infallible,
     future::{poll_fn, Future},
     io,
@@ -57,6 +57,7 @@ use crate::{
             Branches, Link,
         },
         table::{Id, Table},
+        timer::{Key, TimerQueue},
     },
     message::{
         header::{via::Via, VIA},
@@ -178,41 +179,6 @@ enum Pending {
     OneShot(Bytes, Completion),
 }
 
-/// A heap entry. Earlier deadlines come out first.
-#[derive(Clone, Copy)]
-struct Timer {
-    at: Instant,
-    key: Key,
-}
-
-#[derive(Clone, Copy)]
-enum Key {
-    Server(Id),
-    Client(Id),
-    /// The shutdown deadline. The driver stops when it fires.
-    Shutdown,
-}
-
-impl PartialEq for Timer {
-    fn eq(&self, other: &Timer) -> bool {
-        self.at == other.at
-    }
-}
-
-impl Eq for Timer {}
-
-impl PartialOrd for Timer {
-    fn partial_cmp(&self, other: &Timer) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Timer {
-    fn cmp(&self, other: &Timer) -> Ordering {
-        other.at.cmp(&self.at)
-    }
-}
-
 /// What one turn of the loop acts on.
 enum Event {
     Timer(Key),
@@ -246,7 +212,7 @@ pub(super) struct Driver<S> {
     servers: Table<ServerKey, ServerEntry>,
     clients: Table<ClientKey, ClientEntry>,
     routes: HashMap<SocketAddr, Route, RandomState>,
-    timers: BinaryHeap<Timer>,
+    timers: TimerQueue,
     sleep: Pin<Box<Sleep>>,
     /// Requests waiting for the service to be ready.
     queue: VecDeque<(Slot, Request<Bytes>)>,
@@ -301,7 +267,7 @@ where
             servers: Table::new(),
             clients: Table::new(),
             routes: HashMap::default(),
-            timers: BinaryHeap::new(),
+            timers: TimerQueue::new(),
             sleep: Box::pin(tokio::time::sleep(std::time::Duration::ZERO)),
             queue: VecDeque::new(),
             pending: 0,
@@ -349,14 +315,24 @@ where
     /// The shutdown check comes last, once every source is pending, so that it
     /// sees the tables after everything that arrived has been handled.
     fn poll_event(&mut self, cx: &mut Context<'_>) -> Poll<Event> {
-        if let Some(timer) = self.timers.peek() {
-            let at = tokio::time::Instant::from_std(timer.at);
+        let servers = &self.servers;
+        let clients = &self.clients;
+        self.timers.compact(servers.len() + clients.len(), |key| match key {
+            Key::Server(id) => servers.get(id)?.tx.deadline(),
+            Key::Client(id) => clients.get(id)?.tx.deadline(),
+            Key::Shutdown => {
+                unreachable!("the queue owns the shutdown deadline")
+            }
+        });
+
+        if let Some(at) = self.timers.deadline() {
+            let at = tokio::time::Instant::from_std(at);
             if self.sleep.deadline() != at {
                 self.sleep.as_mut().reset(at);
             }
             if self.sleep.as_mut().poll(cx).is_ready() {
-                let timer = self.timers.pop().expect("peeked");
-                return Poll::Ready(Event::Timer(timer.key));
+                let key = self.timers.pop().expect("peeked");
+                return Poll::Ready(Event::Timer(key));
             }
         }
 
@@ -493,7 +469,7 @@ where
                 // The earliest deadline wins when several handles ask. A
                 // timeout too long for the clock means no deadline.
                 if let Some(at) = now().checked_add(timeout) {
-                    self.timers.push(Timer { at, key: Key::Shutdown });
+                    self.timers.push(at, Key::Shutdown);
                 }
             }
         }
@@ -563,7 +539,7 @@ where
         let after = entry.tx.deadline();
         if after != before {
             if let Some(at) = after {
-                self.timers.push(Timer { at, key: Key::Server(id) });
+                self.timers.push(at, Key::Server(id));
             }
         }
     }
@@ -579,7 +555,7 @@ where
         let after = entry.tx.deadline();
         if after != before {
             if let Some(at) = after {
-                self.timers.push(Timer { at, key: Key::Client(id) });
+                self.timers.push(at, Key::Client(id));
             }
         }
     }
@@ -849,7 +825,7 @@ where
         let entry = ClientEntry { tx, link, respond: Some(respond), permit };
         let id = self.clients.insert(key, entry);
         if let Some(at) = deadline {
-            self.timers.push(Timer { at, key: Key::Client(id) });
+            self.timers.push(at, Key::Client(id));
         }
         self.unanswered += 1;
     }
@@ -998,6 +974,8 @@ where
         if self.service_failed
             || self.shutting_down
             || waiting >= self.config.max_pending_requests
+            || (key.is_some()
+                && self.servers.len() >= self.config.max_server_transactions)
         {
             self.stateless(&request, &link, SERVICE_UNAVAILABLE);
             return;
@@ -1016,7 +994,7 @@ where
                 let deadline = tx.deadline();
                 let id = self.servers.insert(key, ServerEntry { tx, link });
                 if let Some(at) = deadline {
-                    self.timers.push(Timer { at, key: Key::Server(id) });
+                    self.timers.push(at, Key::Server(id));
                 }
 
                 Slot::Transaction(id)
@@ -1157,6 +1135,79 @@ mod tests {
             // returns, rather than relying on a scheduler race.
             drop(self.client.lock().unwrap().call(self.request.clone()));
         }
+    }
+
+    #[tokio::test]
+    async fn timer_j_returns_server_capacity_and_old_ids_do_not_touch_reused_slots(
+    ) {
+        let (mut driver, _commands, local) = reply_driver_with(Config {
+            max_server_transactions: 1,
+            ..Config::default()
+        });
+        let request = route_request(
+            "SIP/2.0/UDP example.com:9;branch=z9hG4bKfirst;rport",
+        );
+        let link = udp_reply_link(local, "127.0.0.1:9".parse().unwrap());
+
+        driver.on_request(request.clone(), link.clone());
+        let (slot, received) = driver.queue.pop_front().unwrap();
+        let Slot::Transaction(old) = slot else { panic!("stateful request") };
+        driver.on_response(slot, Some(route_response(&received)));
+        assert_eq!(driver.servers.len(), 1);
+        let entry = driver.servers.get_mut(old).unwrap();
+        let at = entry.tx.deadline().unwrap();
+        entry.tx.on_timeout(at);
+        driver.settle_server(old, Some(at));
+        assert_eq!(driver.servers.len(), 0);
+
+        driver.on_request(request, link);
+        driver.on_timer(Key::Server(old));
+
+        assert_eq!(driver.servers.len(), 1);
+        assert_eq!(driver.queue.len(), 1);
+        let (Slot::Transaction(current), _) = driver.queue.front().unwrap()
+        else {
+            panic!("stateful request");
+        };
+        assert_ne!(*current, old);
+        assert!(driver.servers.get(*current).is_some());
+    }
+
+    #[tokio::test]
+    async fn fast_server_churn_does_not_retain_every_cancelled_trying_timer() {
+        let (mut driver, _commands, local) = reply_driver_with(Config {
+            max_server_transactions: 1,
+            ..Config::default()
+        });
+        let request = route_request(
+            "SIP/2.0/UDP example.com:9;branch=z9hG4bKchurn;rport",
+        );
+        let link = udp_reply_link(local, "127.0.0.1:9".parse().unwrap());
+
+        for _ in 0..1000 {
+            driver.on_request(request.clone(), link.clone());
+            let (slot, received) = driver.queue.pop_front().unwrap();
+            let response = Response::reply_to(&received)
+                .status(408)
+                .body(Bytes::new())
+                .unwrap();
+            // RFC 4320 drops a TU 408 and terminates without a wire response.
+            driver.on_response(slot, Some(response));
+            poll_fn(|cx| {
+                if let Poll::Ready(Event::Timer(key)) = driver.poll_event(cx) {
+                    driver.on_timer(key);
+                }
+                Poll::Ready(())
+            })
+            .await;
+        }
+
+        assert_eq!(driver.servers.len(), 0);
+        let mut retained = 0;
+        while driver.timers.pop().is_some() {
+            retained += 1;
+        }
+        assert!(retained <= 64, "retained {retained} cancelled timers");
     }
 
     #[tokio::test]

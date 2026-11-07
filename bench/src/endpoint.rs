@@ -80,6 +80,7 @@ pub(super) fn round_trip(c: &mut Criterion) {
             .udp(LOCALHOST)
             .tcp(LOCALHOST)
             .timers(short_timers())
+            .max_server_transactions(1 << 20)
             .serve(Ok200)
             .unwrap();
         // Even with Timer K at 50 ms, more than the default 4096 client
@@ -305,4 +306,51 @@ pub(super) fn client_admission(c: &mut Criterion) {
     });
 
     drop(pending);
+}
+
+pub(super) fn server_admission(c: &mut Criterion) {
+    let rt = runtime();
+    let (server, endpoint) = {
+        let _guard = rt.enter();
+        // Keep the first Completed entry for the whole measurement, including
+        // longer CI runs. No rejected request may create another entry.
+        let timers = Timers::builder()
+            .t1(Duration::from_secs(60))
+            .t2(Duration::from_secs(240))
+            .build()
+            .unwrap();
+        let server = Endpoint::builder()
+            .udp(LOCALHOST)
+            .timers(timers)
+            .max_server_transactions(1)
+            .serve(Ok200)
+            .unwrap();
+        let endpoint = Endpoint::builder()
+            .udp(LOCALHOST)
+            .timers(short_timers())
+            .max_client_transactions(1 << 20)
+            .serve(NoDispatch)
+            .unwrap();
+        (server, endpoint)
+    };
+    let mut client =
+        endpoint.client(Transport::Udp, server.udp_addr().unwrap());
+    let request = Request::builder()
+        .method("OPTIONS")
+        .uri("sip:example.com")
+        .header("CSeq", "1 OPTIONS")
+        .body(Bytes::new())
+        .unwrap();
+    let len = request.to_bytes().len() as u64;
+
+    let first = rt.block_on(client.call(request.clone())).unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    benchmark(c, "reject/endpoint/server_table", len, |b| {
+        b.iter(|| {
+            let response =
+                rt.block_on(client.call(bb(request.clone()))).unwrap();
+            assert_eq!(response.status().as_u16(), 503);
+        });
+    });
 }

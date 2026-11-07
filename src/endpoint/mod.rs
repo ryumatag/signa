@@ -20,6 +20,13 @@ non-INVITE request no provisional response worth sending, and the endpoint
 sends the one 100 the RFC asks for itself when the service is slow, so the
 service never deals with provisional responses.
 
+[`Builder::max_pending_requests`] bounds requests waiting for or held by the
+service until their response command is processed. The separate
+[`Builder::max_server_transactions`] counts every live server entry, including
+UDP Completed entries retained for Timer J. A full table refuses new stateful
+requests with a stateless 503 while still handling existing retransmissions.
+These are count limits. They do not bound application-owned response sizes.
+
 The service is polled for readiness before each request and called on the
 same instance, and each call runs in its own task. Requests wait for the
 service up to a limit, and a request beyond it is answered with a stateless
@@ -147,6 +154,7 @@ mod reply;
 mod routing;
 mod shutdown;
 mod table;
+mod timer;
 
 /// A handle to a running endpoint.
 ///
@@ -966,6 +974,94 @@ mod tests {
         let response = peer.recv().await.unwrap();
         assert!(response.starts_with("SIP/2.0 200 OK\r\n"), "{response}");
         assert!(response.contains("branch=z9hG4bK2"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn completed_servers_refuse_new_transactions_but_answer_retransmissions(
+    ) {
+        let service = Counting::default();
+        let server = Endpoint::builder()
+            .udp(LOCALHOST)
+            .max_server_transactions(1)
+            .serve(service.clone())
+            .unwrap();
+        let to = server.udp_addr().unwrap();
+        let mut peer = Peer::new().await;
+        let first = peer.request(
+            "OPTIONS",
+            &format!(
+                "SIP/2.0/UDP 127.0.0.1:{};branch=z9hG4bKfirst",
+                peer.port(),
+            ),
+        );
+        let second = first.replace("z9hG4bKfirst", "z9hG4bKsecond");
+
+        peer.send(to, &first).await;
+        let final_response = peer.recv().await.unwrap();
+        assert!(final_response.starts_with("SIP/2.0 200 OK\r\n"));
+
+        peer.send(to, &second).await;
+        assert!(peer.recv().await.unwrap().starts_with("SIP/2.0 503 "));
+        peer.send(to, &second).await;
+        assert!(peer.recv().await.unwrap().starts_with("SIP/2.0 503 "));
+        peer.send(to, &first).await;
+
+        assert_eq!(peer.recv().await.unwrap(), final_response);
+        assert_eq!(service.requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn reliable_server_finals_return_the_only_table_slot() {
+        let service = Counting::default();
+        let server = Endpoint::builder()
+            .tcp(LOCALHOST)
+            .max_server_transactions(1)
+            .max_pending_requests(1)
+            .serve(service.clone())
+            .unwrap();
+        let endpoint = Endpoint::builder().serve(Counting::default()).unwrap();
+        let mut client =
+            endpoint.client(Transport::Tcp, server.tcp_addr().unwrap());
+
+        for _ in 0..40 {
+            let response = timeout(
+                Duration::from_secs(3),
+                client.call(request("OPTIONS")),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        assert_eq!(service.requests.load(Ordering::SeqCst), 40);
+    }
+
+    #[tokio::test]
+    async fn zero_server_capacity_still_allows_legacy_stateless_dispatch() {
+        let service = Counting::default();
+        let server = Endpoint::builder()
+            .udp(LOCALHOST)
+            .max_server_transactions(0)
+            .serve(service.clone())
+            .unwrap();
+        let to = server.udp_addr().unwrap();
+        let mut peer = Peer::new().await;
+        let stateful = peer.request(
+            "OPTIONS",
+            &format!(
+                "SIP/2.0/UDP 127.0.0.1:{};branch=z9hG4bKfirst",
+                peer.port(),
+            ),
+        );
+        let stateless = stateful.replace(";branch=z9hG4bKfirst", "");
+
+        peer.send(to, &stateful).await;
+        assert!(peer.recv().await.unwrap().starts_with("SIP/2.0 503 "));
+        peer.send(to, &stateless).await;
+
+        assert!(peer.recv().await.unwrap().starts_with("SIP/2.0 200 OK\r\n"));
+        assert_eq!(service.requests.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

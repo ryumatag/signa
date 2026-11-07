@@ -24,6 +24,7 @@ pub(super) struct Config {
     pub(super) timers: Timers,
     pub(super) tcp: tcp::Config,
     pub(super) max_pending_requests: usize,
+    pub(super) max_server_transactions: usize,
     pub(super) max_client_transactions: usize,
     pub(super) max_client_request_bytes: usize,
 }
@@ -34,6 +35,7 @@ impl Default for Config {
             timers: Timers::default(),
             tcp: tcp::Config::default(),
             max_pending_requests: 1024,
+            max_server_transactions: 4096,
             max_client_transactions: 4096,
             max_client_request_bytes: 64 * 1024 * 1024,
         }
@@ -144,6 +146,34 @@ impl Builder {
     /// once. A request beyond that gets a stateless 503. The default is 1024.
     pub fn max_pending_requests(mut self, limit: usize) -> Builder {
         self.config.max_pending_requests = limit;
+        self
+    }
+
+    /// Sets how many server transactions may be retained at once.
+    ///
+    /// The default is 4096. The limit includes requests waiting for the
+    /// service, requests in its hands and Completed entries. Over UDP a
+    /// non-INVITE final response stays in the table for Timer J (64 T1,
+    /// normally 32 seconds) to answer retransmissions, as required by
+    /// [RFC 3261 section 17.2.2]. A full table refuses new transactions with
+    /// a stateless 503. Existing retransmissions still match their transaction.
+    ///
+    /// Zero refuses all new stateful requests. Requests without an RFC 3261
+    /// transaction key still use only [`Builder::max_pending_requests`].
+    /// Neither limit caps response sizes or application-owned allocations.
+    ///
+    /// ```
+    /// use signa::endpoint::Endpoint;
+    ///
+    /// let builder = Endpoint::builder()
+    ///     .max_server_transactions(8192)
+    ///     .max_pending_requests(512);
+    /// # drop(builder);
+    /// ```
+    ///
+    /// [RFC 3261 section 17.2.2]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17.2.2
+    pub fn max_server_transactions(mut self, limit: usize) -> Builder {
+        self.config.max_server_transactions = limit;
         self
     }
 
