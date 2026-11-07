@@ -36,11 +36,19 @@ impl Datagram {
     }
 
     fn admit(&self, bytes: usize) -> io::Result<()> {
-        if self.backlog.len() >= self.limits.messages
+        self.admit_with_limits(bytes, self.limits)
+    }
+
+    fn admit_with_limits(
+        &self,
+        bytes: usize,
+        limits: WriteLimits,
+    ) -> io::Result<()> {
+        if self.backlog.len() >= limits.messages
             || self
                 .queued_bytes
                 .checked_add(bytes)
-                .map_or(true, |total| total > self.limits.bytes)
+                .map_or(true, |total| total > limits.bytes)
         {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -93,6 +101,18 @@ impl Datagram {
             }
         }
         self.enqueue(bytes.clone(), *flow)
+    }
+
+    pub(super) fn send_request(
+        &mut self,
+        bytes: &Bytes,
+        flow: &Flow,
+    ) -> io::Result<()> {
+        self.admit_with_limits(
+            bytes.len(),
+            crate::transport::budget::request_limits(self.limits),
+        )?;
+        self.send(bytes, flow)
     }
 
     pub(super) fn submit(
@@ -215,6 +235,31 @@ mod tests {
             commands: receiver,
             capacity,
         }
+    }
+
+    #[tokio::test]
+    async fn new_requests_leave_udp_capacity_for_transaction_output() {
+        let Fixture { mut datagram, .. } =
+            fixture("127.0.0.1:9".parse().unwrap());
+        datagram.limits = WriteLimits { messages: 4, bytes: 8 };
+        let flow = udp_reply_link(
+            datagram.local_addr(),
+            "127.0.0.1:9".parse().unwrap(),
+        )
+        .flow;
+        datagram.enqueue(Bytes::from_static(b"123456"), flow).unwrap();
+        assert_eq!(
+            datagram
+                .send_request(&Bytes::from_static(b"7"), &flow)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        datagram.send(&Bytes::from_static(b"78"), &flow).unwrap();
+        datagram.send_request(&Bytes::new(), &flow).unwrap_err();
+        datagram.send(&Bytes::new(), &flow).unwrap();
+        datagram.send(&Bytes::new(), &flow).unwrap();
+        assert_eq!(datagram.backlog.len(), 4);
     }
 
     #[tokio::test]

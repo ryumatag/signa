@@ -16,7 +16,8 @@ use crate::message::HeaderName;
 /// of making up a response, and [`Error::is_timeout`] and
 /// [`Error::is_transport`] tell them apart. The other cases are refusals: a
 /// request too large for UDP, one without the `CSeq` the response is matched
-/// by, too many transactions open, or an endpoint that has stopped.
+/// by, exhausted request or connection admission, or an endpoint that has
+/// stopped.
 ///
 /// [`Client`]: super::Client
 pub struct Error {
@@ -81,8 +82,11 @@ impl Error {
         matches!(self.kind, Kind::TooLarge(_))
     }
 
-    /// Returns `true` if client admission has exhausted its request count or
-    /// logical request-byte budget. The request was not enqueued or sent.
+    /// Returns `true` if request or connection admission is exhausted.
+    ///
+    /// Request count and logical-byte limits refuse before command enqueue.
+    /// Route, connection and connect-attempt limits refuse in the driver. In
+    /// either case the request was not sent.
     pub fn is_busy(&self) -> bool {
         matches!(self.kind, Kind::Busy)
     }

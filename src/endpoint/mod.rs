@@ -61,6 +61,29 @@ transaction, without a later callback to the service. A later UDP send failure
 drops the datagram and lets peer retransmissions recover it. These limits do
 not cap application response allocations or operating-system socket buffers.
 
+Connection and route admission is also finite. Accepted connections use
+[`Builder::max_connections`], while outbound client connections use
+[`Builder::max_outbound_connections`] and [`Builder::max_pending_connects`].
+Responses have 64 independent outbound connection and attempt slots.
+[`Builder::max_routes`] bounds cached next hops, with 64 extra response
+entries. UDP source selection continues without caching when it cannot retain
+an entry. TCP attempts have a [`Builder::connect_timeout`]. All connection
+slots include writer drain and abort completion.
+
+[`Builder::fallback_limits`] bounds ordinary responses waiting for a new
+connection through local write completion. [`Endpoint::connection_stats`]
+reports refusals and fallback drops, including unfinished fallbacks discarded
+when the driver stops. One-shot reply failures go to their completion futures.
+New client writes leave a quarter of each socket's write counts and bytes for
+existing transaction output and responses, rounded down. These reserves do not
+promise delivery when response traffic itself exhausts capacity.
+
+The connection count and per-connection write limits together bound aggregate
+TCP output. There is no additional shared TCP output counter on every write.
+UDP, one-shot replies and ordinary fallback have their own endpoint budgets.
+These are logical encoded-byte limits, not backing allocation or RSS limits.
+Application response allocations remain outside these transport limits.
+
 # Shutdown
 
 [`Endpoint::shutdown`] stops the endpoint once what it has in hand is done, or
@@ -178,11 +201,43 @@ mod timer;
 pub struct Endpoint {
     commands: mpsc::UnboundedSender<Command>,
     client_admission: ClientAdmission,
+    connection_stats: std::sync::Arc<driver::ConnectionCounters>,
     udp: Option<SocketAddr>,
     tcp: Option<SocketAddr>,
 }
 
+/// Cumulative connection-admission and ordinary fallback outcomes.
+///
+/// Counters saturate at `u64::MAX`. Snapshots can include concurrent updates
+/// independently. They count local outcomes, not delivery to the SIP peer.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct ConnectionStats {
+    /// TCP submissions refused by route, connection or connect-attempt limits.
+    pub rejected: u64,
+    /// Ordinary fallback responses lost to admission, connect or write failure.
+    /// Includes unfinished fallbacks discarded when the driver stops.
+    /// One-shot replies report their own error and are not included.
+    pub dropped: u64,
+}
+
 impl Endpoint {
+    /// Returns connection-admission and ordinary fallback counters.
+    ///
+    /// ```no_run
+    /// # fn inspect(endpoint: &signa::endpoint::Endpoint) {
+    /// let stats = endpoint.connection_stats();
+    /// println!("{} refusals, {} fallback drops", stats.rejected, stats.dropped);
+    /// # }
+    /// ```
+    pub fn connection_stats(&self) -> ConnectionStats {
+        use std::sync::atomic::Ordering;
+        ConnectionStats {
+            rejected: self.connection_stats.rejected.load(Ordering::Relaxed),
+            dropped: self.connection_stats.dropped.load(Ordering::Relaxed),
+        }
+    }
+
     /// Starts building an endpoint.
     pub fn builder() -> Builder {
         Builder::new()

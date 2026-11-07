@@ -34,11 +34,32 @@ impl Budget {
     }
 
     pub(crate) fn acquire(&self, bytes: usize) -> Option<Permit> {
-        reserve(&self.0.messages, 1, self.0.limits.messages)?;
+        self.acquire_with_limits(bytes, self.0.limits)
+    }
+
+    // New requests leave a quarter of output capacity for transaction output
+    // and rejection responses. Tiny limits round the reserve down to zero.
+    pub(crate) fn acquire_request(&self, bytes: usize) -> Option<Permit> {
+        self.acquire_with_limits(bytes, request_limits(self.0.limits))
+    }
+
+    fn acquire_with_limits(
+        &self,
+        bytes: usize,
+        limits: WriteLimits,
+    ) -> Option<Permit> {
+        reserve(&self.0.messages, 1, limits.messages)?;
         let mut permit = Permit { budget: self.clone(), bytes: 0 };
-        reserve(&self.0.bytes, bytes, self.0.limits.bytes)?;
+        reserve(&self.0.bytes, bytes, limits.bytes)?;
         permit.bytes = bytes;
         Some(permit)
+    }
+}
+
+pub(crate) fn request_limits(limits: WriteLimits) -> WriteLimits {
+    WriteLimits {
+        messages: limits.messages - limits.messages / 4,
+        bytes: limits.bytes - limits.bytes / 4,
     }
 }
 

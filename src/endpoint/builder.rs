@@ -29,6 +29,11 @@ pub(super) struct Config {
     pub(super) max_client_request_bytes: usize,
     pub(super) udp_write_limits: WriteLimits,
     pub(super) max_reply_bytes: usize,
+    pub(super) max_outbound_connections: usize,
+    pub(super) max_pending_connects: usize,
+    pub(super) max_routes: usize,
+    pub(super) fallback_limits: WriteLimits,
+    pub(super) connect_timeout: Duration,
 }
 
 impl Default for Config {
@@ -45,6 +50,14 @@ impl Default for Config {
                 ..WriteLimits::default()
             },
             max_reply_bytes: 64 * 1024 * 1024,
+            max_outbound_connections: 1024,
+            max_pending_connects: 64,
+            max_routes: 4096,
+            fallback_limits: WriteLimits {
+                messages: 64,
+                bytes: 8 * 1024 * 1024,
+            },
+            connect_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -135,17 +148,80 @@ impl Builder {
     }
 
     /// Sets how long a TCP connection may go without receiving anything before
-    /// it is closed. The default is five minutes, which outlasts the RFC 5626
-    /// keepalive interval.
+    /// it is closed.
+    ///
+    /// The default is five minutes, which outlasts the RFC 5626 keepalive
+    /// interval.
     pub fn idle_timeout(mut self, timeout: Duration) -> Builder {
         self.config.tcp.idle_timeout = timeout;
         self
     }
 
     /// Sets how many TCP connections the listener keeps open at once. More
-    /// wait in the OS backlog. The default is 1024.
+    /// wait in the OS backlog.
+    ///
+    /// The default is 1024. The slot lasts through reader exit, writer drain
+    /// and acknowledgement of writer abort.
+    ///
+    /// Outbound connections use [`Builder::max_outbound_connections`].
     pub fn max_connections(mut self, limit: usize) -> Builder {
         self.config.tcp.max_connections = limit;
+        self
+    }
+
+    /// Sets the maximum connections opened for new client requests.
+    ///
+    /// The default is 1024. Connecting, reading, writing and draining all hold
+    /// a slot. Exhaustion reports [`Error::is_busy`]. Accepted
+    /// connections have the independent [`Builder::max_connections`] limit.
+    /// Another 64 outbound slots are reserved for response fallback, so new
+    /// client traffic cannot consume them. Zero disables new client connects.
+    ///
+    /// [`Error::is_busy`]: super::Error::is_busy
+    pub fn max_outbound_connections(mut self, limit: usize) -> Builder {
+        self.config.max_outbound_connections = limit;
+        self
+    }
+
+    /// Sets concurrent client connection attempts, including unprocessed
+    /// results.
+    ///
+    /// The default is 64. Responses have 64 separate attempt slots. A request
+    /// joining an existing attempt needs no additional slot.
+    pub fn max_pending_connects(mut self, limit: usize) -> Builder {
+        self.config.max_pending_connects = limit;
+        self
+    }
+
+    /// Sets the next-hop cache size available to new client requests.
+    ///
+    /// The default is 4096. Another 64 entries are reserved for response
+    /// fallback. At capacity, unused UDP or closed TCP entries are evicted.
+    /// Live or connecting entries are never evicted. A UDP source can be
+    /// computed without caching when full. New TCP destinations report Busy.
+    pub fn max_routes(mut self, limit: usize) -> Builder {
+        self.config.max_routes = limit;
+        self
+    }
+
+    /// Sets ordinary response fallback counts and encoded bytes.
+    ///
+    /// The defaults are 64 responses and 8 MiB, held from reconnect admission
+    /// through local write completion or failure. This is independent of
+    /// client request and one-shot reply admission. Saturated responses are
+    /// dropped and counted by [`Endpoint::connection_stats`].
+    ///
+    /// [`Endpoint::connection_stats`]: super::Endpoint::connection_stats
+    pub fn fallback_limits(mut self, limits: WriteLimits) -> Builder {
+        self.config.fallback_limits = limits;
+        self
+    }
+
+    /// Sets how long an outbound TCP connection attempt may take.
+    ///
+    /// The default is ten seconds. Endpoint teardown also cancels attempts.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Builder {
+        self.config.connect_timeout = timeout;
         self
     }
 
@@ -154,8 +230,14 @@ impl Builder {
     /// The defaults are 64 messages and 8 MiB. Counts and encoded bytes stay
     /// charged while queued, batched and partially written, until local
     /// completion or teardown. A saturated connection refuses new writes
-    /// without waiting. Client sends report a transport error and one-shot
-    /// replies report [`super::ReplyError::Busy`].
+    /// without waiting. New client requests leave one quarter of both limits
+    /// (rounded down) for existing transaction output and responses. Client
+    /// sends report a transport error and one-shot replies report
+    /// [`ReplyError::Busy`].
+    ///
+    /// [`ReplyError::Busy`]: super::ReplyError::Busy
+    ///
+    /// # Example
     ///
     /// ```
     /// use signa::{endpoint::Endpoint, transport::WriteLimits};
@@ -176,7 +258,11 @@ impl Builder {
     /// socket refuses new writes without waiting. Capacity is returned after
     /// the local send attempt, including failures. These limits also apply
     /// to immediately writable sends, so a single datagram cannot exceed
-    /// the byte budget. They do not promise delivery to a peer.
+    /// the byte budget. New client requests leave one quarter of both limits
+    /// (rounded down) for existing transaction output and responses. These
+    /// limits do not promise delivery to a peer.
+    ///
+    /// # Example
     ///
     /// ```
     /// use signa::{endpoint::Endpoint, transport::WriteLimits};
@@ -195,9 +281,13 @@ impl Builder {
     ///
     /// The default is 64 MiB. Reservation precedes encoding and command
     /// enqueue and lasts through connect setup and local write completion.
-    /// Saturation returns [`super::ReplyError::Busy`] without enqueue.
+    /// Saturation returns [`ReplyError::Busy`] without enqueue.
     /// The existing limit of 64 outstanding one-shot replies also applies.
     /// A dropped completion future does not return either reservation.
+    ///
+    /// [`ReplyError::Busy`]: super::ReplyError::Busy
+    ///
+    /// # Example
     ///
     /// ```
     /// use signa::endpoint::Endpoint;
@@ -229,6 +319,8 @@ impl Builder {
     /// transaction key still use only [`Builder::max_pending_requests`].
     /// Neither limit caps response sizes or application-owned allocations.
     ///
+    /// # Example
+    ///
     /// ```
     /// use signa::endpoint::Endpoint;
     ///
@@ -246,13 +338,15 @@ impl Builder {
 
     /// Sets how many client requests may be admitted at once, including
     /// queued commands, pending connects and live transactions. A request
-    /// beyond that fails before enqueue with [`super::Error::is_busy`].
+    /// beyond that fails before enqueue with [`Error::is_busy`].
     /// The default is 4096. Zero refuses all client requests.
     ///
     /// Over UDP a transaction stays open for Timer K, which is T4 or 5 s,
     /// after its final response, to absorb retransmissions of it. So the limit
     /// bounds the requests of the last five seconds, not the ones still
     /// waiting for an answer.
+    ///
+    /// [`Error::is_busy`]: super::Error::is_busy
     pub fn max_client_transactions(mut self, limit: usize) -> Builder {
         self.config.max_client_transactions = limit;
         self
@@ -270,6 +364,8 @@ impl Builder {
     /// backing allocations, generated Via metadata or allocator overhead.
     /// The transaction count separately bounds per-entry metadata. It is
     /// not a process memory ceiling.
+    ///
+    /// # Example
     ///
     /// ```
     /// use signa::endpoint::Endpoint;
@@ -326,6 +422,7 @@ impl Builder {
         );
         let endpoint = Endpoint {
             client_admission: driver.client_admission(),
+            connection_stats: driver.connection_stats.clone(),
             commands,
             udp: udp_addr,
             tcp: tcp_addr,

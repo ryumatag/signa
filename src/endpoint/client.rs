@@ -29,14 +29,18 @@ use crate::message::{header::CSEQ, request::Request, response::Response};
 /// `Client` implements [`Service`]. It is always ready. [`Service::call`]
 /// validates CSeq presence and reserves an endpoint-wide request count and
 /// content-byte budget before enqueue. Saturation returns [`Error::is_busy`]
-/// without queuing or sending. Successful enqueue commits the operation even
-/// when the returned future is never polled. The endpoint adds the
-/// topmost `Via` with a new branch, starts a client transaction, and sends the
-/// request. The future resolves with the final response, or with an
-/// [`Error`] when Timer F fires first or the transport fails. Provisional
-/// responses are not returned. A non-INVITE request gets at most a 100 that
-/// says nothing (RFC 4320), so there is nothing to return before the final
-/// response.
+/// without queuing or sending.
+///
+/// The driver can also return Busy when route or connection admission is full,
+/// before sending the request. Successful enqueue commits the operation even
+/// when the returned future is never polled. The endpoint adds the topmost
+/// `Via` with a new branch, starts a client transaction, and sends the
+/// request.
+///
+/// The future resolves with the final response, or with an [`Error`] when
+/// Timer F fires first or the transport fails. Provisional responses are not
+/// returned. A non-INVITE request gets at most a 100 that says nothing
+/// (RFC 4320), so there is nothing to return before the final response.
 ///
 /// # Dropping the future
 ///

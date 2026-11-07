@@ -142,6 +142,19 @@ impl Writer {
         self.enqueue(Write { bytes, done: None, permit: Some(permit) })
     }
 
+    /// Queues a new client request without consuming protocol headroom.
+    pub(crate) fn send_request(&self, bytes: Bytes) -> Result<(), SendError> {
+        if self.is_closed() {
+            return Err(SendError::Closed);
+        }
+        let permit = self
+            .0
+            .capacity
+            .acquire_request(bytes.len())
+            .ok_or(SendError::Full)?;
+        self.enqueue(Write { bytes, done: None, permit: Some(permit) })
+    }
+
     /// Queues a write and returns its local completion receipt.
     ///
     /// Successful enqueue commits the write. Dropping the receipt does not
@@ -261,7 +274,9 @@ impl Listener {
         listener.set_nonblocking(true)?;
         let local = listener.local_addr()?;
         let inner = TcpListener::from_std(listener)?;
-        let permits = Arc::new(Semaphore::new(config.max_connections));
+        let permits = Arc::new(Semaphore::new(
+            config.max_connections.min(Semaphore::MAX_PERMITS),
+        ));
 
         Ok(Listener { inner, local, config, permits, inbound })
     }
@@ -325,17 +340,25 @@ impl Listener {
 
 /// Opens a connection to `remote` and starts its tasks. Messages received on
 /// it go to `inbound`, and the returned `Writer` sends on it.
+#[cfg(any(test, feature = "__bench"))]
 pub async fn connect(
     remote: SocketAddr,
     config: &Config,
     inbound: &mpsc::Sender<Inbound>,
 ) -> io::Result<(Flow, Writer)> {
+    connect_reserved(remote, config, inbound, None).await
+}
+
+/// Opens a connection with a reservation held through reader and writer exit.
+pub(crate) async fn connect_reserved(
+    remote: SocketAddr,
+    config: &Config,
+    inbound: &mpsc::Sender<Inbound>,
+    permit: Option<OwnedSemaphorePermit>,
+) -> io::Result<(Flow, Writer)> {
     let stream = TcpStream::connect(remote).await?;
     let local = stream.local_addr()?;
     let flow = Flow { transport: Transport::Tcp, local, remote };
-    // The permit limits accepted connections. Opened ones are limited by
-    // whoever opens them.
-    let permit = None;
     let writer = start(stream, flow, Role::Client, config, inbound, permit)?;
 
     Ok((flow, writer))
@@ -343,8 +366,8 @@ pub async fn connect(
 
 /// Starts the reader and writer tasks of one connection.
 ///
-/// `permit` is the listener's slot for the connection. It is released when the
-/// reader ends, which is when the connection is over.
+/// `permit` is the admission slot for the connection. It is released when the
+/// reader and writer have both ended, including drain and abort completion.
 fn start(
     stream: TcpStream,
     flow: Flow,
@@ -363,7 +386,12 @@ fn start(
         queue,
         capacity: Budget::new(config.write_limits),
     }));
-    let mut writing = tokio::spawn(write_loop(write, pending));
+    let permit = Arc::new(permit.into());
+    let writer_permit = permit.clone();
+    let mut writing = tokio::spawn(async move {
+        write_loop(write, pending).await;
+        drop(writer_permit);
+    });
     let reading = read_loop(
         read,
         flow,
@@ -373,19 +401,22 @@ fn start(
         inbound.clone(),
         writer.clone(),
     );
-    let permit = permit.into();
 
     tokio::spawn(async move {
         match reading.await {
             // The connection is over. A write still in flight is lost, which
             // is no worse than the peer having gone away.
-            End::Peer => writing.abort(),
+            End::Peer => {
+                writing.abort();
+                let _ = writing.await;
+            }
             // The endpoint stopped. What it queued last, such as the final
             // responses before a shutdown, still goes out. The queue closes
             // with the endpoint's last `Writer`, and the writer ends with it.
             End::Endpoint => {
                 if timeout(DRAIN_TIMEOUT, &mut writing).await.is_err() {
                     writing.abort();
+                    let _ = writing.await;
                 }
             }
         }
@@ -628,6 +659,58 @@ mod tests {
     // The async receipt tests build runtimes without an I/O driver to run
     // under Miri. #[tokio::test] initializes kqueue, which Miri does not
     // support. Channels and mock writers need no I/O driver.
+
+    #[test]
+    fn new_requests_leave_output_capacity_for_protocol_messages() {
+        let (writer, mut pending) = test_writer(4, 8);
+        writer.send_request(Bytes::from_static(b"123456")).unwrap();
+        assert_eq!(
+            writer.send_request(Bytes::from_static(b"7")),
+            Err(SendError::Full)
+        );
+        writer.send(Bytes::from_static(b"78")).unwrap();
+        assert_eq!(
+            writer.send(Bytes::from_static(b"9")),
+            Err(SendError::Full)
+        );
+        drop(pending.try_recv().unwrap());
+        drop(pending.try_recv().unwrap());
+        for _ in 0..3 {
+            writer.send_request(Bytes::new()).unwrap();
+        }
+        assert_eq!(writer.send_request(Bytes::new()), Err(SendError::Full));
+        writer.send(Bytes::new()).unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn connection_reservation_survives_drain_and_writer_abort() {
+        let (tx, rx) = mpsc::channel(1);
+        let listener = TcpListener::bind(LOCALHOST).await.unwrap();
+        let permits = Arc::new(Semaphore::new(1));
+        let permit = permits.clone().try_acquire_owned().unwrap();
+        let (_, writer) = connect_reserved(
+            listener.local_addr().unwrap(),
+            &Config::default(),
+            &tx,
+            Some(permit),
+        )
+        .await
+        .unwrap();
+        let (_peer, _) = listener.accept().await.unwrap();
+
+        // A retained Writer keeps the queue open after the reader notices
+        // endpoint shutdown. Its reservation lasts through the drain timeout.
+        drop(rx);
+        tokio::task::yield_now().await;
+        assert_eq!(permits.available_permits(), 0);
+        timeout(DRAIN_TIMEOUT + Duration::from_secs(1), async {
+            let _permit = permits.acquire().await.unwrap();
+            assert!(writer.is_closed());
+        })
+        .await
+        .unwrap();
+    }
 
     #[test]
     fn receipts_distinguish_complete_partial_and_unwritten_messages() {

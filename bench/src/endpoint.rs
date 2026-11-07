@@ -354,3 +354,34 @@ pub(super) fn server_admission(c: &mut Criterion) {
         });
     });
 }
+
+/// Exercise driver-side refusal without starting a socket or a transaction.
+pub(super) fn connection_admission(c: &mut Criterion) {
+    let rt = runtime();
+    let endpoint = {
+        let _guard = rt.enter();
+        Endpoint::builder()
+            .max_outbound_connections(0)
+            .serve(NoDispatch)
+            .unwrap()
+    };
+    let mut client = endpoint.client(Transport::Tcp, LOCALHOST);
+    let request = Request::builder()
+        .method("OPTIONS")
+        .uri("sip:example.com")
+        .header("CSeq", "1 OPTIONS")
+        .body(Bytes::new())
+        .unwrap();
+    benchmark(
+        c,
+        "endpoint/tcp/connection_rejection",
+        request.to_bytes().len() as u64,
+        |b| {
+            b.iter(|| {
+                let error =
+                    rt.block_on(client.call(request.clone())).unwrap_err();
+                assert!(error.is_busy());
+            });
+        },
+    );
+}

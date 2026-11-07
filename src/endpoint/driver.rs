@@ -32,7 +32,10 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -115,7 +118,11 @@ pub(super) enum Command {
     /// The service answered a request, or failed on it.
     Respond { slot: Slot, response: Option<Response<Bytes>> },
     /// A connection the driver asked for is open, or could not be opened.
-    Connected { remote: SocketAddr, result: io::Result<(Flow, tcp::Writer)> },
+    Connected {
+        remote: SocketAddr,
+        result: io::Result<(Flow, tcp::Writer)>,
+        _attempt: crate::transport::budget::Permit,
+    },
     /// An `Endpoint` asks the driver to stop once nothing is open, or after
     /// `timeout`. `done` is dropped when it has, which is all the handle waits
     /// for.
@@ -175,8 +182,46 @@ enum Pending {
     /// An encoded response whose request came on a connection that has closed
     /// since. It goes to `sent-by` on a new connection
     /// (RFC 3261 section 18.2.2).
-    Response(Bytes),
+    Response(Bytes, Fallback),
     OneShot(Bytes, Completion),
+}
+
+/// Counters shared with endpoint handles. No per-message allocation.
+#[derive(Default, Debug)]
+pub(super) struct ConnectionCounters {
+    pub(super) rejected: AtomicU64,
+    pub(super) dropped: AtomicU64,
+}
+
+fn increment(counter: &AtomicU64) {
+    let mut n = counter.load(Ordering::Relaxed);
+    while n != u64::MAX {
+        match counter.compare_exchange_weak(
+            n,
+            n + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(actual) => n = actual,
+        }
+    }
+}
+
+// Count every admitted fallback that fails, including driver teardown. A
+// completed local write disarms the counter before returning its reservation.
+struct Fallback {
+    _permit: crate::transport::budget::Permit,
+    stats: Arc<ConnectionCounters>,
+    written: bool,
+}
+
+impl Drop for Fallback {
+    fn drop(&mut self) {
+        if !self.written {
+            increment(&self.stats.dropped);
+        }
+    }
 }
 
 /// What one turn of the loop acts on.
@@ -213,6 +258,13 @@ pub(super) struct Driver<S> {
     servers: Table<ServerKey, ServerEntry>,
     clients: Table<ClientKey, ClientEntry>,
     routes: HashMap<SocketAddr, Route, RandomState>,
+    outbound: Arc<Semaphore>,
+    response_connections: Arc<Semaphore>,
+    connects: Budget,
+    response_connects: Budget,
+    fallback: Budget,
+    fallback_writes: Vec<(tcp::Receipt, Fallback)>,
+    pub(super) connection_stats: Arc<ConnectionCounters>,
     timers: TimerQueue,
     sleep: Pin<Box<Sleep>>,
     /// Requests waiting for the service to be ready.
@@ -273,6 +325,21 @@ where
             servers: Table::new(),
             clients: Table::new(),
             routes: HashMap::default(),
+            outbound: Arc::new(Semaphore::new(
+                config.max_outbound_connections.min(Semaphore::MAX_PERMITS),
+            )),
+            response_connections: Arc::new(Semaphore::new(REPLY_OPERATIONS)),
+            connects: Budget::new(WriteLimits {
+                messages: config.max_pending_connects,
+                bytes: 0,
+            }),
+            response_connects: Budget::new(WriteLimits {
+                messages: REPLY_OPERATIONS,
+                bytes: 0,
+            }),
+            fallback: Budget::new(config.fallback_limits),
+            fallback_writes: Vec::new(),
+            connection_stats: Arc::default(),
             timers: TimerQueue::new(),
             sleep: Box::pin(tokio::time::sleep(std::time::Duration::ZERO)),
             queue: VecDeque::new(),
@@ -355,6 +422,19 @@ where
             }
         }
 
+        let mut index = 0;
+        while index < self.fallback_writes.len() {
+            if let Poll::Ready(result) =
+                Pin::new(&mut self.fallback_writes[index].0).poll(cx)
+            {
+                let (_, mut fallback) =
+                    self.fallback_writes.swap_remove(index);
+                fallback.written = result.is_ok();
+            } else {
+                index += 1;
+            }
+        }
+
         if let Poll::Ready(Some(command)) = self.internal.poll_recv(cx) {
             return Poll::Ready(Event::Command(command));
         }
@@ -407,6 +487,7 @@ where
         self.writes.is_empty()
             && self.queue.is_empty()
             && self.pending == 0
+            && self.fallback_writes.is_empty()
             && self.unanswered == 0
             && self.udp.as_ref().map_or(true, |udp| udp.is_idle())
             && !self
@@ -465,7 +546,7 @@ where
                 self.pending -= 1;
                 self.on_response(slot, response);
             }
-            Command::Connected { remote, result } => {
+            Command::Connected { remote, result, _attempt } => {
                 self.on_connected(remote, result);
             }
             Command::Shutdown { timeout, done } => {
@@ -503,8 +584,12 @@ where
                 let before = entry.tx.deadline();
                 let completion = match entry.tx.on_timeout(&timers, now) {
                     ClientEvent::Retransmit(request) => {
-                        match send_on(self.udp.as_mut(), &entry.link, &request)
-                        {
+                        match send_on(
+                            self.udp.as_mut(),
+                            &entry.link,
+                            &request,
+                            false,
+                        ) {
                             Ok(()) => None,
                             Err(err) => {
                                 entry.tx.on_transport_error();
@@ -626,7 +711,12 @@ where
 
     /// Sends `pending` to `remote` over the connection the driver has to it,
     /// or over one it opens now.
-    fn send_over_tcp(&mut self, remote: SocketAddr, pending: Pending) {
+    fn send_over_tcp(&mut self, remote: SocketAddr, pending: Pending) -> bool {
+        let response = !matches!(pending, Pending::Request(..));
+        if !self.admit_route(remote, response) {
+            self.reject_pending(pending);
+            return false;
+        }
         let route = self.routes.entry(remote).or_default();
         match &mut route.tcp {
             TcpState::Open(flow, writer) if !writer.is_closed() => {
@@ -634,18 +724,86 @@ where
                 self.deliver(pending, flow, writer);
             }
             TcpState::Connecting(waiting) => waiting.push(pending),
-            // Closed, or open once and gone since. Open a new connection
-            // and send once it is up.
             TcpState::Closed | TcpState::Open(..) => {
+                let (connections, attempts) = if response {
+                    (&self.response_connections, &self.response_connects)
+                } else {
+                    (&self.outbound, &self.connects)
+                };
+                let connection = connections.clone().try_acquire_owned();
+                let attempt = attempts.acquire(0);
+                let (Ok(connection), Some(attempt)) = (connection, attempt)
+                else {
+                    self.reject_pending(pending);
+                    return false;
+                };
                 route.tcp = TcpState::Connecting(vec![pending]);
                 let config = self.config.tcp;
+                let deadline = self.config.connect_timeout;
                 let inbound = self.tcp_tx.clone();
                 let internal = self.internal_tx.clone();
                 tokio::spawn(async move {
-                    let result = tcp::connect(remote, &config, &inbound).await;
-                    let _ =
-                        internal.send(Command::Connected { remote, result });
+                    let connect = tcp::connect_reserved(
+                        remote,
+                        &config,
+                        &inbound,
+                        Some(connection),
+                    );
+                    let result =
+                        connect_until(connect, &inbound, deadline).await;
+                    let _ = internal.send(Command::Connected {
+                        remote,
+                        result,
+                        _attempt: attempt,
+                    });
                 });
+            }
+        }
+        true
+    }
+
+    // New client destinations cannot consume the response reserve. Cache
+    // entries are only hints. Eviction never invalidates a transaction Link.
+    fn admit_route(&mut self, remote: SocketAddr, response: bool) -> bool {
+        if self.routes.contains_key(&remote) {
+            return true;
+        }
+        let limit = self.config.max_routes.saturating_add(if response {
+            REPLY_OPERATIONS
+        } else {
+            0
+        });
+        if limit == 0 {
+            return false;
+        }
+        if self.routes.len() >= limit {
+            let stale =
+                self.routes.iter().find_map(|(key, route)| match &route.tcp {
+                    TcpState::Closed => Some(*key),
+                    TcpState::Open(_, writer) if writer.is_closed() => {
+                        Some(*key)
+                    }
+                    _ => None,
+                });
+            if let Some(key) = stale {
+                self.routes.remove(&key);
+            }
+        }
+        self.routes.len() < limit
+    }
+
+    fn reject_pending(&self, pending: Pending) {
+        increment(&self.connection_stats.rejected);
+        match pending {
+            Pending::Request(request, respond, permit) => {
+                drop(request);
+                drop(permit);
+                let _ = respond.send(Err(Error::busy()));
+            }
+            Pending::Response(..) => {}
+            Pending::OneShot(bytes, completion) => {
+                drop(bytes);
+                completion.finish(Err(ReplyError::Busy));
             }
         }
     }
@@ -671,8 +829,10 @@ where
                     })),
                 }
             }
-            Pending::Response(bytes) => {
-                let _ = writer.send(bytes);
+            Pending::Response(bytes, permit) => {
+                if let Ok(receipt) = writer.submit(bytes) {
+                    self.fallback_writes.push((receipt, permit));
+                }
             }
         }
     }
@@ -725,10 +885,12 @@ where
                     drop(bytes);
                     completion.finish(Err(ReplyError::Busy))
                 }
-                Err(tcp::SendError::Closed) => self.send_over_tcp(
-                    link.flow.remote,
-                    Pending::OneShot(bytes, completion),
-                ),
+                Err(tcp::SendError::Closed) => {
+                    self.send_over_tcp(
+                        link.flow.remote,
+                        Pending::OneShot(bytes, completion),
+                    );
+                }
             }
         } else if let Some(udp) = self.udp.as_mut() {
             udp.submit(bytes, link.flow, completion);
@@ -750,14 +912,37 @@ where
     /// If that connection cannot be opened the response is lost. The RFC then
     /// asks for RFC 3263 to find another address, which is out of scope.
     fn send_reply(&mut self, link: &Link, bytes: &Bytes) -> io::Result<()> {
-        match send_on(self.udp.as_mut(), link, bytes) {
+        match send_on(self.udp.as_mut(), link, bytes, false) {
             Err(err)
                 if err.kind() == io::ErrorKind::BrokenPipe
                     && link.writer.is_some() =>
             {
                 let target = link.flow.remote;
-                self.send_over_tcp(target, Pending::Response(bytes.clone()));
-                Ok(())
+                let Some(permit) = self.fallback.acquire(bytes.len()) else {
+                    increment(&self.connection_stats.dropped);
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "response fallback budget is full",
+                    ));
+                };
+                if self.send_over_tcp(
+                    target,
+                    Pending::Response(
+                        bytes.clone(),
+                        Fallback {
+                            _permit: permit,
+                            stats: self.connection_stats.clone(),
+                            written: false,
+                        },
+                    ),
+                ) {
+                    Ok(())
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "connection admission is full",
+                    ))
+                }
             }
             result => result,
         }
@@ -777,13 +962,16 @@ where
             return Ok(bound);
         }
 
-        let route = self.routes.entry(remote).or_default();
-        if let Some(source) = route.udp_source {
+        if let Some(source) =
+            self.routes.get(&remote).and_then(|route| route.udp_source)
+        {
             return Ok(source);
         }
 
         let source = source_toward(remote)?;
-        route.udp_source = Some(source);
+        if self.admit_route(remote, false) {
+            self.routes.entry(remote).or_default().udp_source = Some(source);
+        }
 
         Ok(source)
     }
@@ -816,7 +1004,7 @@ where
             return;
         }
 
-        if let Err(err) = send_on(self.udp.as_mut(), &link, &bytes) {
+        if let Err(err) = send_on(self.udp.as_mut(), &link, &bytes, true) {
             drop(request);
             drop(bytes);
             drop(permit);
@@ -876,7 +1064,7 @@ where
                             let _ = respond.send(Err(Error::transport(err)));
                         }
                         // See `send_reply`.
-                        Pending::Response(_) => {}
+                        Pending::Response(..) => {}
                         Pending::OneShot(_, completion) => {
                             completion.finish(Err(ReplyError::Transport(
                                 io::Error::new(
@@ -970,7 +1158,12 @@ where
         if let Some(key) = &key {
             if let Some((_, entry)) = self.servers.find(key) {
                 if let Some(response) = entry.tx.on_retransmission() {
-                    let _ = send_on(self.udp.as_mut(), &entry.link, &response);
+                    let _ = send_on(
+                        self.udp.as_mut(),
+                        &entry.link,
+                        &response,
+                        false,
+                    );
                 }
                 return;
             }
@@ -1095,22 +1288,61 @@ fn now() -> Instant {
 
 /// Sends `bytes` along `link` without waiting.
 ///
+/// An attempt cannot outlive endpoint teardown or its setup deadline.
+async fn connect_until<T>(
+    connect: impl Future<Output = io::Result<T>>,
+    inbound: &mpsc::Sender<tcp::Inbound>,
+    deadline: Duration,
+) -> io::Result<T> {
+    let mut connect = std::pin::pin!(tokio::time::timeout(deadline, connect));
+    let mut closed = std::pin::pin!(inbound.closed());
+    poll_fn(|cx| {
+        if closed.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "endpoint stopped",
+            )));
+        }
+        connect.as_mut().poll(cx).map(|result| {
+            result.unwrap_or_else(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "TCP connect timed out",
+                ))
+            })
+        })
+    })
+    .await
+}
+
 /// Over TCP a full write queue is an error here. The connection is in trouble,
 /// and a transaction that retransmits will try again.
 fn send_on(
     udp: Option<&mut Datagram>,
     link: &Link,
     bytes: &Bytes,
+    new_request: bool,
 ) -> io::Result<()> {
     match (&link.writer, udp) {
-        (Some(writer), _) => writer.send(bytes.clone()).map_err(|err| {
+        (Some(writer), _) => (if new_request {
+            writer.send_request(bytes.clone())
+        } else {
+            writer.send(bytes.clone())
+        })
+        .map_err(|err| {
             let kind = match err {
                 tcp::SendError::Full => io::ErrorKind::WouldBlock,
                 tcp::SendError::Closed => io::ErrorKind::BrokenPipe,
             };
             io::Error::new(kind, err)
         }),
-        (None, Some(udp)) => udp.send(bytes, &link.flow),
+        (None, Some(udp)) => {
+            if new_request {
+                udp.send_request(bytes, &link.flow)
+            } else {
+                udp.send(bytes, &link.flow)
+            }
+        }
         (None, None) => unreachable!("a UDP flow comes from the UDP socket"),
     }
 }
@@ -1133,6 +1365,306 @@ mod tests {
         },
         Client,
     };
+
+    fn fallback(
+        driver: &Driver<crate::endpoint::tests::RouteService>,
+        bytes: Bytes,
+    ) -> Pending {
+        let permit = driver.fallback.acquire(bytes.len()).unwrap();
+        Pending::Response(
+            bytes,
+            Fallback {
+                _permit: permit,
+                stats: driver.connection_stats.clone(),
+                written: false,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn connect_deadline_and_endpoint_close_drop_the_attempt() {
+        let (tx, rx) = mpsc::channel(1);
+        let slots = Arc::new(Semaphore::new(1));
+        let permit = slots.clone().try_acquire_owned().unwrap();
+        let stalled = async move {
+            let _permit = permit;
+            std::future::pending::<io::Result<()>>().await
+        };
+        let error =
+            connect_until(stalled, &tx, Duration::ZERO).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(slots.available_permits(), 1);
+
+        let permit = slots.clone().try_acquire_owned().unwrap();
+        let stalled = async move {
+            let _permit = permit;
+            std::future::pending::<io::Result<()>>().await
+        };
+        drop(rx);
+        let error = connect_until(stalled, &tx, Duration::from_secs(60))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn route_churn_is_bounded_and_response_entries_have_reserved_room() {
+        let (mut driver, _commands, _) =
+            reply_driver_with(Config { max_routes: 2, ..Config::default() });
+        for port in 1..100 {
+            let remote = SocketAddr::from(([127, 0, 0, 1], port));
+            driver.udp_source(remote).unwrap();
+            assert!(driver.routes.len() <= 2);
+        }
+        driver.routes.clear();
+        for port in 1..=2 {
+            driver.routes.insert(
+                SocketAddr::from(([127, 0, 0, 1], port)),
+                Route {
+                    tcp: TcpState::Connecting(Vec::new()),
+                    ..Route::default()
+                },
+            );
+        }
+        let remote = "127.0.0.1:3".parse().unwrap();
+        assert!(!driver.admit_route(remote, false));
+        assert!(driver.admit_route(remote, true));
+        driver.udp_source(remote).unwrap();
+        assert_eq!(driver.routes.len(), 2);
+        for port in 3..=66 {
+            let remote = SocketAddr::from(([127, 0, 0, 1], port));
+            assert!(driver.admit_route(remote, true));
+            driver.routes.insert(
+                remote,
+                Route {
+                    tcp: TcpState::Connecting(Vec::new()),
+                    ..Route::default()
+                },
+            );
+        }
+        assert!(!driver.admit_route("127.0.0.1:67".parse().unwrap(), true));
+        driver.config.max_routes = 0;
+        driver.routes.clear();
+        driver.udp_source(remote).unwrap();
+        assert!(driver.routes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn new_client_connect_limits_do_not_block_response_connects() {
+        for (connections, attempts) in [(0, 1), (1, 0)] {
+            let (mut driver, commands, _) = reply_driver_with(Config {
+                max_outbound_connections: connections,
+                max_pending_connects: attempts,
+                ..Config::default()
+            });
+            let remote = "127.0.0.1:9".parse().unwrap();
+            let mut client = Client::new(
+                commands,
+                driver.client_admission(),
+                Transport::Tcp,
+                remote,
+            );
+            let response =
+                client.call(route_request("SIP/2.0/TCP example.com:9"));
+            let command = driver.commands.try_recv().unwrap();
+            driver.on_command(command);
+            assert!(response.await.unwrap_err().is_busy());
+            assert_eq!(
+                driver.connection_stats.rejected.load(Ordering::Relaxed),
+                1
+            );
+
+            let response = fallback(&driver, Bytes::from_static(b"response"));
+            assert!(driver.send_over_tcp(remote, response));
+            assert!(matches!(
+                driver.routes[&remote].tcp,
+                TcpState::Connecting(_)
+            ));
+            assert_eq!(driver.response_connections.available_permits(), 63);
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_results_keep_attempt_capacity_until_processed() {
+        let (mut driver, commands, _) = reply_driver_with(Config {
+            max_pending_connects: 1,
+            ..Config::default()
+        });
+        let listener =
+            tokio::net::TcpListener::bind(REPLY_LOCAL).await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let mut client = Client::new(
+            commands,
+            driver.client_admission(),
+            Transport::Tcp,
+            remote,
+        );
+        let response = client.call(route_request("SIP/2.0/TCP example.com:9"));
+        let command = driver.commands.try_recv().unwrap();
+        driver.on_command(command);
+        assert!(driver.connects.acquire(0).is_none());
+
+        let command = timeout(Duration::from_secs(1), driver.internal.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(driver.connects.acquire(0).is_none());
+        driver.on_command(command);
+        assert!(driver.connects.acquire(0).is_some());
+        assert_eq!(driver.outbound.available_permits(), 1023);
+        drop(response);
+        assert_eq!(driver.outbound.available_permits(), 1023);
+    }
+
+    #[tokio::test]
+    async fn fallback_count_and_bytes_survive_connect_and_write() {
+        let (mut driver, _commands, _) = reply_driver_with(Config {
+            fallback_limits: WriteLimits { messages: 2, bytes: 3 },
+            ..Config::default()
+        });
+        let listener =
+            tokio::net::TcpListener::bind(REPLY_LOCAL).await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let response = fallback(&driver, Bytes::from_static(b"abc"));
+        assert!(driver.send_over_tcp(remote, response));
+        assert!(driver.fallback.acquire(1).is_none());
+        let empty = fallback(&driver, Bytes::new());
+        assert!(driver.send_over_tcp(remote, empty));
+        assert!(driver.fallback.acquire(0).is_none());
+        let command = timeout(Duration::from_secs(1), driver.internal.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        driver.on_command(command);
+        assert_eq!(driver.fallback_writes.len(), 2);
+        assert!(driver.fallback.acquire(0).is_none());
+
+        poll_fn(|cx| {
+            let _ = driver.poll_event(cx);
+            if driver.fallback_writes.is_empty() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+
+        assert!(driver.fallback.acquire(3).is_some());
+        assert_eq!(driver.connection_stats.dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn ordinary_fallback_rejects_before_enqueue_and_returns_its_budget()
+    {
+        let (mut driver, _commands, _) = reply_driver_with(Config {
+            fallback_limits: WriteLimits { messages: 2, bytes: 3 },
+            ..Config::default()
+        });
+        let listener =
+            tokio::net::TcpListener::bind(REPLY_LOCAL).await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let (flow, writer) =
+            tcp::connect(remote, &driver.config.tcp, &driver.tcp_tx)
+                .await
+                .unwrap();
+        let (peer, _) = listener.accept().await.unwrap();
+        drop(peer);
+        timeout(Duration::from_secs(1), async {
+            while !writer.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let link = Link { flow, writer: Some(writer) };
+        driver.routes.insert(
+            remote,
+            Route {
+                tcp: TcpState::Connecting(Vec::new()),
+                ..Route::default()
+            },
+        );
+
+        driver.send_reply(&link, &Bytes::from_static(b"abc")).unwrap();
+        assert_eq!(
+            driver
+                .send_reply(&link, &Bytes::from_static(b"d"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        driver.send_reply(&link, &Bytes::new()).unwrap();
+        assert_eq!(
+            driver.send_reply(&link, &Bytes::new()).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let TcpState::Connecting(waiting) = &driver.routes[&remote].tcp else {
+            panic!("waiting for connection");
+        };
+        assert_eq!(waiting.len(), 2);
+        assert_eq!(driver.connection_stats.dropped.load(Ordering::Relaxed), 2);
+        driver.on_connected(
+            remote,
+            Err(io::Error::new(io::ErrorKind::ConnectionRefused, "refused")),
+        );
+        assert_eq!(driver.connection_stats.dropped.load(Ordering::Relaxed), 4);
+        assert!(driver.fallback.acquire(3).is_some());
+
+        let all = driver
+            .response_connections
+            .clone()
+            .try_acquire_many_owned(REPLY_OPERATIONS as u32)
+            .unwrap();
+        assert_eq!(
+            driver
+                .send_reply(&link, &Bytes::from_static(b"abc"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(driver.fallback.acquire(3).is_some());
+        assert_eq!(
+            driver.connection_stats.rejected.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(driver.connection_stats.dropped.load(Ordering::Relaxed), 5);
+        drop(all);
+    }
+
+    #[tokio::test]
+    async fn fallback_failure_and_teardown_return_capacity_and_count_drops() {
+        let (mut driver, _commands, _) = reply_driver_with(Config {
+            fallback_limits: WriteLimits { messages: 1, bytes: 3 },
+            ..Config::default()
+        });
+        let remote = "127.0.0.1:9".parse().unwrap();
+        driver.routes.insert(
+            remote,
+            Route {
+                tcp: TcpState::Connecting(Vec::new()),
+                ..Route::default()
+            },
+        );
+        let response = fallback(&driver, Bytes::from_static(b"abc"));
+        driver.send_over_tcp(remote, response);
+        driver.on_connected(
+            remote,
+            Err(io::Error::new(io::ErrorKind::ConnectionRefused, "refused")),
+        );
+        assert!(driver.fallback.acquire(3).is_some());
+        assert_eq!(driver.connection_stats.dropped.load(Ordering::Relaxed), 1);
+
+        driver.routes.get_mut(&remote).unwrap().tcp =
+            TcpState::Connecting(Vec::new());
+        let response = fallback(&driver, Bytes::from_static(b"abc"));
+        driver.send_over_tcp(remote, response);
+        let stats = driver.connection_stats.clone();
+        let capacity = driver.fallback.clone();
+        drop(driver);
+        assert!(capacity.acquire(3).is_some());
+        assert_eq!(stats.dropped.load(Ordering::Relaxed), 2);
+    }
 
     struct SendNext {
         client: Mutex<Client>,
