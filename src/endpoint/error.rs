@@ -15,9 +15,9 @@ use crate::message::HeaderName;
 /// 408 and a transport error as a 503. signa reports both as errors instead
 /// of making up a response, and [`Error::is_timeout`] and
 /// [`Error::is_transport`] tell them apart. The other cases are refusals: a
-/// request too large for UDP, one without the `CSeq` the response is matched
-/// by, exhausted request or connection admission, or an endpoint that has
-/// stopped.
+/// request too large for UDP, a missing or invalid `CSeq`, a method this
+/// client cannot send, exhausted request or connection admission, or an
+/// endpoint that has stopped.
 ///
 /// [`Client`]: super::Client
 pub struct Error {
@@ -29,6 +29,8 @@ enum Kind {
     Transport(io::Error),
     TooLarge(usize),
     Missing(HeaderName),
+    InvalidCSeq,
+    UnsupportedMethod,
     Busy,
     Closed,
 }
@@ -48,6 +50,26 @@ impl Error {
 
     pub(super) fn missing(name: HeaderName) -> Error {
         Error { kind: Kind::Missing(name) }
+    }
+
+    pub(super) fn invalid_cseq() -> Error {
+        Error { kind: Kind::InvalidCSeq }
+    }
+
+    pub(super) fn unsupported_method() -> Error {
+        Error { kind: Kind::UnsupportedMethod }
+    }
+
+    /// Returns `true` if CSeq is duplicated, malformed, or names a method
+    /// other than the request's method. The request was not sent.
+    pub fn is_invalid_cseq(&self) -> bool {
+        matches!(self.kind, Kind::InvalidCSeq)
+    }
+
+    /// Returns `true` for INVITE, ACK or CANCEL, which this non-INVITE
+    /// client cannot send with the required transaction semantics.
+    pub fn is_unsupported_method(&self) -> bool {
+        matches!(self.kind, Kind::UnsupportedMethod)
     }
 
     pub(super) fn busy() -> Error {
@@ -110,6 +132,8 @@ impl fmt::Debug for Error {
             Kind::Missing(name) => {
                 debug.field(&format_args!("Missing({name:?})"))
             }
+            Kind::InvalidCSeq => debug.field(&"InvalidCSeq"),
+            Kind::UnsupportedMethod => debug.field(&"UnsupportedMethod"),
             Kind::Busy => debug.field(&"Busy"),
             Kind::Closed => debug.field(&"Closed"),
         };
@@ -128,6 +152,12 @@ impl fmt::Display for Error {
                  that go over UDP"
             ),
             Kind::Missing(name) => write!(f, "the request has no {name}"),
+            Kind::InvalidCSeq => f.write_str(
+                "the request needs one valid CSeq matching its method",
+            ),
+            Kind::UnsupportedMethod => f.write_str(
+                "the client does not support INVITE, ACK or CANCEL",
+            ),
             Kind::Busy => {
                 f.write_str("client admission capacity is exhausted")
             }

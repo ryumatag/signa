@@ -307,6 +307,22 @@ pub(super) fn client_admission(c: &mut Criterion) {
         });
     });
 
+    let mut invalid = request.clone();
+    invalid
+        .headers_mut()
+        .insert(signa::message::header::CSEQ, "1 BYE".parse().unwrap());
+    benchmark(c, "reject/endpoint/client_cseq", len, |b| {
+        b.iter(|| {
+            let mut response = client.call(bb(invalid.clone()));
+            let Poll::Ready(Err(error)) =
+                Pin::new(&mut response).poll(&mut cx)
+            else {
+                panic!("invalid CSeq must reject before enqueue");
+            };
+            assert!(error.is_invalid_cseq());
+        });
+    });
+
     drop(pending);
 }
 

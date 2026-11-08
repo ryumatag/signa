@@ -15,7 +15,12 @@ use tokio::sync::{mpsc, oneshot};
 use tower_service::Service;
 
 use super::{admission::ClientAdmission, driver::Command, Error, Transport};
-use crate::message::{header::CSEQ, request::Request, response::Response};
+use crate::message::{
+    header::{cseq::CSeq, CSEQ},
+    request::Request,
+    response::Response,
+    Method,
+};
 
 /// Sends requests to one next hop and returns their final responses.
 ///
@@ -27,7 +32,7 @@ use crate::message::{header::CSEQ, request::Request, response::Response};
 /// # What a request becomes
 ///
 /// `Client` implements [`Service`]. It is always ready. [`Service::call`]
-/// validates CSeq presence and reserves an endpoint-wide request count and
+/// validates the method and CSeq and reserves an endpoint-wide request count and
 /// content-byte budget before enqueue. Saturation returns [`Error::is_busy`]
 /// without queuing or sending.
 ///
@@ -59,7 +64,17 @@ use crate::message::{header::CSEQ, request::Request, response::Response};
 ///
 /// # What the request needs
 ///
-/// The request must have a `CSeq`, since responses are matched by its method.
+/// The request must have exactly one parseable `CSeq` whose method matches
+/// the request, as required by [RFC 3261 section 8.1.1.5]. Missing or invalid
+/// CSeq values fail before admission or transport setup. Extension methods
+/// remain case-sensitive.
+///
+/// INVITE, ACK and CANCEL are rejected with [`Error::is_unsupported_method`].
+/// This client only runs non-INVITE transactions. INVITE needs its own machine,
+/// ACK needs a transport operation, and CANCEL must reuse its target's branch.
+///
+/// [RFC 3261 section 8.1.1.5]: https://www.rfc-editor.org/rfc/rfc3261.html#section-8.1.1.5
+///
 /// RFC 3261 section 8.1.1 requires `To`, `From`, `Call-ID`, and `Max-Forwards`
 /// too, but signa does not check them. Nothing in it depends on them.
 ///
@@ -111,8 +126,8 @@ impl Service<Request<Bytes>> for Client {
         if self.commands.is_closed() {
             return ResponseFuture::failed(Error::closed());
         }
-        if !request.headers().contains_key(CSEQ) {
-            return ResponseFuture::failed(Error::missing(CSEQ));
+        if let Err(error) = validate(&request) {
+            return ResponseFuture::failed(error);
         }
         let permit = match self.admission.acquire(&request) {
             Ok(permit) => permit,
@@ -134,6 +149,26 @@ impl Service<Request<Bytes>> for Client {
 
         ResponseFuture { state }
     }
+}
+
+// Validate before reserving commands or opening a connection. A mismatched
+// CSeq cannot identify the transaction for the request method on the wire.
+fn validate(request: &Request<Bytes>) -> Result<(), Error> {
+    if matches!(
+        *request.method(),
+        Method::INVITE | Method::ACK | Method::CANCEL
+    ) {
+        return Err(Error::unsupported_method());
+    }
+    let mut values = request.headers().get_all(CSEQ);
+    let value = values.next().ok_or_else(|| Error::missing(CSEQ))?;
+    if values.next().is_some()
+        || !CSeq::parse(value)
+            .is_some_and(|cseq| cseq.method == request.method())
+    {
+        return Err(Error::invalid_cseq());
+    }
+    Ok(())
 }
 
 /// The final response to a request sent through a [`Client`].
@@ -220,6 +255,70 @@ mod tests {
         match future.state {
             State::Failed(Some(error)) => error,
             _ => panic!("expected immediate admission failure"),
+        }
+    }
+
+    // RFC 3261 sections 8.1.1.5 and 20.16 require a single CSeq with
+    // a case-sensitive method matching the request.
+    #[test]
+    fn invalid_cseq_never_queues_or_reserves_admission() {
+        let (mut client, received) = client(1, usize::MAX);
+        for value in [
+            "",
+            "1",
+            "1 BYE",
+            "1 options",
+            "-1 OPTIONS",
+            "4294967296 OPTIONS",
+            "1 OPTIONS extra",
+            "1 OPTIONS, 2 OPTIONS",
+        ] {
+            let mut request = request(b"");
+            request.headers_mut().insert(CSEQ, value.parse().unwrap());
+            assert!(failure(client.call(request)).is_invalid_cseq());
+            assert!(received.is_empty());
+        }
+        let mut duplicate = request(b"");
+        duplicate.headers_mut().append(CSEQ, "1 OPTIONS".parse().unwrap());
+        assert!(failure(client.call(duplicate)).is_invalid_cseq());
+        assert!(received.is_empty());
+
+        drop(client.call(request(b"")));
+        assert_eq!(received.len(), 1);
+    }
+
+    // RFC 3261 sections 9.1, 17.1.1 and 17.1.2 give these methods
+    // different branch or machine semantics from an ordinary request.
+    #[test]
+    fn invite_ack_and_cancel_do_not_enter_the_non_invite_machine() {
+        let (mut client, received) = client(1, usize::MAX);
+        for method in ["INVITE", "ACK", "CANCEL"] {
+            let request = Request::builder()
+                .method(method)
+                .uri("sip:example.com")
+                .header("CSeq", format!("1 {method}").as_str())
+                .body(Bytes::new())
+                .unwrap();
+            assert!(failure(client.call(request)).is_unsupported_method());
+            assert!(received.is_empty());
+        }
+        drop(client.call(request(b"")));
+        assert_eq!(received.len(), 1);
+    }
+
+    #[test]
+    fn extension_methods_and_cseq_whitespace_remain_usable() {
+        let (mut client, mut received) = client(1, usize::MAX);
+        for method in ["OPTIONS", "X-VENDOR", "invite", "ack", "cancel"] {
+            let request = Request::builder()
+                .method(method)
+                .uri("sip:example.com")
+                .header("CSeq", format!(" 007\r\n {method} \t").as_str())
+                .body(Bytes::new())
+                .unwrap();
+            drop(client.call(request));
+            assert_eq!(received.len(), 1);
+            drop(received.try_recv().unwrap());
         }
     }
 
