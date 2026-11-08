@@ -19,7 +19,7 @@ use bytes::Bytes;
 use signa::{
     endpoint::{
         Endpoint, Incoming, IncomingEvent, Responder, ResponseSubmission,
-        SubmitError,
+        SubmitError, Target,
     },
     message::header::Tag,
     transport::Transport,
@@ -126,8 +126,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(dispatch(incoming, Echo { ready: false, calls: 0 }));
     let (client, _incoming) =
         Endpoint::builder().udp("127.0.0.1:0".parse()?).bind()?;
-    let mut target =
-        client.client(Transport::Udp, server.udp_addr().expect("UDP bound"));
+    let target =
+        Target::new(Transport::Udp, server.udp_addr().expect("UDP bound"));
     let request = Request::builder()
         .method("OPTIONS")
         .uri("sip:bob@example.com")
@@ -137,9 +137,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .header("CSeq", "1 OPTIONS")
         .body(Bytes::new())?;
 
-    let response = target.call(request).await?;
+    let (_control, mut responses) =
+        client.start(request, target).await?.into_parts();
+    let response = responses.next().await.expect("transaction outcome")?;
     assert_eq!(response.status().as_u16(), 200);
     server.shutdown(Duration::from_secs(1)).await;
     handling.await?;
+
     Ok(())
 }

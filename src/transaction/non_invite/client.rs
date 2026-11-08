@@ -39,11 +39,6 @@ pub enum ClientEvent {
     /// Send the request again.
     Retransmit(Bytes),
     /// Hand up a provisional response. The transaction goes on.
-    ///
-    /// The endpoint does not hand provisional responses up in 0.2.0, since a
-    /// non-INVITE request gets none worth seeing (RFC 4320). INVITE
-    /// transactions will.
-    #[cfg_attr(not(any(test, feature = "__bench")), allow(dead_code))]
     Provisional(Response<Bytes>),
     /// Hand up the final response. The transaction is over for the caller,
     /// though it may linger to absorb retransmissions.

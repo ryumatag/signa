@@ -36,17 +36,16 @@ while let Some(event) = incoming.recv().await {
 
 ### Sending a request
 
-A [`Client`](endpoint::Client) is bound to one next hop. The endpoint adds the
-topmost `Via`, retransmits over UDP, and resolves the future with the final
-response.
+An explicit target chooses the next hop. The endpoint adds a fresh Via and
+returns a transaction after acceptance. Its response stream exposes provisional
+responses followed by the final response or a terminal error.
 
 ```no_run
 use bytes::Bytes;
-use signa::{endpoint::Endpoint, transport::Transport, Request, StatusCode};
-use tower_service::Service;
+use signa::{endpoint::{Endpoint, Target}, transport::Transport, Request};
 
 # async fn run(endpoint: Endpoint) -> Result<(), Box<dyn std::error::Error>> {
-let mut client = endpoint.client(Transport::Udp, "192.0.2.4:5060".parse()?);
+let target = Target::new(Transport::Udp, "192.0.2.4:5060".parse()?);
 let request = Request::builder()
     .method("OPTIONS")
     .uri("sip:bob@192.0.2.4")
@@ -57,8 +56,13 @@ let request = Request::builder()
     .header("Max-Forwards", "70")
     .body(Bytes::new())?;
 
-let response = client.call(request).await?;
-assert_eq!(response.status(), StatusCode::OK);
+let (control, mut responses) =
+    endpoint.start(request, target).await?.into_parts();
+println!("local address: {}", control.flow().local);
+while let Some(response) = responses.next().await {
+    let response = response?;
+    println!("{}", response.status());
+}
 # Ok(())
 # }
 ```

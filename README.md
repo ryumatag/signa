@@ -21,10 +21,11 @@ Its design draws heavily on the [hyper] and [http] crates.
 The current development API has request and response types modeled on the http
 crate, parsing with [**siparse**] and encoding, and an endpoint that carries
 messages over UDP and TCP, runs non-INVITE transactions, and exposes incoming
-requests, responders and independent transaction observation. Its client still
-sends requests through a Tower `Service` until a later release. The
-endpoint supports graceful shutdown. INVITE, ACK, and CANCEL transactions are
-planned for the next release, and TLS and next-hop selection are later work.
+requests, responders and independent transaction observation. Client requests
+start asynchronously and return split control and bounded response streams.
+The endpoint supports graceful shutdown. INVITE, ACK, and CANCEL transactions
+are planned for the next release, and TLS and next-hop selection are later
+work.
 
 The [API documentation on docs.rs] says what is covered in detail.
 

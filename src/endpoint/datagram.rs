@@ -11,6 +11,7 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
+use tokio::sync::oneshot;
 
 use super::{
     reply::{Completion, ReplyError},
@@ -23,11 +24,29 @@ use crate::transport::{udp, Flow, WriteLimits};
 pub(super) struct Datagram {
     socket: udp::Socket,
     buf: BytesMut,
-    backlog:
-        VecDeque<(Bytes, Flow, Option<Completion>, Option<WriteObservation>)>,
+    backlog: VecDeque<Queued>,
     limits: WriteLimits,
     queued_bytes: usize,
     failures: VecDeque<Arc<Shared>>,
+}
+
+/// A datagram waiting for the socket.
+struct Queued {
+    bytes: Bytes,
+    flow: Flow,
+    outcome: Outcome,
+}
+
+/// Who learns how a queued write ended.
+enum Outcome {
+    /// A plain send, such as a retransmission, which reports nothing.
+    Unobserved,
+    /// A one-shot reply through a route.
+    Reply(Completion),
+    /// A response submitted to a server transaction.
+    Server(WriteObservation),
+    /// A client request whose failure ends its transaction.
+    Client(oneshot::Sender<io::Result<()>>),
 }
 
 impl Datagram {
@@ -77,7 +96,11 @@ impl Datagram {
     fn enqueue(&mut self, bytes: Bytes, flow: Flow) -> io::Result<()> {
         self.admit(bytes.len())?;
         let len = bytes.len();
-        self.backlog.push_back((bytes, flow, None, None));
+        self.backlog.push_back(Queued {
+            bytes,
+            flow,
+            outcome: Outcome::Unobserved,
+        });
         self.queued_bytes += len;
 
         Ok(())
@@ -130,6 +153,30 @@ impl Datagram {
         self.send(bytes, flow)
     }
 
+    /// Sends a client request, returning a receipt when it has to wait for
+    /// the socket.
+    pub(super) fn submit_client(
+        &mut self,
+        bytes: &Bytes,
+        flow: &Flow,
+        initial: bool,
+    ) -> io::Result<Option<oneshot::Receiver<io::Result<()>>>> {
+        let before = self.backlog.len();
+        if initial {
+            self.send_request(bytes, flow)?;
+        } else {
+            self.send(bytes, flow)?;
+        }
+        if self.backlog.len() == before {
+            return Ok(None);
+        }
+
+        let (done, receipt) = oneshot::channel();
+        self.backlog.back_mut().expect("just enqueued").outcome =
+            Outcome::Client(done);
+        Ok(Some(receipt))
+    }
+
     pub(super) fn submit(
         &mut self,
         bytes: Bytes,
@@ -140,8 +187,8 @@ impl Datagram {
 
         match self.send(&bytes, &flow) {
             Ok(()) if self.backlog.len() > before => {
-                self.backlog.back_mut().expect("just enqueued").2 =
-                    Some(completion);
+                self.backlog.back_mut().expect("just enqueued").outcome =
+                    Outcome::Reply(completion);
             }
             result => {
                 drop(bytes);
@@ -181,26 +228,36 @@ impl Datagram {
         }
 
         self.queued_bytes += bytes.len();
-        self.backlog.push_back((bytes, flow, None, Some(observation)));
+        self.backlog.push_back(Queued {
+            bytes,
+            flow,
+            outcome: Outcome::Server(observation),
+        });
 
         true
     }
 
     fn finish_front(&mut self, result: io::Result<()>) {
-        if let Some((bytes, _, completion, observation)) =
-            self.backlog.pop_front()
-        {
-            self.queued_bytes -= bytes.len();
-            drop(bytes);
-            if let Some(observation) = observation {
+        let Some(Queued { bytes, outcome, .. }) = self.backlog.pop_front()
+        else {
+            return;
+        };
+        self.queued_bytes -= bytes.len();
+        drop(bytes);
+
+        match outcome {
+            Outcome::Unobserved => {}
+            Outcome::Reply(completion) => {
+                completion.finish(result.map_err(ReplyError::Transport));
+            }
+            Outcome::Server(observation) => {
                 if result.is_err() {
                     self.failures.push_back(observation.shared().clone());
                 }
                 observation.complete(result);
-                return;
             }
-            if let Some(completion) = completion {
-                completion.finish(result.map_err(ReplyError::Transport));
+            Outcome::Client(receipt) => {
+                let _ = receipt.send(result);
             }
         }
     }
@@ -208,7 +265,7 @@ impl Datagram {
     /// Sends what waits, as far as the socket takes it.
     pub(super) fn poll_flush(&mut self, cx: &mut Context<'_>) {
         for _ in 0..32 {
-            let Some((bytes, flow, _, _)) = self.backlog.front() else {
+            let Some(Queued { bytes, flow, .. }) = self.backlog.front() else {
                 return;
             };
 
@@ -297,6 +354,35 @@ mod tests {
             commands: receiver,
             capacity,
         }
+    }
+
+    #[tokio::test]
+    async fn queued_client_write_failure_reaches_its_receipt() {
+        let mut fixture = fixture("127.0.0.1:9".parse().unwrap());
+        let flow = udp_reply_link(
+            fixture.datagram.local_addr(),
+            "127.0.0.1:9".parse().unwrap(),
+        )
+        .flow;
+        fixture.datagram.enqueue(Bytes::from_static(b"queued"), flow).unwrap();
+
+        let receipt = fixture
+            .datagram
+            .submit_client(&Bytes::from_static(b"request"), &flow, true)
+            .unwrap()
+            .unwrap();
+        fixture.datagram.finish_front(Ok(()));
+        fixture.datagram.finish_front(Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "test failure",
+        )));
+
+        assert_eq!(
+            receipt.await.unwrap().unwrap_err().kind(),
+            io::ErrorKind::ConnectionRefused
+        );
+        assert!(fixture.datagram.is_idle());
+        assert_eq!(fixture.datagram.queued_bytes, 0);
     }
 
     #[tokio::test]

@@ -15,9 +15,10 @@ use std::{
 
 use bytes::Bytes;
 use signa::{
-    endpoint::Endpoint, transport::Transport, Request, Response, StatusCode,
+    endpoint::{Endpoint, Target},
+    transport::Transport,
+    Request, Response, StatusCode,
 };
-use tower_service::Service;
 
 const LOCALHOST: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
@@ -77,16 +78,24 @@ async fn main() {
         .max_client_transactions(1 << 24)
         .bind()
         .unwrap();
-    let client = client_end.client(Transport::Udp, server.udp_addr().unwrap());
+    let target = Target::new(Transport::Udp, server.udp_addr().unwrap());
 
     let started = Instant::now();
 
     let mut tasks = Vec::new();
     for _ in 0..in_flight {
-        let mut client = client.clone();
+        let client = client_end.clone();
         tasks.push(tokio::spawn(async move {
             for _ in 0..total / in_flight {
-                let response = client.call(request()).await.unwrap();
+                let (_control, mut responses) = client
+                    .start(request(), target)
+                    .await
+                    .unwrap()
+                    .into_parts();
+                let mut response = responses.next().await.unwrap().unwrap();
+                while response.status().as_u16() < 200 {
+                    response = responses.next().await.unwrap().unwrap();
+                }
                 assert_eq!(response.status(), StatusCode::OK);
             }
         }));

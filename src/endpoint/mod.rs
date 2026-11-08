@@ -9,16 +9,16 @@ application data.
 
 # Non-INVITE reception
 
-[`IncomingEvent::Request`] owns a request and its [`ServerTransaction`]. Split the
-transaction into a non-cloneable [`Responder`] and independent [`ServerEvents`].
-`respond` returns once the driver accepts the response, not when the peer gets
-it. A final response may leave a UDP transaction in Completed until Timer J.
-Every response other than 100 needs a To tag, which
+[`IncomingEvent::Request`] owns a request and its [`ServerTransaction`]. Split
+the transaction into a non-cloneable [`Responder`] and independent
+[`ServerEvents`]. `respond` returns once the driver accepts the response, not
+when the peer gets it. A final response may leave a UDP transaction in
+Completed until Timer J. Every response other than 100 needs a To tag, which
 [`response::Builder::to_tag`](crate::message::response::Builder::to_tag) adds.
 
-Dropping an unanswered responder makes the driver send a 500. It reuses a To tag
-already sent in a provisional response, or adds a random one. If the 500 cannot
-be admitted, the transaction ends, and a retransmission arrives as a new
+Dropping an unanswered responder makes the driver send a 500. It reuses a To
+tag already sent in a provisional response, or adds a random one. If the 500
+cannot be admitted, the transaction ends, and a retransmission arrives as a new
 request. This is signa's abandonment policy, not an RFC rule.
 
 [`IncomingEvent::Untracked`] carries a one-shot [`ReplyRoute`] instead, for a
@@ -68,17 +68,19 @@ and a queued submission may still run after its waiting future is dropped.
 
 # Client operations and shutdown
 
-[`Client`] still implements [`tower_service::Service`] for one explicit next hop
-until a later release. Client admission bounds commands, connects and live
-transactions. Initial sends leave a quarter of output capacity for transaction
-output and responses. See [`Builder::tcp_write_limits`],
-[`Builder::udp_write_limits`] and [`Builder::fallback_limits`].
+[`Endpoint::start`] accepts an explicit [`Target`] and returns split control
+and response observation. All accepted provisional responses are delivered.
+Client admission bounds commands, connects and live transactions. Initial sends
+leave a quarter of output capacity for transaction output and responses. See
+[`Builder::tcp_write_limits`], [`Builder::udp_write_limits`] and
+[`Builder::fallback_limits`].
 
 [`Endpoint::shutdown`] closes new admission and drains current work until the
 earliest requested deadline. Once shutdown starts, new requests get a 503 and
-[`ReplyRoute::send`] returns [`ReplyError::Closed`]. Responders keep working.
+existing reply routes and responders keep working while admitted work drains.
 
-Transaction timers remain under [`crate::transaction`], without an endpoint alias:
+Transaction timers remain under [`crate::transaction`], without an endpoint
+alias:
 
 ```compile_fail
 use signa::endpoint::Timers;
@@ -119,16 +121,20 @@ while let Some(event) = incoming.recv().await {
 ```
 */
 
-use std::{fmt, net::SocketAddr, time::Duration};
+use std::{fmt, net::SocketAddr, sync::Arc, time::Duration};
 
 #[cfg(feature = "__bench")]
 use bytes::Bytes;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
+#[cfg(all(test, not(miri)))]
+use self::client::compatibility::Client;
 use self::{admission::ClientAdmission, driver::Command};
 #[cfg(feature = "__bench")]
 use self::{builder::Config, driver::Driver};
+#[cfg(all(test, not(miri)))]
 use crate::transport::Transport;
+use crate::transport::{budget::Budget, WriteLimits};
 #[cfg(feature = "__bench")]
 use crate::{
     message::Request,
@@ -137,7 +143,10 @@ use crate::{
 
 pub use self::{
     builder::Builder,
-    client::{Client, ResponseFuture},
+    client::{
+        ClientControl, ClientTransaction, ClientTransactionId, Responses,
+        Target,
+    },
     error::{BindError, Error},
     reply::{ReplyError, ReplyRoute},
     server::{
@@ -163,7 +172,7 @@ mod timer;
 
 /// A handle to a running endpoint.
 ///
-/// The endpoint runs while an `Endpoint`, [`Client`], [`Responder`],
+/// The endpoint runs while an `Endpoint`, [`ClientControl`], [`Responder`],
 /// [`ReplyRoute`] or [`Shutdown`] exists, and while a one-shot reply is in
 /// flight. [`ServerEvents`] and [`Incoming`] do not keep it running, and
 /// dropping `Incoming` starts an immediate shutdown. When the last of those
@@ -175,10 +184,13 @@ mod timer;
 pub struct Endpoint {
     commands: mpsc::UnboundedSender<Command>,
     client_admission: ClientAdmission,
-    shutdown_control: std::sync::Arc<shutdown::Control>,
+    client_response_budget: Budget,
+    client_handles: Budget,
+    client_response_limits: WriteLimits,
+    shutdown_control: Arc<shutdown::Control>,
     control: mpsc::Sender<()>,
-    shutdown_wait: tokio::sync::watch::Receiver<()>,
-    connection_stats: std::sync::Arc<driver::ConnectionCounters>,
+    shutdown_wait: watch::Receiver<()>,
+    connection_stats: Arc<driver::ConnectionCounters>,
     udp: Option<SocketAddr>,
     tcp: Option<SocketAddr>,
 }
@@ -232,16 +244,9 @@ impl Endpoint {
         self.tcp
     }
 
-    /// Makes a client that sends to `next_hop` over `transport`.
-    ///
-    /// A UDP client needs the endpoint to have a UDP socket, and fails each
-    /// request with a transport error otherwise. A TCP client opens its own
-    /// connection, with or without a listener.
-    pub fn client(
-        &self,
-        transport: Transport,
-        next_hop: SocketAddr,
-    ) -> Client {
+    // See `client::compatibility`.
+    #[cfg(all(test, not(miri)))]
+    fn client(&self, transport: Transport, next_hop: SocketAddr) -> Client {
         Client::new(
             self.commands.clone(),
             self.client_admission.clone(),
@@ -254,7 +259,7 @@ impl Endpoint {
     /// `timeout`, and returns a future that resolves when it has stopped.
     ///
     /// From this call on, the endpoint answers a new request with a 503 and
-    /// fails a new request through a [`Client`] with [`Error::is_closed`].
+    /// rejects [`Endpoint::start`] with [`Error::is_closed`].
     /// It waits until every admitted request has a final response, its own
     /// requests have theirs, and pending writes and connects finish, then
     /// stops. It does not wait out Timer J. At `timeout` it stops regardless,
@@ -338,7 +343,7 @@ mod tests {
         future::{self, Future, Ready},
         io,
         net::{IpAddr, Ipv4Addr, SocketAddr},
-        pin::Pin,
+        pin::{self, Pin},
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -364,16 +369,16 @@ mod tests {
             error::Error,
             routing::Link,
             Builder, Endpoint, Incoming, IncomingEvent, ReplyError,
-            ServerRequest,
+            ServerRequest, Target,
         },
         message::{
-            header::{HeaderValue, CSEQ, TO, VIA},
+            header::{HeaderValue, Tag, CSEQ, TO, VIA},
             request::Request,
             response::Response,
             StatusCode,
         },
         transaction::Timers,
-        transport::{tcp, udp, Flow, Transport},
+        transport::{tcp, udp, Flow, Transport, WriteLimits},
     };
 
     const LOCALHOST: SocketAddr =
@@ -408,6 +413,315 @@ mod tests {
             .status(StatusCode::OK)
             .body(Bytes::new())
             .unwrap()
+    }
+
+    // RFC 3261 section 17.1.2 delivers provisional responses and the first
+    // final. Timer K remains independent of response observation.
+    #[tokio::test]
+    async fn client_tu_reports_flow_via_provisionals_and_final_on_both_transports(
+    ) {
+        for transport in [Transport::Udp, Transport::Tcp] {
+            let (server, mut incoming) = Endpoint::builder()
+                .udp(LOCALHOST)
+                .tcp(LOCALHOST)
+                .bind()
+                .unwrap();
+            let target = Target::new(
+                transport,
+                if transport == Transport::Udp {
+                    server.udp_addr().unwrap()
+                } else {
+                    server.tcp_addr().unwrap()
+                },
+            );
+            let (endpoint, _incoming) =
+                Endpoint::builder().udp(LOCALHOST).bind().unwrap();
+
+            let transaction =
+                endpoint.start(request("OPTIONS"), target).await.unwrap();
+            let (control, mut responses) = transaction.into_parts();
+            assert_eq!(control.flow().remote, target.address());
+            assert_eq!(control.flow().transport, transport);
+            assert_ne!(control.flow().local.port(), 0);
+
+            let IncomingEvent::Request(envelope) =
+                incoming.recv().await.unwrap()
+            else {
+                panic!("request")
+            };
+            assert!(envelope
+                .request
+                .headers()
+                .get(VIA)
+                .unwrap()
+                .as_str()
+                .contains(
+                    control.via().as_str().split("branch=").nth(1).unwrap()
+                ));
+
+            let (responder, _) = envelope.transaction.into_parts();
+            // Reliable non-INVITE transactions allow an immediate 100.
+            if transport == Transport::Tcp {
+                responder
+                    .respond(
+                        Response::reply_to(&envelope.request)
+                            .status(100)
+                            .body(Bytes::new())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    responses.next().await.unwrap().unwrap().status().as_u16(),
+                    100
+                );
+            }
+            responder
+                .respond(
+                    Response::reply_to(&envelope.request)
+                        .status(200)
+                        .to_tag(Tag::random())
+                        .body(Bytes::new())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                responses.next().await.unwrap().unwrap().status(),
+                StatusCode::OK
+            );
+            assert!(responses.next().await.is_none());
+            assert!(responses.next().await.is_none());
+
+            endpoint.shutdown(Duration::ZERO).await;
+            server.shutdown(Duration::ZERO).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn client_tu_overflow_does_not_end_the_machine_or_free_its_slot() {
+        let mut peer = Peer::new().await;
+        let (endpoint, _incoming) = Endpoint::builder()
+            .udp(LOCALHOST)
+            .timers(short_timers())
+            .max_client_transactions(1)
+            .client_response_limits(WriteLimits { messages: 1, bytes: 4096 })
+            .bind()
+            .unwrap();
+        let target =
+            Target::new(Transport::Udp, peer.socket.local_addr().unwrap());
+
+        let (control, mut responses) = endpoint
+            .start(request("OPTIONS"), target)
+            .await
+            .unwrap()
+            .into_parts();
+        let wire = peer.recv().await.unwrap();
+        let original = Request::from_bytes(wire.as_bytes()).unwrap();
+        for _ in 0..2 {
+            let provisional = Response::reply_to(&original)
+                .status(100)
+                .body(Bytes::new())
+                .unwrap();
+            peer.send(
+                endpoint.udp_addr().unwrap(),
+                std::str::from_utf8(&provisional.to_bytes()).unwrap(),
+            )
+            .await;
+        }
+
+        // Wait for another request retransmission so the driver has processed
+        // the queued responses without requiring an application read.
+        assert!(peer.recv().await.is_some());
+        assert_eq!(
+            responses.next().await.unwrap().unwrap().status().as_u16(),
+            100
+        );
+        assert!(responses
+            .next()
+            .await
+            .unwrap()
+            .unwrap_err()
+            .is_delivery_overflow());
+        assert!(responses.next().await.is_none());
+
+        drop(control);
+        assert!(endpoint
+            .start(request("OPTIONS"), target)
+            .await
+            .unwrap_err()
+            .is_busy());
+
+        peer.send(
+            endpoint.udp_addr().unwrap(),
+            std::str::from_utf8(&ok(&original).to_bytes()).unwrap(),
+        )
+        .await;
+        endpoint.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn client_tu_start_and_receive_cancellation_preserve_committed_work()
+    {
+        let mut peer = Peer::new().await;
+        let (endpoint, _incoming) = Endpoint::builder()
+            .udp(LOCALHOST)
+            .timers(short_timers())
+            .max_client_transactions(1)
+            .bind()
+            .unwrap();
+        let target =
+            Target::new(Transport::Udp, peer.socket.local_addr().unwrap());
+
+        drop(endpoint.start(request("OPTIONS"), target));
+        {
+            let mut starting =
+                pin::pin!(endpoint.start(request("OPTIONS"), target));
+            future::poll_fn(|cx| {
+                assert!(starting.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+        }
+
+        assert!(peer.recv().await.is_some());
+        assert!(endpoint
+            .start(request("OPTIONS"), target)
+            .await
+            .unwrap_err()
+            .is_busy());
+        assert!(
+            peer.recv().await.is_some(),
+            "dropping start must not stop retransmission"
+        );
+
+        endpoint.shutdown(Duration::ZERO).await;
+    }
+
+    #[tokio::test]
+    async fn client_tu_observes_timeout_shutdown_and_held_handle_capacity() {
+        let peer = Peer::new().await;
+        let target =
+            Target::new(Transport::Udp, peer.socket.local_addr().unwrap());
+        let (endpoint, _incoming) = Endpoint::builder()
+            .udp(LOCALHOST)
+            .timers(short_timers())
+            .max_client_handles(1)
+            .bind()
+            .unwrap();
+
+        let (control, mut responses) = endpoint
+            .start(request("OPTIONS"), target)
+            .await
+            .unwrap()
+            .into_parts();
+        assert!(responses.next().await.unwrap().unwrap_err().is_timeout());
+        assert!(responses.next().await.is_none());
+
+        drop(responses);
+        assert!(endpoint
+            .start(request("OPTIONS"), target)
+            .await
+            .unwrap_err()
+            .is_busy());
+
+        drop(control);
+        let (control, mut responses) = endpoint
+            .start(request("OPTIONS"), target)
+            .await
+            .unwrap()
+            .into_parts();
+        endpoint.shutdown(Duration::ZERO).await;
+        assert!(responses.next().await.unwrap().unwrap_err().is_closed());
+        assert!(responses.next().await.is_none());
+        drop(control);
+    }
+
+    #[tokio::test]
+    async fn client_tu_rejects_multicast_before_admission() {
+        let (endpoint, _incoming) =
+            Endpoint::builder().max_client_transactions(0).bind().unwrap();
+
+        for address in ["224.0.0.1:5060", "[ff02::1]:5060"] {
+            let error = endpoint
+                .start(
+                    request("OPTIONS"),
+                    Target::new(Transport::Udp, address.parse().unwrap()),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.is_unsupported_routing());
+        }
+
+        endpoint.shutdown(Duration::ZERO).await;
+    }
+
+    #[tokio::test]
+    async fn client_tu_reports_tcp_eof_after_a_successful_request_write() {
+        let listener = TcpListener::bind(LOCALHOST).await.unwrap();
+        let (endpoint, _incoming) = Endpoint::builder().bind().unwrap();
+        let target =
+            Target::new(Transport::Tcp, listener.local_addr().unwrap());
+        let (control, mut responses) = endpoint
+            .start(request("OPTIONS"), target)
+            .await
+            .unwrap()
+            .into_parts();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let mut buffer = [0; 4096];
+        assert!(peer.read(&mut buffer).await.unwrap() > 0);
+
+        drop(peer);
+
+        let error = timeout(Duration::from_secs(1), responses.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.is_transport());
+        assert!(responses.next().await.is_none());
+
+        drop(control);
+        endpoint.shutdown(Duration::ZERO).await;
+    }
+
+    #[tokio::test]
+    async fn reply_routes_keep_sending_while_existing_work_drains() {
+        let mut peer = Peer::new().await;
+        let (endpoint, mut incoming) =
+            Endpoint::builder().udp(LOCALHOST).bind().unwrap();
+        let to = endpoint.udp_addr().unwrap();
+        peer.send(
+            to,
+            &peer.request(
+                "OPTIONS",
+                &format!(
+                    "SIP/2.0/UDP 127.0.0.1:{};branch=z9hG4bKdrain;rport",
+                    peer.port()
+                ),
+            ),
+        )
+        .await;
+        let IncomingEvent::Request(envelope) = incoming.recv().await.unwrap()
+        else {
+            panic!("request")
+        };
+        let (responder, _) = envelope.transaction.into_parts();
+        let route = responder.reply_route();
+
+        let shutdown = endpoint.shutdown(Duration::from_secs(1));
+        tokio::task::yield_now().await;
+
+        let response = Response::reply_to(&envelope.request)
+            .status(200)
+            .to_tag(Tag::random())
+            .body(Bytes::new())
+            .unwrap();
+        route.send(response.clone()).await.unwrap();
+        assert!(peer.recv().await.unwrap().starts_with("SIP/2.0 200"));
+
+        responder.respond(response).await.unwrap();
+        shutdown.await;
     }
 
     /// A service that answers 200 and counts what it saw.
@@ -1388,11 +1702,16 @@ mod tests {
         assert!(err.is_transport(), "{err}");
         assert!(std::error::Error::source(&err).is_some());
 
-        // No UDP socket to send from.
+        // No UDP socket to send from. The endpoint refuses before admission.
         let tcp_only = Endpoint::builder().serve(Counting::default()).unwrap();
-        let mut client = tcp_only.client(Transport::Udp, LOCALHOST);
-        let err = client.call(self::request("OPTIONS")).await.unwrap_err();
-        assert!(err.is_transport(), "{err}");
+        let err = tcp_only
+            .start(
+                self::request("OPTIONS"),
+                Target::new(Transport::Udp, LOCALHOST),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.is_unsupported_routing(), "{err}");
 
         // Too many transactions.
         let peer = Peer::new().await;
@@ -1972,10 +2291,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exhausted_write_bytes_report_transport_errors_without_leaking_client_admission(
+    async fn exhausted_write_bytes_report_busy_without_leaking_client_admission(
     ) {
-        use crate::transport::WriteLimits;
-
         let service = Counting::default();
         let server = serve(service.clone());
         let limits = WriteLimits { messages: 1, bytes: 1 };
@@ -2000,12 +2317,8 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap_err();
-                assert!(error.is_transport());
-                let source = std::error::Error::source(&error)
-                    .unwrap()
-                    .downcast_ref::<io::Error>()
-                    .unwrap();
-                assert_eq!(source.kind(), io::ErrorKind::WouldBlock);
+                assert!(error.is_busy());
+                assert!(std::error::Error::source(&error).is_none());
             }
         }
 

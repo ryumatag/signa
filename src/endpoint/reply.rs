@@ -7,8 +7,8 @@ use std::{error, fmt, io, sync::Arc};
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 
+use super::{driver::Command, routing::Link, server};
 use crate::{
-    endpoint::{driver::Command, routing::Link},
     message::{
         header::{
             address::has_tag, HeaderMap, HeaderValue, CALL_ID, CSEQ, FROM, TO,
@@ -55,7 +55,7 @@ struct Route {
     // Untracked application work, which ends at the first accepted final
     // rather than with the last clone. A route kept for logging or later
     // sends must not hold `max_pending_requests` or graceful shutdown.
-    work: Option<super::server::Work>,
+    work: Option<server::Work>,
 }
 
 impl ReplyRoute {
@@ -128,8 +128,8 @@ impl ReplyRoute {
     /// * [`ReplyError::Unsupported`] for a route of an ACK.
     /// * [`ReplyError::Busy`] when [`Builder::max_reply_bytes`] or the
     ///   transport queue is full.
-    /// * [`ReplyError::Closed`] once the endpoint has stopped or started to
-    ///   shut down.
+    /// * [`ReplyError::Closed`] once the endpoint has stopped. Existing routes
+    ///   remain usable while admitted work drains.
     /// * [`ReplyError::Transport`] for a local I/O error, with its source.
     ///
     /// # Example

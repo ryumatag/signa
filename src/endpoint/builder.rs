@@ -12,7 +12,7 @@ use super::{
 };
 use crate::{
     transaction::Timers,
-    transport::{tcp, udp, MessageLimits, WriteLimits},
+    transport::{budget::Budget, tcp, udp, MessageLimits, WriteLimits},
 };
 
 /// Settings shared by endpoint startup and the protocol driver.
@@ -24,6 +24,9 @@ pub(super) struct Config {
     pub(super) max_server_transactions: usize,
     pub(super) max_client_transactions: usize,
     pub(super) max_client_request_bytes: usize,
+    pub(super) client_response_limits: WriteLimits,
+    pub(super) client_response_budget: WriteLimits,
+    pub(super) max_client_handles: usize,
     pub(super) udp_write_limits: WriteLimits,
     pub(super) max_reply_bytes: usize,
     pub(super) max_server_request_bytes: usize,
@@ -46,6 +49,15 @@ impl Default for Config {
             max_server_transactions: 4096,
             max_client_transactions: 4096,
             max_client_request_bytes: 64 * 1024 * 1024,
+            client_response_limits: WriteLimits {
+                messages: 64,
+                bytes: 1024 * 1024,
+            },
+            client_response_budget: WriteLimits {
+                messages: 4096,
+                bytes: 64 * 1024 * 1024,
+            },
+            max_client_handles: 4096,
             udp_write_limits: WriteLimits {
                 messages: 1024,
                 ..WriteLimits::default()
@@ -434,6 +446,37 @@ impl Builder {
         self
     }
 
+    /// Bounds each client response stream by message count and encoded bytes.
+    ///
+    /// The default is 64 messages and 1 MiB. Both values must be positive.
+    /// Overflow keeps the queued responses and then delivers one terminal
+    /// error on [`Responses`](super::Responses).
+    pub fn client_response_limits(mut self, limits: WriteLimits) -> Builder {
+        self.config.client_response_limits = limits;
+        self
+    }
+
+    /// Bounds response content retained across all streams, including unread
+    /// streams whose machines have terminated.
+    ///
+    /// The default is 4096 messages and 64 MiB. Both values must be positive.
+    /// Shared `Bytes` backing allocations and application `Extensions` are not
+    /// measured.
+    pub fn client_response_budget(mut self, limits: WriteLimits) -> Builder {
+        self.config.client_response_budget = limits;
+        self
+    }
+
+    /// Bounds client allocations retained by pending starts, machines,
+    /// controls, transaction IDs or response observers.
+    ///
+    /// The default is 4096 and must be positive. Dropping both the machine's
+    /// delivery and the observer returns capacity.
+    pub fn max_client_handles(mut self, limit: usize) -> Builder {
+        self.config.max_client_handles = limit;
+        self
+    }
+
     /// Binds sockets and starts the protocol driver, returning its command
     /// handle and incoming event receiver. The endpoint spawns no handler
     /// tasks.
@@ -451,8 +494,11 @@ impl Builder {
     /// Returns a [`BindError`] for a socket that fails to bind, or an invalid
     /// configuration: a zero `max_pending_requests`,
     /// `max_server_request_bytes`, `max_responder_handles`,
-    /// `max_responder_bytes` or `max_server_response_bytes`. Zero client,
-    /// table and transport limits are valid and refuse that work instead.
+    /// `max_responder_bytes`, `max_server_response_bytes` or
+    /// `max_client_handles`, or a zero count or byte limit in
+    /// `client_response_limits` or `client_response_budget`. Zero client
+    /// transaction, table and transport limits are valid and refuse that work
+    /// instead.
     pub fn bind(self) -> Result<(Endpoint, Incoming), BindError> {
         for (reason, value) in [
             (
@@ -474,6 +520,26 @@ impl Builder {
             (
                 "max_server_response_bytes must be positive",
                 self.config.max_server_response_bytes,
+            ),
+            (
+                "max_client_handles must be positive",
+                self.config.max_client_handles,
+            ),
+            (
+                "client_response_limits.messages must be positive",
+                self.config.client_response_limits.messages,
+            ),
+            (
+                "client_response_limits.bytes must be positive",
+                self.config.client_response_limits.bytes,
+            ),
+            (
+                "client_response_budget.messages must be positive",
+                self.config.client_response_budget.messages,
+            ),
+            (
+                "client_response_budget.bytes must be positive",
+                self.config.client_response_budget.bytes,
             ),
         ] {
             if value == 0 {
@@ -513,6 +579,14 @@ impl Builder {
         );
         let endpoint = Endpoint {
             client_admission: driver.client_admission(),
+            client_response_budget: Budget::new(
+                self.config.client_response_budget,
+            ),
+            client_handles: Budget::new(WriteLimits {
+                messages: self.config.max_client_handles,
+                bytes: usize::MAX,
+            }),
+            client_response_limits: self.config.client_response_limits,
             shutdown_control: driver.shutdown_control.clone(),
             control: driver.control.clone(),
             shutdown_wait: driver.shutdown_done.subscribe(),

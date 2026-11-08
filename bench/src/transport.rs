@@ -132,10 +132,10 @@ pub(super) fn tcp(c: &mut Criterion) {
             rt.block_on(async {
                 client.send(bb(request.clone())).unwrap();
                 let inbound = server_rx.recv().await.unwrap();
-                assert!(matches!(inbound.message, Message::Request(_)));
+                assert!(matches!(inbound.message, Some(Message::Request(_))));
                 inbound.writer.send(bb(response.clone())).unwrap();
                 let inbound = client_rx.recv().await.unwrap();
-                assert!(matches!(inbound.message, Message::Response(_)));
+                assert!(matches!(inbound.message, Some(Message::Response(_))));
             });
         });
     });
@@ -145,7 +145,7 @@ pub(super) fn tcp(c: &mut Criterion) {
             rt.block_on(async {
                 client.submit(bb(request.clone())).unwrap().await.unwrap();
                 let inbound = server_rx.recv().await.unwrap();
-                assert!(matches!(inbound.message, Message::Request(_)));
+                assert!(matches!(inbound.message, Some(Message::Request(_))));
                 inbound
                     .writer
                     .submit(bb(response.clone()))
@@ -153,7 +153,7 @@ pub(super) fn tcp(c: &mut Criterion) {
                     .await
                     .unwrap();
                 let inbound = client_rx.recv().await.unwrap();
-                assert!(matches!(inbound.message, Message::Response(_)));
+                assert!(matches!(inbound.message, Some(Message::Response(_))));
             });
         });
     });
@@ -168,12 +168,18 @@ pub(super) fn tcp(c: &mut Criterion) {
                 }
                 for _ in 0..8 {
                     let inbound = server_rx.recv().await.unwrap();
-                    assert!(matches!(inbound.message, Message::Request(_)));
+                    assert!(matches!(
+                        inbound.message,
+                        Some(Message::Request(_))
+                    ));
                     inbound.writer.send(bb(response.clone())).unwrap();
                 }
                 for _ in 0..8 {
                     let inbound = client_rx.recv().await.unwrap();
-                    assert!(matches!(inbound.message, Message::Response(_)));
+                    assert!(matches!(
+                        inbound.message,
+                        Some(Message::Response(_))
+                    ));
                 }
             });
         });

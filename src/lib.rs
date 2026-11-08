@@ -24,11 +24,11 @@ Its design draws heavily on the [`http`] and [`hyper`] crates.
   messages by `Content-Length` and answers RFC 5626 keepalives, runs the
   non-INVITE client and server transactions of RFC 3261 section 17 as updated
   by RFC 4320, and exposes incoming events, server responders and independent
-  transaction observation. Its `Client` still sends requests to one next hop
-  through a Tower `Service` until the client TU migration. Application code
-  owns server dispatch and handler tasks. These operations live in `endpoint`.
-  A graceful shutdown answers new requests with a 503 and waits for the ones in
-  hand up to a deadline.
+  transaction observation. `Endpoint::start` returns client control and a
+  bounded response stream after transport preparation and driver acceptance.
+  Application code owns server dispatch and handler tasks. These operations
+  live in `endpoint`. A graceful shutdown answers new requests with a 503 and
+  waits for the ones in hand up to a deadline.
 
 # What it does not cover yet
 
@@ -36,8 +36,8 @@ Its design draws heavily on the [`http`] and [`hyper`] crates.
   other than the 100 the endpoint sends itself. An INVITE gets a 501 and a
   CANCEL a 481. They are planned for 0.3.0, with RFC 6026.
 * Choosing a next hop. RFC 3263 resolution belongs to a layer above, which
-  holds one `Client` per hop. [`Uri::sip`] exposes SIP/SIPS components without
-  selecting a destination or transport.
+  selects an explicit `Target` for each request. [`Uri::sip`] exposes SIP/SIPS
+  components without selecting a destination or transport.
 * TLS, and anything that would make `sips:` mean what it says.
 * Dialogs, registration, proxying, and the rest of what an application does
   with messages. Those belong in crates built on signa.

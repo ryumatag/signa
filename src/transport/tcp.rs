@@ -97,8 +97,8 @@ impl Default for Config {
 /// A message received on a connection, with how to answer it.
 #[derive(Debug)]
 pub struct Inbound {
-    /// The message.
-    pub message: Message<Bytes>,
+    /// The message, or `None` once this connection has closed.
+    pub message: Option<Message<Bytes>>,
     /// The connection it arrived on.
     pub flow: Flow,
     /// The way to send on that connection.
@@ -132,6 +132,17 @@ pub enum SendError {
 }
 
 impl Writer {
+    /// Returns `true` if both writers send on one connection.
+    pub(crate) fn same_connection(&self, other: &Writer) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Identifies the connection while this writer, or a clone of it, lives.
+    /// The address can be reused once every writer of the connection drops.
+    pub(crate) fn connection_id(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+
     /// Returns `true` once the connection has ended.
     pub fn is_closed(&self) -> bool {
         self.0.queue.is_closed()
@@ -154,6 +165,24 @@ impl Writer {
             .acquire_request(bytes.len())
             .ok_or(SendError::Full)?;
         self.enqueue(Write { bytes, done: None, permit: Some(permit) })
+    }
+
+    /// Queues a client request with reserved protocol headroom and a receipt.
+    pub(crate) fn submit_request(
+        &self,
+        bytes: Bytes,
+    ) -> Result<Receipt, SendError> {
+        if self.is_closed() {
+            return Err(SendError::Closed);
+        }
+        let permit = self
+            .0
+            .capacity
+            .acquire_request(bytes.len())
+            .ok_or(SendError::Full)?;
+        let (done, result) = oneshot::channel();
+        self.enqueue(Write { bytes, done: Some(done), permit: Some(permit) })?;
+        Ok(Receipt(result))
     }
 
     /// Reserves output before the endpoint changes a server machine.
@@ -432,7 +461,22 @@ fn start(
         writer.clone(),
     );
 
-    tokio::spawn(run_connection(reading, writing, permit));
+    // After the connection ends, one message without content tells the
+    // endpoint which writer closed, unless every writer is already gone.
+    // The notice holds the connection permit, so connection admission bounds
+    // pending notices.
+    let closed_writer = Arc::downgrade(&writer.0);
+    let closed_inbound = inbound.clone();
+    let closed_permit = permit.clone();
+    tokio::spawn(async move {
+        run_connection(reading, writing, permit).await;
+        if let Some(writer) = closed_writer.upgrade() {
+            let _ = closed_inbound
+                .send(Inbound { message: None, flow, writer: Writer(writer) })
+                .await;
+        }
+        drop(closed_permit);
+    });
 
     Ok(writer)
 }
@@ -503,7 +547,8 @@ async fn read_loop(
             match decoder.decode(&mut buf) {
                 Ok(Some(Frame::Message(message))) => {
                     let writer = writer.clone();
-                    let inbound_message = Inbound { message, flow, writer };
+                    let inbound_message =
+                        Inbound { message: Some(message), flow, writer };
                     if inbound.send(inbound_message).await.is_err() {
                         return End::Endpoint;
                     }
@@ -1163,7 +1208,7 @@ mod tests {
 
         client.write_all(REQUEST).await.unwrap();
         let inbound = rx.recv().await.unwrap();
-        let Message::Request(request) = &inbound.message else {
+        let Some(Message::Request(request)) = &inbound.message else {
             panic!("expected a request");
         };
         assert_eq!(request.method(), Method::OPTIONS);
@@ -1189,7 +1234,7 @@ mod tests {
         client.write_all(rest).await.unwrap();
 
         let inbound = rx.recv().await.unwrap();
-        assert!(matches!(inbound.message, Message::Request(_)));
+        assert!(matches!(inbound.message, Some(Message::Request(_))));
     }
 
     #[tokio::test]
@@ -1305,7 +1350,7 @@ mod tests {
         inbound.writer.send(Bytes::from_static(RESPONSE)).unwrap();
 
         let inbound = client_rx.recv().await.unwrap();
-        let Message::Response(response) = &inbound.message else {
+        let Some(Message::Response(response)) = &inbound.message else {
             panic!("expected a response");
         };
         assert_eq!(response.status(), StatusCode::OK);
@@ -1332,7 +1377,7 @@ mod tests {
         server.write_all(b"\r\n").await.unwrap();
         server.write_all(RESPONSE).await.unwrap();
         let inbound = rx.recv().await.unwrap();
-        assert!(matches!(inbound.message, Message::Response(_)));
+        assert!(matches!(inbound.message, Some(Message::Response(_))));
     }
 
     #[test]

@@ -49,6 +49,7 @@ use crate::{
     endpoint::{
         admission::{AdmissionOwner, ClientAdmission, Permit},
         builder::Config,
+        client::{Delivery, Observation, Starting},
         datagram::Datagram,
         error::Error,
         reply::{Admission, Completion, ReplyError, ReplyRoute},
@@ -103,8 +104,8 @@ const fn status(code: u16) -> StatusCode {
     }
 }
 
-/// What a client sends.
-pub(super) type Responder = oneshot::Sender<Result<Response<Bytes>, Error>>;
+/// Where a client transaction delivers its responses.
+type Responder = Delivery;
 
 /// What the driver is told, by the handles and by its own tasks.
 pub(super) enum Command {
@@ -113,7 +114,7 @@ pub(super) enum Command {
         request: Request<Bytes>,
         transport: Transport,
         next_hop: SocketAddr,
-        respond: Responder,
+        respond: Starting,
         permit: Permit,
     },
     /// A route sends one response without a transaction.
@@ -198,7 +199,7 @@ enum TcpState {
 /// Something waiting for a TCP connection to open.
 enum Pending {
     /// A client's request, which starts a transaction once it can be sent.
-    Request(Request<Bytes>, Responder, Permit),
+    Request(Request<Bytes>, Starting, Permit),
     /// An encoded response whose request came on a connection that has closed
     /// since. It goes to `sent-by` on a new connection
     /// (RFC 3261 section 18.2.2).
@@ -302,8 +303,12 @@ pub(super) struct Driver {
     reply_admission: Admission,
     reply_bytes: Budget,
     writes: Vec<(tcp::Receipt, Completion)>,
-    /// From the `Endpoint`, `Client`, `Responder` and `ReplyRoute` handles.
-    /// The driver ends when they are all gone.
+    /// Client request writes whose failure ends their transaction. The
+    /// observation keeps a late receipt away from a reused table slot.
+    client_writes: Vec<(ClientReceipt, Id, Observation)>,
+    client_write_cursor: usize,
+    /// From the `Endpoint`, `ClientControl`, `Responder` and `ReplyRoute`
+    /// handles. The driver ends when they are all gone.
     commands: mpsc::UnboundedReceiver<Command>,
     /// From the connect tasks. Kept apart from `commands`, because the driver
     /// holds the sender for them.
@@ -317,6 +322,10 @@ pub(super) struct Driver {
     servers: Table<ServerKey, ServerEntry>,
     clients: Table<ClientKey, ClientEntry>,
     routes: HashMap<SocketAddr, Route, RandomState>,
+    /// Live client entries per TCP connection, keyed by
+    /// [`tcp::Writer::connection_id`]. A closed connection without clients,
+    /// such as one a server request came on, skips the client table scan.
+    client_connections: HashMap<usize, usize, RandomState>,
     outbound: Arc<Semaphore>,
     response_connections: Arc<Semaphore>,
     connects: Budget,
@@ -400,6 +409,8 @@ impl Driver {
                 bytes: config.max_reply_bytes,
             }),
             writes: Vec::new(),
+            client_writes: Vec::new(),
+            client_write_cursor: 0,
             commands,
             internal,
             internal_tx,
@@ -411,6 +422,7 @@ impl Driver {
             servers: Table::new(),
             clients: Table::new(),
             routes: HashMap::default(),
+            client_connections: HashMap::default(),
             outbound: Arc::new(Semaphore::new(
                 config.max_outbound_connections.min(Semaphore::MAX_PERMITS),
             )),
@@ -475,7 +487,13 @@ impl Driver {
                         flow: inbound.flow,
                         writer: Some(inbound.writer),
                     };
-                    self.on_message(inbound.message, link);
+                    if let Some(message) = inbound.message {
+                        self.on_message(message, link);
+                    } else {
+                        self.on_connection_closed(
+                            link.writer.as_ref().expect("TCP writer"),
+                        );
+                    }
                 }
                 Event::Datagram(datagram, flow) => {
                     // A datagram that is not one whole message is dropped.
@@ -511,6 +529,34 @@ impl Driver {
                 unreachable!("the queue owns the shutdown deadline")
             }
         });
+
+        let mut index = self.client_write_cursor.min(self.client_writes.len());
+        let mut inspected = 0;
+        while index < self.client_writes.len() && inspected < 32 {
+            inspected += 1;
+            if let Poll::Ready(result) = self.client_writes[index].0.poll(cx) {
+                let (_, id, observation) =
+                    self.client_writes.swap_remove(index);
+                let Err(error) = result else { continue };
+                let current = self
+                    .clients
+                    .get(id)
+                    .and_then(|entry| entry.respond.as_ref())
+                    .is_some_and(|delivery| observation.matches(delivery));
+                if current {
+                    self.fail_client(id, error);
+                }
+            } else {
+                index += 1;
+            }
+        }
+
+        self.client_write_cursor = if index < self.client_writes.len() {
+            cx.waker().wake_by_ref();
+            index
+        } else {
+            0
+        };
 
         let mut index = self.write_cursor.min(self.writes.len());
         let mut inspected = 0;
@@ -656,7 +702,8 @@ impl Driver {
 
     /// Returns whether protocol and transport work has drained.
     fn is_drained(&self) -> bool {
-        self.writes.is_empty()
+        self.client_writes.is_empty()
+            && self.writes.is_empty()
             && self.server_writes.is_empty()
             && self.live_work_is_drained()
             && self.fallback_writes.is_empty()
@@ -721,13 +768,49 @@ impl Driver {
                 let before = entry.tx.deadline();
                 let completion = match entry.tx.on_timeout(&timers, now) {
                     ClientEvent::Retransmit(request) => {
-                        match send_on(
-                            self.udp.as_mut(),
-                            &entry.link,
-                            &request,
-                            false,
-                        ) {
-                            Ok(()) => None,
+                        // Without room for another receipt the retransmission
+                        // goes out unobserved. Its failure would be one lost
+                        // datagram, which the next retransmission or Timer F
+                        // covers.
+                        let result = if self.client_writes.len()
+                            < self.config.max_client_transactions
+                        {
+                            send_client(
+                                self.udp.as_mut(),
+                                &entry.link,
+                                &request,
+                                false,
+                            )
+                        } else {
+                            send_on(
+                                self.udp.as_mut(),
+                                &entry.link,
+                                &request,
+                                false,
+                            )
+                            .map(|()| None)
+                        };
+                        match result {
+                            Ok(receipt) => {
+                                if let (Some(receipt), Some(delivery)) =
+                                    (receipt, &entry.respond)
+                                {
+                                    self.client_writes.push((
+                                        receipt,
+                                        id,
+                                        delivery.observation(),
+                                    ));
+                                }
+                                None
+                            }
+                            // A full local write queue is not a transport
+                            // failure. Skip this retransmission as if UDP had
+                            // lost it, and keep the transaction.
+                            Err(err)
+                                if err.kind() == io::ErrorKind::WouldBlock =>
+                            {
+                                None
+                            }
                             Err(err) => {
                                 entry.tx.on_transport_error();
                                 entry.answer(Err(Error::transport(err)))
@@ -748,7 +831,7 @@ impl Driver {
 
                 self.settle_client(id, before);
                 if let Some((respond, result)) = completion {
-                    let _ = respond.send(result);
+                    respond.send(result);
                 }
             }
             Key::Shutdown => unreachable!("handled by the loop"),
@@ -779,7 +862,19 @@ impl Driver {
     fn settle_client(&mut self, id: Id, before: Option<Instant>) {
         let Some(entry) = self.clients.get(id) else { return };
         if entry.tx.is_terminated() {
+            let connection =
+                entry.link.writer.as_ref().map(tcp::Writer::connection_id);
             self.clients.remove(id);
+            if let Some(connection) = connection {
+                let count = self
+                    .client_connections
+                    .get_mut(&connection)
+                    .expect("a counted client connection");
+                *count -= 1;
+                if *count == 0 {
+                    self.client_connections.remove(&connection);
+                }
+            }
             return;
         }
 
@@ -796,13 +891,13 @@ impl Driver {
         request: Request<Bytes>,
         transport: Transport,
         next_hop: SocketAddr,
-        respond: Responder,
+        respond: Starting,
         permit: Permit,
     ) {
         if self.shutting_down {
             drop(request);
             drop(permit);
-            let _ = respond.send(Err(Error::closed()));
+            respond.send(Err(Error::closed()));
             return;
         }
 
@@ -815,7 +910,7 @@ impl Driver {
                     );
                     drop(request);
                     drop(permit);
-                    let _ = respond.send(Err(Error::transport(err)));
+                    respond.send(Err(Error::transport(err)));
                     return;
                 };
                 let port = udp.local_addr().port();
@@ -824,7 +919,7 @@ impl Driver {
                     Err(err) => {
                         drop(request);
                         drop(permit);
-                        let _ = respond.send(Err(Error::transport(err)));
+                        respond.send(Err(Error::transport(err)));
                         return;
                     }
                 };
@@ -946,7 +1041,7 @@ impl Driver {
             Pending::Request(request, respond, permit) => {
                 drop(request);
                 drop(permit);
-                let _ = respond.send(Err(Error::busy()));
+                respond.send(Err(Error::busy()));
             }
             Pending::Response(..) => {}
             // Server output reserves its route and connection before commit
@@ -1045,12 +1140,6 @@ impl Driver {
     }
 
     fn on_reply(&mut self, link: Link, bytes: Bytes, completion: Completion) {
-        if self.shutting_down {
-            drop(bytes);
-            completion.finish(Err(ReplyError::Closed));
-            return;
-        }
-
         if let Some(writer) = &link.writer {
             match writer.submit(bytes.clone()) {
                 Ok(receipt) => self.writes.push((receipt, completion)),
@@ -1154,7 +1243,7 @@ impl Driver {
         &mut self,
         mut request: Request<Bytes>,
         link: Link,
-        respond: Responder,
+        respond: Starting,
         permit: Permit,
     ) {
         // The command owns capacity reserved before enqueue and connect.
@@ -1162,7 +1251,7 @@ impl Driver {
             self.clients.len() < self.config.max_client_transactions
         );
         let via = via_value(&link.flow, &mut self.branches);
-        request.headers_mut().prepend(VIA, via);
+        request.headers_mut().prepend(VIA, via.clone());
         let key = ClientKey::from_request(&request)
             .expect("the Via signa wrote has a branch");
         let bytes = request.to_bytes();
@@ -1173,17 +1262,30 @@ impl Driver {
             drop(request);
             drop(bytes);
             drop(permit);
-            let _ = respond.send(Err(error));
+            respond.send(Err(error));
             return;
         }
 
-        if let Err(err) = send_on(self.udp.as_mut(), &link, &bytes, true) {
-            drop(request);
-            drop(bytes);
+        if self.client_writes.len() >= self.config.max_client_transactions {
             drop(permit);
-            let _ = respond.send(Err(Error::transport(err)));
+            respond.send(Err(Error::busy()));
             return;
         }
+        let sent = send_client(self.udp.as_mut(), &link, &bytes, true);
+        let receipt = match sent {
+            Ok(receipt) => receipt,
+            Err(err) => {
+                drop(permit);
+                respond.send(Err(
+                    if err.kind() == io::ErrorKind::WouldBlock {
+                        Error::busy()
+                    } else {
+                        Error::transport(err)
+                    },
+                ));
+                return;
+            }
+        };
 
         let reliable = link.flow.transport.is_reliable();
         let tx = ClientTransaction::new(
@@ -1193,12 +1295,25 @@ impl Driver {
             now(),
         );
         let deadline = tx.deadline();
+        let (respond, transaction, accepted) = respond.prepare(via, link.flow);
+        let observation = respond.observation();
+        if let Some(writer) = &link.writer {
+            *self
+                .client_connections
+                .entry(writer.connection_id())
+                .or_default() += 1;
+        }
         let entry = ClientEntry { tx, link, respond: Some(respond), permit };
         let id = self.clients.insert(key, entry);
+        if let Some(receipt) = receipt {
+            self.client_writes.push((receipt, id, observation));
+        }
         if let Some(at) = deadline {
             self.timers.push(at, Key::Client(id));
         }
         self.unanswered += 1;
+
+        let _ = accepted.send(Ok(transaction));
     }
 
     fn on_connected(
@@ -1234,7 +1349,7 @@ impl Driver {
                             );
                             drop(request);
                             drop(permit);
-                            let _ = respond.send(Err(Error::transport(err)));
+                            respond.send(Err(Error::transport(err)));
                         }
                         // See `send_reply`.
                         Pending::Response(..) => {}
@@ -1256,6 +1371,53 @@ impl Driver {
                     }
                 }
             }
+        }
+    }
+
+    /// Fails the client transactions on a TCP connection that has closed.
+    /// Another connection to the same address keeps its transactions.
+    fn on_connection_closed(&mut self, writer: &tcp::Writer) {
+        let Some(&count) =
+            self.client_connections.get(&writer.connection_id())
+        else {
+            return;
+        };
+        let ids: Vec<_> = self
+            .clients
+            .iter()
+            .filter_map(|(id, entry)| {
+                entry
+                    .link
+                    .writer
+                    .as_ref()
+                    .filter(|other| writer.same_connection(other))
+                    .map(|_| id)
+            })
+            .take(count)
+            .collect();
+        for id in ids {
+            self.fail_client(
+                id,
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "TCP connection closed",
+                ),
+            );
+        }
+    }
+
+    /// Ends a live client transaction whose request could not be written.
+    fn fail_client(&mut self, id: Id, error: io::Error) {
+        let entry = self.clients.get_mut(id).expect("a live client entry");
+        entry.tx.on_transport_error();
+        let completion = entry.answer(Err(Error::transport(error)));
+        if completion.is_some() {
+            self.unanswered -= 1;
+        }
+
+        self.settle_client(id, None);
+        if let Some((delivery, result)) = completion {
+            delivery.send(result);
         }
     }
 
@@ -1284,9 +1446,13 @@ impl Driver {
         let completion =
             match entry.tx.on_response(response, &self.config.timers, now()) {
                 ClientEvent::Final(response) => entry.answer(Ok(response)),
-                // A non-INVITE provisional response is not handed up.
-                ClientEvent::Provisional(_)
-                | ClientEvent::None
+                ClientEvent::Provisional(response) => {
+                    if let Some(delivery) = &entry.respond {
+                        delivery.response(response);
+                    }
+                    None
+                }
+                ClientEvent::None
                 | ClientEvent::Retransmit(_)
                 | ClientEvent::Timeout => None,
             };
@@ -1295,7 +1461,7 @@ impl Driver {
         }
         self.settle_client(id, before);
         if let Some((respond, result)) = completion {
-            let _ = respond.send(result);
+            respond.send(result);
         }
     }
 
@@ -1971,6 +2137,58 @@ async fn connect_until<T>(
     .await
 }
 
+/// The local write outcome of a client request.
+enum ClientReceipt {
+    Tcp(tcp::Receipt),
+    Udp(oneshot::Receiver<io::Result<()>>),
+}
+
+impl ClientReceipt {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self {
+            ClientReceipt::Tcp(receipt) => Pin::new(receipt).poll(cx),
+            ClientReceipt::Udp(receipt) => {
+                Pin::new(receipt).poll(cx).map(|result| {
+                    result.unwrap_or_else(|_| {
+                        Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "UDP writer closed",
+                        ))
+                    })
+                })
+            }
+        }
+    }
+}
+
+/// Sends a client request and returns a receipt when its write is queued.
+/// A full TCP queue is reported as `WouldBlock`.
+fn send_client(
+    udp: Option<&mut Datagram>,
+    link: &Link,
+    bytes: &Bytes,
+    initial: bool,
+) -> io::Result<Option<ClientReceipt>> {
+    if let Some(writer) = &link.writer {
+        writer
+            .submit_request(bytes.clone())
+            .map(|receipt| Some(ClientReceipt::Tcp(receipt)))
+            .map_err(|error| {
+                io::Error::new(
+                    match error {
+                        tcp::SendError::Full => io::ErrorKind::WouldBlock,
+                        tcp::SendError::Closed => io::ErrorKind::BrokenPipe,
+                    },
+                    error,
+                )
+            })
+    } else {
+        udp.expect("UDP link has a socket")
+            .submit_client(bytes, &link.flow, initial)
+            .map(|receipt| receipt.map(ClientReceipt::Udp))
+    }
+}
+
 /// Over TCP a full write queue is an error here. The connection is in trouble,
 /// and a transaction that retransmits will try again.
 fn send_on(
@@ -2012,17 +2230,19 @@ mod tests {
     };
 
     use tokio::{net::UdpSocket, time::timeout};
+    use tower_service::Service;
 
     use super::*;
-    use crate::endpoint::tests::TestServe;
-    use crate::endpoint::{
-        tests::{
-            reply_driver, reply_driver_with, route_request, route_response,
-            udp_reply_link, REPLY_LOCAL,
+    use crate::{
+        endpoint::{
+            tests::{
+                reply_driver, reply_driver_with, route_request,
+                route_response, udp_reply_link, TestServe, REPLY_LOCAL,
+            },
+            Client,
         },
-        Client,
+        transaction::Timers,
     };
-    use tower_service::Service;
 
     fn fallback(driver: &Driver, bytes: Bytes) -> Pending {
         let permit = driver.fallback.acquire(bytes.len()).unwrap();
@@ -3138,14 +3358,93 @@ mod tests {
         })
         .await
         .unwrap();
+        // Start acceptance wakes separately from final-response delivery.
+        assert!(response
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
         driver.on_received_response(route_response(&wire_request));
 
         assert!(response.await.is_ok());
         assert_eq!(driver.clients.len(), 0);
+        assert!(driver.client_connections.is_empty());
         assert_eq!(
             driver.commands.len(),
             1,
             "the completion waker admitted the next request"
         );
+    }
+
+    #[tokio::test]
+    async fn a_retransmission_without_receipt_capacity_keeps_the_transaction()
+    {
+        async fn flush(driver: &mut Driver) {
+            timeout(
+                Duration::from_secs(3),
+                poll_fn(|cx| {
+                    let udp = driver.udp.as_mut().unwrap();
+                    udp.poll_flush(cx);
+                    if udp.is_idle() {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        let (mut driver, commands, _local) = reply_driver_with(Config {
+            timers: Timers::builder()
+                .t1(Duration::from_millis(10))
+                .build()
+                .unwrap(),
+            max_client_transactions: 1,
+            ..Config::default()
+        });
+        let peer = UdpSocket::bind(REPLY_LOCAL).await.unwrap();
+        let mut client = Client::new(
+            commands,
+            driver.client_admission(),
+            Transport::Udp,
+            peer.local_addr().unwrap(),
+        );
+        let mut response = Box::pin(
+            client.call(route_request("SIP/2.0/UDP example.com:9;rport")),
+        );
+        let command = driver.commands.try_recv().unwrap();
+        driver.on_command(command);
+        flush(&mut driver).await;
+        let mut buffer = [0; 4096];
+        let first = timeout(Duration::from_secs(1), peer.recv(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // A receipt that never resolves takes the only observation slot.
+        let (id, entry) = driver.clients.iter().next().unwrap();
+        let observation = entry.respond.as_ref().unwrap().observation();
+        let (_never, receipt) = oneshot::channel();
+        driver.client_writes.clear();
+        driver.client_writes.push((
+            ClientReceipt::Udp(receipt),
+            id,
+            observation,
+        ));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        driver.on_timer(Key::Client(id));
+        flush(&mut driver).await;
+
+        let again = timeout(Duration::from_secs(1), peer.recv(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(again, first);
+        assert!(driver.clients.get(id).is_some());
+        assert_eq!(driver.client_writes.len(), 1);
+        assert!(poll_fn(|cx| Poll::Ready(response.as_mut().poll(cx)))
+            .await
+            .is_pending());
     }
 }

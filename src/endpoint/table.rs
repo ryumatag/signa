@@ -60,6 +60,21 @@ impl<K: Hash + Eq, E> Table<K, E> {
         self.index.len()
     }
 
+    /// Returns each live entry with its id, in slot order.
+    pub(super) fn iter(&self) -> impl Iterator<Item = (Id, &E)> {
+        self.slots.iter().enumerate().filter_map(|(slot, value)| {
+            value.as_ref().map(|(_, entry)| {
+                (
+                    Id {
+                        slot: slot as u32,
+                        generation: self.generations[slot],
+                    },
+                    entry,
+                )
+            })
+        })
+    }
+
     /// Returns the entry under `key` and its id, if there is one.
     pub(super) fn find(&self, key: &K) -> Option<(Id, &E)> {
         let slot = self.slot_of(key)?;

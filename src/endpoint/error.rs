@@ -1,7 +1,8 @@
 /*!
-The errors of binding an endpoint and of a request sent through a [`Client`].
+The errors of binding an endpoint and of a request sent through
+[`Endpoint::start`].
 
-[`Client`]: super::Client
+[`Endpoint::start`]: super::Endpoint::start
 */
 
 use std::{error, fmt, io};
@@ -9,7 +10,7 @@ use std::{error, fmt, io};
 use super::driver::MAX_UDP_REQUEST;
 use crate::message::HeaderName;
 
-/// Why a request sent through a [`Client`] got no final response.
+/// A start rejection or a terminal client response-stream failure.
 ///
 /// RFC 3261 section 8.1.3.1 tells a transaction user to treat a timeout as a
 /// 408 and a transport error as a 503. signa reports both as errors instead
@@ -17,20 +18,23 @@ use crate::message::HeaderName;
 /// [`Error::is_transport`] tell them apart. The other cases are refusals: a
 /// request too large for UDP, a missing or invalid `CSeq`, a method this
 /// client cannot send, exhausted request or connection admission, or an
-/// endpoint that has stopped.
+/// endpoint that has stopped. Response delivery overflow is reported after
+/// already queued responses, without ending the underlying SIP machine.
 ///
-/// [`Client`]: super::Client
+/// [`Endpoint::start`]: super::Endpoint::start
 pub struct Error {
     kind: Kind,
 }
 
 enum Kind {
     Timeout,
+    DeliveryOverflow,
     Transport(io::Error),
     TooLarge(usize),
     Missing(HeaderName),
     InvalidCSeq,
     UnsupportedMethod,
+    UnsupportedRouting,
     Busy,
     Closed,
 }
@@ -38,6 +42,10 @@ enum Kind {
 impl Error {
     pub(super) fn timeout() -> Error {
         Error { kind: Kind::Timeout }
+    }
+
+    pub(super) fn delivery_overflow() -> Error {
+        Error { kind: Kind::DeliveryOverflow }
     }
 
     pub(super) fn transport(err: io::Error) -> Error {
@@ -60,16 +68,8 @@ impl Error {
         Error { kind: Kind::UnsupportedMethod }
     }
 
-    /// Returns `true` if CSeq is duplicated, malformed, or names a method
-    /// other than the request's method. The request was not sent.
-    pub fn is_invalid_cseq(&self) -> bool {
-        matches!(self.kind, Kind::InvalidCSeq)
-    }
-
-    /// Returns `true` for INVITE, ACK or CANCEL, which this non-INVITE
-    /// client cannot send with the required transaction semantics.
-    pub fn is_unsupported_method(&self) -> bool {
-        matches!(self.kind, Kind::UnsupportedMethod)
+    pub(super) fn unsupported_routing() -> Error {
+        Error { kind: Kind::UnsupportedRouting }
     }
 
     pub(super) fn busy() -> Error {
@@ -86,6 +86,12 @@ impl Error {
         matches!(self.kind, Kind::Timeout)
     }
 
+    /// Returns `true` if response count or byte capacity was exhausted.
+    /// Queued responses precede this terminal error. SIP work continues.
+    pub fn is_delivery_overflow(&self) -> bool {
+        matches!(self.kind, Kind::DeliveryOverflow)
+    }
+
     /// Returns `true` if the transport could not send the request or lost
     /// the connection it went over. [`Error::source`] has the I/O error.
     ///
@@ -98,10 +104,28 @@ impl Error {
     ///
     /// RFC 3261 section 18.1.1 sends a request over a congestion-controlled
     /// transport when it is within 200 bytes of the path MTU, or over 1300
-    /// bytes when the MTU is unknown, as it is here. The caller sends such a
-    /// request through a TCP client instead.
+    /// bytes when the MTU is unknown, as it is here. The caller starts such a
+    /// request with a TCP target instead.
     pub fn is_too_large(&self) -> bool {
         matches!(self.kind, Kind::TooLarge(_))
+    }
+
+    /// Returns `true` if CSeq is duplicated, malformed, or names a method
+    /// other than the request's method. The request was not sent.
+    pub fn is_invalid_cseq(&self) -> bool {
+        matches!(self.kind, Kind::InvalidCSeq)
+    }
+
+    /// Returns `true` for INVITE, ACK or CANCEL, which this non-INVITE
+    /// client cannot send with the required transaction semantics.
+    pub fn is_unsupported_method(&self) -> bool {
+        matches!(self.kind, Kind::UnsupportedMethod)
+    }
+
+    /// Returns `true` if the request needs TLS, targets multicast, or targets
+    /// UDP on an endpoint without a UDP socket. The request was not sent.
+    pub fn is_unsupported_routing(&self) -> bool {
+        matches!(self.kind, Kind::UnsupportedRouting)
     }
 
     /// Returns `true` if request or connection admission is exhausted.
@@ -125,6 +149,7 @@ impl fmt::Debug for Error {
         let mut debug = f.debug_tuple("signa::endpoint::Error");
         match &self.kind {
             Kind::Timeout => debug.field(&"Timeout"),
+            Kind::DeliveryOverflow => debug.field(&"DeliveryOverflow"),
             Kind::Transport(err) => debug.field(err),
             Kind::TooLarge(len) => {
                 debug.field(&format_args!("TooLarge({len})"))
@@ -134,6 +159,7 @@ impl fmt::Debug for Error {
             }
             Kind::InvalidCSeq => debug.field(&"InvalidCSeq"),
             Kind::UnsupportedMethod => debug.field(&"UnsupportedMethod"),
+            Kind::UnsupportedRouting => debug.field(&"UnsupportedRouting"),
             Kind::Busy => debug.field(&"Busy"),
             Kind::Closed => debug.field(&"Closed"),
         };
@@ -145,6 +171,9 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.kind {
             Kind::Timeout => f.write_str("no final response before Timer F"),
+            Kind::DeliveryOverflow => {
+                f.write_str("client response delivery capacity is exhausted")
+            }
             Kind::Transport(err) => write!(f, "transport error: {err}"),
             Kind::TooLarge(len) => write!(
                 f,
@@ -158,6 +187,9 @@ impl fmt::Display for Error {
             Kind::UnsupportedMethod => f.write_str(
                 "the client does not support INVITE, ACK or CANCEL",
             ),
+            Kind::UnsupportedRouting => {
+                f.write_str("the endpoint has no transport for this target")
+            }
             Kind::Busy => {
                 f.write_str("client admission capacity is exhausted")
             }

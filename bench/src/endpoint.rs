@@ -12,7 +12,8 @@ use bytes::Bytes;
 use criterion::Criterion;
 use signa::{
     bench::{reply_driver, tcp, udp, Flow},
-    endpoint::{Builder, Endpoint, IncomingEvent, ReplyRoute},
+    endpoint::{Builder, Endpoint, Error, IncomingEvent, ReplyRoute, Target},
+    message::header::CSEQ,
     transaction::Timers,
     transport::Transport,
     Request, Response, StatusCode,
@@ -271,7 +272,11 @@ async fn reply_route_fixture(
 }
 
 pub(super) fn client_admission(c: &mut Criterion) {
-    use std::{future::Future, pin::Pin, task::Waker};
+    use std::{
+        future::Future,
+        pin::{pin, Pin},
+        task::Waker,
+    };
 
     let rt = runtime();
     let _guard = rt.enter();
@@ -279,7 +284,6 @@ pub(super) fn client_admission(c: &mut Criterion) {
         .max_client_transactions(1)
         .serve(NoDispatch)
         .unwrap();
-    let mut client = endpoint.client(Transport::Tcp, LOCALHOST);
     let request = Request::builder()
         .method("OPTIONS")
         .uri("sip:example.com")
@@ -289,15 +293,18 @@ pub(super) fn client_admission(c: &mut Criterion) {
         .header("Call-ID", "admission-bench")
         .body(Bytes::new())
         .unwrap();
-    let pending = client.call(request.clone());
+    let target = Target::new(Transport::Tcp, LOCALHOST);
+    let mut pending = pin!(endpoint.start(request.clone(), target));
     let mut cx = Context::from_waker(Waker::noop());
+    assert!(pending.as_mut().poll(&mut cx).is_pending());
     let len = request.to_bytes().len() as u64;
 
     // Enter the runtime without driving it. The first command stays queued,
     // so each subsequent call must reject without depending on connect timing.
     benchmark(c, "reject/endpoint/client_admission", len, |b| {
         b.iter(|| {
-            let mut response = client.call(bb(request.clone()));
+            let mut response =
+                pin!(endpoint.start(bb(request.clone()), target));
             let Poll::Ready(Err(error)) =
                 Pin::new(&mut response).poll(&mut cx)
             else {
@@ -308,12 +315,11 @@ pub(super) fn client_admission(c: &mut Criterion) {
     });
 
     let mut invalid = request.clone();
-    invalid
-        .headers_mut()
-        .insert(signa::message::header::CSEQ, "1 BYE".parse().unwrap());
+    invalid.headers_mut().insert(CSEQ, "1 BYE".parse().unwrap());
     benchmark(c, "reject/endpoint/client_cseq", len, |b| {
         b.iter(|| {
-            let mut response = client.call(bb(invalid.clone()));
+            let mut response =
+                pin!(endpoint.start(bb(invalid.clone()), target));
             let Poll::Ready(Err(error)) =
                 Pin::new(&mut response).poll(&mut cx)
             else {
@@ -322,8 +328,6 @@ pub(super) fn client_admission(c: &mut Criterion) {
             assert!(error.is_invalid_cseq());
         });
     });
-
-    drop(pending);
 }
 
 pub(super) fn server_admission(c: &mut Criterion) {
@@ -486,5 +490,42 @@ impl Serve for Builder {
         });
 
         Ok(endpoint)
+    }
+}
+
+// A benchmark-local client that waits for the final response. signa exposes
+// every response through `Endpoint::start` and implements no `Service`.
+struct Client {
+    endpoint: Endpoint,
+    target: Target,
+}
+
+trait ClientFixture {
+    fn client(&self, transport: Transport, address: SocketAddr) -> Client;
+}
+
+impl ClientFixture for Endpoint {
+    fn client(&self, transport: Transport, address: SocketAddr) -> Client {
+        Client {
+            endpoint: self.clone(),
+            target: Target::new(transport, address),
+        }
+    }
+}
+
+impl Client {
+    async fn call(
+        &mut self,
+        request: Request<Bytes>,
+    ) -> Result<Response<Bytes>, Error> {
+        let (_control, mut responses) =
+            self.endpoint.start(request, self.target).await?.into_parts();
+        loop {
+            let response =
+                responses.next().await.expect("transaction outcome")?;
+            if response.status().as_u16() >= 200 {
+                return Ok(response);
+            }
+        }
     }
 }

@@ -1,16 +1,15 @@
 /*!
 Two transaction-user loops on the loopback. The server answers OPTIONS over
-UDP and TCP. Client operations retain the Service API until their TU migration.
+UDP and TCP, with explicit client response observation.
 */
 
 use bytes::Bytes;
 use signa::{
-    endpoint::{Endpoint, IncomingEvent},
+    endpoint::{Endpoint, IncomingEvent, Target},
     message::header::Tag,
     transport::Transport,
     Request, Response,
 };
-use tower_service::Service;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -47,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (Transport::Udp, server.udp_addr().expect("UDP bound")),
         (Transport::Tcp, server.tcp_addr().expect("TCP bound")),
     ] {
-        let mut client = client_end.client(transport, next_hop);
+        let target = Target::new(transport, next_hop);
         let request = Request::builder()
             .method("OPTIONS")
             .uri(format!("sip:bob@{next_hop}").as_str())
@@ -57,7 +56,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .header("CSeq", "1 OPTIONS")
             .body(Bytes::new())?;
 
-        let response = client.call(request).await?;
+        let (_control, mut responses) =
+            client_end.start(request, target).await?.into_parts();
+        let mut response =
+            responses.next().await.expect("transaction outcome")?;
+        while response.status().as_u16() < 200 {
+            response = responses.next().await.expect("final outcome")?;
+        }
         println!("client: {} over {transport}", response.status());
     }
 
