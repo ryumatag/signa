@@ -656,6 +656,8 @@ mod tests {
         endpoint.shutdown(Duration::ZERO).await;
     }
 
+    // Without a TCP listener the Via names the connection's own port, so no
+    // response can come once that connection closes.
     #[tokio::test]
     async fn client_tu_reports_tcp_eof_after_a_successful_request_write() {
         let listener = TcpListener::bind(LOCALHOST).await.unwrap();
@@ -683,6 +685,102 @@ mod tests {
 
         drop(control);
         endpoint.shutdown(Duration::ZERO).await;
+    }
+
+    // RFC 3261 sections 18.1.1 and 18.2.2. The client advertises its listener,
+    // so a server whose connection closed answers on a new one.
+    #[tokio::test]
+    async fn client_tu_takes_a_tcp_response_on_a_connection_to_its_listener() {
+        let server = TcpListener::bind(LOCALHOST).await.unwrap();
+        let (endpoint, _incoming) = Endpoint::builder()
+            .tcp(LOCALHOST)
+            .timers(short_timers())
+            .bind()
+            .unwrap();
+        let listener = endpoint.tcp_addr().unwrap();
+        let target = Target::new(Transport::Tcp, server.local_addr().unwrap());
+        let (control, mut responses) = endpoint
+            .start(request("OPTIONS"), target)
+            .await
+            .unwrap()
+            .into_parts();
+        let (mut peer, _) = server.accept().await.unwrap();
+        let request = read_request(&mut peer).await;
+
+        let via = control.via().as_str();
+        assert!(
+            via.starts_with(&format!(
+                "SIP/2.0/TCP 127.0.0.1:{};",
+                listener.port()
+            )),
+            "{via}"
+        );
+        assert_ne!(control.flow().local.port(), listener.port());
+        assert_eq!(request.headers().get(VIA).unwrap(), control.via());
+
+        drop(peer);
+        sleep(Duration::from_millis(50)).await;
+        let mut callback = TcpStream::connect(listener).await.unwrap();
+        callback.write_all(&ok(&request).to_bytes()).await.unwrap();
+
+        let response = timeout(Duration::from_secs(1), responses.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(responses.next().await.is_none());
+
+        drop(control);
+        endpoint.shutdown(Duration::ZERO).await;
+    }
+
+    // With a listener advertised, a closed connection is not the end of the
+    // transaction. Timer F is, when no response comes another way.
+    #[tokio::test]
+    async fn client_tu_waits_for_timer_f_after_eof_when_it_has_a_listener() {
+        let server = TcpListener::bind(LOCALHOST).await.unwrap();
+        let (endpoint, _incoming) = Endpoint::builder()
+            .tcp(LOCALHOST)
+            .timers(short_timers())
+            .bind()
+            .unwrap();
+        let target = Target::new(Transport::Tcp, server.local_addr().unwrap());
+        let (control, mut responses) = endpoint
+            .start(request("OPTIONS"), target)
+            .await
+            .unwrap()
+            .into_parts();
+        let (mut peer, _) = server.accept().await.unwrap();
+        read_request(&mut peer).await;
+
+        drop(peer);
+
+        let error = timeout(Duration::from_secs(2), responses.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.is_timeout(), "{error}");
+        assert!(responses.next().await.is_none());
+
+        drop(control);
+        endpoint.shutdown(Duration::ZERO).await;
+    }
+
+    /// Reads one request from a raw TCP peer.
+    async fn read_request(stream: &mut TcpStream) -> Request<Bytes> {
+        let mut bytes = Vec::new();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                assert!(stream.read_buf(&mut bytes).await.unwrap() > 0);
+                if let Ok(request) = Request::from_bytes(&bytes) {
+                    break request;
+                }
+            }
+        })
+        .await
+        .expect("a request within a second")
     }
 
     #[tokio::test]

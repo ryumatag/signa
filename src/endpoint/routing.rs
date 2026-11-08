@@ -20,7 +20,7 @@ use std::{
 
 use crate::{
     message::header::{via::Via, HeaderValue},
-    transport::{tcp, Flow},
+    transport::{tcp, Flow, Transport},
 };
 
 /// The port `sent-by` means when it names none (RFC 3261 section 18.2.2).
@@ -74,18 +74,57 @@ pub(super) fn source_toward(remote: SocketAddr) -> io::Result<IpAddr> {
     Ok(probe.local_addr()?.ip())
 }
 
-/// The `Via` this endpoint puts on a request it sends on `flow`.
+/// The `sent-by` this endpoint puts in the `Via` of a request it sends on
+/// `flow`, given the address of its TCP listener.
+///
+/// A client on a reliable transport must accept a connection on the `sent-by`
+/// port, because a server whose connection has closed opens a new one there
+/// for the response ([RFC 3261 sections 18.1.1 and 18.2.2]). The local port of
+/// an outbound TCP connection is ephemeral and nothing listens on it. So when
+/// the listener accepts connections on the connection's local address, the
+/// `sent-by` is that address with the listener's port. Otherwise it is the
+/// flow's own local address, and no response reaches the client once its
+/// connection has closed.
+///
+/// I only advertise a listener of the same address family. A dual-stack IPv6
+/// listener may accept IPv4 connections, but that depends on a socket option
+/// the endpoint does not control.
+///
+/// [RFC 3261 sections 18.1.1 and 18.2.2]: https://www.rfc-editor.org/rfc/rfc3261.html#section-18.1.1
+pub(super) fn sent_by(
+    flow: &Flow,
+    listener: Option<SocketAddr>,
+) -> SocketAddr {
+    match listener {
+        Some(listener)
+            if flow.transport == Transport::Tcp
+                && listener.is_ipv4() == flow.local.is_ipv4()
+                && (listener.ip().is_unspecified()
+                    || listener.ip() == flow.local.ip()) =>
+        {
+            SocketAddr::new(flow.local.ip(), listener.port())
+        }
+        _ => flow.local,
+    }
+}
+
+/// The `Via` this endpoint puts on a request it sends over `transport`, with
+/// `sent_by` from [`sent_by`].
 ///
 /// `rport` asks the server to answer the port the request came from
 /// (RFC 3581), which is what a NAT lets through.
-pub(super) fn via_value(flow: &Flow, branches: &mut Branches) -> HeaderValue {
+pub(super) fn via_value(
+    transport: Transport,
+    sent_by: SocketAddr,
+    branches: &mut Branches,
+) -> HeaderValue {
     let mut value = String::with_capacity(80);
     let n = branches.next;
     branches.next += 1;
     let _ = write!(
         value,
-        "SIP/2.0/{} {};rport;branch={}{n:x}",
-        flow.transport, flow.local, branches.prefix
+        "SIP/2.0/{transport} {sent_by};rport;branch={}{n:x}",
+        branches.prefix
     );
 
     HeaderValue::from_built(value)
@@ -159,7 +198,6 @@ pub(super) fn mark_via(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::Transport;
 
     #[test]
     fn reply_ports_follow_transport_and_rport_without_trusting_received() {
@@ -208,6 +246,65 @@ mod tests {
             assert_eq!(reply.remote.port(), port);
             assert_eq!(reply.local, flow.local);
             assert_eq!(reply.transport, flow.transport);
+        }
+    }
+
+    #[test]
+    fn sent_by_names_a_listener_that_accepts_on_the_connection_s_address() {
+        for (transport, local, listener, sent_by) in [
+            (Transport::Tcp, "192.0.2.2:49152", None, "192.0.2.2:49152"),
+            (
+                Transport::Tcp,
+                "192.0.2.2:49152",
+                Some("0.0.0.0:5060"),
+                "192.0.2.2:5060",
+            ),
+            (
+                Transport::Tcp,
+                "192.0.2.2:49152",
+                Some("192.0.2.2:5070"),
+                "192.0.2.2:5070",
+            ),
+            // A listener on another address cannot take the connection.
+            (
+                Transport::Tcp,
+                "192.0.2.2:49152",
+                Some("192.0.2.3:5060"),
+                "192.0.2.2:49152",
+            ),
+            // Nor can one of another family, whatever its dual-stack setting.
+            (
+                Transport::Tcp,
+                "192.0.2.2:49152",
+                Some("[::]:5060"),
+                "192.0.2.2:49152",
+            ),
+            (
+                Transport::Tcp,
+                "[2001:db8::2]:49152",
+                Some("[::]:5060"),
+                "[2001:db8::2]:5060",
+            ),
+            // UDP answers the socket itself.
+            (
+                Transport::Udp,
+                "192.0.2.2:5062",
+                Some("0.0.0.0:5060"),
+                "192.0.2.2:5062",
+            ),
+        ] {
+            let flow = Flow {
+                transport,
+                local: local.parse().unwrap(),
+                remote: "192.0.2.1:5060".parse().unwrap(),
+            };
+            let listener = listener.map(|addr| addr.parse().unwrap());
+
+            assert_eq!(
+                super::sent_by(&flow, listener),
+                sent_by.parse::<SocketAddr>().unwrap(),
+                "{local} with {listener:?}"
+            );
         }
     }
 

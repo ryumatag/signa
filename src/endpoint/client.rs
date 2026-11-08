@@ -382,6 +382,17 @@ impl Endpoint {
     /// acceptance, failures belong to [`Responses`], including ones that occur
     /// before this future resumes. See [RFC 3261 section 17].
     ///
+    /// # TCP
+    ///
+    /// The `sent-by` of the Via is the connection's local address with the
+    /// port of the endpoint's TCP listener, when [`Builder::tcp`] has one that
+    /// accepts connections on that address. A server whose connection has
+    /// closed can then answer on a new connection, so a closed connection does
+    /// not end the transaction, and Timer F does if no final arrives. Without
+    /// such a listener the Via names the connection's own port, and the
+    /// transaction fails with a transport error as soon as the connection
+    /// closes, since no response can reach it any more.
+    ///
     /// # Cancellation
     ///
     /// Dropping an unpolled future does nothing. The first poll queues the
@@ -407,6 +418,7 @@ impl Endpoint {
     ///   shut down.
     ///
     /// [RFC 3261 section 17]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17
+    /// [`Builder::tcp`]: super::Builder::tcp
     #[allow(clippy::manual_async_fn)] // Expose the Send guarantee on Rust 1.71.
     pub fn start(
         &self,

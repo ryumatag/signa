@@ -54,8 +54,8 @@ use crate::{
         error::Error,
         reply::{Admission, Completion, ReplyError, ReplyRoute},
         routing::{
-            mark_via, reply_flow, sent_by_is, source_toward, via_value,
-            Branches, Link,
+            mark_via, reply_flow, sent_by, sent_by_is, source_toward,
+            via_value, Branches, Link,
         },
         server::{
             self, IncomingEvent, ReceivedRequest, ServerRequest,
@@ -490,9 +490,7 @@ impl Driver {
                     if let Some(message) = inbound.message {
                         self.on_message(message, link);
                     } else {
-                        self.on_connection_closed(
-                            link.writer.as_ref().expect("TCP writer"),
-                        );
+                        self.on_connection_closed(&link);
                     }
                 }
                 Event::Datagram(datagram, flow) => {
@@ -1250,7 +1248,11 @@ impl Driver {
         debug_assert!(
             self.clients.len() < self.config.max_client_transactions
         );
-        let via = via_value(&link.flow, &mut self.branches);
+        let via = via_value(
+            link.flow.transport,
+            sent_by(&link.flow, self.config.tcp_listener),
+            &mut self.branches,
+        );
         request.headers_mut().prepend(VIA, via.clone());
         let key = ClientKey::from_request(&request)
             .expect("the Via signa wrote has a branch");
@@ -1374,9 +1376,22 @@ impl Driver {
         }
     }
 
-    /// Fails the client transactions on a TCP connection that has closed.
-    /// Another connection to the same address keeps its transactions.
-    fn on_connection_closed(&mut self, writer: &tcp::Writer) {
+    /// Fails the client transactions on a TCP connection that has closed,
+    /// unless their `Via` advertises the listener.
+    ///
+    /// A server whose connection has closed sends the response on a new one to
+    /// the `sent-by` (RFC 3261 section 18.2.2). With the listener there, the
+    /// transaction keeps waiting, and Timer F ends it if nothing comes.
+    /// Without it nothing can come, so the transaction fails now rather than
+    /// after 64*T1. Client links are always connections the driver opened, so
+    /// the closed connection's flow decides for all of its transactions.
+    /// Another connection to the same address keeps its transactions either
+    /// way.
+    fn on_connection_closed(&mut self, link: &Link) {
+        if sent_by(&link.flow, self.config.tcp_listener) != link.flow.local {
+            return;
+        }
+        let writer = link.writer.as_ref().expect("a TCP link has a writer");
         let Some(&count) =
             self.client_connections.get(&writer.connection_id())
         else {
@@ -1432,12 +1447,16 @@ impl Driver {
         let Some(key) = ClientKey::from_response(&response) else { return };
         let Some((id, entry)) = self.clients.find_mut(&key) else { return };
         // RFC 3261 section 18.1.2 discards a response whose top `Via` names
-        // a `sent-by` other than this one's.
-        let ours = response
-            .headers()
-            .get(VIA)
-            .and_then(Via::top)
-            .is_some_and(|via| sent_by_is(&via, entry.link.flow.local));
+        // a `sent-by` other than this one's. Over TCP the response may come
+        // on any connection, including one the server opened to the listener.
+        let ours = response.headers().get(VIA).and_then(Via::top).is_some_and(
+            |via| {
+                sent_by_is(
+                    &via,
+                    sent_by(&entry.link.flow, self.config.tcp_listener),
+                )
+            },
+        );
         if !ours {
             return;
         }

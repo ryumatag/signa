@@ -38,6 +38,9 @@ pub(super) struct Config {
     pub(super) max_routes: usize,
     pub(super) fallback_limits: WriteLimits,
     pub(super) connect_timeout: Duration,
+    /// The address the TCP listener is bound to, which `bind` fills in once
+    /// the port is known. Client `Via` headers advertise its port.
+    pub(super) tcp_listener: Option<SocketAddr>,
 }
 
 impl Default for Config {
@@ -75,6 +78,7 @@ impl Default for Config {
                 bytes: 8 * 1024 * 1024,
             },
             connect_timeout: Duration::from_secs(10),
+            tcp_listener: None,
         }
     }
 }
@@ -124,6 +128,18 @@ impl Builder {
     }
 
     /// Binds a TCP listener to `addr`.
+    ///
+    /// The listener also takes the responses to requests this endpoint sends
+    /// over TCP. A server whose connection has closed opens a new one to the
+    /// `sent-by` of the request's `Via` ([RFC 3261 section 18.2.2]), so a
+    /// client `Via` names the listener's port with the connection's local
+    /// address, as section 18.1.1 requires. That needs the listener to accept
+    /// connections on that address, either as a wildcard of the same address
+    /// family or bound to the address itself. When it does not, or there is no
+    /// listener, the `Via` names the connection's ephemeral port, and a client
+    /// transaction fails as soon as its connection closes.
+    ///
+    /// [RFC 3261 section 18.2.2]: https://www.rfc-editor.org/rfc/rfc3261.html#section-18.2.2
     pub fn tcp(mut self, addr: SocketAddr) -> Builder {
         self.tcp = Some(addr);
         self
@@ -499,7 +515,7 @@ impl Builder {
     /// `client_response_limits` or `client_response_budget`. Zero client
     /// transaction, table and transport limits are valid and refuse that work
     /// instead.
-    pub fn bind(self) -> Result<(Endpoint, Incoming), BindError> {
+    pub fn bind(mut self) -> Result<(Endpoint, Incoming), BindError> {
         for (reason, value) in [
             (
                 "max_pending_requests must be positive",
@@ -564,6 +580,7 @@ impl Builder {
         let (commands, commands_rx) = mpsc::unbounded_channel();
         let udp_addr = udp.as_ref().map(udp::Socket::local_addr);
         let tcp_addr = listener.as_ref().map(tcp::Listener::local_addr);
+        self.config.tcp_listener = tcp_addr;
 
         if let Some(listener) = listener {
             tokio::spawn(listener.run());
