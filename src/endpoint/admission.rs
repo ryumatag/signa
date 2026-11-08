@@ -3,9 +3,15 @@ Client admission before command enqueue.
 
 A reservation follows a request through the command queue, a pending connect
 and the transaction table. Its count is returned only when the transaction
-ends. Its bytes are returned once the non-INVITE machine drops its request.
-The caller's response future owns neither reservation, so dropping it cannot
-release capacity.
+ends. Its bytes are returned once the machine drops its request, at the final
+response of a non-INVITE or the first response of an INVITE. The caller's
+response future owns neither reservation, so dropping it cannot release
+capacity.
+
+An INVITE also reserves one CANCEL transaction when it is admitted, so filling
+client capacity with new requests cannot make an INVITE impossible to cancel.
+That reservation lives in the INVITE's entry until the CANCEL takes it or the
+INVITE ends.
 
 The counters account for logical message content, not the backing allocations
 of shared buffers or application Extensions. Channels transfer ownership and
@@ -21,7 +27,10 @@ use std::sync::{
 use bytes::Bytes;
 
 use super::Error;
-use crate::Request;
+use crate::{
+    message::header::{CALL_ID, CSEQ, FROM, MAX_FORWARDS, ROUTE, TO},
+    Request,
+};
 
 #[derive(Clone, Debug)]
 pub(super) struct ClientAdmission(Arc<Capacity>);
@@ -66,6 +75,26 @@ impl ClientAdmission {
             return Err(Error::closed());
         }
         Ok(permit)
+    }
+
+    /// Reserves `request`, an INVITE, together with the CANCEL that may
+    /// follow it. Both succeed or neither does.
+    pub(super) fn acquire_invite(
+        &self,
+        request: &Request<Bytes>,
+    ) -> Result<(Permit, Permit), Error> {
+        let invite = self.acquire(request)?;
+
+        reserve(&self.0.count, 1, self.0.max_count)?;
+        let mut cancel = Permit { admission: self.clone(), bytes: 0 };
+        let bytes = cancel_bytes(request).ok_or_else(Error::busy)?;
+        reserve(&self.0.bytes, bytes, self.0.max_bytes)?;
+        cancel.bytes = bytes;
+
+        if self.0.closed.load(Ordering::Acquire) {
+            return Err(Error::closed());
+        }
+        Ok((invite, cancel))
     }
 
     pub(super) fn close(&self) {
@@ -145,6 +174,28 @@ pub(super) fn request_bytes(request: &Request<Bytes>) -> Option<usize> {
     Some(bytes)
 }
 
+/// The logical size of the CANCEL an INVITE may need, which copies the
+/// INVITE's Request-URI, From, To, Call-ID, CSeq and Route
+/// ([RFC 3261 section 9.1]). Max-Forwards is two digits, and the CSeq method
+/// grows from INVITE to CANCEL by nothing. The Via is not counted, as for
+/// every client request, since the driver adds it.
+///
+/// [RFC 3261 section 9.1]: https://www.rfc-editor.org/rfc/rfc3261.html#section-9.1
+pub(super) fn cancel_bytes(request: &Request<Bytes>) -> Option<usize> {
+    let mut bytes = ["CANCEL", request.uri().as_str(), "SIP/2.0", "70"]
+        .iter()
+        .try_fold(0usize, |total, part| total.checked_add(part.len()))?;
+    bytes = bytes.checked_add(MAX_FORWARDS.as_str().len())?;
+    for (name, value) in request.headers() {
+        if [FROM, TO, CALL_ID, CSEQ, ROUTE].contains(name) {
+            bytes = bytes
+                .checked_add(name.as_str().len())?
+                .checked_add(value.len())?;
+        }
+    }
+    Some(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +229,37 @@ mod tests {
         assert_eq!(admission.0.count.load(Ordering::Relaxed), 0);
         assert_eq!(admission.0.bytes.load(Ordering::Relaxed), 0);
         assert!(admission.acquire(&request).is_ok());
+    }
+
+    #[test]
+    fn an_invite_reserves_its_cancel_or_nothing() {
+        let invite = Request::builder()
+            .method("INVITE")
+            .uri("sip:bob@example.com")
+            .header("Route", "<sip:proxy.example.com;lr>")
+            .header("CSeq", "1 INVITE")
+            .body(Bytes::from_static(b"v=0"))
+            .unwrap();
+        let invite_bytes = request_bytes(&invite).unwrap();
+        let cancel = cancel_bytes(&invite).unwrap();
+        assert!(cancel < invite_bytes + "Max-Forwards70".len());
+
+        let admission = ClientAdmission::new(2, invite_bytes + cancel);
+        let (first, reserved) = admission.acquire_invite(&invite).unwrap();
+        assert_eq!(admission.0.count.load(Ordering::Relaxed), 2);
+        assert_eq!(reserved.bytes, cancel);
+
+        // Neither the count nor the bytes of a refused pair stay reserved.
+        drop(first);
+        assert!(admission.acquire_invite(&invite).unwrap_err().is_busy());
+        assert_eq!(admission.0.count.load(Ordering::Relaxed), 1);
+        assert_eq!(admission.0.bytes.load(Ordering::Relaxed), cancel);
+
+        drop(reserved);
+        let admission = ClientAdmission::new(3, invite_bytes + cancel - 1);
+        assert!(admission.acquire_invite(&invite).unwrap_err().is_busy());
+        assert_eq!(admission.0.count.load(Ordering::Relaxed), 0);
+        assert_eq!(admission.0.bytes.load(Ordering::Relaxed), 0);
     }
 
     #[test]

@@ -1,27 +1,34 @@
 /*!
-Client transaction submission and bounded response observation.
+Client transaction submission, cancellation and bounded response observation.
 */
 
 use std::{
     collections::VecDeque,
-    fmt,
+    error, fmt,
     future::{poll_fn, Future},
     hash::{Hash, Hasher},
+    io,
     net::SocketAddr,
-    sync::{Arc, Mutex, Weak},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, Weak,
+    },
     task::{Context, Poll, Waker},
 };
 
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 
-use super::{driver::Command, Endpoint, Error};
+use super::{admission, driver::Command, table::Id, Endpoint, Error};
 use crate::{
     message::{
-        header::{cseq::CSeq, HeaderValue, CSEQ},
+        header::{
+            address, cseq::CSeq, HeaderName, HeaderValue, CALL_ID, CSEQ, FROM,
+            TO,
+        },
         request::Request,
         response::Response,
-        Method,
+        Method, Uri,
     },
     transport::{
         budget::{Budget, Permit},
@@ -102,16 +109,17 @@ impl ClientTransaction {
     }
 }
 
-/// Metadata for an accepted transaction.
+/// Metadata and cancellation for an accepted transaction.
 ///
-/// Dropping it does not stop the machine. INVITE cancellation is added with
-/// INVITE endpoint support.
+/// Dropping it does not stop the machine or send a CANCEL. An INVITE is
+/// cancelled only by [`ClientControl::cancel`].
 #[derive(Debug)]
 pub struct ClientControl {
     id: ClientTransactionId,
     via: HeaderValue,
     flow: Flow,
-    _commands: mpsc::UnboundedSender<Command>,
+    cancel: Option<CancelHandle>,
+    commands: mpsc::UnboundedSender<Command>,
 }
 
 impl ClientControl {
@@ -129,26 +137,179 @@ impl ClientControl {
     pub fn flow(&self) -> Flow {
         self.flow
     }
+
+    /// Asks the driver to cancel this INVITE, and waits for the outcome.
+    ///
+    /// Each INVITE has one cancellation intent. The driver waits for a
+    /// provisional response before it sends the CANCEL, since
+    /// [RFC 3261 section 9.1] forbids one earlier. If a final response or the
+    /// end of the transaction comes first, the outcome is
+    /// [`CancelOutcome::NotNeeded`]. Otherwise the CANCEL copies the INVITE's
+    /// Request-URI, From, To, Call-ID, CSeq number, Route values and top Via,
+    /// goes to the INVITE's next hop and transport, and starts a separate
+    /// non-INVITE transaction, which [`CancelOutcome::Sent`] returns. Over TCP
+    /// it opens a new connection to that next hop if the INVITE's has closed.
+    ///
+    /// The CANCEL does not end the INVITE or its [`Responses`]. The INVITE
+    /// usually ends with a 487, which signa acknowledges. A 2xx can still win
+    /// the race. It is delivered as usual, and the TU must acknowledge it. If
+    /// no final response arrives within 64 T1 of the CANCEL, signa stops
+    /// waiting, ends the INVITE, and [`Responses`] yields
+    /// [`Error::is_cancel_timeout`]. That deadline is this endpoint's
+    /// implementation of the section's recommendation, not Timer B.
+    ///
+    /// # Cancellation
+    ///
+    /// An unpolled future does nothing. The first poll records the intent and
+    /// queues it for the driver, which commits it. Dropping the future after
+    /// that does not withdraw it. The driver still sends the CANCEL after the
+    /// first provisional response, and that CANCEL transaction runs
+    /// unobserved. Calling again then reports
+    /// [`CancelError::AlreadyRequested`], without a second CANCEL.
+    ///
+    /// # Errors
+    ///
+    /// * [`CancelError::NotInvite`] for a transaction that is not an INVITE.
+    /// * [`CancelError::AlreadyRequested`] for every call after the first.
+    /// * [`CancelError::Busy`] or [`CancelError::Transport`] when a new TCP
+    ///   connection to the next hop was needed and could not be admitted or
+    ///   opened. Nothing was sent.
+    /// * [`CancelError::Closed`] once the endpoint has stopped.
+    ///
+    /// [RFC 3261 section 9.1]: https://www.rfc-editor.org/rfc/rfc3261.html#section-9.1
+    #[allow(clippy::manual_async_fn)] // Expose the Send guarantee on Rust 1.71.
+    pub fn cancel(
+        &self,
+    ) -> impl Future<Output = Result<CancelOutcome, CancelError>> + Send + '_
+    {
+        async move {
+            let handle = self.cancel.as_ref().ok_or(CancelError::NotInvite)?;
+            if handle.intent.requested.swap(true, Ordering::AcqRel) {
+                return Err(CancelError::AlreadyRequested);
+            }
+
+            let (done, outcome) = oneshot::channel();
+            self.commands
+                .send(Command::Cancel {
+                    id: handle.id,
+                    intent: handle.intent.clone(),
+                    done,
+                })
+                .map_err(|_| CancelError::Closed)?;
+            outcome.await.unwrap_or(Err(CancelError::Closed))
+        }
+    }
+}
+
+/// What [`ClientControl::cancel`] did.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum CancelOutcome {
+    /// The CANCEL was handed to its own client transaction, which sent it or
+    /// reports why it could not through its [`Responses`]. This is not
+    /// receipt by the peer.
+    Sent(ClientTransaction),
+    /// A final response arrived, or the INVITE ended, before a CANCEL could
+    /// be sent. Nothing was sent.
+    NotNeeded,
+}
+
+/// Why [`ClientControl::cancel`] sent no CANCEL.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum CancelError {
+    /// The transaction is not an INVITE. signa cancels only INVITEs.
+    NotInvite,
+    /// An earlier call recorded the intent. No second CANCEL is created.
+    AlreadyRequested,
+    /// A new TCP connection to the next hop could not be admitted.
+    Busy,
+    /// A new TCP connection to the next hop could not be opened.
+    Transport(io::Error),
+    /// The endpoint has stopped.
+    Closed,
+}
+
+impl fmt::Display for CancelError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotInvite => f.write_str("only an INVITE can be cancelled"),
+            Self::AlreadyRequested => {
+                f.write_str("cancellation was already requested")
+            }
+            Self::Busy => {
+                f.write_str("no connection to the next hop could be admitted")
+            }
+            Self::Transport(error) => {
+                write!(f, "the next hop could not be reached: {error}")
+            }
+            Self::Closed => f.write_str("the endpoint is closed"),
+        }
+    }
+}
+
+impl error::Error for CancelError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            Self::Transport(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// What `cancel` needs to find its INVITE in the driver. The intent is shared
+/// with the driver's entry, which compares it before acting, so a reused table
+/// slot cannot take a stale request.
+#[derive(Debug)]
+pub(super) struct CancelHandle {
+    id: Id,
+    intent: Arc<Intent>,
+}
+
+/// One INVITE's single cancellation intent.
+#[derive(Debug, Default)]
+pub(super) struct Intent {
+    requested: AtomicBool,
+}
+
+impl CancelHandle {
+    pub(super) fn new(id: Id, intent: Arc<Intent>) -> CancelHandle {
+        CancelHandle { id, intent }
+    }
 }
 
 /// Responses accepted by the transaction machine, in arrival order.
 ///
-/// Every accepted provisional response is observable. A non-INVITE final ends
-/// observation even while Timer K keeps the machine alive. See
-/// [RFC 3261 section 17.1.2].
+/// Every accepted provisional response is observable. A non-INVITE final, or
+/// a non-2xx INVITE final, ends observation even while the machine stays to
+/// absorb retransmissions and, for the INVITE, to acknowledge them. See
+/// [RFC 3261 sections 17.1.1 and 17.1.2].
+///
+/// An INVITE 2xx does not end observation. Every 2xx the machine accepts,
+/// including retransmissions and the 2xx of other forks with other To tags,
+/// arrives until Timer M, 64 T1 after the first ([RFC 6026 section 8.4]).
+/// Further 2xx do not restart Timer M, and the stream ends without an error
+/// when it fires. signa does not merge 2xx by To tag. The TU sends the ACK
+/// for each 2xx, for example with [`Endpoint::send_request`]. Dropping the
+/// observation of an INVITE leaves later 2xx without anyone to acknowledge
+/// them, and the UAS eventually gives up on the dialog.
 ///
 /// # Overflow
 ///
 /// Each stream is bounded by [`Builder::client_response_limits`] and shares
 /// [`Builder::client_response_budget`] with the others. Overflow preserves
-/// queued responses and then yields one explicit error.
+/// queued responses and then yields one explicit error. The machine goes on,
+/// acknowledging a non-2xx and keeping an INVITE in Accepted until Timer M,
+/// but nothing more is observed. A truncated set of 2xx is never presented
+/// as a complete one.
 ///
 /// # Cancellation
 ///
 /// Receiving is cancellation-safe and fused. Dropping observation never
 /// cancels SIP work.
 ///
-/// [RFC 3261 section 17.1.2]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17.1.2
+/// [RFC 3261 sections 17.1.1 and 17.1.2]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17.1.1
+/// [RFC 6026 section 8.4]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.4
 /// [`Builder::client_response_limits`]: super::Builder::client_response_limits
 /// [`Builder::client_response_budget`]: super::Builder::client_response_budget
 pub struct Responses {
@@ -253,6 +414,12 @@ struct Queued {
 pub(super) struct Delivery(Arc<Mutex<State>>);
 
 impl Delivery {
+    /// Ends the stream without an error, as Timer M does for an INVITE that
+    /// received a 2xx.
+    pub(super) fn end(self) {
+        self.update(|state| state.ended = true);
+    }
+
     pub(super) fn observation(&self) -> Observation {
         Observation(Arc::downgrade(&self.0))
     }
@@ -335,8 +502,22 @@ impl Observation {
 /// the transaction handles once it installs the machine.
 pub(super) struct Starting {
     accepted: oneshot::Sender<Result<ClientTransaction, Error>>,
+    observation: Observing,
+    /// What an INVITE reserved for its CANCEL.
+    cancel: Option<Reserved>,
+}
+
+/// The handles of a transaction before the driver installs it.
+pub(super) struct Observing {
     commands: mpsc::UnboundedSender<Command>,
     responses: Responses,
+}
+
+/// The admission and observation capacity an admitted INVITE holds for one
+/// CANCEL transaction.
+pub(super) struct Reserved {
+    pub(super) permit: admission::Permit,
+    pub(super) observation: Observing,
 }
 
 impl Starting {
@@ -344,18 +525,40 @@ impl Starting {
         let _ = self.accepted.send(result);
     }
 
-    /// Returns the driver's delivery, the caller's transaction, and the
-    /// channel that hands the transaction over.
-    pub(super) fn prepare(
+    /// Splits the start into the channel that answers it, its handles, and
+    /// the CANCEL reservation of an INVITE.
+    pub(super) fn split(
+        self,
+    ) -> (
+        oneshot::Sender<Result<ClientTransaction, Error>>,
+        Observing,
+        Option<Reserved>,
+    ) {
+        (self.accepted, self.observation, self.cancel)
+    }
+}
+
+impl Observing {
+    pub(super) fn new(
+        commands: mpsc::UnboundedSender<Command>,
+        responses: Responses,
+    ) -> Observing {
+        Observing { commands, responses }
+    }
+
+    /// The driver's side of the response stream.
+    pub(super) fn delivery(&self) -> Delivery {
+        Delivery(self.responses.shared.clone())
+    }
+
+    /// The caller's transaction once the driver has installed it. `cancel`
+    /// is set for an INVITE.
+    pub(super) fn finish(
         self,
         via: HeaderValue,
         flow: Flow,
-    ) -> (
-        Delivery,
-        ClientTransaction,
-        oneshot::Sender<Result<ClientTransaction, Error>>,
-    ) {
-        let delivery = Delivery(self.responses.shared.clone());
+        cancel: Option<CancelHandle>,
+    ) -> ClientTransaction {
         let handle = self
             .responses
             .shared
@@ -363,28 +566,51 @@ impl Starting {
             .expect("response state is not poisoned")
             ._handle
             .clone();
-        let transaction = ClientTransaction {
+
+        ClientTransaction {
             control: ClientControl {
                 id: ClientTransactionId(handle),
                 via,
                 flow,
-                _commands: self.commands,
+                cancel,
+                commands: self.commands,
             },
             responses: self.responses,
-        };
-
-        (delivery, transaction, self.accepted)
+        }
     }
 }
 
 impl Endpoint {
-    /// Starts a non-INVITE client transaction toward `target`.
+    /// Starts an INVITE or non-INVITE client transaction toward `target`.
     ///
     /// The driver prepares the transport, prepends a Via with a fresh branch
     /// and sends the request. The future returns after driver acceptance, and
     /// [`ClientControl::flow`] then has the actual local address. After
     /// acceptance, failures belong to [`Responses`], including ones that occur
     /// before this future resumes. See [RFC 3261 section 17].
+    ///
+    /// # INVITE
+    ///
+    /// An INVITE needs one From and one To with a valid URI, one Call-ID, and
+    /// a CSeq below 2<sup>31</sup> ([RFC 3261 section 8.1.1.5]), since its
+    /// ACK and CANCEL copy them. The transaction keeps those values, the
+    /// Request-URI, the Route values, its top Via and the next hop until the
+    /// final response, without the body or the buffer they came in.
+    ///
+    /// Retransmissions stop at the first provisional response, and nothing
+    /// times the INVITE out after that. Timer B ends only an INVITE that got
+    /// no response at all. The TU applies its own limit on ringing, such as a
+    /// proxy's Timer C, and calls [`ClientControl::cancel`].
+    ///
+    /// The transaction acknowledges a non-2xx final response itself, on the
+    /// INVITE's next hop, and again for each retransmission of that response
+    /// ([RFC 3261 section 17.1.1.3]). The TU acknowledges each 2xx
+    /// ([RFC 3261 section 13.2.2.4]). See [`Responses`].
+    ///
+    /// Admission reserves a CANCEL transaction with each INVITE, in
+    /// [`Builder::max_client_transactions`] and
+    /// [`Builder::max_client_handles`], so a cancellation never waits for
+    /// capacity.
     ///
     /// # Routing
     ///
@@ -428,15 +654,21 @@ impl Endpoint {
     /// operation, and a queued operation may execute even if this future is
     /// dropped. A caller that drops it before it resolves cannot tell whether
     /// the request was sent. Starting the request again sends a second
-    /// transaction with a new branch, so do not retry blindly.
+    /// transaction with a new branch, so do not retry blindly. An INVITE whose
+    /// future was dropped runs without anyone to observe or cancel it, so a
+    /// 2xx to it goes unacknowledged. Dropping the future is never a CANCEL.
     ///
     /// # Errors
     ///
     /// * [`Error::is_invalid_cseq`] unless the request has one parseable CSeq
-    ///   with its own method. A request without CSeq gets an error naming it.
-    /// * [`Error::is_unsupported_method`] for INVITE, ACK and CANCEL. ACK and
-    ///   CANCEL need explicit protocol operations, and INVITE waits for its
-    ///   endpoint machine. Extension methods are supported.
+    ///   with its own method, below 2<sup>31</sup> for an INVITE. A request
+    ///   without CSeq, or an INVITE without From, To or Call-ID, gets an error
+    ///   naming the header.
+    /// * [`Error::is_invalid_header`] for an INVITE with more than one From,
+    ///   To or Call-ID, or one that does not parse.
+    /// * [`Error::is_unsupported_method`] for ACK and CANCEL. An ACK for a 2xx
+    ///   goes through [`Endpoint::send_request`], and an INVITE's CANCEL
+    ///   through [`ClientControl::cancel`]. Extension methods are supported.
     /// * [`Error::is_unsupported_routing`] for a `sips:` Request-URI, a
     ///   multicast target, or a UDP target on an endpoint without a UDP
     ///   socket. Route is not checked, as Routing above explains.
@@ -453,7 +685,13 @@ impl Endpoint {
     /// [RFC 3261 section 8.1.2]: https://www.rfc-editor.org/rfc/rfc3261.html#section-8.1.2
     /// [RFC 5630 section 5.1.1]: https://www.rfc-editor.org/rfc/rfc5630.html#section-5.1.1
     /// [RFC 3261 section 12.2.1.1]: https://www.rfc-editor.org/rfc/rfc3261.html#section-12.2.1.1
+    /// [RFC 3261 section 8.1.1.5]: https://www.rfc-editor.org/rfc/rfc3261.html#section-8.1.1.5
+    /// [RFC 3261 section 17.1.1.3]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17.1.1.3
+    /// [RFC 3261 section 13.2.2.4]: https://www.rfc-editor.org/rfc/rfc3261.html#section-13.2.2.4
+    /// [RFC 3261 section 18.1.1]: https://www.rfc-editor.org/rfc/rfc3261.html#section-18.1.1
     /// [`Builder::tcp`]: super::Builder::tcp
+    /// [`Builder::max_client_transactions`]: super::Builder::max_client_transactions
+    /// [`Builder::max_client_handles`]: super::Builder::max_client_handles
     #[allow(clippy::manual_async_fn)] // Expose the Send guarantee on Rust 1.71.
     pub fn start(
         &self,
@@ -483,13 +721,20 @@ impl Endpoint {
             return Err(Error::unsupported_routing());
         }
 
-        let permit = self.client_admission.acquire(&request)?;
-        let handle = self.client_handles.acquire(0).ok_or_else(Error::busy)?;
-        let responses = Responses::new(
-            self.client_response_budget.clone(),
-            self.client_response_limits,
-            handle,
-        );
+        let (permit, cancel) = if request.method() == Method::INVITE {
+            let (permit, cancel) =
+                self.client_admission.acquire_invite(&request)?;
+            (permit, Some(cancel))
+        } else {
+            (self.client_admission.acquire(&request)?, None)
+        };
+        let observation = self.observing()?;
+        let cancel = match cancel {
+            Some(permit) => {
+                Some(Reserved { permit, observation: self.observing()? })
+            }
+            None => None,
+        };
 
         let (accepted, response) = oneshot::channel();
         self.commands
@@ -497,15 +742,22 @@ impl Endpoint {
                 request,
                 transport: target.transport,
                 next_hop: target.address,
-                respond: Starting {
-                    accepted,
-                    commands: self.commands.clone(),
-                    responses,
-                },
+                respond: Starting { accepted, observation, cancel },
                 permit,
             })
             .map_err(|_| Error::closed())?;
         Ok(response)
+    }
+
+    /// Reserves one `max_client_handles` slot for a response stream.
+    fn observing(&self) -> Result<Observing, Error> {
+        let handle = self.client_handles.acquire(0).ok_or_else(Error::busy)?;
+        let responses = Responses::new(
+            self.client_response_budget.clone(),
+            self.client_response_limits,
+            handle,
+        );
+        Ok(Observing::new(self.commands.clone(), responses))
     }
 }
 
@@ -522,20 +774,86 @@ fn validate(request: &Request<Bytes>) -> Result<(), Error> {
     {
         return Err(Error::unsupported_routing());
     }
-    if matches!(
-        *request.method(),
-        Method::INVITE | Method::ACK | Method::CANCEL
-    ) {
+    if matches!(*request.method(), Method::ACK | Method::CANCEL) {
         return Err(Error::unsupported_method());
     }
 
     let mut values = request.headers().get_all(CSEQ);
     let value = values.next().ok_or_else(|| Error::missing(CSEQ))?;
-    if values.next().is_some()
-        || !CSeq::parse(value)
-            .is_some_and(|cseq| cseq.method == request.method())
-    {
-        return Err(Error::invalid_cseq());
+    let cseq = CSeq::parse(value)
+        .filter(|cseq| cseq.method == request.method())
+        .filter(|_| values.next().is_none())
+        .ok_or_else(Error::invalid_cseq)?;
+
+    if request.method() == Method::INVITE {
+        // RFC 3261 section 8.1.1.5. The ACK and CANCEL repeat the number.
+        if cseq.number >= 1 << 31 {
+            return Err(Error::invalid_cseq());
+        }
+        validate_identity(request)?;
+    }
+    Ok(())
+}
+
+/// Checks the From, To and Call-ID that an INVITE's ACK and CANCEL copy.
+///
+/// The transaction layer copies them verbatim, so it checks the structure it
+/// relies on rather than full UA semantics. From and To are a `name-addr` or
+/// `addr-spec`, whose URI has a valid SIP or SIPS structure or another
+/// scheme. Call-ID is `word ["@" word]` (RFC 3261 section 25.1). A From tag is
+/// not required, so a proxy can forward an INVITE from an RFC 2543 client.
+fn validate_identity(request: &Request<Bytes>) -> Result<(), Error> {
+    let one = |name: HeaderName| {
+        let mut values = request.headers().get_all(&name);
+        match (values.next(), values.next()) {
+            (Some(value), None) => Ok(value.as_str()),
+            (None, _) => Err(Error::missing(name)),
+            (Some(_), Some(_)) => Err(Error::invalid_header(name)),
+        }
+    };
+
+    // A SIP or SIPS URI gets its structure checked. Another scheme, such as
+    // `tel:`, needs `scheme ":"` and what the message layer accepts after it.
+    let valid_uri = |uri: &str| {
+        let Ok(uri) = uri.parse::<Uri>() else { return false };
+        match uri.sip() {
+            Ok(Some(_)) => true,
+            Ok(None) => {
+                uri.as_str().split_once(':').is_some_and(|(scheme, rest)| {
+                    !rest.is_empty()
+                        && scheme
+                            .bytes()
+                            .next()
+                            .is_some_and(|b| b.is_ascii_alphabetic())
+                        && scheme.bytes().all(|b| {
+                            b.is_ascii_alphanumeric() || b"+-.".contains(&b)
+                        })
+                })
+            }
+            Err(_) => false,
+        }
+    };
+    for name in [FROM, TO] {
+        let value = one(name.clone())?;
+        if !address::uri(value).is_some_and(valid_uri) {
+            return Err(Error::invalid_header(name));
+        }
+    }
+
+    let call_id = one(CALL_ID)?.trim();
+    let word = |word: &str| {
+        !word.is_empty()
+            && word.bytes().all(|b| {
+                b.is_ascii_alphanumeric()
+                    || b"-.!%*_+`'~()<>:\\\"/[]?{}".contains(&b)
+            })
+    };
+    let valid = match call_id.split_once('@') {
+        Some((local, host)) => word(local) && word(host),
+        None => word(call_id),
+    };
+    if !valid {
+        return Err(Error::invalid_header(CALL_ID));
     }
     Ok(())
 }
@@ -591,6 +909,11 @@ pub(super) mod compatibility {
             if self.commands.is_closed() {
                 return ResponseFuture::failed(Error::closed());
             }
+            // The final-only adapter cannot cancel or acknowledge a 2xx, so
+            // it keeps refusing INVITE as the pre-TU client did.
+            if request.method() == Method::INVITE {
+                return ResponseFuture::failed(Error::unsupported_method());
+            }
             if let Err(error) = validate(&request) {
                 return ResponseFuture::failed(error);
             }
@@ -612,8 +935,8 @@ pub(super) mod compatibility {
             );
             let respond = Starting {
                 accepted,
-                commands: self.commands.clone(),
-                responses,
+                observation: Observing::new(self.commands.clone(), responses),
+                cancel: None,
             };
             let command = Command::Send {
                 request,
@@ -849,6 +1172,82 @@ mod tests {
         }
     }
 
+    fn invite() -> Request<Bytes> {
+        Request::builder()
+            .method("INVITE")
+            .uri("sip:bob@example.com")
+            .header("From", "Alice <sip:alice@example.com>;tag=1")
+            .header("To", "<sip:bob@example.com>")
+            .header("Call-ID", "a84b4c76e66710@pc33.example.com")
+            .header("CSeq", "2147483647 INVITE")
+            .body(Bytes::new())
+            .unwrap()
+    }
+
+    // RFC 3261 sections 8.1.1.5, 9.1 and 17.1.1.3. The ACK and CANCEL copy
+    // these fields, so an INVITE without a usable copy is never sent.
+    #[test]
+    fn invite_identity_is_validated_before_admission() {
+        assert!(validate(&invite()).is_ok());
+
+        for (name, value) in [
+            ("From", "\"Alice\" <sip:alice@example.com>"),
+            ("From", "sip:alice@example.com;tag=1"),
+            ("To", "Bob <tel:+12015550123>;tag=x"),
+            ("Call-ID", "f81d4fae-7dec-11d0-a765-00a0c91e6bf6"),
+            ("Call-ID", "a!%*_+`'~()<>:\\\"/[]?{}@[2001:db8::1]"),
+        ] {
+            let mut request = invite();
+            request
+                .headers_mut()
+                .insert(name.parse().unwrap(), value.parse().unwrap());
+            assert!(validate(&request).is_ok(), "{name}: {value}");
+        }
+
+        for name in [FROM, TO, CALL_ID] {
+            let mut request = invite();
+            request.headers_mut().remove(&name);
+            let error = validate(&request).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                Error::missing(name.clone()).to_string()
+            );
+
+            let mut request = invite();
+            let value = request.headers().get(&name).unwrap().clone();
+            request.headers_mut().append(name.clone(), value);
+            assert!(validate(&request).unwrap_err().is_invalid_header());
+        }
+
+        for (name, value) in [
+            ("From", "<sip:alice@example.com"),
+            ("From", "Alice"),
+            ("To", "<not a uri>"),
+            ("To", "<bob@example.com>"),
+            ("To", "<sip:>"),
+            ("To", "\"Bob <sip:bob@example.com>"),
+            ("Call-ID", "two words"),
+            ("Call-ID", "a@b@c"),
+            ("Call-ID", "@example.com"),
+            ("Call-ID", "caf\u{e9}"),
+        ] {
+            let mut request = invite();
+            request
+                .headers_mut()
+                .insert(name.parse().unwrap(), value.parse().unwrap());
+            assert!(
+                validate(&request).unwrap_err().is_invalid_header(),
+                "{name}: {value}"
+            );
+        }
+
+        for cseq in ["2147483648 INVITE", "4294967295 INVITE", "1 OPTIONS"] {
+            let mut request = invite();
+            request.headers_mut().insert(CSEQ, cseq.parse().unwrap());
+            assert!(validate(&request).unwrap_err().is_invalid_cseq());
+        }
+    }
+
     fn routed(uri: &str, routes: &[&str]) -> Request<Bytes> {
         let mut builder = Request::builder()
             .method("OPTIONS")
@@ -918,7 +1317,7 @@ mod tests {
             assert!(validate(&request).unwrap_err().is_invalid_cseq());
         }
 
-        for method in ["INVITE", "ACK", "CANCEL"] {
+        for method in ["ACK", "CANCEL"] {
             let request = Request::builder()
                 .method(method)
                 .uri("sip:example.com")

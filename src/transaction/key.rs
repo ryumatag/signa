@@ -26,8 +26,10 @@ const COOKIE: &str = "z9hG4bK";
 ///
 /// The branch compares byte for byte after the cookie, since the same element
 /// made it each time. The host of `sent-by` compares without regard to ASCII
-/// case, as a hostname does. The hash covers the branch and the method only,
-/// which keeps equal keys hashing alike.
+/// case, as a hostname does. The hash covers the branch only, which keeps
+/// equal keys hashing alike. It leaves out the method so that a CANCEL can
+/// find the request it targets whatever that request's method is, see
+/// [`ServerKey::is_cancel_target`].
 ///
 /// The branch and the host are copied out of the request. A key lives in the
 /// table for Timer J after its request is gone, and a slice of the request
@@ -76,6 +78,25 @@ impl ServerKey {
         })
     }
 
+    /// Whether this transaction is the one `cancel`, the key of a CANCEL,
+    /// targets.
+    ///
+    /// [RFC 3261 section 9.2] matches a CANCEL as [section 17.2.3] matches
+    /// a request, taking the method to be anything but CANCEL or ACK. So the
+    /// branch and the whole `sent-by` decide, and an INVITE is the usual but
+    /// not the only target. Two peers that pick the same branch have
+    /// different `sent-by` values and different targets.
+    ///
+    /// [RFC 3261 section 9.2]: https://www.rfc-editor.org/rfc/rfc3261.html#section-9.2
+    /// [section 17.2.3]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17.2.3
+    pub fn is_cancel_target(&self, cancel: &ServerKey) -> bool {
+        self.method != Method::CANCEL
+            && self.method != Method::ACK
+            && self.branch() == cancel.branch()
+            && self.port == cancel.port
+            && self.host().eq_ignore_ascii_case(cancel.host())
+    }
+
     fn branch(&self) -> &[u8] {
         &self.text[..usize::from(self.branch_len)]
     }
@@ -99,7 +120,6 @@ impl Eq for ServerKey {}
 impl Hash for ServerKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.branch().hash(state);
-        self.method.hash(state);
     }
 }
 
@@ -161,9 +181,15 @@ fn branch<'a>(via: &Via<'a>) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::{
+        collections::HashSet,
+        hash::{BuildHasher, BuildHasherDefault, DefaultHasher},
+    };
 
     use super::*;
+
+    // An unseeded hasher, so the two keys hash with the same state.
+    type FixedState = BuildHasherDefault<DefaultHasher>;
 
     fn request(head: &str) -> Request<Bytes> {
         Request::from_bytes(format!("{head}\r\n").as_bytes()).unwrap()
@@ -207,6 +233,43 @@ mod tests {
         ] {
             let other = ServerKey::from_request(&request(other)).unwrap();
             assert_ne!(key, other, "{other:?}");
+        }
+    }
+
+    // RFC 3261 section 9.2. Equal branches from different peers are
+    // different targets, and the target may be a non-INVITE request.
+    #[test]
+    fn a_cancel_targets_its_request_by_branch_and_sent_by() {
+        let key =
+            |head: &str| ServerKey::from_request(&request(head)).unwrap();
+        let cancel = key("CANCEL sip:a@b SIP/2.0\r\n\
+             Via: SIP/2.0/UDP pc33.example.com:5060;branch=z9hG4bK1\r\n");
+
+        for method in ["INVITE", "OPTIONS", "X-VENDOR"] {
+            let target = key(&format!(
+                "{method} sip:a@b SIP/2.0\r\n\
+                 Via: SIP/2.0/UDP PC33.example.com:5060;branch=z9hG4bK1\r\n"
+            ));
+            assert!(target.is_cancel_target(&cancel), "{method}");
+            assert_eq!(
+                FixedState::default().hash_one(&target),
+                FixedState::default().hash_one(&cancel),
+                "a CANCEL looks its target up under its own hash"
+            );
+        }
+        for other in [
+            "CANCEL sip:a@b SIP/2.0\r\n\
+             Via: SIP/2.0/UDP pc33.example.com:5060;branch=z9hG4bK1\r\n",
+            "ACK sip:a@b SIP/2.0\r\n\
+             Via: SIP/2.0/UDP pc33.example.com:5060;branch=z9hG4bK1\r\n",
+            "INVITE sip:a@b SIP/2.0\r\n\
+             Via: SIP/2.0/UDP pc34.example.com:5060;branch=z9hG4bK1\r\n",
+            "INVITE sip:a@b SIP/2.0\r\n\
+             Via: SIP/2.0/UDP pc33.example.com:5061;branch=z9hG4bK1\r\n",
+            "INVITE sip:a@b SIP/2.0\r\n\
+             Via: SIP/2.0/UDP pc33.example.com:5060;branch=z9hG4bK2\r\n",
+        ] {
+            assert!(!key(other).is_cancel_target(&cancel), "{other:?}");
         }
     }
 

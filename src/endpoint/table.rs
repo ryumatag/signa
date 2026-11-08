@@ -84,13 +84,23 @@ impl<K: Hash + Eq, E> Table<K, E> {
         Some((Id { slot, generation }, entry))
     }
 
-    /// See [`Table::find`].
-    pub(super) fn find_mut(&mut self, key: &K) -> Option<(Id, &mut E)> {
-        let slot = self.slot_of(key)?;
-        let generation = self.generations[slot as usize];
-        let (_, entry) = self.slots[slot as usize].as_mut().expect("indexed");
+    /// Returns an entry whose key hashes as `probe` does and satisfies
+    /// `matches`, and its id.
+    ///
+    /// A CANCEL finds its target this way. The keys hash by branch alone, so
+    /// the CANCEL's own key finds candidates of any method.
+    pub(super) fn find_by(
+        &self,
+        probe: &K,
+        mut matches: impl FnMut(&K) -> bool,
+    ) -> Option<(Id, &E)> {
+        let hash = self.hasher.hash_one(probe);
+        let slots = &self.slots;
+        let &slot =
+            self.index.find(hash, |&slot| matches(key_of(slots, slot)))?;
+        let (_, entry) = self.slots[slot as usize].as_ref().expect("indexed");
 
-        Some((Id { slot, generation }, entry))
+        Some((Id { slot, generation: self.generations[slot as usize] }, entry))
     }
 
     /// Returns the entry `id` names, or `None` once it is removed.
@@ -190,6 +200,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn find_by_takes_a_predicate_under_the_probe_hash() {
+        let mut table = Table::new();
+        let a = table.insert("a", 1);
+        table.insert("b", 2);
+
+        assert_eq!(table.find_by(&"a", |key| *key == "a"), Some((a, &1)));
+        assert_eq!(table.find_by(&"a", |key| *key == "b"), None);
+        table.remove(a);
+        assert_eq!(table.find_by(&"a", |_| true), None);
+    }
+
+    #[test]
     fn entries_are_found_by_key_and_by_id() {
         let mut table = Table::new();
         let a = table.insert("a", 1);
@@ -204,10 +226,6 @@ mod tests {
 
         *table.get_mut(b).unwrap() = 3;
         assert_eq!(table.get(b), Some(&3));
-        let (id, entry) = table.find_mut(&"b").unwrap();
-        assert_eq!(id, b);
-        *entry = 4;
-        assert_eq!(table.get(b), Some(&4));
     }
 
     #[test]

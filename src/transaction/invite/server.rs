@@ -62,11 +62,22 @@ pub enum ServerEvent {
 
 /// The TU supplied a response that the current state cannot send.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ResponseError;
+pub enum ResponseError {
+    /// A final response was sent, and this one is not a further 2xx in
+    /// Accepted.
+    FinalAlreadySent,
+    /// The transaction has terminated.
+    Terminated,
+}
 
 impl fmt::Display for ResponseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("response is not permitted in the INVITE server state")
+        f.write_str(match self {
+            Self::FinalAlreadySent => {
+                "a final response was sent and only another 2xx can follow"
+            }
+            Self::Terminated => "the INVITE server transaction has terminated",
+        })
     }
 }
 
@@ -107,6 +118,11 @@ impl ServerTransaction {
         matches!(self.state, State::Terminated)
     }
 
+    /// Whether a 2xx was sent. Accepted keeps no response to retransmit.
+    pub fn is_accepted(&self) -> bool {
+        matches!(self.state, State::Accepted { .. })
+    }
+
     /// The next timer deadline, if this state has a timer.
     pub fn deadline(&self) -> Option<Instant> {
         match self.state {
@@ -114,6 +130,25 @@ impl ServerTransaction {
             State::Confirmed { i } => Some(i),
             State::Accepted { l } => Some(l),
             State::Proceeding { .. } | State::Terminated => None,
+        }
+    }
+
+    /// Whether the TU can send a response with `status` now.
+    ///
+    /// Proceeding takes any response. Accepted takes another 2xx, which
+    /// may come from another fork ([RFC 6026 section 8.7]). Nothing else
+    /// follows a final response.
+    ///
+    /// [RFC 6026 section 8.7]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.7
+    pub fn check_response(
+        &self,
+        status: StatusCode,
+    ) -> Result<(), ResponseError> {
+        match self.state {
+            State::Proceeding { .. } => Ok(()),
+            State::Accepted { .. } if status.is_success() => Ok(()),
+            State::Terminated => Err(ResponseError::Terminated),
+            _ => Err(ResponseError::FinalAlreadySent),
         }
     }
 
@@ -146,7 +181,8 @@ impl ServerTransaction {
             State::Accepted { .. } if status.is_success() => {
                 Ok(ServerEvent::Send(response))
             }
-            _ => Err(ResponseError),
+            State::Terminated => Err(ResponseError::Terminated),
+            _ => Err(ResponseError::FinalAlreadySent),
         }
     }
 
@@ -214,6 +250,21 @@ impl ServerTransaction {
             ServerEvent::None
         } else {
             ServerEvent::TransportError
+        }
+    }
+
+    /// Ends Proceeding when no TU is left to answer and the driver cannot send
+    /// its fallback response either.
+    ///
+    /// This is the driver's abandonment policy, not an RFC transition.
+    /// Proceeding has no timer, so the entry would otherwise stay forever.
+    /// Returns `false` in any other state, which keeps its own timers.
+    pub fn abandon(&mut self) -> bool {
+        if matches!(self.state, State::Proceeding { .. }) {
+            self.state = State::Terminated;
+            true
+        } else {
+            false
         }
     }
 }
@@ -393,6 +444,58 @@ mod tests {
             assert_eq!(tx.deadline(), deadline);
             assert_eq!(tx.on_retransmission(), retransmission);
             assert!(!tx.is_terminated());
+        }
+    }
+
+    // RFC 6026 section 8.7. Accepted takes further 2xx only.
+    #[test]
+    fn check_response_reports_why_a_response_is_refused() {
+        let start = Instant::now();
+        let status = |code| StatusCode::from_u16(code).unwrap();
+        let mut tx = server(false);
+        for code in [100, 180, 200, 486] {
+            assert_eq!(tx.check_response(status(code)), Ok(()));
+        }
+
+        send(&mut tx, 200, start);
+        assert!(tx.is_accepted());
+        assert_eq!(tx.check_response(status(299)), Ok(()));
+        for code in [180, 486] {
+            assert_eq!(
+                tx.check_response(status(code)),
+                Err(ResponseError::FinalAlreadySent)
+            );
+        }
+
+        let mut tx = server(true);
+        send(&mut tx, 486, start);
+        assert!(!tx.is_accepted());
+        assert_eq!(
+            tx.check_response(status(200)),
+            Err(ResponseError::FinalAlreadySent)
+        );
+        tx.on_ack(&TIMERS, start);
+        assert_eq!(
+            tx.check_response(status(200)),
+            Err(ResponseError::Terminated)
+        );
+    }
+
+    #[test]
+    fn abandon_ends_proceeding_only() {
+        let start = Instant::now();
+        let mut tx = server(false);
+        send(&mut tx, 180, start);
+        assert!(tx.abandon());
+        assert!(tx.is_terminated());
+
+        for code in [200, 486] {
+            let mut tx = server(false);
+            send(&mut tx, code, start);
+            let deadline = tx.deadline();
+
+            assert!(!tx.abandon());
+            assert_eq!(tx.deadline(), deadline);
         }
     }
 

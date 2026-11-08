@@ -7,7 +7,7 @@ its receive loop and handler tasks. Incoming requests carry their
 [`Flow`](crate::transport::Flow) in the envelope, and `Extensions` stays for
 application data.
 
-# Non-INVITE reception
+# Reception
 
 [`IncomingEvent::Request`] owns a request and its [`ServerTransaction`]. Split
 the transaction into a non-cloneable [`Responder`] and independent
@@ -15,6 +15,29 @@ the transaction into a non-cloneable [`Responder`] and independent
 when the peer gets it. A final response may leave a UDP transaction in
 Completed until Timer J. Every response other than 100 needs a To tag, which
 [`response::Builder::to_tag`](crate::message::response::Builder::to_tag) adds.
+
+An INVITE gets a 100 Trying from the driver as soon as it is admitted, and a
+refused one gets a 503 without it. The TU sends provisional responses and a
+final one. After a non-2xx the transaction retransmits it over UDP, absorbs its
+ACK, and reports [`ServerEvent::AckTimeout`] if none comes. After a 2xx it
+stays in Accepted for Timer L, takes further 2xx, including other forks', and
+absorbs INVITE retransmissions without sending anything
+([RFC 6026 section 8.7]). It does not retransmit a 2xx. A UAS does that through
+[`Responder::reply_route`] until its ACK arrives
+([RFC 3261 section 13.3.1.4]).
+
+An ACK never gets a response. One for a non-2xx is the transaction's. One
+for a 2xx, which matches an INVITE in Accepted or no transaction at all,
+arrives as [`IncomingEvent::Ack`].
+
+A CANCEL that matches a transaction, by branch and `sent-by`, arrives as
+[`IncomingEvent::Cancel`] with its own transaction and its target's
+[`ServerTransactionId`] ([RFC 3261 section 9.2]). The target may be a
+non-INVITE request. The TU decides what the CANCEL means. A UAS answers it with
+a 200 and a pending INVITE with a 487. A proxy cancels its branches. A CANCEL
+without a target arrives as [`IncomingEvent::UnmatchedCancel`], with a reply
+route and no automatic 481, since a stateful proxy may have to forward it
+instead (section 16.10).
 
 Dropping an unanswered responder makes the driver send a 500. It reuses a To
 tag already sent in a provisional response, or adds a random one. If the 500
@@ -25,12 +48,16 @@ request. This is signa's abandonment policy, not an RFC rule.
 request without an RFC 3261 branch. Each retransmission of it arrives as a new
 event.
 
-The driver absorbs retransmissions and sends RFC 4320's automatic 100. INVITE
-gets 501, CANCEL gets 481 and ACK is discarded until INVITE support lands. A
-request without exactly one From, To, Call-ID and CSeq, or whose CSeq method
-differs from its own, gets a stateless 400 and never reaches the application. A
-request whose top Via has `maddr` is dropped, since its response would go to a
-multicast group, which signa does not support.
+The driver absorbs retransmissions and sends RFC 4320's automatic 100 for a
+non-INVITE. A request without exactly one From, To, Call-ID and CSeq, or whose
+CSeq method differs from its own, gets a stateless 400, or nothing if it is an
+ACK, and never reaches the application. A request whose top Via has `maddr` is
+dropped, since its response would go to a multicast group, which signa does not
+support.
+
+[RFC 6026 section 8.7]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.7
+[RFC 3261 section 13.3.1.4]: https://www.rfc-editor.org/rfc/rfc3261.html#section-13.3.1.4
+[RFC 3261 section 9.2]: https://www.rfc-editor.org/rfc/rfc3261.html#section-9.2
 
 Dropping [`Incoming`] starts an immediate shutdown. An application that only
 sends requests keeps it anyway, because peers can still send it requests, such
@@ -48,7 +75,12 @@ transactions go on:
   reply routes. A responder holds its request's route, and a route counts until
   its last clone drops.
 * [`Builder::max_server_transactions`] bounds the transaction table, including
-  Completed UDP entries kept for Timer J.
+  Completed UDP entries kept for Timer J and INVITEs kept for Timers I, H and
+  L. An INVITE also holds the entry its CANCEL would take.
+
+ACK and matched CANCEL events have their own count and byte limit,
+[`Builder::control_event_limits`], so handlers that hold every ordinary slot
+while they wait for an ACK or CANCEL do not stop it.
 
 [`Builder::max_server_response_bytes`] bounds submitted and retained responses.
 `respond` reports a full submission queue as [`SubmitError::Busy`], full
@@ -70,14 +102,19 @@ and a queued submission may still run after its waiting future is dropped.
 
 [`Endpoint::start`] accepts an explicit [`Target`] and returns split control
 and response observation. All accepted provisional responses are delivered.
-Client admission bounds commands, connects and live transactions. Initial sends
-leave a quarter of output capacity for transaction output and responses. See
+An INVITE also delivers every 2xx until Timer M, acknowledges a non-2xx itself,
+and is cancelled with [`ClientControl::cancel`]. The TU acknowledges a 2xx
+with [`Endpoint::send_request`]. Client admission bounds commands, connects and
+live transactions, and reserves a CANCEL with each INVITE. Initial sends leave a
+quarter of output capacity for transaction output and responses. See
 [`Builder::tcp_write_limits`], [`Builder::udp_write_limits`] and
 [`Builder::fallback_limits`].
 
 [`Endpoint::shutdown`] closes new admission and drains current work until the
 earliest requested deadline. Once shutdown starts, new requests get a 503 and
 existing reply routes and responders keep working while admitted work drains.
+Matched CANCELs, ACKs and `send_request` still work then. The drain does not
+wait for INVITEs in Accepted or for their 2xx and ACKs yet.
 
 Transaction timers remain under [`crate::transaction`], without an endpoint
 alias:
@@ -88,15 +125,20 @@ use signa::endpoint::Timers;
 
 # Example
 
-This UAS answers each request with a 200. `to_tag` adds a fresh To tag to an
-initial request's response and keeps the tag of a request within a dialog. It
-ignores untracked requests, which then get no answer. A failed submission is
-logged rather than returned, since leaving the loop would drop `incoming` and
-shut the endpoint down.
+This UAS answers each non-INVITE request with a 200 and refuses INVITE.
+
+`to_tag` adds a fresh To tag to an initial request's response and keeps the tag
+of a request within a dialog. It ignores untracked requests, which then get no
+answer. A failed submission is logged rather than returned, since leaving the
+loop would drop `incoming` and shut the endpoint down.
 
 ```no_run
 use bytes::Bytes;
-use signa::{endpoint::{Endpoint, IncomingEvent}, message::header::Tag, Response};
+use signa::{
+    endpoint::{Endpoint, IncomingEvent},
+    message::header::Tag,
+    Method, Response,
+};
 
 # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 let (_endpoint, mut incoming) = Endpoint::builder()
@@ -105,9 +147,16 @@ let (_endpoint, mut incoming) = Endpoint::builder()
 
 while let Some(event) = incoming.recv().await {
     if let IncomingEvent::Request(envelope) = event {
+        // A 2xx to an INVITE starts a dialog, whose 2xx retransmissions and
+        // ACK this loop does not handle.
+        let status = if envelope.request.method() == Method::INVITE {
+            501
+        } else {
+            200
+        };
         let (responder, _) = envelope.transaction.into_parts();
         let response = Response::reply_to(&envelope.request)
-            .status(200)
+            .status(status)
             .to_tag(Tag::random())
             .body(Bytes::new())?;
 
@@ -125,7 +174,7 @@ use std::{fmt, net::SocketAddr, sync::Arc, time::Duration};
 
 #[cfg(feature = "__bench")]
 use bytes::Bytes;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Semaphore};
 
 #[cfg(all(test, not(miri)))]
 use self::client::compatibility::Client;
@@ -144,15 +193,16 @@ use crate::{
 pub use self::{
     builder::Builder,
     client::{
-        ClientControl, ClientTransaction, ClientTransactionId, Responses,
-        Target,
+        CancelError, CancelOutcome, ClientControl, ClientTransaction,
+        ClientTransactionId, Responses, Target,
     },
     error::{BindError, Error},
     reply::{ReplyError, ReplyRoute},
+    send::{SentRequest, ViaMode},
     server::{
-        Incoming, IncomingEvent, ReceivedRequest, Responder, ResponseId,
-        ResponseSubmission, ServerEvent, ServerEvents, ServerRequest,
-        ServerTransaction, ServerTransactionId, SubmitError,
+        Incoming, IncomingCancel, IncomingEvent, ReceivedAck, ReceivedRequest,
+        Responder, ResponseId, ResponseSubmission, ServerEvent, ServerEvents,
+        ServerRequest, ServerTransaction, ServerTransactionId, SubmitError,
     },
     shutdown::Shutdown,
 };
@@ -165,6 +215,7 @@ mod driver;
 mod error;
 mod reply;
 mod routing;
+mod send;
 mod server;
 mod shutdown;
 mod table;
@@ -191,6 +242,10 @@ pub struct Endpoint {
     control: mpsc::Sender<()>,
     shutdown_wait: watch::Receiver<()>,
     connection_stats: Arc<driver::ConnectionCounters>,
+    /// The one-shot slots and bytes that reply routes share, for
+    /// [`Endpoint::send_request`].
+    oneshot_capacity: Arc<Semaphore>,
+    oneshot_bytes: Budget,
     udp: Option<SocketAddr>,
     tcp: Option<SocketAddr>,
 }
@@ -262,7 +317,9 @@ impl Endpoint {
     /// rejects [`Endpoint::start`] with [`Error::is_closed`].
     /// It waits until every admitted request has a final response, its own
     /// requests have theirs, and pending writes and connects finish, then
-    /// stops. It does not wait out Timer J. At `timeout` it stops regardless,
+    /// stops. It does not wait out Timer J, or Timer L or M of an INVITE that
+    /// got a 2xx, so a 2xx retransmission or ACK after that finds the endpoint
+    /// gone. At `timeout` it stops regardless,
     /// and whatever still waits fails with [`Error::is_closed`]. See the
     /// [module docs](self#client-operations-and-shutdown).
     ///
@@ -340,7 +397,7 @@ pub fn reply_driver(
 mod tests {
     use std::{
         convert::Infallible,
-        future::{self, Future, Ready},
+        future::{self, poll_fn, Future, Ready},
         io,
         net::{IpAddr, Ipv4Addr, SocketAddr},
         pin::{self, Pin},
@@ -349,7 +406,7 @@ mod tests {
             Arc,
         },
         task::{Context, Poll},
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use bytes::Bytes;
@@ -368,17 +425,18 @@ mod tests {
             driver::{Command, Driver, TCP_INBOUND},
             error::Error,
             routing::Link,
-            Builder, Endpoint, Incoming, IncomingEvent, ReplyError,
-            ServerRequest, Target,
+            Builder, CancelError, CancelOutcome, Endpoint, Incoming,
+            IncomingEvent, ReplyError, Responses, ServerEvent, ServerEvents,
+            ServerRequest, SubmitError, Target, ViaMode,
         },
         message::{
-            header::{HeaderValue, Tag, CSEQ, TO, VIA},
+            header::{HeaderValue, Tag, CALL_ID, CSEQ, FROM, ROUTE, TO, VIA},
             request::Request,
             response::Response,
-            StatusCode,
+            Message, Method, StatusCode,
         },
         transaction::Timers,
-        transport::{tcp, udp, Flow, Transport, WriteLimits},
+        transport::{budget::Budget, tcp, udp, Flow, Transport, WriteLimits},
     };
 
     const LOCALHOST: SocketAddr =
@@ -996,12 +1054,12 @@ mod tests {
                             None,
                             Some(envelope.reply),
                         ),
+                        // The final-only adapter has no use for ACK or
+                        // CANCEL. A dropped CANCEL responder sends a 500.
+                        _ => continue,
                     };
                     request.extensions_mut().insert(flow);
-                    if std::future::poll_fn(|cx| service.poll_ready(cx))
-                        .await
-                        .is_err()
-                    {
+                    if poll_fn(|cx| service.poll_ready(cx)).await.is_err() {
                         break;
                     }
                     let future = service.call(request);
@@ -1089,6 +1147,20 @@ mod tests {
             Some(String::from_utf8(self.buf[..len].to_vec()).unwrap())
         }
 
+        /// Receives one message, or `None` after 200 ms without one.
+        async fn message(&mut self) -> Option<Message<Bytes>> {
+            let received = self.recv().await?;
+            Some(Message::from_bytes(received.as_bytes()).unwrap())
+        }
+
+        async fn send_message(&self, to: SocketAddr, message: &impl ToWire) {
+            self.socket.send_to(&message.wire(), to).await.unwrap();
+        }
+
+        fn addr(&self) -> SocketAddr {
+            self.socket.local_addr().unwrap()
+        }
+
         /// A request from this peer, with `via` as its top `Via` value.
         fn request(&self, method: &str, via: &str) -> String {
             format!(
@@ -1103,6 +1175,160 @@ mod tests {
                 self.port()
             )
         }
+    }
+
+    trait ToWire {
+        fn wire(&self) -> Bytes;
+    }
+
+    impl ToWire for Request<Bytes> {
+        fn wire(&self) -> Bytes {
+            self.to_bytes()
+        }
+    }
+
+    impl ToWire for Response<Bytes> {
+        fn wire(&self) -> Bytes {
+            self.to_bytes()
+        }
+    }
+
+    impl ToWire for String {
+        fn wire(&self) -> Bytes {
+            Bytes::copy_from_slice(self.as_bytes())
+        }
+    }
+
+    /// A raw TCP peer that takes one framed message at a time.
+    struct Stream {
+        stream: TcpStream,
+        buf: Vec<u8>,
+    }
+
+    impl Stream {
+        fn new(stream: TcpStream) -> Stream {
+            Stream { stream, buf: Vec::new() }
+        }
+
+        async fn send(&mut self, message: &impl ToWire) {
+            self.stream.write_all(&message.wire()).await.unwrap();
+        }
+
+        /// The next message, or `None` after `wait` without one or at EOF.
+        async fn within(&mut self, wait: Duration) -> Option<Message<Bytes>> {
+            timeout(wait, async {
+                loop {
+                    if let Some(message) = self.take() {
+                        return message;
+                    }
+                    if self.stream.read_buf(&mut self.buf).await.unwrap() == 0
+                    {
+                        future::pending::<()>().await;
+                    }
+                }
+            })
+            .await
+            .ok()
+        }
+
+        async fn next(&mut self) -> Message<Bytes> {
+            self.within(Duration::from_secs(1)).await.expect("a message")
+        }
+
+        fn take(&mut self) -> Option<Message<Bytes>> {
+            let head = self.buf.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+            let text = std::str::from_utf8(&self.buf[..head]).unwrap();
+            let body = text
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            if self.buf.len() < head + body {
+                return None;
+            }
+            let bytes: Vec<u8> = self.buf.drain(..head + body).collect();
+            Some(Message::from_bytes(&bytes).unwrap())
+        }
+    }
+
+    fn into_request(message: Message<Bytes>) -> Request<Bytes> {
+        match message {
+            Message::Request(request) => request,
+            Message::Response(response) => {
+                panic!("a request, got {response:?}")
+            }
+        }
+    }
+
+    fn into_response(message: Message<Bytes>) -> Response<Bytes> {
+        match message {
+            Message::Response(response) => response,
+            Message::Request(request) => panic!("a response, got {request:?}"),
+        }
+    }
+
+    /// An INVITE with a body and a route set, which its ACK and CANCEL must
+    /// not copy and must copy respectively.
+    pub(super) fn invite() -> Request<Bytes> {
+        Request::builder()
+            .method("INVITE")
+            .uri("sip:bob@example.com")
+            .header("From", "Alice <sip:alice@example.com>;tag=1928301774")
+            .header("To", "Bob <sip:bob@example.com>")
+            .header("Call-ID", "a84b4c76e66710@pc33.example.com")
+            .header("CSeq", "314159 INVITE")
+            .header("Max-Forwards", "70")
+            .header(
+                "Route",
+                "<sip:p1.example.com;lr>, <sip:p2.example.com;lr>",
+            )
+            .header("Content-Type", "application/sdp")
+            .body(Bytes::from_static(b"v=0\r\n"))
+            .unwrap()
+    }
+
+    /// A response to `request`, with a To tag unless it is a 100.
+    pub(super) fn reply(
+        request: &Request<Bytes>,
+        code: u16,
+        tag: &str,
+    ) -> Response<Bytes> {
+        let builder = Response::reply_to(request).status(code);
+        let builder = if code == 100 { builder } else { builder.to_tag(tag) };
+        builder.body(Bytes::new()).unwrap()
+    }
+
+    /// The ACK a UAC core builds for a 2xx, with the To of the 2xx.
+    fn ack_for(
+        invite: &Request<Bytes>,
+        ok: &Response<Bytes>,
+    ) -> Request<Bytes> {
+        let mut builder = Request::builder()
+            .method("ACK")
+            .uri(invite.uri().as_str())
+            .header("Max-Forwards", "70");
+        for name in [FROM, CALL_ID] {
+            builder = builder.header(
+                name.as_str(),
+                invite.headers().get(&name).unwrap().as_str(),
+            );
+        }
+        let number = invite
+            .headers()
+            .get(CSEQ)
+            .unwrap()
+            .as_str()
+            .split(' ')
+            .next()
+            .unwrap();
+        builder
+            .header("To", ok.headers().get(TO).unwrap().as_str())
+            .header("CSeq", format!("{number} ACK").as_str())
+            .body(Bytes::new())
+            .unwrap()
     }
 
     pub(super) const REPLY_LOCAL: SocketAddr =
@@ -1201,6 +1427,38 @@ mod tests {
             driver.control.clone(),
         );
         (DriverFixture { driver, incoming }, commands, local)
+    }
+
+    /// An endpoint handle on a driver that a test runs by hand.
+    pub(super) fn fixture_endpoint(
+        fixture: &DriverFixture,
+        commands: mpsc::UnboundedSender<Command>,
+        udp: SocketAddr,
+    ) -> Endpoint {
+        Endpoint {
+            commands,
+            client_admission: fixture.client_admission(),
+            client_response_budget: Budget::new(WriteLimits {
+                messages: 64,
+                bytes: 1 << 20,
+            }),
+            client_handles: Budget::new(WriteLimits {
+                messages: 64,
+                bytes: usize::MAX,
+            }),
+            client_response_limits: WriteLimits {
+                messages: 16,
+                bytes: 1 << 16,
+            },
+            shutdown_control: fixture.shutdown_control.clone(),
+            control: fixture.control.clone(),
+            shutdown_wait: fixture.shutdown_done.subscribe(),
+            connection_stats: fixture.connection_stats.clone(),
+            oneshot_capacity: fixture.oneshot_capacity(),
+            oneshot_bytes: fixture.oneshot_bytes(),
+            udp: Some(udp),
+            tcp: None,
+        }
     }
 
     pub(super) fn route_request(via: &str) -> Request<Bytes> {
@@ -1563,32 +1821,6 @@ mod tests {
         assert!(trying.contains("branch=z9hG4bK1"), "{trying}");
         let response = peer.recv().await.unwrap();
         assert!(response.starts_with("SIP/2.0 200 OK\r\n"), "{response}");
-    }
-
-    #[tokio::test]
-    async fn invite_ack_and_cancel_do_not_reach_the_service() {
-        let service = Counting::default();
-        let server = serve(service.clone());
-        let to = server.udp_addr().unwrap();
-        let mut peer = Peer::new().await;
-        let via =
-            format!("SIP/2.0/UDP 127.0.0.1:{};branch=z9hG4bK1", peer.port());
-
-        peer.send(to, &peer.request("INVITE", &via)).await;
-        let response = peer.recv().await.unwrap();
-        assert!(
-            response.starts_with("SIP/2.0 501 Not Implemented\r\n"),
-            "{response}"
-        );
-
-        peer.send(to, &peer.request("CANCEL", &via)).await;
-        let response = peer.recv().await.unwrap();
-        assert!(response.starts_with("SIP/2.0 481 "), "{response}");
-
-        peer.send(to, &peer.request("ACK", &via)).await;
-        assert!(peer.recv().await.is_none());
-
-        assert_eq!(service.requests.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -2530,5 +2762,1073 @@ mod tests {
         }
 
         assert_eq!(service.requests.load(Ordering::SeqCst), 0);
+    }
+
+    /// The far side of a transaction, over either transport.
+    enum Remote {
+        Udp(Peer, SocketAddr),
+        Tcp(Stream),
+    }
+
+    impl Remote {
+        async fn send(&mut self, message: &impl ToWire) {
+            match self {
+                Remote::Udp(peer, to) => peer.send_message(*to, message).await,
+                Remote::Tcp(stream) => stream.send(message).await,
+            }
+        }
+
+        /// The next message, or `None` after 200 ms without one.
+        async fn next(&mut self) -> Option<Message<Bytes>> {
+            match self {
+                Remote::Udp(peer, _) => peer.message().await,
+                Remote::Tcp(stream) => {
+                    stream.within(Duration::from_millis(200)).await
+                }
+            }
+        }
+
+        /// As `next`, skipping retransmissions of `method`.
+        async fn next_except(
+            &mut self,
+            method: &str,
+        ) -> Option<Message<Bytes>> {
+            loop {
+                let message = self.next().await?;
+                let skipped = matches!(
+                    &message,
+                    Message::Request(request) if request.method() == method
+                );
+                if !skipped {
+                    return Some(message);
+                }
+            }
+        }
+    }
+
+    /// A UAS for client tests, listening on UDP and TCP.
+    struct Far {
+        udp: Peer,
+        tcp: TcpListener,
+    }
+
+    impl Far {
+        async fn new() -> Far {
+            Far {
+                udp: Peer::new().await,
+                tcp: TcpListener::bind(LOCALHOST).await.unwrap(),
+            }
+        }
+
+        fn target(&self, transport: Transport) -> Target {
+            Target::new(
+                transport,
+                match transport {
+                    Transport::Udp => self.udp.addr(),
+                    Transport::Tcp => self.tcp.local_addr().unwrap(),
+                },
+            )
+        }
+
+        /// The side of the connection the endpoint opened, or of its socket.
+        async fn remote(
+            self,
+            transport: Transport,
+            endpoint: &Endpoint,
+        ) -> Remote {
+            match transport {
+                Transport::Udp => {
+                    Remote::Udp(self.udp, endpoint.udp_addr().unwrap())
+                }
+                Transport::Tcp => {
+                    let (stream, _) = self.tcp.accept().await.unwrap();
+                    Remote::Tcp(Stream::new(stream))
+                }
+            }
+        }
+    }
+
+    /// The next response, which must come within a second.
+    async fn next(responses: &mut Responses) -> Response<Bytes> {
+        timeout(Duration::from_secs(1), responses.next())
+            .await
+            .expect("a response within a second")
+            .expect("an open stream")
+            .unwrap()
+    }
+
+    fn invite_endpoint(timers: Timers) -> (Endpoint, Incoming) {
+        Endpoint::builder()
+            .udp(LOCALHOST)
+            .tcp(LOCALHOST)
+            .timers(timers)
+            .bind()
+            .unwrap()
+    }
+
+    // RFC 3261 sections 17.1.1.2 and 17.1.1.3. The TU sees each provisional
+    // response and the first non-2xx final. The transaction acknowledges that
+    // final and each retransmission of it, with the INVITE's routing and the
+    // final's To, and delivers it once.
+    #[tokio::test]
+    async fn invite_client_acknowledges_a_non_2xx_on_both_transports() {
+        for transport in [Transport::Udp, Transport::Tcp] {
+            let (endpoint, _incoming) = invite_endpoint(Timers::default());
+            let far = Far::new().await;
+            let target = far.target(transport);
+
+            let (control, mut responses) =
+                endpoint.start(invite(), target).await.unwrap().into_parts();
+            let mut remote = far.remote(transport, &endpoint).await;
+            let sent = into_request(remote.next().await.unwrap());
+            assert_eq!(sent.headers().get(VIA), Some(control.via()));
+            assert_eq!(sent.body().as_ref(), b"v=0\r\n");
+
+            for code in [100, 180, 183] {
+                remote.send(&reply(&sent, code, "early")).await;
+                assert_eq!(next(&mut responses).await.status().as_u16(), code);
+            }
+            let busy = reply(&sent, 486, "busy");
+            remote.send(&busy).await;
+            assert_eq!(next(&mut responses).await.status().as_u16(), 486);
+            assert!(responses.next().await.is_none());
+
+            let ack = into_request(remote.next().await.unwrap());
+            assert_eq!(ack.method(), Method::ACK);
+            assert_eq!(ack.uri().as_str(), sent.uri().as_str());
+            assert_eq!(
+                ack.headers().get_all(VIA).collect::<Vec<_>>(),
+                [control.via()]
+            );
+            assert_eq!(ack.headers().get(CSEQ).unwrap(), "314159 ACK");
+            assert_eq!(ack.headers().get(TO), busy.headers().get(TO));
+            for name in [FROM, CALL_ID] {
+                assert_eq!(
+                    ack.headers().get(&name),
+                    sent.headers().get(&name)
+                );
+            }
+            assert_eq!(
+                ack.headers().get_all(ROUTE).collect::<Vec<_>>(),
+                sent.headers().get_all(ROUTE).collect::<Vec<_>>()
+            );
+            assert!(ack.body().is_empty());
+
+            if transport == Transport::Udp {
+                remote.send(&busy).await;
+                let again = into_request(remote.next().await.unwrap());
+                assert_eq!(again.to_bytes(), ack.to_bytes());
+            }
+            assert!(responses.next().await.is_none());
+            assert!(matches!(
+                control.cancel().await,
+                Ok(CancelOutcome::NotNeeded)
+            ));
+
+            endpoint.shutdown(Duration::ZERO).await;
+        }
+    }
+
+    // RFC 6026 section 8.4 and RFC 3261 section 13.2.2.4. Every 2xx reaches
+    // the TU until Timer M, including retransmissions and other forks, and
+    // the TU acknowledges each with an ACK of its own. signa sends none.
+    #[tokio::test]
+    async fn invite_client_delivers_forked_2xx_until_timer_m_for_the_tu_to_ack(
+    ) {
+        for transport in [Transport::Udp, Transport::Tcp] {
+            let (endpoint, _incoming) = invite_endpoint(short_timers());
+            let far = Far::new().await;
+            let target = far.target(transport);
+
+            let (control, mut responses) =
+                endpoint.start(invite(), target).await.unwrap().into_parts();
+            let mut remote = far.remote(transport, &endpoint).await;
+            let sent = into_request(remote.next().await.unwrap());
+
+            remote.send(&reply(&sent, 180, "a")).await;
+            assert_eq!(next(&mut responses).await.status().as_u16(), 180);
+            let first = reply(&sent, 200, "a");
+            let second = reply(&sent, 200, "b");
+            for ok in [&first, &second, &first] {
+                remote.send(ok).await;
+                let response = next(&mut responses).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(response.headers().get(TO), ok.headers().get(TO));
+            }
+            assert!(remote.next_except("INVITE").await.is_none());
+
+            for ok in [&first, &second] {
+                let sent_ack = endpoint
+                    .send_request(ack_for(&sent, ok), target, ViaMode::Fresh)
+                    .await
+                    .unwrap();
+                let ack =
+                    into_request(remote.next_except("INVITE").await.unwrap());
+                assert_eq!(ack.method(), Method::ACK);
+                assert_eq!(ack.headers().get(VIA), Some(sent_ack.via()));
+                assert_ne!(sent_ack.via(), control.via());
+                assert_eq!(sent_ack.flow().remote, target.address());
+                assert_eq!(ack.headers().get(TO), ok.headers().get(TO));
+            }
+
+            // Timer M ends observation without an error.
+            let end = timeout(Duration::from_secs(2), responses.next()).await;
+            assert!(end.unwrap().is_none());
+
+            endpoint.shutdown(Duration::ZERO).await;
+        }
+    }
+
+    // A full response stream stops observation, not the machine. The non-2xx
+    // is still acknowledged.
+    #[tokio::test]
+    async fn invite_client_overflow_keeps_acknowledging() {
+        let (endpoint, _incoming) = Endpoint::builder()
+            .udp(LOCALHOST)
+            .client_response_limits(WriteLimits { messages: 1, bytes: 4096 })
+            .bind()
+            .unwrap();
+        let far = Far::new().await;
+        let target = far.target(Transport::Udp);
+        let (_control, mut responses) =
+            endpoint.start(invite(), target).await.unwrap().into_parts();
+        let mut remote = far.remote(Transport::Udp, &endpoint).await;
+        let sent = into_request(remote.next().await.unwrap());
+
+        remote.send(&reply(&sent, 180, "a")).await;
+        remote.send(&reply(&sent, 183, "a")).await;
+        sleep(Duration::from_millis(50)).await;
+        remote.send(&reply(&sent, 486, "a")).await;
+
+        assert_eq!(next(&mut responses).await.status().as_u16(), 180);
+        let error = responses.next().await.unwrap().unwrap_err();
+        assert!(error.is_delivery_overflow(), "{error}");
+        assert!(responses.next().await.is_none());
+        let ack = into_request(remote.next().await.unwrap());
+        assert_eq!(ack.method(), Method::ACK);
+    }
+
+    // An INVITE reserves its CANCEL, so new requests cannot take what a
+    // cancellation needs.
+    #[tokio::test]
+    async fn invite_admission_reserves_a_cancel() {
+        let (endpoint, _incoming) = Endpoint::builder()
+            .udp(LOCALHOST)
+            .max_client_transactions(2)
+            .bind()
+            .unwrap();
+        let far = Far::new().await;
+        let target = far.target(Transport::Udp);
+
+        let (control, _responses) =
+            endpoint.start(invite(), target).await.unwrap().into_parts();
+        assert!(endpoint.start(invite(), target).await.unwrap_err().is_busy());
+        assert!(endpoint
+            .start(request("OPTIONS"), target)
+            .await
+            .unwrap_err()
+            .is_busy());
+
+        let mut remote = far.remote(Transport::Udp, &endpoint).await;
+        let sent = into_request(remote.next().await.unwrap());
+        remote.send(&reply(&sent, 180, "a")).await;
+        sleep(Duration::from_millis(50)).await;
+        let Ok(CancelOutcome::Sent(_)) = control.cancel().await else {
+            panic!("a CANCEL within the reservation");
+        };
+        let cancel = into_request(remote.next().await.unwrap());
+        assert_eq!(cancel.method(), Method::CANCEL);
+    }
+
+    /// A request from a raw UAC, with `via` and the To tag of the response
+    /// an ACK acknowledges.
+    fn raw(method: &str, via: &str, to_tag: Option<&str>) -> String {
+        let to = match to_tag {
+            Some(tag) => format!("<sip:bob@example.com>;tag={tag}"),
+            None => "<sip:bob@example.com>".to_owned(),
+        };
+        format!(
+            "{method} sip:bob@example.com SIP/2.0\r\n\
+             Via: {via}\r\n\
+             From: <sip:alice@example.com>;tag=uac\r\n\
+             To: {to}\r\n\
+             Call-ID: raw-call\r\n\
+             CSeq: 1 {method}\r\n\
+             Max-Forwards: 70\r\n\
+             Content-Length: 0\r\n\
+             \r\n"
+        )
+    }
+
+    /// A raw UAC of `endpoint` and the Via of its requests with `branch`.
+    async fn uac(
+        transport: Transport,
+        endpoint: &Endpoint,
+        branch: &str,
+    ) -> (Remote, String) {
+        match transport {
+            Transport::Udp => {
+                let peer = Peer::new().await;
+                let via = format!(
+                    "SIP/2.0/UDP {};branch=z9hG4bK{branch};rport",
+                    peer.addr()
+                );
+                (Remote::Udp(peer, endpoint.udp_addr().unwrap()), via)
+            }
+            Transport::Tcp => {
+                let stream = TcpStream::connect(endpoint.tcp_addr().unwrap())
+                    .await
+                    .unwrap();
+                let via = format!(
+                    "SIP/2.0/TCP {};branch=z9hG4bK{branch}",
+                    stream.local_addr().unwrap()
+                );
+                (Remote::Tcp(Stream::new(stream)), via)
+            }
+        }
+    }
+
+    async fn event(incoming: &mut Incoming) -> IncomingEvent {
+        timeout(Duration::from_secs(1), incoming.recv())
+            .await
+            .expect("an event within a second")
+            .expect("an open endpoint")
+    }
+
+    async fn server_request(incoming: &mut Incoming) -> ServerRequest {
+        match event(incoming).await {
+            IncomingEvent::Request(request) => request,
+            other => panic!("a request, got {other:?}"),
+        }
+    }
+
+    async fn server_event(events: &mut ServerEvents) -> ServerEvent {
+        timeout(Duration::from_secs(2), events.next())
+            .await
+            .expect("an event within two seconds")
+            .expect("an open observation")
+    }
+
+    fn status_of(message: Option<Message<Bytes>>) -> u16 {
+        into_response(message.expect("a response")).status().as_u16()
+    }
+
+    // RFC 3261 section 17.2.1. An admitted INVITE gets a 100 at once, takes
+    // provisional responses, and absorbs the ACK of its non-2xx final.
+    #[tokio::test]
+    async fn invite_server_sends_100_and_absorbs_the_non_2xx_ack() {
+        for transport in [Transport::Udp, Transport::Tcp] {
+            let (endpoint, mut incoming) = invite_endpoint(short_timers());
+            let (mut remote, via) = uac(transport, &endpoint, "invite").await;
+            let invite = raw("INVITE", &via, None);
+
+            remote.send(&invite).await;
+            assert_eq!(status_of(remote.next().await), 100);
+            let ServerRequest { request, transaction, .. } =
+                server_request(&mut incoming).await;
+            assert_eq!(request.method(), Method::INVITE);
+            let (responder, mut events) = transaction.into_parts();
+
+            for code in [180, 183] {
+                responder.respond(reply(&request, code, "uas")).await.unwrap();
+                assert_eq!(status_of(remote.next().await), code);
+            }
+            if transport == Transport::Udp {
+                remote.send(&invite).await;
+                assert_eq!(status_of(remote.next().await), 183);
+            }
+            responder.respond(reply(&request, 486, "uas")).await.unwrap();
+            assert_eq!(status_of(remote.next().await), 486);
+            for code in [180, 200, 486] {
+                assert_eq!(
+                    responder.respond(reply(&request, code, "uas")).await,
+                    Err(SubmitError::FinalAlreadySent)
+                );
+            }
+
+            remote.send(&raw("ACK", &via, Some("uas"))).await;
+            assert!(matches!(
+                server_event(&mut events).await,
+                ServerEvent::Terminated
+            ));
+            assert!(timeout(Duration::from_millis(50), incoming.recv())
+                .await
+                .is_err());
+
+            endpoint.shutdown(Duration::ZERO).await;
+        }
+    }
+
+    // RFC 6026 section 8.7. Accepted takes further 2xx, including another
+    // fork's, absorbs INVITE retransmissions without sending anything, and
+    // hands every ACK to the TU. Timer L ends it, not the ACK.
+    #[tokio::test]
+    async fn invite_server_takes_forked_2xx_and_hands_acks_to_the_tu() {
+        for transport in [Transport::Udp, Transport::Tcp] {
+            let (endpoint, mut incoming) = invite_endpoint(short_timers());
+            let (mut remote, via) = uac(transport, &endpoint, "forked").await;
+            let invite = raw("INVITE", &via, None);
+            remote.send(&invite).await;
+            assert_eq!(status_of(remote.next().await), 100);
+            let ServerRequest { request, transaction, .. } =
+                server_request(&mut incoming).await;
+            let (responder, mut events) = transaction.into_parts();
+
+            let accepted = Instant::now();
+            for tag in ["a", "b"] {
+                responder.respond(reply(&request, 200, tag)).await.unwrap();
+                let ok = into_response(remote.next().await.unwrap());
+                assert_eq!(
+                    ok.headers().get(TO).unwrap().as_str(),
+                    format!("<sip:bob@example.com>;tag={tag}")
+                );
+            }
+            for code in [180, 486] {
+                assert_eq!(
+                    responder.respond(reply(&request, code, "a")).await,
+                    Err(SubmitError::FinalAlreadySent)
+                );
+            }
+            if transport == Transport::Udp {
+                remote.send(&invite).await;
+                assert!(remote.next().await.is_none());
+            }
+
+            // An ACK with the INVITE's branch matches Accepted. One with its
+            // own branch, as RFC 3261 sends, matches nothing.
+            let fresh =
+                via.replace("branch=z9hG4bKforked", "branch=z9hG4bKack");
+            for via in [&via, &fresh] {
+                remote.send(&raw("ACK", via, Some("a"))).await;
+                let IncomingEvent::Ack(ack) = event(&mut incoming).await
+                else {
+                    panic!("an ACK for the TU");
+                };
+                assert_eq!(ack.request.method(), Method::ACK);
+            }
+            drop(responder);
+            assert!(remote.next().await.is_none());
+
+            // The machine-level and driver tests pin L exactly. Here it is
+            // enough that neither the ACK nor the second 2xx ended it.
+            assert!(matches!(
+                server_event(&mut events).await,
+                ServerEvent::Terminated
+            ));
+            assert!(accepted.elapsed() >= 64 * short_timers().t1());
+
+            endpoint.shutdown(Duration::ZERO).await;
+        }
+    }
+
+    // RFC 3261 section 17.2.1. Timer G retransmits the non-2xx over UDP, and
+    // Timer H reports the missing ACK before the transaction ends.
+    #[tokio::test]
+    async fn invite_server_reports_a_missing_ack_at_timer_h() {
+        let (endpoint, mut incoming) = invite_endpoint(short_timers());
+        let (mut remote, via) = uac(Transport::Udp, &endpoint, "h").await;
+        remote.send(&raw("INVITE", &via, None)).await;
+        assert_eq!(status_of(remote.next().await), 100);
+        let ServerRequest { request, transaction, .. } =
+            server_request(&mut incoming).await;
+        let (responder, mut events) = transaction.into_parts();
+
+        responder.respond(reply(&request, 486, "uas")).await.unwrap();
+        for _ in 0..3 {
+            assert_eq!(status_of(remote.next().await), 486);
+        }
+
+        assert!(matches!(
+            server_event(&mut events).await,
+            ServerEvent::AckTimeout
+        ));
+        assert!(matches!(
+            server_event(&mut events).await,
+            ServerEvent::Terminated
+        ));
+        assert!(events.next().await.is_none());
+    }
+
+    // signa's abandonment policy applies to an INVITE too. The 500 keeps the
+    // To tag of the provisional response, and the ACK of the 500 is absorbed.
+    #[tokio::test]
+    async fn a_dropped_invite_responder_sends_a_500_with_the_provisional_tag()
+    {
+        let (endpoint, mut incoming) = invite_endpoint(Timers::default());
+        let (mut remote, via) = uac(Transport::Udp, &endpoint, "drop").await;
+        remote.send(&raw("INVITE", &via, None)).await;
+        assert_eq!(status_of(remote.next().await), 100);
+        let ServerRequest { request, transaction, .. } =
+            server_request(&mut incoming).await;
+        let (responder, _events) = transaction.into_parts();
+        responder.respond(reply(&request, 180, "ringing")).await.unwrap();
+        assert_eq!(status_of(remote.next().await), 180);
+
+        drop(responder);
+
+        let error = into_response(remote.next().await.unwrap());
+        assert_eq!(error.status().as_u16(), 500);
+        assert_eq!(
+            error.headers().get(TO).unwrap(),
+            "<sip:bob@example.com>;tag=ringing"
+        );
+        remote.send(&raw("ACK", &via, Some("ringing"))).await;
+        assert!(remote.next().await.is_none());
+        assert!(timeout(Duration::from_millis(50), incoming.recv())
+            .await
+            .is_err());
+    }
+
+    // RFC 6026 section 8.8. A response transport failure is reported, and
+    // the INVITE stays in Accepted for further 2xx.
+    #[tokio::test]
+    async fn invite_server_keeps_accepted_after_a_transport_failure() {
+        let (endpoint, mut incoming) = invite_endpoint(Timers::default());
+        let (mut remote, via) = uac(Transport::Udp, &endpoint, "error").await;
+        remote.send(&raw("INVITE", &via, None)).await;
+        assert_eq!(status_of(remote.next().await), 100);
+        let ServerRequest { request, transaction, .. } =
+            server_request(&mut incoming).await;
+        let (responder, mut events) = transaction.into_parts();
+
+        // This fits the byte quotas but exceeds the UDP payload maximum.
+        let mut large = reply(&request, 200, "a");
+        *large.body_mut() = Bytes::from(vec![0; 80 * 1024]);
+        let submission = responder.respond(large);
+        let operation = submission.id();
+        submission.await.unwrap();
+        let ServerEvent::TransportFailure { operation: failed, .. } =
+            server_event(&mut events).await
+        else {
+            panic!("a transport failure");
+        };
+        assert_eq!(failed, Some(operation));
+
+        responder.respond(reply(&request, 200, "b")).await.unwrap();
+        assert_eq!(status_of(remote.next().await), 200);
+        assert!(timeout(Duration::from_millis(50), events.next())
+            .await
+            .is_err());
+    }
+
+    // RFC 3261 section 17. No ACK gets a response. One that matches no
+    // transaction, even without an RFC 3261 branch, goes to the TU. One
+    // without a usable identity is discarded.
+    #[tokio::test]
+    async fn acks_never_get_a_response() {
+        let (endpoint, mut incoming) = invite_endpoint(Timers::default());
+        let (mut remote, via) =
+            uac(Transport::Udp, &endpoint, "unmatched").await;
+        let untracked = via.replace("branch=z9hG4bKunmatched", "branch=1");
+
+        for via in [&via, &untracked] {
+            remote.send(&raw("ACK", via, Some("x"))).await;
+            let IncomingEvent::Ack(ack) = event(&mut incoming).await else {
+                panic!("an ACK for the TU");
+            };
+            assert_eq!(ack.flow.transport, Transport::Udp);
+        }
+        let broken =
+            raw("ACK", &via, Some("x")).replace("Call-ID: raw-call\r\n", "");
+        remote.send(&broken).await;
+        assert!(timeout(Duration::from_millis(50), incoming.recv())
+            .await
+            .is_err());
+        assert!(remote.next().await.is_none());
+    }
+
+    // Ordinary admission is full and the TU holds an INVITE, waiting for its
+    // ACK or CANCEL. Both still reach the TU, through their own capacity.
+    #[tokio::test]
+    async fn ack_and_cancel_progress_while_ordinary_admission_is_full() {
+        let (endpoint, mut incoming) = Endpoint::builder()
+            .udp(LOCALHOST)
+            .max_pending_requests(1)
+            .bind()
+            .unwrap();
+        let (mut remote, via) = uac(Transport::Udp, &endpoint, "held").await;
+        remote.send(&raw("INVITE", &via, None)).await;
+        assert_eq!(status_of(remote.next().await), 100);
+        let held = server_request(&mut incoming).await;
+        let target = held.transaction.id();
+
+        let (mut other, other_via) =
+            uac(Transport::Udp, &endpoint, "new").await;
+        other.send(&raw("OPTIONS", &other_via, None)).await;
+        assert_eq!(status_of(other.next().await), 503);
+
+        other.send(&raw("ACK", &other_via, Some("x"))).await;
+        assert!(matches!(event(&mut incoming).await, IncomingEvent::Ack(_)));
+        assert!(other.next().await.is_none());
+
+        remote.send(&raw("CANCEL", &via, None)).await;
+        let IncomingEvent::Cancel(cancel) = event(&mut incoming).await else {
+            panic!("a matched CANCEL");
+        };
+        assert_eq!(cancel.target, target);
+        let (responder, _) = cancel.transaction.into_parts();
+        responder.respond(reply(&cancel.request, 200, "uas")).await.unwrap();
+        assert_eq!(status_of(remote.next().await), 200);
+        drop(held);
+    }
+
+    // Control capacity is finite as well. An ACK beyond it is discarded
+    // without a response, and capacity returns once the TU takes the event.
+    #[tokio::test]
+    async fn control_capacity_discards_acks_beyond_it() {
+        let (endpoint, mut incoming) = Endpoint::builder()
+            .udp(LOCALHOST)
+            .control_event_limits(WriteLimits { messages: 1, bytes: 4096 })
+            .bind()
+            .unwrap();
+        let (mut remote, via) = uac(Transport::Udp, &endpoint, "full").await;
+        for tag in ["first", "second"] {
+            remote.send(&raw("ACK", &via, Some(tag))).await;
+        }
+        sleep(Duration::from_millis(50)).await;
+
+        let IncomingEvent::Ack(ack) = event(&mut incoming).await else {
+            panic!("the first ACK");
+        };
+        assert!(ack
+            .request
+            .headers()
+            .get(TO)
+            .unwrap()
+            .as_str()
+            .ends_with("first"));
+        assert!(timeout(Duration::from_millis(50), incoming.recv())
+            .await
+            .is_err());
+        assert!(remote.next().await.is_none());
+
+        remote.send(&raw("ACK", &via, Some("third"))).await;
+        assert!(matches!(event(&mut incoming).await, IncomingEvent::Ack(_)));
+    }
+
+    // A shutdown refuses new requests with a 503 but still hands the TU an
+    // ACK, and never answers it. The unanswered INVITE keeps the endpoint
+    // draining. Draining Accepted transactions themselves is later work.
+    #[tokio::test]
+    async fn acks_reach_the_tu_during_shutdown_without_a_response() {
+        let (endpoint, mut incoming) = invite_endpoint(Timers::default());
+        let (mut remote, via) = uac(Transport::Udp, &endpoint, "drain").await;
+        remote.send(&raw("INVITE", &via, None)).await;
+        assert_eq!(status_of(remote.next().await), 100);
+        let ServerRequest { transaction, .. } =
+            server_request(&mut incoming).await;
+        let (responder, _events) = transaction.into_parts();
+
+        let shutdown = endpoint.clone().shutdown(Duration::from_secs(10));
+        sleep(Duration::from_millis(20)).await;
+        let (mut late, late_via) =
+            uac(Transport::Udp, &endpoint, "late").await;
+        late.send(&raw("INVITE", &late_via, None)).await;
+        assert_eq!(status_of(late.next().await), 503);
+
+        let fresh =
+            via.replace("branch=z9hG4bKdrain", "branch=z9hG4bKdrainack");
+        remote.send(&raw("ACK", &fresh, Some("a"))).await;
+        assert!(matches!(event(&mut incoming).await, IncomingEvent::Ack(_)));
+        assert!(remote.next().await.is_none());
+        drop((shutdown, responder));
+    }
+
+    // RFC 3261 section 9.2. A CANCEL matches by branch and sent-by, so two
+    // peers with the same branch have different targets. The CANCEL has its
+    // own transaction, which answers its retransmissions after the target
+    // has ended.
+    #[tokio::test]
+    async fn a_cancel_reaches_the_tu_with_its_target_and_transaction() {
+        let (endpoint, mut incoming) = invite_endpoint(short_timers());
+        let (mut first, first_via) =
+            uac(Transport::Udp, &endpoint, "same").await;
+        let (mut second, second_via) =
+            uac(Transport::Udp, &endpoint, "same").await;
+        first.send(&raw("INVITE", &first_via, None)).await;
+        assert_eq!(status_of(first.next().await), 100);
+        let one = server_request(&mut incoming).await;
+        second.send(&raw("INVITE", &second_via, None)).await;
+        assert_eq!(status_of(second.next().await), 100);
+        let two = server_request(&mut incoming).await;
+        assert_ne!(one.transaction.id(), two.transaction.id());
+
+        let cancel = raw("CANCEL", &second_via, None);
+        second.send(&cancel).await;
+        let IncomingEvent::Cancel(matched) = event(&mut incoming).await else {
+            panic!("a matched CANCEL");
+        };
+        assert_eq!(matched.target, two.transaction.id());
+        assert_eq!(matched.request.method(), Method::CANCEL);
+
+        // The UAS answers the CANCEL and then its INVITE with a 487.
+        let (cancel_responder, _) = matched.transaction.into_parts();
+        cancel_responder
+            .respond(reply(&matched.request, 200, "uas"))
+            .await
+            .unwrap();
+        assert_eq!(status_of(second.next().await), 200);
+        let (responder, mut events) = two.transaction.into_parts();
+        responder.respond(reply(&two.request, 487, "uas")).await.unwrap();
+        assert_eq!(status_of(second.next().await), 487);
+        second.send(&raw("ACK", &second_via, Some("uas"))).await;
+        assert!(matches!(
+            server_event(&mut events).await,
+            ServerEvent::Terminated
+        ));
+
+        second.send(&cancel).await;
+        assert_eq!(status_of(second.next_except("INVITE").await), 200);
+        assert!(timeout(Duration::from_millis(50), incoming.recv())
+            .await
+            .is_err());
+        drop(one);
+    }
+
+    // RFC 3261 section 9.2. A CANCEL can target a non-INVITE request, which
+    // it does not affect. The TU answers both as usual.
+    #[tokio::test]
+    async fn a_cancel_of_a_non_invite_is_not_an_invite_cancellation() {
+        let (endpoint, mut incoming) = invite_endpoint(Timers::default());
+        let (mut remote, via) =
+            uac(Transport::Udp, &endpoint, "options").await;
+        remote.send(&raw("OPTIONS", &via, None)).await;
+        let options = server_request(&mut incoming).await;
+
+        remote.send(&raw("CANCEL", &via, None)).await;
+        let IncomingEvent::Cancel(cancel) = event(&mut incoming).await else {
+            panic!("a matched CANCEL");
+        };
+        assert_eq!(cancel.target, options.transaction.id());
+        assert!(remote.next().await.is_none());
+
+        let (responder, _) = options.transaction.into_parts();
+        responder.respond(reply(&options.request, 200, "uas")).await.unwrap();
+        assert_eq!(status_of(remote.next().await), 200);
+        drop(cancel);
+    }
+
+    // A CANCEL without a target gets no transaction and no automatic 481.
+    // The TU answers through its reply route.
+    #[tokio::test]
+    async fn an_unmatched_cancel_waits_for_the_tu() {
+        let (endpoint, mut incoming) = invite_endpoint(Timers::default());
+        let (mut remote, via) = uac(Transport::Udp, &endpoint, "none").await;
+        let cancel = raw("CANCEL", &via, None);
+
+        remote.send(&cancel).await;
+        let IncomingEvent::UnmatchedCancel(unmatched) =
+            event(&mut incoming).await
+        else {
+            panic!("an unmatched CANCEL");
+        };
+        assert!(remote.next().await.is_none());
+        unmatched
+            .reply
+            .send(reply(&unmatched.request, 481, "uas"))
+            .await
+            .unwrap();
+        assert_eq!(status_of(remote.next().await), 481);
+
+        remote.send(&cancel).await;
+        assert!(matches!(
+            event(&mut incoming).await,
+            IncomingEvent::UnmatchedCancel(_)
+        ));
+    }
+
+    /// Polls `future` once, which commits a `cancel` or `start`.
+    async fn poll_once<F: Future + Unpin>(future: &mut F) {
+        poll_fn(|cx| {
+            assert!(Pin::new(&mut *future).poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+    }
+
+    // RFC 3261 section 9.1. One intent per INVITE, no CANCEL before a
+    // provisional response, and a CANCEL that copies the INVITE's identity,
+    // routing and top Via into a transaction and observation of its own.
+    #[tokio::test]
+    async fn cancel_waits_for_a_provisional_and_runs_its_own_transaction() {
+        let (endpoint, _incoming) = invite_endpoint(Timers::default());
+        let far = Far::new().await;
+        let target = far.target(Transport::Udp);
+        let (control, mut responses) =
+            endpoint.start(invite(), target).await.unwrap().into_parts();
+        let mut remote = far.remote(Transport::Udp, &endpoint).await;
+        let sent = into_request(remote.next().await.unwrap());
+
+        let mut first = Box::pin(control.cancel());
+        poll_once(&mut first).await;
+        assert!(matches!(
+            control.cancel().await,
+            Err(CancelError::AlreadyRequested)
+        ));
+        assert!(remote.next_except("INVITE").await.is_none());
+
+        remote.send(&reply(&sent, 180, "early")).await;
+        let Ok(CancelOutcome::Sent(cancelling)) =
+            timeout(Duration::from_secs(1), first).await.unwrap()
+        else {
+            panic!("a CANCEL after the provisional response");
+        };
+        let cancel = into_request(remote.next_except("INVITE").await.unwrap());
+        assert_eq!(cancel.method(), Method::CANCEL);
+        assert_eq!(cancel.uri().as_str(), sent.uri().as_str());
+        assert_eq!(
+            cancel.headers().get_all(VIA).collect::<Vec<_>>(),
+            [control.via()]
+        );
+        assert_eq!(cancel.headers().get(CSEQ).unwrap(), "314159 CANCEL");
+        for name in [FROM, TO, CALL_ID] {
+            assert_eq!(cancel.headers().get(&name), sent.headers().get(&name));
+        }
+        assert_eq!(
+            cancel.headers().get_all(ROUTE).collect::<Vec<_>>(),
+            sent.headers().get_all(ROUTE).collect::<Vec<_>>()
+        );
+        for name in ["Require", "Proxy-Require", "Content-Type"] {
+            assert!(!cancel.headers().contains_key(name), "{name}");
+        }
+        assert!(cancel.body().is_empty());
+
+        let (cancel_control, mut cancel_responses) = cancelling.into_parts();
+        assert_eq!(cancel_control.via(), control.via());
+        assert!(matches!(
+            cancel_control.cancel().await,
+            Err(CancelError::NotInvite)
+        ));
+        assert_eq!(next(&mut responses).await.status().as_u16(), 180);
+        remote.send(&reply(&cancel, 200, "early")).await;
+        assert_eq!(next(&mut cancel_responses).await.status(), StatusCode::OK);
+        assert!(cancel_responses.next().await.is_none());
+
+        // The CANCEL's outcome does not end the INVITE. Its 487 does.
+        remote.send(&reply(&sent, 487, "early")).await;
+        assert_eq!(next(&mut responses).await.status().as_u16(), 487);
+        assert!(responses.next().await.is_none());
+        let ack = into_request(remote.next().await.unwrap());
+        assert_eq!(ack.method(), Method::ACK);
+    }
+
+    // A dropped cancel future does not withdraw a committed intent.
+    #[tokio::test]
+    async fn a_dropped_cancel_future_still_cancels_once() {
+        let (endpoint, _incoming) = invite_endpoint(Timers::default());
+        let far = Far::new().await;
+        let target = far.target(Transport::Udp);
+        let (control, _responses) =
+            endpoint.start(invite(), target).await.unwrap().into_parts();
+        let mut remote = far.remote(Transport::Udp, &endpoint).await;
+        let sent = into_request(remote.next().await.unwrap());
+
+        let mut cancel = Box::pin(control.cancel());
+        poll_once(&mut cancel).await;
+        drop(cancel);
+        remote.send(&reply(&sent, 183, "early")).await;
+
+        let cancel = into_request(remote.next_except("INVITE").await.unwrap());
+        assert_eq!(cancel.method(), Method::CANCEL);
+        assert!(matches!(
+            control.cancel().await,
+            Err(CancelError::AlreadyRequested)
+        ));
+        assert!(remote.next_except("CANCEL").await.is_none());
+    }
+
+    // RFC 3261 section 9.1. A 2xx that wins the race with the CANCEL reaches
+    // the TU, which acknowledges it. The cancellation deadline does not apply
+    // once a final response has arrived.
+    #[tokio::test]
+    async fn a_2xx_racing_a_cancel_still_reaches_the_tu() {
+        let (endpoint, _incoming) = invite_endpoint(short_timers());
+        let far = Far::new().await;
+        let target = far.target(Transport::Udp);
+        let (control, mut responses) =
+            endpoint.start(invite(), target).await.unwrap().into_parts();
+        let mut remote = far.remote(Transport::Udp, &endpoint).await;
+        let sent = into_request(remote.next().await.unwrap());
+        remote.send(&reply(&sent, 180, "a")).await;
+        assert_eq!(next(&mut responses).await.status().as_u16(), 180);
+        let Ok(CancelOutcome::Sent(_)) = control.cancel().await else {
+            panic!("a CANCEL");
+        };
+        let cancel = into_request(remote.next_except("INVITE").await.unwrap());
+
+        let ok = reply(&sent, 200, "a");
+        remote.send(&ok).await;
+        remote.send(&reply(&cancel, 200, "a")).await;
+        assert_eq!(next(&mut responses).await.status(), StatusCode::OK);
+        assert!(remote.next_except("CANCEL").await.is_none());
+        endpoint
+            .send_request(ack_for(&sent, &ok), target, ViaMode::Fresh)
+            .await
+            .unwrap();
+        let ack = into_request(remote.next_except("CANCEL").await.unwrap());
+        assert_eq!(ack.method(), Method::ACK);
+
+        let end = timeout(Duration::from_secs(2), responses.next()).await;
+        assert!(end.unwrap().is_none(), "Timer M, not the cancel deadline");
+    }
+
+    // RFC 3261 section 9.1. Without a final response 64 T1 after the CANCEL,
+    // the INVITE ends with an explicit error. A later final is stray.
+    #[tokio::test]
+    async fn the_cancel_deadline_ends_an_unanswered_invite() {
+        let (endpoint, _incoming) = invite_endpoint(short_timers());
+        let far = Far::new().await;
+        let target = far.target(Transport::Udp);
+        let (control, mut responses) =
+            endpoint.start(invite(), target).await.unwrap().into_parts();
+        let mut remote = far.remote(Transport::Udp, &endpoint).await;
+        let sent = into_request(remote.next().await.unwrap());
+        remote.send(&reply(&sent, 180, "a")).await;
+        assert_eq!(next(&mut responses).await.status().as_u16(), 180);
+        let Ok(CancelOutcome::Sent(_)) = control.cancel().await else {
+            panic!("a CANCEL");
+        };
+        let cancel = into_request(remote.next_except("INVITE").await.unwrap());
+        remote.send(&reply(&cancel, 200, "a")).await;
+        let cancelled = Instant::now();
+
+        let error = timeout(Duration::from_secs(2), responses.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.is_cancel_timeout(), "{error}");
+        assert!(cancelled.elapsed() >= 63 * short_timers().t1());
+        assert!(responses.next().await.is_none());
+
+        remote.send(&reply(&sent, 487, "a")).await;
+        assert!(remote.next_except("CANCEL").await.is_none());
+    }
+
+    // The decision for a TCP INVITE in Proceeding whose connection closes,
+    // with an advertised listener. Nothing is reported and no timer runs,
+    // since the final may come on a new connection (RFC 3261 section 18.2.2).
+    // When it does, the ACK goes to the INVITE's own target, on a new
+    // connection if needed (section 17.1.1.3), never back to where the final
+    // came from.
+    #[tokio::test]
+    async fn a_tcp_invite_acks_a_final_from_a_new_connection_at_its_target() {
+        let (endpoint, _incoming) = invite_endpoint(short_timers());
+        let far = Far::new().await;
+        let target = far.target(Transport::Tcp);
+        let (control, mut responses) =
+            endpoint.start(invite(), target).await.unwrap().into_parts();
+        let (connection, _) = far.tcp.accept().await.unwrap();
+        let mut first = Stream::new(connection);
+        let sent = into_request(first.next().await);
+        first.send(&reply(&sent, 180, "a")).await;
+        assert_eq!(next(&mut responses).await.status().as_u16(), 180);
+
+        drop(first);
+        let quiet = 3 * 64 * short_timers().t1();
+        assert!(timeout(quiet, responses.next()).await.is_err());
+
+        let listener = endpoint.tcp_addr().unwrap();
+        let mut callback =
+            Stream::new(TcpStream::connect(listener).await.unwrap());
+        let busy = reply(&sent, 486, "a");
+        callback.send(&busy).await;
+        assert_eq!(next(&mut responses).await.status().as_u16(), 486);
+
+        let (connection, _) =
+            timeout(Duration::from_secs(1), far.tcp.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        let mut second = Stream::new(connection);
+        let ack = into_request(second.next().await);
+        assert_eq!(ack.method(), Method::ACK);
+        assert_eq!(ack.headers().get(VIA), Some(control.via()));
+        assert_eq!(ack.headers().get(TO), busy.headers().get(TO));
+        assert!(callback.within(Duration::from_millis(100)).await.is_none());
+    }
+
+    // A CANCEL whose INVITE connection has closed goes to the INVITE's
+    // target on a new connection, with the INVITE's Via.
+    #[tokio::test]
+    async fn a_tcp_cancel_after_the_connection_closed_goes_to_the_target() {
+        let (endpoint, _incoming) = invite_endpoint(short_timers());
+        let far = Far::new().await;
+        let target = far.target(Transport::Tcp);
+        let (control, mut responses) =
+            endpoint.start(invite(), target).await.unwrap().into_parts();
+        let (connection, _) = far.tcp.accept().await.unwrap();
+        let mut first = Stream::new(connection);
+        let sent = into_request(first.next().await);
+        first.send(&reply(&sent, 180, "a")).await;
+        assert_eq!(next(&mut responses).await.status().as_u16(), 180);
+        drop(first);
+        sleep(Duration::from_millis(50)).await;
+
+        let Ok(CancelOutcome::Sent(cancelling)) = control.cancel().await
+        else {
+            panic!("a CANCEL on a new connection");
+        };
+        let (_, mut cancel_responses) = cancelling.into_parts();
+        let (connection, _) =
+            timeout(Duration::from_secs(1), far.tcp.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        let mut second = Stream::new(connection);
+        let cancel = into_request(second.next().await);
+        assert_eq!(cancel.method(), Method::CANCEL);
+        assert_eq!(cancel.headers().get(VIA), Some(control.via()));
+
+        second.send(&reply(&cancel, 200, "a")).await;
+        assert_eq!(next(&mut cancel_responses).await.status(), StatusCode::OK);
+        second.send(&reply(&sent, 487, "a")).await;
+        assert_eq!(next(&mut responses).await.status().as_u16(), 487);
+        assert_eq!(into_request(second.next().await).method(), Method::ACK);
+    }
+
+    // Without a listener, no response can reach a TCP INVITE once its
+    // connection closes, so it fails at once, as any client transaction does.
+    #[tokio::test]
+    async fn a_tcp_invite_without_a_listener_fails_when_its_connection_closes()
+    {
+        let (endpoint, _incoming) =
+            Endpoint::builder().udp(LOCALHOST).bind().unwrap();
+        let far = Far::new().await;
+        let target = far.target(Transport::Tcp);
+        let (_control, mut responses) =
+            endpoint.start(invite(), target).await.unwrap().into_parts();
+        let (connection, _) = far.tcp.accept().await.unwrap();
+        let mut first = Stream::new(connection);
+        let sent = into_request(first.next().await);
+        first.send(&reply(&sent, 180, "a")).await;
+        assert_eq!(next(&mut responses).await.status().as_u16(), 180);
+
+        drop(first);
+        let error = timeout(Duration::from_secs(1), responses.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.is_transport(), "{error}");
+    }
+
+    // Dropping both client handles is neither a CANCEL nor the end of the
+    // machine, which still acknowledges the non-2xx.
+    #[tokio::test]
+    async fn dropped_invite_handles_neither_cancel_nor_stop_the_machine() {
+        let (endpoint, _incoming) = invite_endpoint(Timers::default());
+        let far = Far::new().await;
+        let target = far.target(Transport::Udp);
+        let transaction = endpoint.start(invite(), target).await.unwrap();
+        let mut remote = far.remote(Transport::Udp, &endpoint).await;
+        let sent = into_request(remote.next().await.unwrap());
+
+        drop(transaction);
+        remote.send(&reply(&sent, 180, "a")).await;
+        assert!(remote.next_except("INVITE").await.is_none());
+        remote.send(&reply(&sent, 603, "a")).await;
+        let ack = into_request(remote.next_except("INVITE").await.unwrap());
+        assert_eq!(ack.method(), Method::ACK);
     }
 }

@@ -1,15 +1,19 @@
 ### Serving requests
 
-A non-INVITE UAS receives owned transaction-user envelopes. The application
-chooses its To tag, submits a response, and can observe the transaction
-separately. `to_tag` adds a fresh tag to an initial request's response and
-keeps the tag of a request within a dialog. A failed submission is logged
-rather than returned, since leaving the loop would drop `incoming` and shut the
-endpoint down.
+A UAS for non-INVITE requests receives owned transaction-user envelopes. The
+application chooses its To tag, submits a response, and can observe the
+transaction separately. `to_tag` adds a fresh tag to an initial request's
+response and keeps the tag of a request within a dialog. A failed submission is
+logged rather than returned, since leaving the loop would drop `incoming` and
+shut the endpoint down.
 
 ```no_run
 use bytes::Bytes;
-use signa::{endpoint::{Endpoint, IncomingEvent}, message::header::Tag, Response};
+use signa::{
+    endpoint::{Endpoint, IncomingEvent},
+    message::header::Tag,
+    Method, Response,
+};
 
 # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 let (_endpoint, mut incoming) = Endpoint::builder()
@@ -19,9 +23,16 @@ let (_endpoint, mut incoming) = Endpoint::builder()
 
 while let Some(event) = incoming.recv().await {
     if let IncomingEvent::Request(envelope) = event {
+        // A 2xx to an INVITE starts a dialog, whose 2xx retransmissions and
+        // ACK this loop does not handle.
+        let status = if envelope.request.method() == Method::INVITE {
+            501
+        } else {
+            200
+        };
         let (responder, _) = envelope.transaction.into_parts();
         let response = Response::reply_to(&envelope.request)
-            .status(200)
+            .status(status)
             .to_tag(Tag::random())
             .body(Bytes::new())?;
 

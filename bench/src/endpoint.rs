@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     convert::Infallible,
     future,
     hint::black_box as bb,
@@ -12,7 +13,10 @@ use bytes::Bytes;
 use criterion::Criterion;
 use signa::{
     bench::{reply_driver, tcp, udp, Flow},
-    endpoint::{Builder, Endpoint, Error, IncomingEvent, ReplyRoute, Target},
+    endpoint::{
+        Builder, CancelOutcome, Endpoint, Error, Incoming, IncomingEvent,
+        ReplyRoute, Responder, Target, ViaMode,
+    },
     message::header::CSEQ,
     transaction::Timers,
     transport::Transport,
@@ -129,6 +133,236 @@ pub(super) fn round_trip(c: &mut Criterion) {
             });
         });
     });
+}
+
+/// A UAS for the INVITE benchmarks. The Request-URI user says what it does:
+/// `accept` answers 200, `reject` answers 486, and `ring` answers 180 and
+/// waits for the CANCEL, which it answers with 200 and the INVITE with 487.
+/// It does not retransmit its 2xx. The UAC acknowledges each 2xx at once,
+/// within the benchmark, so the UAS core never needs to.
+fn invite_uas(mut incoming: Incoming) {
+    tokio::spawn(async move {
+        let mut ringing: HashMap<_, (Responder, Request<Bytes>)> =
+            HashMap::new();
+        while let Some(event) = incoming.recv().await {
+            match event {
+                IncomingEvent::Request(envelope) => {
+                    let (responder, _) = envelope.transaction.into_parts();
+                    let user = envelope.request.uri().as_str();
+                    let status = if user.starts_with("sip:accept@") {
+                        200
+                    } else if user.starts_with("sip:reject@") {
+                        486
+                    } else {
+                        180
+                    };
+                    let response = tagged(&envelope.request, status);
+                    responder.respond(response).await.unwrap();
+                    if status == 180 {
+                        ringing.insert(
+                            responder.id(),
+                            (responder, envelope.request),
+                        );
+                    }
+                }
+                IncomingEvent::Cancel(cancel) => {
+                    let (responder, _) = cancel.transaction.into_parts();
+                    responder
+                        .respond(tagged(&cancel.request, 200))
+                        .await
+                        .unwrap();
+                    let (invite, request) = ringing
+                        .remove(&cancel.target)
+                        .expect("a ringing INVITE");
+                    invite.respond(tagged(&request, 487)).await.unwrap();
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
+fn tagged(request: &Request<Bytes>, status: u16) -> Response<Bytes> {
+    Response::reply_to(request)
+        .status(status)
+        .to_tag("bench")
+        .body(Bytes::new())
+        .unwrap()
+}
+
+fn invite_request(user: &str) -> Request<Bytes> {
+    Request::builder()
+        .method("INVITE")
+        .uri(format!("sip:{user}@biloxi.example.com").as_str())
+        .header("From", "Alice <sip:alice@atlanta.example.com>;tag=1928301774")
+        .header("To", "Bob <sip:bob@biloxi.example.com>")
+        .header("Call-ID", "a84b4c76e66710@pc33.atlanta.example.com")
+        .header("CSeq", "314159 INVITE")
+        .header("Max-Forwards", "70")
+        .header("Contact", "<sip:alice@pc33.atlanta.example.com>")
+        .header("Content-Type", "application/sdp")
+        .body(Bytes::from_static(
+            b"v=0\r\n\
+              o=alice 2890844526 2890844526 IN IP4 \
+              pc33.atlanta.example.com\r\n",
+        ))
+        .unwrap()
+}
+
+/// The ACK a UAC core sends for `ok`, which the benchmark builds as a UA would.
+fn ack_for(invite: &Request<Bytes>, ok: &Response<Bytes>) -> Request<Bytes> {
+    Request::builder()
+        .method("ACK")
+        .uri(invite.uri().as_str())
+        .header("From", invite.headers().get("From").unwrap().as_str())
+        .header("To", ok.headers().get("To").unwrap().as_str())
+        .header("Call-ID", invite.headers().get("Call-ID").unwrap().as_str())
+        .header("CSeq", "314159 ACK")
+        .header("Max-Forwards", "70")
+        .body(Bytes::new())
+        .unwrap()
+}
+
+// INVITE transactions between two endpoints over the loopback, with the TU
+// API and no final-only adapter. Each benchmark says where its measurement
+// ends. None of them is the time to the end of a transaction, which comes at
+// Timer L or M, or at Timer H or the ACK on the server.
+//
+// T1 is 10 ms, so L and M are their 64 T1 of 640 ms, and the tables hold a
+// steady number of Accepted entries instead of growing for the whole run.
+// Over UDP a non-2xx leaves the client in Completed for Timer D, which is at
+// least 32 s whatever T1 is. At this rate that grows the table for the whole
+// measurement, so the non-2xx and CANCEL paths run over TCP only, where D is
+// zero. Retained state belongs to `scripts/tables`.
+pub(super) fn invite(c: &mut Criterion) {
+    let rt = runtime();
+    let (server, uac) = {
+        let _guard = rt.enter();
+        let (server, incoming) = Endpoint::builder()
+            .udp(LOCALHOST)
+            .tcp(LOCALHOST)
+            .timers(short_timers())
+            .max_server_transactions(1 << 20)
+            .bind()
+            .unwrap();
+        invite_uas(incoming);
+        let uac = Endpoint::builder()
+            .udp(LOCALHOST)
+            .timers(short_timers())
+            .max_client_transactions(1 << 20)
+            .max_client_handles(1 << 20)
+            .bind()
+            .unwrap();
+        (server, uac)
+    };
+    let (uac, _incoming) = uac;
+
+    // From `start` to the first 2xx in `Responses` and the TU's ACK written
+    // locally by `send_request`. The 100 Trying and the 2xx come from the
+    // UAS endpoint.
+    for (transport, address) in [
+        (Transport::Udp, server.udp_addr().unwrap()),
+        (Transport::Tcp, server.tcp_addr().unwrap()),
+    ] {
+        let target = Target::new(transport, address);
+        let request = invite_request("accept");
+        let len = request.to_bytes().len() as u64;
+        let id =
+            format!("endpoint/invite/{}/accepted", transport_name(transport));
+        benchmark(c, id, len, |b| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let (_control, mut responses) = uac
+                        .start(bb(request.clone()), target)
+                        .await
+                        .unwrap()
+                        .into_parts();
+                    let ok = loop {
+                        let response =
+                            responses.next().await.unwrap().unwrap();
+                        if response.status() == StatusCode::OK {
+                            break response;
+                        }
+                    };
+                    uac.send_request(
+                        ack_for(&request, &ok),
+                        target,
+                        ViaMode::Fresh,
+                    )
+                    .await
+                    .unwrap();
+                });
+            });
+        });
+    }
+
+    // From `start` to the 486 in `Responses`. The driver writes the ACK
+    // before it delivers the final.
+    let target = Target::new(Transport::Tcp, server.tcp_addr().unwrap());
+    let request = invite_request("reject");
+    let len = request.to_bytes().len() as u64;
+    benchmark(c, "endpoint/invite/tcp/rejected", len, |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let (_control, mut responses) = uac
+                    .start(bb(request.clone()), target)
+                    .await
+                    .unwrap()
+                    .into_parts();
+                let busy = loop {
+                    let response = responses.next().await.unwrap().unwrap();
+                    if response.status().is_final() {
+                        break response;
+                    }
+                };
+                assert_eq!(busy.status().as_u16(), 486);
+            });
+        });
+    });
+
+    // From `start` to the 487 in the INVITE's `Responses`, through the 180,
+    // `cancel`, and the CANCEL's own 200 in its separate stream.
+    let request = invite_request("ring");
+    let len = request.to_bytes().len() as u64;
+    benchmark(c, "endpoint/cancel/tcp/ringing", len, |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let (control, mut responses) = uac
+                    .start(bb(request.clone()), target)
+                    .await
+                    .unwrap()
+                    .into_parts();
+                loop {
+                    let response = responses.next().await.unwrap().unwrap();
+                    if response.status().as_u16() == 180 {
+                        break;
+                    }
+                }
+                let CancelOutcome::Sent(cancel) =
+                    control.cancel().await.unwrap()
+                else {
+                    panic!("a CANCEL after the 180");
+                };
+                let (_, mut cancel_responses) = cancel.into_parts();
+                let terminated = loop {
+                    let response = responses.next().await.unwrap().unwrap();
+                    if response.status().is_final() {
+                        break response;
+                    }
+                };
+                assert_eq!(terminated.status().as_u16(), 487);
+                let ok = cancel_responses.next().await.unwrap().unwrap();
+                assert_eq!(ok.status(), StatusCode::OK);
+            });
+        });
+    });
+}
+
+fn transport_name(transport: Transport) -> &'static str {
+    match transport {
+        Transport::Udp => "udp",
+        Transport::Tcp => "tcp",
+    }
 }
 
 pub(super) fn reply_route(c: &mut Criterion) {

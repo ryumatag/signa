@@ -155,7 +155,7 @@ impl Request<Bytes> {
     ///   different values;
     /// * the body is shorter than `Content-Length`.
     pub fn from_shared(src: Bytes) -> Result<Request<Bytes>, InvalidMessage> {
-        crate::message::parse::request(src)
+        super::parse::request(src)
     }
 }
 
@@ -198,7 +198,13 @@ impl<T: AsRef<[u8]>> Request<T> {
     /// # Ok::<(), signa::message::BuildError>(())
     /// ```
     pub fn encode(&self, dst: &mut BytesMut) {
-        crate::message::encode::request(self, dst);
+        super::encode::request(self, dst);
+    }
+
+    /// Wire length for transport admission before encoding.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn encoded_len(&self) -> Option<usize> {
+        super::encode::request_len(self, self.body().as_ref().len())
     }
 
     /// Returns the request as the bytes of one complete message.

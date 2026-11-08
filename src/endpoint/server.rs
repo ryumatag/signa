@@ -1,10 +1,9 @@
 /*!
-Owned non-INVITE transaction-user operations.
+Owned server transaction-user operations.
 
-The driver accepts responses according to RFC 3261 section 17.2.2 and RFC 4320
-section 4. Local acceptance is distinct from transport completion and
-transaction termination. INVITE, ACK and CANCEL delivery are added by the
-INVITE endpoint work.
+The driver accepts responses according to RFC 3261 sections 17.2.1 and 17.2.2,
+RFC 6026 section 8.7 and RFC 4320 section 4. Local acceptance is distinct from
+transport completion and transaction termination.
 */
 
 use std::{
@@ -89,11 +88,23 @@ pub(super) struct Queued {
 }
 
 /// A request delivered by a stateful endpoint.
+///
+/// See the [module docs](super#reception) for which event each request
+/// becomes.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum IncomingEvent {
-    /// A new non-INVITE server transaction.
+    /// A new INVITE or non-INVITE server transaction, other than CANCEL.
     Request(ServerRequest),
+    /// A CANCEL that matches a server transaction, with its own transaction.
+    Cancel(IncomingCancel),
+    /// An ACK that no transaction absorbed: one for a 2xx, which matches an
+    /// INVITE in Accepted, or one that matches nothing.
+    Ack(ReceivedAck),
+    /// A CANCEL that matches no server transaction. It gets no transaction
+    /// and no automatic response, and its retransmissions arrive as new
+    /// events.
+    UnmatchedCancel(ReceivedRequest),
     /// A request without an RFC 3261 branch, which gets no transaction. Its
     /// retransmissions arrive as new events.
     Untracked(ReceivedRequest),
@@ -109,6 +120,50 @@ pub struct ServerRequest {
     pub flow: Flow,
     /// Response submission and independent transaction observation.
     pub transaction: ServerTransaction,
+}
+
+/// A CANCEL and the server transaction it targets.
+///
+/// [RFC 3261 section 9.2] matches a CANCEL by the branch and `sent-by` of the
+/// target's top Via, whatever the target's method. signa does not act on the
+/// target. A UAS answers the CANCEL with a 200 and its INVITE with a 487 if it
+/// has not sent a final response yet. A proxy cancels its pending branches. A
+/// CANCEL of a non-INVITE request has no effect on that request.
+///
+/// The CANCEL's own transaction answers its retransmissions, even after the
+/// target has ended. Dropping its responder sends a 500 as for any request.
+///
+/// [RFC 3261 section 9.2]: https://www.rfc-editor.org/rfc/rfc3261.html#section-9.2
+#[derive(Debug)]
+pub struct IncomingCancel {
+    /// The received CANCEL, with `received` and `rport` filled in its top
+    /// Via.
+    pub request: Request<Bytes>,
+    /// Descriptive metadata for the original received flow.
+    pub flow: Flow,
+    /// The CANCEL's own non-INVITE server transaction.
+    pub transaction: ServerTransaction,
+    /// The transaction the CANCEL targets, as its [`Responder::id`] says.
+    pub target: ServerTransactionId,
+}
+
+/// An ACK for the transaction user.
+///
+/// An ACK for a 2xx is a request of its own, which the UAC core sends
+/// ([RFC 3261 section 13.2.2.4]) and the UAS core matches to its dialog. It
+/// has no reply capability, since no response to an ACK exists. The TU
+/// stops its 2xx retransmissions when it gets the ACK
+/// ([RFC 3261 section 13.3.1.4], [RFC 6026 section 8.1]).
+///
+/// [RFC 3261 section 13.2.2.4]: https://www.rfc-editor.org/rfc/rfc3261.html#section-13.2.2.4
+/// [RFC 3261 section 13.3.1.4]: https://www.rfc-editor.org/rfc/rfc3261.html#section-13.3.1.4
+/// [RFC 6026 section 8.1]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.1
+#[derive(Debug)]
+pub struct ReceivedAck {
+    /// The received ACK, with `received` and `rport` filled in its top Via.
+    pub request: Request<Bytes>,
+    /// Descriptive metadata for the original received flow.
+    pub flow: Flow,
 }
 
 /// An owned request that could not be tracked as an RFC 3261 transaction.
@@ -168,7 +223,8 @@ impl ServerTransaction {
 /// in the [module docs](super). The 500 waits for submissions already
 /// enqueued, even if their futures were dropped. If the 500 cannot be
 /// admitted, the transaction ends. Dropping it after a final response has no
-/// protocol effect.
+/// protocol effect. That includes an INVITE in Accepted. Its 2xx
+/// retransmissions are the TU's, through [`Responder::reply_route`].
 pub struct Responder {
     pub(super) shared: Arc<Shared>,
     pub(super) route: ReplyRoute,
@@ -209,6 +265,12 @@ impl Responder {
     /// Submits a response and waits until the driver accepts it, which is not
     /// peer receipt.
     ///
+    /// An INVITE takes provisional responses until its first final response.
+    /// After a 2xx it takes further 2xx, including those of other forks with
+    /// other To tags, until Timer L ([RFC 6026 section 8.7]). The transaction
+    /// does not retransmit a 2xx itself. A non-INVITE takes one final response
+    /// and the 100 that [RFC 4320 section 4] allows.
+    ///
     /// An unpolled future has no effect. The first poll checks the response
     /// against the request, reserves its encoded size and enqueues it. A
     /// dropped future does not withdraw an enqueued response. Later write
@@ -220,6 +282,9 @@ impl Responder {
     /// transaction unchanged, and `Busy`, `RetentionFull`, `TransportBusy` and
     /// `TooEarly` can succeed later. `Closed` can follow an enqueued
     /// submission, so the response may or may not have been accepted.
+    ///
+    /// [RFC 6026 section 8.7]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.7
+    /// [RFC 4320 section 4]: https://www.rfc-editor.org/rfc/rfc4320.html#section-4
     pub fn respond(
         &self,
         response: Response<Bytes>,
@@ -342,7 +407,8 @@ pub enum SubmitError {
     /// A non-INVITE transaction does not send a provisional response other
     /// than 100, or a 408 (RFC 4320 section 4).
     ProhibitedStatus,
-    /// A final response was already accepted.
+    /// A final response was already accepted, and this is not another 2xx
+    /// for an INVITE in Accepted.
     FinalAlreadySent,
     /// The transaction has terminated.
     Terminated,
@@ -427,9 +493,19 @@ pub enum ServerEvent {
         /// Failures and rejections preceding the latest retained one.
         missed: u64,
     },
-    /// The transaction ended, at Timer J over UDP, at the final response over
-    /// TCP, or after a transport failure. Writes already accepted may still
-    /// report failures before the stream ends.
+    /// An INVITE got no ACK for its non-2xx final response before Timer H.
+    /// `Terminated` follows ([RFC 3261 section 17.2.1]).
+    ///
+    /// [RFC 3261 section 17.2.1]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17.2.1
+    AckTimeout,
+    /// The transaction ended. A non-INVITE ends at Timer J over UDP, at the
+    /// final response over TCP, or after a transport failure. An INVITE ends
+    /// at Timer I after its ACK over UDP, at the ACK over TCP, at Timer H
+    /// without one, or at Timer L after a 2xx. An INVITE transport failure
+    /// does not end it ([RFC 6026 section 8.8]). Writes already accepted may
+    /// still report failures before the stream ends.
+    ///
+    /// [RFC 6026 section 8.8]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.8
     Terminated,
     /// The endpoint ended before transaction observation completed.
     EndpointClosed,
@@ -454,6 +530,7 @@ pub(super) enum Problem {
 #[derive(Clone, Debug, Default)]
 pub(super) struct Observation {
     pub(super) failures: u64,
+    pub(super) ack_timeout: bool,
     pub(super) terminated: bool,
     pub(super) problem: Option<Problem>,
     pub(super) operation: Option<ResponseId>,
@@ -471,6 +548,7 @@ pub struct ServerEvents {
     pub(super) receiver: watch::Receiver<Observation>,
     pub(super) seen: u64,
     pub(super) ended: bool,
+    pub(super) saw_ack_timeout: bool,
     pub(super) saw_termination: bool,
 }
 
@@ -482,10 +560,11 @@ impl ServerEvents {
 
     /// Receives the next event, or `None` once the stream ends.
     ///
-    /// It is cancellation-safe. Failures already recorded come before
-    /// `Terminated`. After `Terminated`, failures of writes already accepted
-    /// can still arrive. The stream then ends, or yields `EndpointClosed` if
-    /// the endpoint stops first. It returns `None` from then on.
+    /// It is cancellation-safe. Failures already recorded, then `AckTimeout`,
+    /// come before `Terminated`. After `Terminated`, failures of writes
+    /// already accepted can still arrive. The stream then ends, or yields
+    /// `EndpointClosed` if the endpoint stops first. It returns `None` from
+    /// then on.
     pub async fn next(&mut self) -> Option<ServerEvent> {
         loop {
             if self.ended {
@@ -513,6 +592,10 @@ impl ServerEvents {
                             ServerEvent::OutputRejected { operation }
                         }
                     });
+                }
+                if state.ack_timeout && !self.saw_ack_timeout {
+                    self.saw_ack_timeout = true;
+                    return Some(ServerEvent::AckTimeout);
                 }
                 if state.terminated && !self.saw_termination {
                     self.saw_termination = true;
@@ -579,6 +662,13 @@ impl Shared {
             state.failures = state.failures.saturating_add(1);
             state.problem = Some(problem);
         });
+    }
+
+    /// Records Timer H. The caller then finishes the transaction.
+    pub(super) fn ack_timeout(&self) {
+        if self.observation.receiver_count() != 0 {
+            self.observation.send_modify(|state| state.ack_timeout = true);
+        }
     }
 
     pub(super) fn finish(&self) {
@@ -1338,6 +1428,7 @@ mod tests {
             receiver,
             seen: 0,
             ended: false,
+            saw_ack_timeout: false,
             saw_termination: false,
         };
 

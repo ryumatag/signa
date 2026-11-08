@@ -8,8 +8,8 @@ RFC 3261 section 17 defines a transaction as one request, its retransmissions,
 and the responses to it. The client side retransmits over an unreliable
 transport until a response arrives, and the server side answers retransmissions
 with the last response instead of handing them up again. The INVITE machines
-apply RFC 6026. The endpoint currently drives only the non-INVITE machines.
-Matching follows sections 17.1.3 and 17.2.3.
+apply RFC 6026. The endpoint drives both kinds. Matching follows sections
+17.1.3 and 17.2.3, and a CANCEL finds its target as section 9.2 says.
 
 The machines own no runtime timers and do no I/O. Each takes the current time
 with every event, reports its next deadline, and says what to send or hand up.

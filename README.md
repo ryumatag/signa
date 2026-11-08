@@ -20,12 +20,17 @@ Its design draws heavily on the [hyper] and [http] crates.
 
 The current development API has request and response types modeled on the http
 crate, parsing with [**siparse**] and encoding, and an endpoint that carries
-messages over UDP and TCP, runs non-INVITE transactions, and exposes incoming
-requests, responders and independent transaction observation. Client requests
-start asynchronously and return split control and bounded response streams.
-The endpoint supports graceful shutdown. INVITE, ACK, and CANCEL transactions
-are planned for the next release, and TLS and next-hop selection are later
-work.
+messages over UDP and TCP, runs INVITE and non-INVITE transactions with the
+Accepted states of RFC 6026, and exposes incoming requests, responders and
+independent transaction observation. Client requests start asynchronously and
+return split control and bounded response streams. An INVITE is cancelled
+through its control, the transaction acknowledges a non-2xx, and the
+application sends the ACK for a 2xx once, without a transaction. ACKs for a 2xx
+and CANCELs reach the application as events of their own. The endpoint
+supports graceful shutdown. Stateless forwarding, draining INVITEs in Accepted
+at shutdown, TLS and next-hop selection are later work. signa is not a
+complete UA or proxy. Dialogs, 2xx retransmission and the meaning of a CANCEL
+stay with the application.
 
 The [API documentation on docs.rs] says what is covered in detail.
 
@@ -51,15 +56,19 @@ internal implementation details.
 
 ### Example
 
-A non-INVITE UAS receives owned requests and responds through their
-transaction. `to_tag` adds a fresh To tag to an initial request's response and
-keeps the tag of a request within a dialog. A failed submission is logged
-rather than returned, since leaving the loop would drop `incoming` and shut the
-endpoint down.
+A UAS for non-INVITE requests receives owned requests and responds through
+their transaction. `to_tag` adds a fresh To tag to an initial request's
+response and keeps the tag of a request within a dialog. A failed submission is
+logged rather than returned, since leaving the loop would drop `incoming` and
+shut the endpoint down.
 
 ```rust
 use bytes::Bytes;
-use signa::{endpoint::{Endpoint, IncomingEvent}, message::header::Tag, Response};
+use signa::{
+    endpoint::{Endpoint, IncomingEvent},
+    message::header::Tag,
+    Method, Response,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -70,9 +79,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while let Some(event) = incoming.recv().await {
         if let IncomingEvent::Request(envelope) = event {
+            // A 2xx to an INVITE starts a dialog, whose 2xx retransmissions and
+            // ACK this loop does not handle.
+            let status = if envelope.request.method() == Method::INVITE {
+                501
+            } else {
+                200
+            };
             let (responder, _) = envelope.transaction.into_parts();
             let response = Response::reply_to(&envelope.request)
-                .status(200)
+                .status(status)
                 .to_tag(Tag::random())
                 .body(Bytes::new())?;
 
@@ -92,8 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 application-owned Tower dispatch with a non-Clone service. The endpoint starts
 no application handler tasks. Response acceptance is distinct from local write
 completion and transaction termination. Dropping an unanswered responder
-requests a 500. A stateless endpoint mode and INVITE/ACK/CANCEL integration
-remain planned.
+requests a 500. A stateless endpoint mode remains planned.
 
 ### License
 

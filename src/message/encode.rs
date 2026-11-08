@@ -120,6 +120,35 @@ pub(crate) fn response_len<T>(
         .checked_add(body_len)
 }
 
+/// Checked wire length for admission before a request is encoded.
+#[cfg(any(feature = "tokio", test))]
+pub(crate) fn request_len<T>(
+    request: &Request<T>,
+    body_len: usize,
+) -> Option<usize> {
+    // `METHOD SP URI SP VERSION CRLF`
+    let line = request
+        .method()
+        .as_str()
+        .len()
+        .checked_add(request.uri().as_str().len())?
+        .checked_add(request.version().as_str().len())?
+        .checked_add(4)?;
+    let fields = request
+        .headers()
+        .iter()
+        .filter(|(name, _)| **name != CONTENT_LENGTH)
+        .try_fold(0usize, |len, (name, value)| {
+            len.checked_add(name.as_str().len())?
+                .checked_add(value.len())?
+                .checked_add(4)
+        })?;
+    line.checked_add(fields)?
+        .checked_add("Content-Length: \r\n\r\n".len())?
+        .checked_add(Digits::new(body_len).len())?
+        .checked_add(body_len)
+}
+
 /// Returns the length of the header fields, the `Content-Length` field, and
 /// the empty line, so the whole message can be reserved at once.
 fn head_fields_len(headers: &HeaderMap, body: &[u8]) -> usize {
@@ -215,6 +244,27 @@ mod tests {
         quickcheck::QuickCheck::new()
             .tests(if cfg!(miri) { 8 } else { 100 })
             .quickcheck(property as fn(Vec<u8>, bool) -> bool);
+    }
+
+    #[test]
+    fn checked_request_length_matches_normalized_wire_output() {
+        fn property(body: Vec<u8>, routes: u8) -> bool {
+            let mut builder = Request::builder()
+                .method("ACK")
+                .uri("sip:bob@example.com")
+                .header("CSeq", "1 ACK")
+                .header("Content-Length", "999");
+            for _ in 0..routes % 4 {
+                builder = builder.header("Route", "<sip:p.example.com;lr>");
+            }
+            let request = builder.body(body).unwrap();
+            request_len(&request, request.body().len())
+                == Some(request.to_bytes().len())
+        }
+
+        quickcheck::QuickCheck::new()
+            .tests(if cfg!(miri) { 8 } else { 100 })
+            .quickcheck(property as fn(Vec<u8>, u8) -> bool);
     }
 
     #[test]

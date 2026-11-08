@@ -21,6 +21,7 @@ pub(super) struct Config {
     pub(super) timers: Timers,
     pub(super) tcp: tcp::Config,
     pub(super) max_pending_requests: usize,
+    pub(super) control_event_limits: WriteLimits,
     pub(super) max_server_transactions: usize,
     pub(super) max_client_transactions: usize,
     pub(super) max_client_request_bytes: usize,
@@ -49,6 +50,10 @@ impl Default for Config {
             timers: Timers::default(),
             tcp: tcp::Config::default(),
             max_pending_requests: 1024,
+            control_event_limits: WriteLimits {
+                messages: 1024,
+                bytes: 16 * 1024 * 1024,
+            },
             max_server_transactions: 4096,
             max_client_transactions: 4096,
             max_client_request_bytes: 64 * 1024 * 1024,
@@ -329,6 +334,24 @@ impl Builder {
         self
     }
 
+    /// Bounds ACK and matched CANCEL events, apart from ordinary requests.
+    ///
+    /// An ACK for the transaction user, and a CANCEL that matches a server
+    /// transaction, take their place in this limit from admission until
+    /// [`Incoming::recv`] returns them. A matched CANCEL also holds one of
+    /// these slots and its bytes until its final response or the end of its
+    /// transaction, and one for its reply route until the last clone drops.
+    /// So a full [`Builder::max_pending_requests`], held by handlers waiting
+    /// for exactly these ACKs and CANCELs, does not stop them. Past the limit
+    /// an ACK is discarded without a response and a CANCEL gets a stateless
+    /// 503.
+    ///
+    /// The default is 1024 messages and 16 MiB. Both must be positive.
+    pub fn control_event_limits(mut self, limits: WriteLimits) -> Builder {
+        self.config.control_event_limits = limits;
+        self
+    }
+
     /// Sets how many server transactions may be retained at once.
     ///
     /// The default is 4096. Each tracked request holds an entry until its
@@ -338,6 +361,11 @@ impl Builder {
     /// [RFC 3261 section 17.2.2]. A full table refuses new transactions with
     /// a stateless 503. Existing retransmissions still match their
     /// transaction.
+    ///
+    /// An INVITE also reserves the entry that a CANCEL of it would take, so
+    /// it needs two free entries, and a CANCEL never waits for one
+    /// ([RFC 3261 section 9.2]). An INVITE in Accepted stays for Timer L, and
+    /// one in Completed until its ACK and Timer I, or Timer H.
     ///
     /// Zero refuses all new stateful requests. Requests without an RFC 3261
     /// transaction key do not count against this limit.
@@ -354,6 +382,7 @@ impl Builder {
     /// ```
     ///
     /// [RFC 3261 section 17.2.2]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17.2.2
+    /// [RFC 3261 section 9.2]: https://www.rfc-editor.org/rfc/rfc3261.html#section-9.2
     pub fn max_server_transactions(mut self, limit: usize) -> Builder {
         self.config.max_server_transactions = limit;
         self
@@ -362,7 +391,8 @@ impl Builder {
     /// Sets how many client requests may be admitted at once, including
     /// queued commands, pending connects and live transactions. A request
     /// beyond that fails before enqueue with [`Error::is_busy`].
-    /// The default is 4096. Zero refuses all client requests.
+    /// The default is 4096. Zero refuses all client requests. An INVITE takes
+    /// two, one for the CANCEL it may need.
     ///
     /// Over UDP a transaction stays open for Timer K, which is T4 or 5 s,
     /// after its final response, to absorb retransmissions of it. So the limit
@@ -509,6 +539,7 @@ impl Builder {
     ///
     /// Returns a [`BindError`] for a socket that fails to bind, or an invalid
     /// configuration: a zero `max_pending_requests`,
+    /// `control_event_limits` count or bytes,
     /// `max_server_request_bytes`, `max_responder_handles`,
     /// `max_responder_bytes`, `max_server_response_bytes` or
     /// `max_client_handles`, or a zero count or byte limit in
@@ -520,6 +551,14 @@ impl Builder {
             (
                 "max_pending_requests must be positive",
                 self.config.max_pending_requests,
+            ),
+            (
+                "control_event_limits.messages must be positive",
+                self.config.control_event_limits.messages,
+            ),
+            (
+                "control_event_limits.bytes must be positive",
+                self.config.control_event_limits.bytes,
             ),
             (
                 "max_server_request_bytes must be positive",
@@ -608,6 +647,8 @@ impl Builder {
             control: driver.control.clone(),
             shutdown_wait: driver.shutdown_done.subscribe(),
             connection_stats: driver.connection_stats.clone(),
+            oneshot_capacity: driver.oneshot_capacity(),
+            oneshot_bytes: driver.oneshot_bytes(),
             commands,
             udp: udp_addr,
             tcp: tcp_addr,

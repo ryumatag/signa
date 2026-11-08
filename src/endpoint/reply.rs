@@ -7,7 +7,9 @@ use std::{error, fmt, io, sync::Arc};
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 
-use super::{driver::Command, routing::Link, server};
+use super::{
+    driver::Command, routing::Link, send::SentRequest, server, Error,
+};
 use crate::{
     message::{
         header::{
@@ -18,7 +20,10 @@ use crate::{
         response::Response,
         Method,
     },
-    transport::budget::{Budget, Permit},
+    transport::{
+        budget::{Budget, Permit},
+        Flow,
+    },
 };
 
 /// An opaque capability for sending responses to one received request.
@@ -177,7 +182,7 @@ impl ReplyRoute {
                 link: self.0.link.clone(),
                 bytes,
                 completion: Completion {
-                    done,
+                    done: Done::Reply(done),
                     _permit: permit,
                     _endpoint: self.0.commands.clone(),
                     reservation,
@@ -301,21 +306,89 @@ impl error::Error for ReplyError {
     }
 }
 
+/// A one-shot write in flight, with its reservations, until its local write
+/// result reaches the waiting future.
 pub(super) struct Completion {
-    done: oneshot::Sender<Result<(), ReplyError>>,
+    done: Done,
     _permit: OwnedSemaphorePermit,
     _endpoint: mpsc::UnboundedSender<Command>,
     reservation: Permit,
 }
 
 impl Completion {
+    pub(super) fn request(
+        done: oneshot::Sender<Result<SentRequest, Error>>,
+        permit: OwnedSemaphorePermit,
+        endpoint: mpsc::UnboundedSender<Command>,
+        reservation: Permit,
+    ) -> Completion {
+        Completion {
+            done: Done::Request { done, sent: None },
+            _permit: permit,
+            _endpoint: endpoint,
+            reservation,
+        }
+    }
+
+    /// Records what a request goes out with, before its write is queued.
+    pub(super) fn sent(&mut self, via: HeaderValue, flow: Flow) {
+        if let Done::Request { sent, .. } = &mut self.done {
+            *sent = Some(SentRequest { via, flow });
+        }
+    }
+
+    /// Ends a request the driver refused before writing anything.
+    pub(super) fn fail(self, error: Error) {
+        let Completion { done, _permit, _endpoint, reservation } = self;
+        drop(reservation);
+        drop(_permit);
+        drop(_endpoint);
+        match done {
+            Done::Request { done, .. } => {
+                let _ = done.send(Err(error));
+            }
+            Done::Reply(done) => {
+                let _ = done.send(Err(ReplyError::Closed));
+            }
+        }
+    }
+
     pub(super) fn finish(self, result: Result<(), ReplyError>) {
         let Completion { done, _permit, _endpoint, reservation } = self;
         drop(reservation);
         drop(_permit);
         drop(_endpoint);
-        let _ = done.send(result);
+        match done {
+            Done::Reply(done) => {
+                let _ = done.send(result);
+            }
+            Done::Request { done, sent } => {
+                let _ = done.send(match result {
+                    Ok(()) => sent.ok_or_else(Error::closed),
+                    Err(ReplyError::Busy) => Err(Error::busy()),
+                    Err(ReplyError::Transport(error)) => {
+                        Err(Error::transport(error))
+                    }
+                    Err(
+                        ReplyError::Closed
+                        | ReplyError::InvalidResponse
+                        | ReplyError::Unsupported,
+                    ) => Err(Error::closed()),
+                });
+            }
+        }
     }
+}
+
+/// Who waits for a one-shot write: a reply route, or
+/// [`Endpoint::send_request`](super::Endpoint::send_request), which also
+/// learns the Via and flow the driver chose.
+enum Done {
+    Reply(oneshot::Sender<Result<(), ReplyError>>),
+    Request {
+        done: oneshot::Sender<Result<SentRequest, Error>>,
+        sent: Option<SentRequest>,
+    },
 }
 
 pub(super) struct Admission(pub(super) Arc<Semaphore>);

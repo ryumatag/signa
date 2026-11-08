@@ -44,6 +44,9 @@ criterion::criterion_group! {
         // The same round trips between two endpoints, which adds the
         // transactions, the service, and the message layer on both sides.
         endpoint::round_trip,
+        // INVITE and CANCEL through the TU API, each to the point its
+        // comment names, which is not the end of the transaction.
+        endpoint::invite,
         endpoint::reply_route,
         endpoint::client_admission,
         endpoint::connection_admission,

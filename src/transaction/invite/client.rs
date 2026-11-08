@@ -30,8 +30,8 @@ enum State {
         b: Instant,
         doublings: u8,
     },
-    // Request retransmissions stop at the first provisional. Only the selected
-    // ACK fields survive until a final response.
+    // Request retransmissions stop at the first provisional. Only the fields
+    // that the ACK and CANCEL copy survive until a final response.
     Proceeding {
         ack: request::Parts,
         reliable: bool,
@@ -105,18 +105,37 @@ impl ClientTransaction {
     ///
     /// The request already has its top Via. The caller validates complete
     /// header semantics. This constructor checks the fields it reads and keeps
-    /// a bodyless ACK template, without retaining the input buffer.
+    /// a bodyless template for the ACK and the CANCEL, without retaining the
+    /// input buffer.
     pub fn new(
         request: &Request<Bytes>,
         reliable: bool,
         timers: &Timers,
         now: Instant,
     ) -> Result<ClientTransaction, InvalidInvite> {
-        let ack = ack_template(request)?;
+        ClientTransaction::from_encoded(
+            request,
+            request.to_bytes(),
+            reliable,
+            timers,
+            now,
+        )
+    }
+
+    /// [`ClientTransaction::new`] for a caller that has encoded `request`
+    /// already, as `encoded`, to send it.
+    pub fn from_encoded(
+        request: &Request<Bytes>,
+        encoded: Bytes,
+        reliable: bool,
+        timers: &Timers,
+        now: Instant,
+    ) -> Result<ClientTransaction, InvalidInvite> {
+        let ack = template(request)?;
 
         Ok(ClientTransaction {
             state: State::Calling {
-                request: request.to_bytes(),
+                request: encoded,
                 ack,
                 a: (!reliable).then_some(now + timers.t1()),
                 b: now + timers.transaction_timeout(),
@@ -128,6 +147,16 @@ impl ClientTransaction {
     /// Whether the driver can remove this transaction.
     pub fn is_terminated(&self) -> bool {
         matches!(self.state, State::Terminated)
+    }
+
+    /// Whether no response has arrived yet.
+    pub fn is_calling(&self) -> bool {
+        matches!(self.state, State::Calling { .. })
+    }
+
+    /// Whether a provisional response has arrived, but no final one.
+    pub fn is_proceeding(&self) -> bool {
+        matches!(self.state, State::Proceeding { .. })
     }
 
     /// The next timer deadline, if this state has a timer.
@@ -271,11 +300,61 @@ impl ClientTransaction {
             State::Accepted { .. } | State::Terminated => ClientEvent::None,
         }
     }
+
+    /// Builds the CANCEL for this INVITE, once a provisional response has
+    /// arrived and before a final one.
+    ///
+    /// [RFC 3261 section 9.1] copies the Request-URI, Call-ID, To, From and
+    /// the CSeq number, the Route values and the single top Via. The CSeq
+    /// method is CANCEL, and neither Require nor Proxy-Require is present.
+    /// The caller starts a separate non-INVITE transaction with it.
+    ///
+    /// [RFC 3261 section 9.1]: https://www.rfc-editor.org/rfc/rfc3261.html#section-9.1
+    pub fn cancel_request(&self) -> Option<Request<Bytes>> {
+        let State::Proceeding { ack, .. } = &self.state else { return None };
+        let number = ack
+            .headers
+            .get(CSEQ)
+            .and_then(CSeq::parse)
+            .expect("the template has a valid CSeq")
+            .number;
+
+        let mut parts = request::Parts::new(Method::CANCEL, ack.uri.copy());
+        parts.headers = ack.headers.clone();
+        parts
+            .headers
+            .insert(CSEQ, HeaderValue::from_built(format!("{number} CANCEL")));
+
+        Some(Request::from_parts(parts, Bytes::new()))
+    }
+
+    /// Ends Calling or Proceeding without a final response.
+    ///
+    /// The driver calls this when its cancellation deadline passes, 64 T1
+    /// after it sent a CANCEL ([RFC 3261 section 9.1]). This is not Timer B,
+    /// which only times out Calling. Returns `false` once a final response
+    /// has arrived, which the caller then processes normally.
+    ///
+    /// [RFC 3261 section 9.1]: https://www.rfc-editor.org/rfc/rfc3261.html#section-9.1
+    pub fn abandon(&mut self) -> bool {
+        if matches!(
+            self.state,
+            State::Calling { .. } | State::Proceeding { .. }
+        ) {
+            self.state = State::Terminated;
+            true
+        } else {
+            false
+        }
+    }
 }
 
-/// RFC 3261 section 17.1.1.3. Copy selected values so a large INVITE body or
-/// read chunk is not retained throughout Proceeding by a header slice.
-fn ack_template(
+/// RFC 3261 sections 17.1.1.3 and 9.1. Copy selected values so a large INVITE
+/// body or read chunk is not retained throughout Proceeding by a header slice.
+///
+/// The template is the ACK with the INVITE's own To. A non-2xx final replaces
+/// To with the response's, and a CANCEL keeps it.
+fn template(
     request: &Request<Bytes>,
 ) -> Result<request::Parts, InvalidInvite> {
     if request.method() != Method::INVITE {
@@ -298,8 +377,6 @@ fn ack_template(
     let via_value = required(VIA)?;
     let via = Via::top(via_value).ok_or(InvalidInvite::Via)?;
 
-    required(TO)?;
-
     // The URI has already been validated. This copy changes ownership only.
     let mut ack = request::Parts::new(Method::ACK, request.uri().copy());
     ack.headers.append(
@@ -307,7 +384,7 @@ fn ack_template(
         HeaderValue::from_built(via_value.as_str()[..via.end].to_owned()),
     );
 
-    for name in [FROM, CALL_ID] {
+    for name in [FROM, TO, CALL_ID] {
         let value = HeaderValue::from_built(
             required(name.clone())?.as_str().to_owned(),
         );
@@ -680,6 +757,78 @@ mod tests {
             ClientTransaction::new(&bad, false, &TIMERS, start).unwrap_err(),
             InvalidInvite::Via
         );
+    }
+
+    // RFC 3261 section 9.1. Only Proceeding can be cancelled, and the
+    // CANCEL keeps the INVITE's own To even after the template served an ACK.
+    #[test]
+    fn cancel_copies_the_invite_identity_routing_and_top_via() {
+        let start = Instant::now();
+        let mut tx = client(false, start);
+        assert!(tx.is_calling());
+        assert!(tx.cancel_request().is_none());
+
+        tx.on_response(response(180, "early"), &TIMERS, start);
+        assert!(tx.is_proceeding());
+        let cancel = tx.cancel_request().unwrap();
+        let invite = request();
+
+        assert_eq!(cancel.method(), Method::CANCEL);
+        assert_eq!(cancel.uri().as_str(), invite.uri().as_str());
+        for name in [FROM, TO, CALL_ID] {
+            assert_eq!(
+                cancel.headers().get(&name),
+                invite.headers().get(&name)
+            );
+        }
+        assert_eq!(cancel.headers().get(CSEQ).unwrap(), "314159 CANCEL");
+        assert_eq!(
+            cancel.headers().get_all(VIA).collect::<Vec<_>>(),
+            ["SIP/2.0/UDP atlanta.example.com:5060;\
+              branch=z9hG4bKfirst;x=\"a,b\""]
+        );
+        assert_eq!(
+            cancel.headers().get_all(ROUTE).collect::<Vec<_>>(),
+            invite.headers().get_all(ROUTE).collect::<Vec<_>>()
+        );
+        for name in ["Require", "Proxy-Require", "Content-Type"] {
+            assert!(!cancel.headers().contains_key(name), "{name}");
+        }
+        assert!(cancel.body().is_empty());
+
+        assert!(matches!(
+            tx.on_response(response(487, "late"), &TIMERS, start),
+            C::Final { ack: Some(_), .. }
+        ));
+        assert!(tx.cancel_request().is_none());
+    }
+
+    // The driver's cancellation deadline, not Timer B. A final that won the
+    // race leaves nothing to abandon.
+    #[test]
+    fn abandon_ends_only_states_without_a_final() {
+        let start = Instant::now();
+        let mut tx = client(false, start);
+        assert!(tx.abandon());
+        assert!(tx.is_terminated());
+        assert_eq!(tx.deadline(), None);
+
+        let mut tx = client(true, start);
+        tx.on_response(response(183, "early"), &TIMERS, start);
+        assert!(tx.abandon());
+        assert!(matches!(
+            tx.on_response(response(200, "late"), &TIMERS, start),
+            C::None
+        ));
+
+        for code in [200, 486] {
+            let mut tx = client(false, start);
+            tx.on_response(response(code, "bob"), &TIMERS, start);
+            let deadline = tx.deadline();
+
+            assert!(!tx.abandon());
+            assert_eq!(tx.deadline(), deadline);
+        }
     }
 
     #[test]

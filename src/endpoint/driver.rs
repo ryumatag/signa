@@ -27,11 +27,12 @@ connections.
 use std::{
     collections::HashMap,
     future::{poll_fn, Future},
-    io,
+    io, mem,
     net::{IpAddr, SocketAddr},
+    ops::{Deref, DerefMut},
     pin::Pin,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     task::{Context, Poll},
@@ -49,7 +50,10 @@ use crate::{
     endpoint::{
         admission::{AdmissionOwner, ClientAdmission, Permit},
         builder::Config,
-        client::{Delivery, Observation, Starting},
+        client::{
+            CancelError, CancelHandle, CancelOutcome, Delivery, Intent,
+            Observation, Reserved, Starting, Target,
+        },
         datagram::Datagram,
         error::Error,
         reply::{Admission, Completion, ReplyError, ReplyRoute},
@@ -66,17 +70,24 @@ use crate::{
         timer::{Key, TimerQueue},
     },
     message::{
-        header::{via::Via, VIA},
+        header::{
+            address::has_tag, cseq::CSeq, via::Via, HeaderMap, Tag, CALL_ID,
+            CSEQ, FROM, TO, VIA,
+        },
         request::Request,
         response::{bare_response, reply_headers, Response},
         Message, Method, StatusCode,
     },
     transaction::{
+        invite,
         key::{ClientKey, ServerKey},
         non_invite::{ClientEvent, ClientTransaction, ServerTransaction},
     },
     transport::{budget::Budget, tcp, udp, Flow, Transport, WriteLimits},
 };
+
+mod cancels;
+mod invites;
 
 /// The most bytes of a request that go over UDP. RFC 3261 section 18.1.1
 /// sends a larger one over a congestion-controlled transport. The limit is
@@ -93,9 +104,7 @@ const REPLY_OPERATIONS: usize = 64;
 
 const BAD_REQUEST: StatusCode = status(400);
 const SERVER_ERROR: StatusCode = status(500);
-const NOT_IMPLEMENTED: StatusCode = status(501);
 const SERVICE_UNAVAILABLE: StatusCode = status(503);
-const TRANSACTION_DOES_NOT_EXIST: StatusCode = status(481);
 
 const fn status(code: u16) -> StatusCode {
     match StatusCode::from_u16(code) {
@@ -121,6 +130,15 @@ pub(super) enum Command {
     Reply { link: Link, bytes: Bytes, completion: Completion },
     /// A TU asks the driver to accept a response.
     Submit(server::Submission),
+    /// A TU asks the driver to cancel an INVITE. One intent per INVITE
+    /// reaches the driver, so these are bounded by live INVITEs.
+    Cancel {
+        id: Id,
+        intent: Arc<Intent>,
+        done: oneshot::Sender<Result<CancelOutcome, CancelError>>,
+    },
+    /// A TU sends a request once, without a transaction.
+    Request { request: Request<Bytes>, target: Target, completion: Completion },
     /// A connection the driver asked for is open, or could not be opened.
     Connected {
         remote: SocketAddr,
@@ -132,24 +150,16 @@ pub(super) enum Command {
     Shutdown,
 }
 
-/// Admission destination before issuing an incoming capability.
-pub(super) enum Slot {
-    /// A server transaction, which sends the response and answers
-    /// retransmissions with it.
-    Transaction(Id),
-    /// No transaction, because the request had no RFC 3261 branch. The
-    /// response is sent once, and a retransmission of the request reaches
-    /// the TU again.
-    Stateless(Link),
-}
-
 struct ServerEntry {
-    tx: ServerTransaction,
+    tx: ServerMachine,
     /// Where responses go. Its remote address is the one RFC 3261 section
     /// 18.2.2 picks, which is the request's source port only with `rport`.
     link: Link,
     shared: Option<Arc<server::Shared>>,
-    identity: usize,
+    /// The TU's name for this transaction. It also tells a capability of a
+    /// removed transaction from one of a new entry in the same slot, since
+    /// the counter behind it never repeats.
+    id: ServerTransactionId,
     retained: Option<crate::transport::budget::Permit>,
 }
 
@@ -168,14 +178,210 @@ impl Drop for ServerEntry {
     }
 }
 
+/// The machine of a server entry. Extension methods use the non-INVITE one.
+/// The INVITE state is boxed, so a non-INVITE entry, the common case, does
+/// not grow by a tag or the reservation flag.
+enum ServerMachine {
+    NonInvite(ServerTransaction),
+    Invite(Box<InviteServer>),
+}
+
+impl ServerMachine {
+    fn cancel_reserved(&self) -> bool {
+        matches!(self, ServerMachine::Invite(invite) if invite.cancel_reserved)
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        match self {
+            ServerMachine::NonInvite(tx) => tx.deadline(),
+            ServerMachine::Invite(tx) => tx.deadline(),
+        }
+    }
+
+    fn is_terminated(&self) -> bool {
+        match self {
+            ServerMachine::NonInvite(tx) => tx.is_terminated(),
+            ServerMachine::Invite(tx) => tx.is_terminated(),
+        }
+    }
+
+    /// Reply headers while the TU can still send a final response.
+    fn headers(&self) -> Option<&HeaderMap> {
+        match self {
+            ServerMachine::NonInvite(tx) => tx.headers(),
+            ServerMachine::Invite(tx) => tx.headers(),
+        }
+    }
+
+    /// What a retransmission of the request gets.
+    fn on_retransmission(&self) -> Option<Bytes> {
+        match self {
+            ServerMachine::NonInvite(tx) => tx.on_retransmission(),
+            ServerMachine::Invite(tx) => match tx.on_retransmission() {
+                invite::ServerEvent::Send(bytes) => Some(bytes),
+                _ => None,
+            },
+        }
+    }
+
+    /// A response write failed. A non-INVITE ends. An INVITE keeps its state
+    /// ([RFC 6026 section 8.8]).
+    ///
+    /// [RFC 6026 section 8.8]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.8
+    fn on_transport_error(&mut self) {
+        match self {
+            ServerMachine::NonInvite(tx) => tx.on_transport_error(),
+            ServerMachine::Invite(tx) => {
+                tx.on_transport_error();
+            }
+        }
+    }
+
+    /// Ends a transaction whose abandonment 500 could not be sent. See
+    /// `Driver::respond_abandoned`.
+    fn abandon(&mut self) {
+        match self {
+            ServerMachine::NonInvite(tx) => tx.on_transport_error(),
+            ServerMachine::Invite(tx) => {
+                tx.abandon();
+            }
+        }
+    }
+}
+
+/// An INVITE server transaction with what the driver adds to its machine.
+struct InviteServer {
+    tx: invite::ServerTransaction,
+    /// The INVITE holds a table entry for the CANCEL that may target it,
+    /// counted in `Driver::reserved_cancels`, until a CANCEL takes it or the
+    /// INVITE is removed.
+    cancel_reserved: bool,
+}
+
+impl Deref for InviteServer {
+    type Target = invite::ServerTransaction;
+
+    fn deref(&self) -> &invite::ServerTransaction {
+        &self.tx
+    }
+}
+
+impl DerefMut for InviteServer {
+    fn deref_mut(&mut self) -> &mut invite::ServerTransaction {
+        &mut self.tx
+    }
+}
+
 struct ClientEntry {
-    tx: ClientTransaction,
+    tx: ClientMachine,
     /// Where the request went. Its local address is the `sent-by` written
     /// into the `Via`, which a response has to carry back.
     link: Link,
-    /// Taken when the final response, or the error, is delivered.
+    /// Taken when the final response, or the error, is delivered. An INVITE
+    /// keeps it after a 2xx, until Timer M.
     respond: Option<Responder>,
     permit: Permit,
+}
+
+impl ClientEntry {
+    /// The machine's deadline, or an INVITE's cancellation deadline if that
+    /// is earlier.
+    fn deadline(&self) -> Option<Instant> {
+        match &self.tx {
+            ClientMachine::NonInvite(tx) => tx.deadline(),
+            ClientMachine::Invite(invite) => {
+                match (invite.tx.deadline(), invite.cancel_deadline) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                }
+            }
+        }
+    }
+
+    fn is_terminated(&self) -> bool {
+        match &self.tx {
+            ClientMachine::NonInvite(tx) => tx.is_terminated(),
+            ClientMachine::Invite(invite) => invite.tx.is_terminated(),
+        }
+    }
+
+    /// Takes a completion once, after the machine has dropped its request.
+    /// The driver settles the table before delivering it. Otherwise a reliable
+    /// final can wake a new call while its last slot is still charged.
+    fn answer(
+        &mut self,
+        result: Result<Response<Bytes>, Error>,
+    ) -> Option<(Responder, Result<Response<Bytes>, Error>)> {
+        let respond = self.respond.take()?;
+        self.permit.release_bytes();
+        Some((respond, result))
+    }
+}
+
+/// The machine of a client entry. The INVITE state is boxed, so a
+/// non-INVITE entry, the common case, does not grow by it.
+enum ClientMachine {
+    NonInvite(ClientTransaction),
+    Invite(Box<InviteClient>),
+}
+
+impl ClientMachine {
+    /// Ends a non-INVITE whose write failed. An INVITE follows its machine,
+    /// see `Driver::fail_client`.
+    fn end_on_transport_error(&mut self) {
+        match self {
+            ClientMachine::NonInvite(tx) => tx.on_transport_error(),
+            ClientMachine::Invite(invite) => {
+                invite.tx.on_transport_error();
+            }
+        }
+    }
+}
+
+/// An INVITE client transaction with what the driver adds to its machine.
+struct InviteClient {
+    tx: invite::ClientTransaction,
+    /// Whether the first final response or an error was delivered, which
+    /// ends the INVITE's place in `Driver::unanswered`.
+    answered: bool,
+    cancel: Cancel,
+    /// Shared with `ClientControl`, so a cancel request cannot reach a
+    /// later INVITE in the same slot.
+    intent: Arc<Intent>,
+    /// 64 T1 after the CANCEL went out ([RFC 3261 section 9.1]).
+    ///
+    /// [RFC 3261 section 9.1]: https://www.rfc-editor.org/rfc/rfc3261.html#section-9.1
+    cancel_deadline: Option<Instant>,
+}
+
+impl InviteClient {
+    /// Records that the first final response or an error was delivered.
+    /// Returns `true` the first time, when the caller decrements
+    /// `Driver::unanswered`.
+    fn mark_answered(&mut self) -> bool {
+        !mem::replace(&mut self.answered, true)
+    }
+
+    /// Answers a waiting request with `NotNeeded` and returns the
+    /// reservation, after a final response or the end of the INVITE.
+    fn cancel_not_needed(&mut self) {
+        if let Cancel::Waiting(_, done) =
+            mem::replace(&mut self.cancel, Cancel::Done)
+        {
+            let _ = done.send(Ok(CancelOutcome::NotNeeded));
+        }
+    }
+}
+
+/// Where an INVITE's cancellation intent stands.
+enum Cancel {
+    /// Not requested. The reservation waits for a request.
+    Reserved(Reserved),
+    /// Requested before any provisional response. The CANCEL goes out with
+    /// the first one, or the request is not needed after a final.
+    Waiting(Reserved, oneshot::Sender<Result<CancelOutcome, CancelError>>),
+    /// Sent, not needed, or never reserved.
+    Done,
 }
 
 /// What the driver knows about one next hop. Pending connects stay here
@@ -200,12 +406,40 @@ enum TcpState {
 enum Pending {
     /// A client's request, which starts a transaction once it can be sent.
     Request(Request<Bytes>, Starting, Permit),
+    /// A non-2xx ACK whose INVITE connection had closed. It goes to the
+    /// INVITE's next hop (RFC 3261 section 17.1.1.3), not to where the final
+    /// response came from.
+    Ack(Bytes),
+    /// A CANCEL whose INVITE connection had closed.
+    Cancel(CancelStart),
+    /// A request sent once, which gets its Via when the connection is open.
+    OneShotRequest(Request<Bytes>, Completion),
     /// An encoded response whose request came on a connection that has closed
     /// since. It goes to `sent-by` on a new connection
     /// (RFC 3261 section 18.2.2).
     Response(Bytes, Fallback),
     OneShot(Bytes, Completion),
     Server(Bytes, server::WriteObservation, crate::transport::budget::Permit),
+}
+
+impl Pending {
+    /// Whether this is protocol work for existing transactions or replies,
+    /// which may use the connection room kept for responses, rather than a
+    /// new request.
+    fn is_protocol_work(&self) -> bool {
+        !matches!(self, Pending::Request(..) | Pending::OneShotRequest(..))
+    }
+}
+
+/// A CANCEL on its way to its own client transaction.
+struct CancelStart {
+    /// The CANCEL, with the INVITE's top Via as its only Via.
+    request: Request<Bytes>,
+    /// The INVITE, whose cancellation deadline starts with the CANCEL.
+    invite: Id,
+    intent: Arc<Intent>,
+    reserved: Reserved,
+    done: Option<oneshot::Sender<Result<CancelOutcome, CancelError>>>,
 }
 
 /// Transport admission held while the driver commits a server response.
@@ -355,6 +589,16 @@ pub(super) struct Driver {
     server_cursor: usize,
     fallback_cursor: usize,
     branches: Branches,
+    /// ACK and matched CANCEL events between admission and `recv`, apart
+    /// from `event_admission`.
+    control_events: Budget,
+    /// Matched CANCELs from admission to their final response, apart from
+    /// `work`.
+    control_work: Budget,
+    /// The reply routes of matched CANCELs, apart from `routes_admission`.
+    control_routes: Budget,
+    /// INVITE server entries that hold a table entry for their CANCEL.
+    reserved_cancels: usize,
 }
 
 impl Driver {
@@ -452,7 +696,21 @@ impl Driver {
             server_cursor: 0,
             fallback_cursor: 0,
             branches: Branches::new(),
+            control_events: Budget::new(config.control_event_limits),
+            control_work: Budget::new(config.control_event_limits),
+            control_routes: Budget::new(config.control_event_limits),
+            reserved_cancels: 0,
         }
+    }
+
+    /// The one-shot slots that reply routes and `send_request` share.
+    pub(super) fn oneshot_capacity(&self) -> Arc<Semaphore> {
+        self.reply_admission.0.clone()
+    }
+
+    /// The one-shot bytes that reply routes and `send_request` share.
+    pub(super) fn oneshot_bytes(&self) -> Budget {
+        self.reply_bytes.clone()
     }
 
     pub(super) fn client_admission(&self) -> ClientAdmission {
@@ -522,7 +780,7 @@ impl Driver {
         let clients = &self.clients;
         self.timers.compact(servers.len() + clients.len(), |key| match key {
             Key::Server(id) => servers.get(id)?.tx.deadline(),
-            Key::Client(id) => clients.get(id)?.tx.deadline(),
+            Key::Client(id) => clients.get(id)?.deadline(),
             Key::Shutdown => {
                 unreachable!("the queue owns the shutdown deadline")
             }
@@ -704,6 +962,7 @@ impl Driver {
             && self.writes.is_empty()
             && self.server_writes.is_empty()
             && self.live_work_is_drained()
+            && self.control_work.is_idle()
             && self.fallback_writes.is_empty()
             && self.unanswered == 0
             && self.udp.as_ref().map_or(true, |udp| udp.is_idle())
@@ -728,6 +987,12 @@ impl Driver {
                 self.on_send(request, transport, next_hop, respond, permit);
             }
             Command::Submit(submission) => self.on_submission(submission),
+            Command::Cancel { id, intent, done } => {
+                self.on_cancel(id, &intent, done);
+            }
+            Command::Request { request, target, completion } => {
+                self.on_oneshot_request(request, target, completion);
+            }
             Command::Connected { remote, result, _attempt } => {
                 self.on_connected(remote, result);
             }
@@ -748,69 +1013,46 @@ impl Driver {
             Key::Server(id) => {
                 let Some(entry) = self.servers.get_mut(id) else { return };
                 let before = entry.tx.deadline();
-                // The automatic 100 copies the request's Via, From, To,
-                // Call-ID and CSeq. The request's work reservation covers
-                // those bytes until a final replaces the 100, so it takes no
-                // separate `retained` reservation that could fail.
-                if let Some(trying) = entry.tx.on_timeout(now) {
-                    let link = entry.link.clone();
-                    let shared =
-                        entry.shared.as_ref().expect("TU transaction").clone();
-                    self.send_generated(id, &link, trying, &shared);
+                match &mut entry.tx {
+                    // The automatic 100 copies the request's Via, From, To,
+                    // Call-ID and CSeq. The request's work reservation covers
+                    // those bytes until a final replaces the 100, so it takes
+                    // no separate `retained` reservation that could fail.
+                    ServerMachine::NonInvite(tx) => {
+                        if let Some(trying) = tx.on_timeout(now) {
+                            let link = entry.link.clone();
+                            let shared = entry
+                                .shared
+                                .as_ref()
+                                .expect("TU transaction")
+                                .clone();
+                            self.send_generated(id, &link, trying, &shared);
+                        }
+                    }
+                    ServerMachine::Invite(_) => {
+                        self.on_invite_server_timer(id, now);
+                    }
                 }
 
                 self.settle_server(id, before);
             }
             Key::Client(id) => {
                 let Some(entry) = self.clients.get_mut(id) else { return };
-                let before = entry.tx.deadline();
-                let completion = match entry.tx.on_timeout(&timers, now) {
+                let before = entry.deadline();
+                let ClientMachine::NonInvite(tx) = &mut entry.tx else {
+                    self.on_invite_client_timer(id, before, now);
+                    return;
+                };
+                let completion = match tx.on_timeout(&timers, now) {
                     ClientEvent::Retransmit(request) => {
-                        // Without room for another receipt the retransmission
-                        // goes out unobserved. Its failure would be one lost
-                        // datagram, which the next retransmission or Timer F
-                        // covers.
-                        let result = if self.client_writes.len()
-                            < self.config.max_client_transactions
-                        {
-                            send_client(
-                                self.udp.as_mut(),
-                                &entry.link,
-                                &request,
-                                false,
-                            )
-                        } else {
-                            send_on(
-                                self.udp.as_mut(),
-                                &entry.link,
-                                &request,
-                                false,
-                            )
-                            .map(|()| None)
-                        };
-                        match result {
-                            Ok(receipt) => {
-                                if let (Some(receipt), Some(delivery)) =
-                                    (receipt, &entry.respond)
-                                {
-                                    self.client_writes.push((
-                                        receipt,
-                                        id,
-                                        delivery.observation(),
-                                    ));
-                                }
-                                None
-                            }
-                            // A full local write queue is not a transport
-                            // failure. Skip this retransmission as if UDP had
-                            // lost it, and keep the transaction.
-                            Err(err)
-                                if err.kind() == io::ErrorKind::WouldBlock =>
-                            {
-                                None
-                            }
-                            Err(err) => {
-                                entry.tx.on_transport_error();
+                        match self.retransmit_client(id, &request) {
+                            None => None,
+                            Some(err) => {
+                                let entry = self
+                                    .clients
+                                    .get_mut(id)
+                                    .expect("a live client entry");
+                                entry.tx.end_on_transport_error();
                                 entry.answer(Err(Error::transport(err)))
                             }
                         }
@@ -836,6 +1078,45 @@ impl Driver {
         }
     }
 
+    /// Retransmits a client request on its link. Returns the error that ends
+    /// the transaction, if any.
+    fn retransmit_client(
+        &mut self,
+        id: Id,
+        request: &Bytes,
+    ) -> Option<io::Error> {
+        let entry = self.clients.get(id).expect("a live client entry");
+        // Without room for another receipt the retransmission goes out
+        // unobserved. Its failure would be one lost datagram, which the next
+        // retransmission or the transaction timeout covers.
+        let result = if self.client_writes.len()
+            < self.config.max_client_transactions
+        {
+            send_client(self.udp.as_mut(), &entry.link, request, false)
+        } else {
+            send_on(self.udp.as_mut(), &entry.link, request, false)
+                .map(|()| None)
+        };
+        match result {
+            Ok(receipt) => {
+                if let (Some(receipt), Some(delivery)) =
+                    (receipt, &entry.respond)
+                {
+                    self.client_writes.push((
+                        receipt,
+                        id,
+                        delivery.observation(),
+                    ));
+                }
+                None
+            }
+            // A full local write queue is not a transport failure. Skip this
+            // retransmission as if UDP had lost it, and keep the transaction.
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => None,
+            Err(err) => Some(err),
+        }
+    }
+
     /// Drops a server transaction that is over, or schedules its next deadline
     /// when it moved.
     fn settle_server(&mut self, id: Id, before: Option<Instant>) {
@@ -844,7 +1125,7 @@ impl Driver {
             if let Some(shared) = &entry.shared {
                 shared.finish();
             }
-            self.servers.remove(id);
+            self.remove_server(id);
             return;
         }
 
@@ -856,13 +1137,40 @@ impl Driver {
         }
     }
 
+    /// Removes a server entry and returns any CANCEL entry it reserved.
+    fn remove_server(&mut self, id: Id) {
+        if let Some(entry) = self.servers.remove(id) {
+            if entry.tx.cancel_reserved() {
+                self.reserved_cancels -= 1;
+            }
+        }
+    }
+
+    /// Whether the server table has `entries` free, beside those reserved for
+    /// CANCELs.
+    fn server_room(&self, entries: usize) -> bool {
+        self.servers
+            .len()
+            .saturating_add(self.reserved_cancels)
+            .saturating_add(entries)
+            <= self.config.max_server_transactions
+    }
+
     /// See [`Driver::settle_server`].
     fn settle_client(&mut self, id: Id, before: Option<Instant>) {
         let Some(entry) = self.clients.get(id) else { return };
-        if entry.tx.is_terminated() {
+        if entry.is_terminated() {
             let connection =
                 entry.link.writer.as_ref().map(tcp::Writer::connection_id);
-            self.clients.remove(id);
+            let mut entry = self.clients.remove(id).expect("found above");
+            // An INVITE that received a 2xx ends its stream at Timer M,
+            // without an error. Every other end delivered its outcome first.
+            if let ClientMachine::Invite(invite) = &mut entry.tx {
+                invite.cancel_not_needed();
+                if let Some(delivery) = entry.respond.take() {
+                    delivery.end();
+                }
+            }
             if let Some(connection) = connection {
                 let count = self
                     .client_connections
@@ -876,7 +1184,7 @@ impl Driver {
             return;
         }
 
-        let after = entry.tx.deadline();
+        let after = entry.deadline();
         if after != before {
             if let Some(at) = after {
                 self.timers.push(at, Key::Client(id));
@@ -945,7 +1253,7 @@ impl Driver {
     /// Sends `pending` to `remote` over the connection the driver has to it,
     /// or over one it opens now.
     fn send_over_tcp(&mut self, remote: SocketAddr, pending: Pending) -> bool {
-        let response = !matches!(pending, Pending::Request(..));
+        let response = pending.is_protocol_work();
         if !self.admit_route(remote, response) {
             self.reject_pending(pending);
             return false;
@@ -1041,7 +1349,7 @@ impl Driver {
                 drop(permit);
                 respond.send(Err(Error::busy()));
             }
-            Pending::Response(..) => {}
+            Pending::Response(..) | Pending::Ack(_) => {}
             // Server output reserves its route and connection before commit
             // and never passes through `send_over_tcp`. Report a rejection
             // rather than a transport failure if that ever changes.
@@ -1049,6 +1357,15 @@ impl Driver {
             Pending::OneShot(bytes, completion) => {
                 drop(bytes);
                 completion.finish(Err(ReplyError::Busy));
+            }
+            Pending::OneShotRequest(request, completion) => {
+                drop(request);
+                completion.finish(Err(ReplyError::Busy));
+            }
+            Pending::Cancel(start) => {
+                if let Some(done) = start.done {
+                    let _ = done.send(Err(CancelError::Busy));
+                }
             }
         }
     }
@@ -1094,6 +1411,21 @@ impl Driver {
                 if let Ok(receipt) = writer.submit(bytes) {
                     self.fallback_writes.push((receipt, permit));
                 }
+            }
+            // A lost ACK over TCP is like one lost over UDP. The server
+            // retransmits its final response until Timer H.
+            Pending::Ack(bytes) => {
+                let _ = writer.send(bytes);
+            }
+            Pending::Cancel(start) => {
+                self.start_cancel(start, Link { flow, writer: Some(writer) });
+            }
+            Pending::OneShotRequest(request, completion) => {
+                self.send_oneshot(
+                    request,
+                    Link { flow, writer: Some(writer) },
+                    completion,
+                );
             }
         }
     }
@@ -1160,6 +1492,89 @@ impl Driver {
                 io::ErrorKind::NotConnected,
                 "no UDP socket",
             ))));
+        }
+    }
+
+    /// Sends a TU request once, without a transaction. See
+    /// `Endpoint::send_request`.
+    fn on_oneshot_request(
+        &mut self,
+        request: Request<Bytes>,
+        target: Target,
+        completion: Completion,
+    ) {
+        match target.transport() {
+            Transport::Udp => {
+                let Some(udp) = &self.udp else {
+                    completion.fail(Error::unsupported_routing());
+                    return;
+                };
+                let port = udp.local_addr().port();
+                let source = match self.udp_source(target.address()) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        completion.fail(Error::transport(error));
+                        return;
+                    }
+                };
+                let flow = Flow {
+                    transport: Transport::Udp,
+                    local: SocketAddr::new(source, port),
+                    remote: target.address(),
+                };
+                self.send_oneshot(
+                    request,
+                    Link { flow, writer: None },
+                    completion,
+                );
+            }
+            Transport::Tcp => {
+                self.send_over_tcp(
+                    target.address(),
+                    Pending::OneShotRequest(request, completion),
+                );
+            }
+        }
+    }
+
+    /// Adds a fresh Via for `link` and writes the request once.
+    fn send_oneshot(
+        &mut self,
+        mut request: Request<Bytes>,
+        link: Link,
+        mut completion: Completion,
+    ) {
+        let via = via_value(
+            link.flow.transport,
+            sent_by(&link.flow, self.config.tcp_listener),
+            &mut self.branches,
+        );
+        request.headers_mut().prepend(VIA, via.clone());
+        let bytes = request.to_bytes();
+        drop(request);
+        if link.writer.is_none() && bytes.len() > MAX_UDP_REQUEST {
+            completion.fail(Error::too_large(bytes.len()));
+            return;
+        }
+
+        completion.sent(via, link.flow);
+        match &link.writer {
+            Some(writer) => match writer.submit(bytes) {
+                Ok(receipt) => self.writes.push((receipt, completion)),
+                Err(tcp::SendError::Full) => {
+                    completion.finish(Err(ReplyError::Busy));
+                }
+                Err(error @ tcp::SendError::Closed) => {
+                    completion.finish(Err(ReplyError::Transport(
+                        io::Error::new(io::ErrorKind::BrokenPipe, error),
+                    )));
+                }
+            },
+            None => self
+                .udp
+                .as_mut()
+                .expect("a UDP link has a socket")
+                .submit(bytes, link.flow, completion),
         }
     }
 
@@ -1273,12 +1688,48 @@ impl Driver {
             respond.send(Err(Error::busy()));
             return;
         }
-        let sent = send_client(self.udp.as_mut(), &link, &bytes, true);
-        let receipt = match sent {
+
+        // The machine copies what it keeps before anything is sent. `start`
+        // checked what an INVITE's machine reads, and the Via is the
+        // endpoint's own.
+        let reliable = link.flow.transport.is_reliable();
+        let timers = self.config.timers;
+        let (accepted, observing, reserved) = respond.split();
+        let (tx, intent) = if request.method() == Method::INVITE {
+            let tx = invite::ClientTransaction::from_encoded(
+                &request,
+                bytes.clone(),
+                reliable,
+                &timers,
+                now(),
+            )
+            .expect("start validated the INVITE");
+            let intent = Arc::<Intent>::default();
+            let invite = InviteClient {
+                tx,
+                answered: false,
+                cancel: reserved.map_or(Cancel::Done, Cancel::Reserved),
+                intent: intent.clone(),
+                cancel_deadline: None,
+            };
+            (ClientMachine::Invite(Box::new(invite)), Some(intent))
+        } else {
+            let tx = ClientTransaction::new(
+                bytes.clone(),
+                reliable,
+                &timers,
+                now(),
+            );
+            (ClientMachine::NonInvite(tx), None)
+        };
+        drop(request);
+
+        let receipt = match send_client(self.udp.as_mut(), &link, &bytes, true)
+        {
             Ok(receipt) => receipt,
             Err(err) => {
-                drop(permit);
-                respond.send(Err(
+                drop((tx, permit));
+                let _ = accepted.send(Err(
                     if err.kind() == io::ErrorKind::WouldBlock {
                         Error::busy()
                     } else {
@@ -1289,23 +1740,17 @@ impl Driver {
             }
         };
 
-        let reliable = link.flow.transport.is_reliable();
-        let tx = ClientTransaction::new(
-            bytes,
-            reliable,
-            &self.config.timers,
-            now(),
-        );
-        let deadline = tx.deadline();
-        let (respond, transaction, accepted) = respond.prepare(via, link.flow);
-        let observation = respond.observation();
+        let delivery = observing.delivery();
+        let observation = delivery.observation();
+        let flow = link.flow;
         if let Some(writer) = &link.writer {
             *self
                 .client_connections
                 .entry(writer.connection_id())
                 .or_default() += 1;
         }
-        let entry = ClientEntry { tx, link, respond: Some(respond), permit };
+        let entry = ClientEntry { tx, link, respond: Some(delivery), permit };
+        let deadline = entry.deadline();
         let id = self.clients.insert(key, entry);
         if let Some(receipt) = receipt {
             self.client_writes.push((receipt, id, observation));
@@ -1315,7 +1760,8 @@ impl Driver {
         }
         self.unanswered += 1;
 
-        let _ = accepted.send(Ok(transaction));
+        let cancel = intent.map(|intent| CancelHandle::new(id, intent));
+        let _ = accepted.send(Ok(observing.finish(via, flow, cancel)));
     }
 
     fn on_connected(
@@ -1324,7 +1770,7 @@ impl Driver {
         result: io::Result<(Flow, tcp::Writer)>,
     ) {
         let Some(route) = self.routes.get_mut(&remote) else { return };
-        let pending = match std::mem::take(&mut route.tcp) {
+        let pending = match mem::take(&mut route.tcp) {
             TcpState::Connecting(pending) => pending,
             other => {
                 route.tcp = other;
@@ -1353,8 +1799,26 @@ impl Driver {
                             drop(permit);
                             respond.send(Err(Error::transport(err)));
                         }
-                        // See `send_reply`.
-                        Pending::Response(..) => {}
+                        // See `send_reply` and `Driver::send_ack`.
+                        Pending::Response(..) | Pending::Ack(_) => {}
+                        Pending::Cancel(start) => {
+                            if let Some(done) = start.done {
+                                let _ = done.send(Err(
+                                    CancelError::Transport(io::Error::new(
+                                        source.kind(),
+                                        Arc::clone(&source),
+                                    )),
+                                ));
+                            }
+                        }
+                        Pending::OneShotRequest(_, completion) => {
+                            completion.finish(Err(ReplyError::Transport(
+                                io::Error::new(
+                                    source.kind(),
+                                    Arc::clone(&source),
+                                ),
+                            )));
+                        }
                         Pending::Server(_, observation, _) => {
                             self.fail_observed(observation.shared());
                             observation.complete(Err(io::Error::new(
@@ -1381,7 +1845,10 @@ impl Driver {
     ///
     /// A server whose connection has closed sends the response on a new one to
     /// the `sent-by` (RFC 3261 section 18.2.2). With the listener there, the
-    /// transaction keeps waiting, and Timer F ends it if nothing comes.
+    /// transaction keeps waiting, and Timer F ends it if nothing comes. An
+    /// INVITE in Proceeding has no such timer. I leave it waiting without a
+    /// notice, for its final or the TU's CANCEL, since the TU applies its own
+    /// ringing limit anyway and a notice would not change what it must do.
     /// Without it nothing can come, so the transaction fails now rather than
     /// after 64*T1. Client links are always connections the driver opened, so
     /// the closed connection's flow decides for all of its transactions.
@@ -1422,13 +1889,35 @@ impl Driver {
     }
 
     /// Ends a live client transaction whose request could not be written.
+    ///
+    /// An INVITE in Accepted keeps its state for Timer M, since a write
+    /// error cannot remove what RFC 6026 retains for forked 2xx responses.
     fn fail_client(&mut self, id: Id, error: io::Error) {
         let entry = self.clients.get_mut(id).expect("a live client entry");
-        entry.tx.on_transport_error();
-        let completion = entry.answer(Err(Error::transport(error)));
-        if completion.is_some() {
-            self.unanswered -= 1;
-        }
+        let completion = match &mut entry.tx {
+            ClientMachine::NonInvite(tx) => {
+                tx.on_transport_error();
+                let completion = entry.answer(Err(Error::transport(error)));
+                if completion.is_some() {
+                    self.unanswered -= 1;
+                }
+                completion
+            }
+            ClientMachine::Invite(invite) => {
+                if let invite::ClientEvent::TransportError =
+                    invite.tx.on_transport_error()
+                {
+                    invite.cancel_not_needed();
+                    invite.cancel_deadline = None;
+                    if invite.mark_answered() {
+                        self.unanswered -= 1;
+                    }
+                    entry.answer(Err(Error::transport(error)))
+                } else {
+                    None
+                }
+            }
+        };
 
         self.settle_client(id, None);
         if let Some((delivery, result)) = completion {
@@ -1443,9 +1932,35 @@ impl Driver {
         }
     }
 
+    /// Returns the live client transaction under `key`, after running its
+    /// timer if that is due by `now`. A timer and a message at the same
+    /// instant take that order, so a response at Timer M is stray.
+    fn find_client(&mut self, key: &ClientKey, now: Instant) -> Option<Id> {
+        let (id, entry) = self.clients.find(key)?;
+        if entry.deadline().is_some_and(|at| at <= now) {
+            self.on_timer(Key::Client(id));
+        }
+        self.clients.get(id).map(|_| id)
+    }
+
+    /// See [`Driver::find_client`].
+    fn find_server(&mut self, key: &ServerKey, now: Instant) -> Option<Id> {
+        let (id, entry) = self.servers.find(key)?;
+        if entry.tx.deadline().is_some_and(|at| at <= now) {
+            self.on_timer(Key::Server(id));
+        }
+        self.servers.get(id).map(|_| id)
+    }
+
+    /// Delivers a response to its client transaction. One that matches none
+    /// is stray and discarded ([RFC 6026 section 8.9]).
+    ///
+    /// [RFC 6026 section 8.9]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.9
     fn on_received_response(&mut self, response: Response<Bytes>) {
         let Some(key) = ClientKey::from_response(&response) else { return };
-        let Some((id, entry)) = self.clients.find_mut(&key) else { return };
+        let now = now();
+        let Some(id) = self.find_client(&key, now) else { return };
+        let entry = self.clients.get_mut(id).expect("found above");
         // RFC 3261 section 18.1.2 discards a response whose top `Via` names
         // a `sent-by` other than this one's. Over TCP the response may come
         // on any connection, including one the server opened to the listener.
@@ -1461,9 +1976,13 @@ impl Driver {
             return;
         }
 
-        let before = entry.tx.deadline();
+        let before = entry.deadline();
+        let ClientMachine::NonInvite(tx) = &mut entry.tx else {
+            self.on_invite_response(id, response, before, now);
+            return;
+        };
         let completion =
-            match entry.tx.on_response(response, &self.config.timers, now()) {
+            match tx.on_response(response, &self.config.timers, now) {
                 ClientEvent::Final(response) => entry.answer(Ok(response)),
                 ClientEvent::Provisional(response) => {
                     if let Some(delivery) = &entry.respond {
@@ -1497,7 +2016,13 @@ impl Driver {
         }
         let reply = reply_flow(&via, &link.flow);
         let marked = mark_via(value, &via, &link.flow);
-        let key = ServerKey::new(&via, request.method());
+        // An ACK matches the INVITE it acknowledges (RFC 3261 section
+        // 17.2.3). Every other request matches its own method.
+        let method = request.method().clone();
+        let key = ServerKey::new(
+            &via,
+            if method == Method::ACK { &Method::INVITE } else { &method },
+        );
 
         // The `Via` the request goes up with, and that every response carries,
         // has `received` and `rport` filled in (RFC 3261 section 18.2.1,
@@ -1509,44 +2034,17 @@ impl Driver {
         // where the response goes, which differs in the port without `rport`.
         let source = link.flow;
         let link = Link { flow: reply, writer: link.writer };
+        let now = now();
 
-        // INVITE transactions are not wired into the endpoint yet. An ACK
-        // outside one has nothing to match and is dropped (section 17.2.3),
-        // and a CANCEL with no transaction to cancel gets a 481 (section 9.2).
-        let method = request.method();
-        if *method == Method::INVITE {
-            self.stateless(&request, &link, NOT_IMPLEMENTED);
-            return;
-        }
-        if *method == Method::ACK {
-            return;
-        }
-        if *method == Method::CANCEL {
-            self.stateless(&request, &link, TRANSACTION_DOES_NOT_EXIST);
+        // No path below answers an ACK, including overload and shutdown.
+        if method == Method::ACK {
+            self.on_ack(request, key.as_ref(), source, now);
             return;
         }
 
         if let Some(key) = &key {
-            if let Some((id, entry)) = self.servers.find(key) {
-                if let Some(response) = entry.tx.on_retransmission() {
-                    let link = entry.link.clone();
-                    if let Some(shared) = entry.shared.clone() {
-                        self.send_generated(id, &link, response, &shared);
-                    } else {
-                        // An unobserved Completed entry has no observer to
-                        // tell. A busy budget only drops this copy, as in
-                        // `send_generated`.
-                        match self.send_reply(&link, &response) {
-                            Err(error)
-                                if error.kind()
-                                    != io::ErrorKind::WouldBlock =>
-                            {
-                                self.fail_server(id);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
+            if let Some(id) = self.find_server(key, now) {
+                self.on_retransmission(id);
                 return;
             }
         }
@@ -1557,36 +2055,36 @@ impl Driver {
         // application work. It gets a stateless 400 so that a UDP client stops
         // retransmitting instead of waiting for Timer F. The 400 copies what
         // identity there is, and uses the same bounded reply path as the 503.
-        let identity = [
-            crate::message::header::FROM,
-            crate::message::header::TO,
-            crate::message::header::CALL_ID,
-            crate::message::header::CSEQ,
-        ]
-        .iter()
-        .all(|name| {
-            let mut values = request.headers().get_all(name);
-            values.next().is_some() && values.next().is_none()
-        });
-        if !identity
-            || !request
-                .headers()
-                .get(crate::message::header::CSEQ)
-                .and_then(crate::message::header::cseq::CSeq::parse)
-                .is_some_and(|cseq| cseq.method == request.method())
-        {
+        if !has_identity(&request) {
             self.stateless(&request, &link, BAD_REQUEST);
             return;
         }
 
+        // A CANCEL that is not a retransmission looks for its target
+        // (RFC 3261 section 9.2). One without a target gets no transaction
+        // and no automatic 481. That is the TU's choice, since a stateful
+        // proxy may forward it instead (section 16.10).
+        if method == Method::CANCEL {
+            if let Some(key) = &key {
+                if let Some(target) = self.find_cancel_target(key, now) {
+                    let key = key.clone();
+                    self.on_matched_cancel(request, key, target, source, link);
+                    return;
+                }
+            }
+        }
+        let tracked = key.is_some() && method != Method::CANCEL;
+        let unmatched_cancel = key.is_some() && method == Method::CANCEL;
+
         // Overload and shutdown answer with a stateless 503, so the peer stops
         // retransmitting and can try elsewhere. Not reading the socket instead
         // would stall every flow on a TCP connection, including the responses
-        // to this endpoint's own requests on it.
+        // to this endpoint's own requests on it. An INVITE needs a second
+        // entry, for the CANCEL it may get.
+        let entries = if method == Method::INVITE { 2 } else { 1 };
         if self.incoming.is_closed()
             || self.shutting_down
-            || (key.is_some()
-                && self.servers.len() >= self.config.max_server_transactions)
+            || (tracked && !self.server_room(entries))
         {
             self.stateless(&request, &link, SERVICE_UNAVAILABLE);
             return;
@@ -1603,23 +2101,7 @@ impl Driver {
             self.stateless(&request, &link, SERVICE_UNAVAILABLE);
             return;
         };
-        let identity_bytes = request
-            .headers()
-            .iter()
-            .filter(|(name, _)| {
-                [
-                    crate::message::header::VIA,
-                    crate::message::header::FROM,
-                    crate::message::header::TO,
-                    crate::message::header::CALL_ID,
-                    crate::message::header::CSEQ,
-                ]
-                .contains(name)
-            })
-            .try_fold(0usize, |total, (_, value)| {
-                total.checked_add(value.len())
-            });
-        let Some(route_permit) = identity_bytes
+        let Some(route_permit) = identity_bytes(&request)
             .and_then(|bytes| self.routes_admission.acquire(bytes))
         else {
             self.stateless(&request, &link, SERVICE_UNAVAILABLE);
@@ -1628,105 +2110,172 @@ impl Driver {
 
         let Some(commands) = self.command_sender.upgrade() else { return };
 
-        let slot = match key {
+        let event = match key.filter(|_| tracked) {
             Some(key) => {
                 let reliable = link.flow.transport.is_reliable();
-                let tx = ServerTransaction::new(
-                    &request,
-                    reliable,
-                    &self.config.timers,
-                    now(),
-                );
-                let deadline = tx.deadline();
-                let id = self.servers.insert(
+                // The 100 goes out only after every admission check, so a
+                // refused INVITE gets a 503 and nothing before it
+                // (RFC 3261 section 17.2.1).
+                let (tx, trying) = if method == Method::INVITE {
+                    let (tx, trying) =
+                        invite::ServerTransaction::new(&request, reliable);
+                    let invite = InviteServer { tx, cancel_reserved: true };
+                    (ServerMachine::Invite(Box::new(invite)), Some(trying))
+                } else {
+                    let tx = ServerTransaction::new(
+                        &request,
+                        reliable,
+                        &self.config.timers,
+                        now,
+                    );
+                    (ServerMachine::NonInvite(tx), None)
+                };
+                let (id, transaction) = self.install_server(
                     key,
-                    ServerEntry {
-                        tx,
-                        link,
-                        shared: None,
-                        identity: 0,
-                        retained: None,
-                    },
+                    tx,
+                    link,
+                    &request,
+                    permit,
+                    route_permit,
+                    commands,
                 );
-                if let Some(at) = deadline {
-                    self.timers.push(at, Key::Server(id));
+                if let Some(trying) = trying {
+                    let entry = self.servers.get(id).expect("new transaction");
+                    let link = entry.link.clone();
+                    let shared =
+                        entry.shared.clone().expect("a new TU transaction");
+                    self.send_generated(id, &link, trying, &shared);
                 }
 
-                Slot::Transaction(id)
-            }
-            None => Slot::Stateless(link),
-        };
-        let route_link = match &slot {
-            Slot::Transaction(id) => {
-                self.servers.get(*id).expect("new transaction").link.clone()
-            }
-            Slot::Stateless(link) => link.clone(),
-        };
-        let route = ReplyRoute::new(
-            &request,
-            route_link,
-            commands.clone(),
-            self.reply_admission.0.clone(),
-            self.reply_bytes.clone(),
-        );
-        let event = match slot {
-            Slot::Transaction(id) => {
-                static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-                let (observation, receiver) =
-                    watch::channel(server::Observation::default());
-                let shared = Arc::new(server::Shared {
-                    id: ServerTransactionId(
-                        NEXT_ID.fetch_add(1, Ordering::Relaxed),
-                    ),
-                    slot: id,
-                    work: server::Work::new(permit),
-                    pending: std::sync::atomic::AtomicUsize::new(0),
-                    next_operation: AtomicU64::new(1),
-                    final_sent: std::sync::atomic::AtomicBool::new(false),
-                    abandoned: std::sync::atomic::AtomicBool::new(false),
-                    observation,
-                    transport: std::sync::atomic::AtomicUsize::new(0),
-                    terminated: std::sync::atomic::AtomicBool::new(false),
-                });
-                let entry = self.servers.get_mut(id).expect("new transaction");
-                entry.identity = Arc::as_ptr(&shared) as usize;
-                entry.shared = Some(shared.clone());
-                let responder = server::Responder {
-                    shared,
-                    route: route.with_reservations(route_permit, None),
-                    method: request.method().clone(),
-                    commands,
-                    drops: self.drop_sender.clone(),
-                    submissions: self.submissions.clone(),
-                };
-                let transaction_id = responder.id();
                 IncomingEvent::Request(ServerRequest {
                     request,
                     flow: source,
-                    transaction: server::ServerTransaction {
-                        responder,
-                        events: server::ServerEvents {
-                            id: transaction_id,
-                            receiver,
-                            seen: 0,
-                            ended: false,
-                            saw_termination: false,
-                        },
-                    },
+                    transaction,
                 })
             }
-            Slot::Stateless(_) => IncomingEvent::Untracked(ReceivedRequest {
-                request,
-                flow: source,
-                reply: route.with_reservations(
+            None => {
+                let route = ReplyRoute::new(
+                    &request,
+                    link,
+                    commands,
+                    self.reply_admission.0.clone(),
+                    self.reply_bytes.clone(),
+                )
+                .with_reservations(
                     route_permit,
                     Some(server::Work::new(permit)),
-                ),
-            }),
+                );
+                let received =
+                    ReceivedRequest { request, flow: source, reply: route };
+                if unmatched_cancel {
+                    IncomingEvent::UnmatchedCancel(received)
+                } else {
+                    IncomingEvent::Untracked(received)
+                }
+            }
         };
         let _ = self
             .incoming
             .send(server::Queued { event, _permit: event_permit });
+    }
+
+    /// Answers a request retransmission from its transaction's cache.
+    fn on_retransmission(&mut self, id: Id) {
+        let entry = self.servers.get(id).expect("a live server entry");
+        let Some(response) = entry.tx.on_retransmission() else { return };
+        let link = entry.link.clone();
+        if let Some(shared) = entry.shared.clone() {
+            self.send_generated(id, &link, response, &shared);
+        } else {
+            // An unobserved Completed entry has no observer to tell. A busy
+            // budget only drops this copy, as in `send_generated`.
+            match self.send_reply(&link, &response) {
+                Err(error) if error.kind() != io::ErrorKind::WouldBlock => {
+                    self.fail_server(id);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Installs a server transaction and returns its TU handles.
+    #[allow(clippy::too_many_arguments)]
+    fn install_server(
+        &mut self,
+        key: ServerKey,
+        tx: ServerMachine,
+        link: Link,
+        request: &Request<Bytes>,
+        work: crate::transport::budget::Permit,
+        route: crate::transport::budget::Permit,
+        commands: mpsc::UnboundedSender<Command>,
+    ) -> (Id, server::ServerTransaction) {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        let transaction_id =
+            ServerTransactionId(NEXT_ID.fetch_add(1, Ordering::Relaxed));
+        let cancel_reserved = tx.cancel_reserved();
+        let deadline = tx.deadline();
+        let reply = ReplyRoute::new(
+            request,
+            link.clone(),
+            commands.clone(),
+            self.reply_admission.0.clone(),
+            self.reply_bytes.clone(),
+        );
+        let id = self.servers.insert(
+            key,
+            ServerEntry {
+                tx,
+                link,
+                shared: None,
+                id: transaction_id,
+                retained: None,
+            },
+        );
+        if cancel_reserved {
+            self.reserved_cancels += 1;
+        }
+        if let Some(at) = deadline {
+            self.timers.push(at, Key::Server(id));
+        }
+
+        let (observation, receiver) =
+            watch::channel(server::Observation::default());
+        let shared = Arc::new(server::Shared {
+            id: transaction_id,
+            slot: id,
+            work: server::Work::new(work),
+            pending: AtomicUsize::new(0),
+            next_operation: AtomicU64::new(1),
+            final_sent: AtomicBool::new(false),
+            abandoned: AtomicBool::new(false),
+            observation,
+            transport: AtomicUsize::new(0),
+            terminated: AtomicBool::new(false),
+        });
+        self.servers.get_mut(id).expect("new transaction").shared =
+            Some(shared.clone());
+        let responder = server::Responder {
+            shared,
+            route: reply.with_reservations(route, None),
+            method: request.method().clone(),
+            commands,
+            drops: self.drop_sender.clone(),
+            submissions: self.submissions.clone(),
+        };
+        let transaction = server::ServerTransaction {
+            responder,
+            events: server::ServerEvents {
+                id: transaction_id,
+                receiver,
+                seen: 0,
+                ended: false,
+                saw_ack_timeout: false,
+                saw_termination: false,
+            },
+        };
+
+        (id, transaction)
     }
 
     /// Sends a response the endpoint makes itself, without a transaction.
@@ -1927,13 +2476,13 @@ impl Driver {
         }
     }
 
-    // A TU capability can outlive every timer. Its Arc keeps the allocation
-    // address from being reused while this identity can still be presented.
-    // The stored address is compared only, never reconstructed or dereferenced.
+    // A TU capability can outlive every timer, and its slot can hold a newer
+    // transaction by then. The transaction id comes from a counter that does
+    // not repeat, so it tells the two apart.
     fn owns_server(&self, shared: &Arc<server::Shared>) -> bool {
-        self.servers.get(shared.slot).is_some_and(|entry| {
-            entry.identity == Arc::as_ptr(shared) as usize
-        })
+        self.servers
+            .get(shared.slot)
+            .is_some_and(|entry| entry.id == shared.id)
     }
 
     fn abandon(&mut self, shared: &Arc<server::Shared>) {
@@ -1957,21 +2506,17 @@ impl Driver {
             done,
             _permit,
         } = submission;
+        // The machine decides what follows a final response. An INVITE in
+        // Accepted takes another 2xx.
         let result = if self.owns_server(&shared) {
-            if shared.final_sent.load(Ordering::Acquire) {
-                drop(bytes);
-                Err(SubmitError::FinalAlreadySent)
-            } else {
-                self.accept_response(
-                    shared.slot,
-                    status,
-                    bytes,
-                    Some(operation),
-                )
-            }
+            self.accept_response(shared.slot, status, bytes, Some(operation))
         } else {
             drop(bytes);
-            Err(SubmitError::Terminated)
+            Err(if shared.final_sent.load(Ordering::Acquire) {
+                SubmitError::FinalAlreadySent
+            } else {
+                SubmitError::Terminated
+            })
         };
         shared.pending.fetch_sub(1, Ordering::Release);
         // Return command capacity before acceptance can wake a new submitter.
@@ -1993,8 +2538,10 @@ impl Driver {
         use crate::transaction::non_invite::ResponseRejection;
 
         let entry = self.servers.get_mut(id).ok_or(SubmitError::Terminated)?;
-        entry.tx.check_response(status, now()).map_err(
-            |error| match error {
+        match &entry.tx {
+            ServerMachine::NonInvite(tx) => tx
+                .check_response(status, now())
+                .map_err(|error| match error {
                 ResponseRejection::TooEarly => SubmitError::TooEarly,
                 ResponseRejection::ProhibitedStatus => {
                     SubmitError::ProhibitedStatus
@@ -2003,8 +2550,18 @@ impl Driver {
                     SubmitError::FinalAlreadySent
                 }
                 ResponseRejection::Terminated => SubmitError::Terminated,
-            },
-        )?;
+            })?,
+            ServerMachine::Invite(tx) => {
+                tx.check_response(status).map_err(|error| match error {
+                    invite::ResponseError::FinalAlreadySent => {
+                        SubmitError::FinalAlreadySent
+                    }
+                    invite::ResponseError::Terminated => {
+                        SubmitError::Terminated
+                    }
+                })?;
+            }
+        }
 
         let link = entry.link.clone();
         let shared = entry.shared.as_ref().expect("TU transaction").clone();
@@ -2017,33 +2574,50 @@ impl Driver {
         // Prepare transport first so rejection preserves the cached response's
         // reservation. Replacement charges only the difference, allowing a final
         // to make progress even when the provisional fills the retained budget.
-        match &mut entry.retained {
-            Some(retained) => retained
-                .resize(bytes.len())
-                .ok_or(SubmitError::RetentionFull)?,
-            None => {
-                entry.retained = Some(
-                    self.retained
-                        .acquire(bytes.len())
-                        .ok_or(SubmitError::RetentionFull)?,
-                )
+        // An INVITE 2xx leaves nothing to retransmit in Accepted, so it needs
+        // no retention.
+        let accepting = matches!(entry.tx, ServerMachine::Invite(_))
+            && status.is_success();
+        if !accepting {
+            match &mut entry.retained {
+                Some(retained) => retained
+                    .resize(bytes.len())
+                    .ok_or(SubmitError::RetentionFull)?,
+                None => {
+                    entry.retained = Some(
+                        self.retained
+                            .acquire(bytes.len())
+                            .ok_or(SubmitError::RetentionFull)?,
+                    )
+                }
             }
         }
         let before = entry.tx.deadline();
-        let sent = entry.tx.on_response(
-            status,
-            bytes.clone(),
-            &self.config.timers,
-            now(),
-        );
-        debug_assert!(sent);
+        let timers = self.config.timers;
+        match &mut entry.tx {
+            ServerMachine::NonInvite(tx) => {
+                let sent =
+                    tx.on_response(status, bytes.clone(), &timers, now());
+                debug_assert!(sent);
+            }
+            ServerMachine::Invite(tx) => {
+                let sent =
+                    tx.on_response(status, bytes.clone(), &timers, now());
+                debug_assert!(sent.is_ok());
+                if tx.is_accepted() {
+                    entry.retained = None;
+                }
+            }
+        }
 
         if status.is_final() {
             shared.final_sent.store(true, Ordering::Release);
             shared.work.finish();
             // An unobserved non-INVITE UDP cache needs only its response and
             // capability identity. No observer can reappear after count zero.
-            if !entry.tx.is_terminated()
+            // An INVITE keeps its observation for ACK timeout and further 2xx.
+            if matches!(entry.tx, ServerMachine::NonInvite(_))
+                && !entry.tx.is_terminated()
                 && shared.observation.receiver_count() == 0
             {
                 entry.shared = None;
@@ -2060,8 +2634,6 @@ impl Driver {
     }
 
     fn respond_abandoned(&mut self, id: Id) {
-        use crate::message::header::{address::has_tag, Tag, TO};
-
         let Some(entry) = self.servers.get(id) else { return };
         let Some(headers) = entry.tx.headers() else { return };
         // Reuse a To tag that the TU already chose for a provisional response.
@@ -2089,8 +2661,8 @@ impl Driver {
             .and_then(|builder| builder.body(Bytes::new()).ok())
             .map(|response| response.to_bytes());
 
-        // No TU is left to answer, and a non-INVITE Proceeding state has no
-        // timer, so a machine whose 500 cannot be built or admitted would stay forever.
+        // No TU is left to answer, and Proceeding has no timer, so a machine
+        // whose 500 cannot be built or admitted would stay forever.
         // Terminating releases its work. A later retransmission then reaches
         // the TU as a new request, which it can answer this time.
         let accepted = response.map_or(Err(SubmitError::Busy), |response| {
@@ -2102,24 +2674,32 @@ impl Driver {
             if let Some(shared) = &entry.shared {
                 shared.rejected();
             }
-            entry.tx.on_transport_error();
+            entry.tx.abandon();
             self.settle_server(id, None);
         }
     }
 }
 
-impl ClientEntry {
-    /// Takes a completion once, after the machine has dropped its request.
-    /// The driver settles the table before delivering it. Otherwise a reliable
-    /// final can wake a new call while its last slot is still charged.
-    fn answer(
-        &mut self,
-        result: Result<Response<Bytes>, Error>,
-    ) -> Option<(Responder, Result<Response<Bytes>, Error>)> {
-        let respond = self.respond.take()?;
-        self.permit.release_bytes();
-        Some((respond, result))
-    }
+/// Whether `request` has exactly one From, To, Call-ID and CSeq, and its CSeq
+/// names its own method, which a stateful response needs.
+fn has_identity(request: &Request<Bytes>) -> bool {
+    [FROM, TO, CALL_ID, CSEQ].iter().all(|name| {
+        let mut values = request.headers().get_all(name);
+        values.next().is_some() && values.next().is_none()
+    }) && request
+        .headers()
+        .get(CSEQ)
+        .and_then(CSeq::parse)
+        .is_some_and(|cseq| cseq.method == request.method())
+}
+
+/// The bytes of the identity values a reply route copies.
+fn identity_bytes(request: &Request<Bytes>) -> Option<usize> {
+    request
+        .headers()
+        .iter()
+        .filter(|(name, _)| [VIA, FROM, TO, CALL_ID, CSEQ].contains(name))
+        .try_fold(0usize, |total, (_, value)| total.checked_add(value.len()))
 }
 
 /// The current time, as the transactions and tokio's timer both see it.
@@ -2248,17 +2828,22 @@ mod tests {
         task::{Wake, Waker},
     };
 
-    use tokio::{net::UdpSocket, time::timeout};
+    use tokio::{
+        net::UdpSocket,
+        time::{advance, timeout},
+    };
     use tower_service::Service;
 
     use super::*;
     use crate::{
         endpoint::{
+            client::{ClientControl, Responses},
             tests::{
-                reply_driver, reply_driver_with, route_request,
-                route_response, udp_reply_link, TestServe, REPLY_LOCAL,
+                fixture_endpoint, invite, reply, reply_driver,
+                reply_driver_with, route_request, route_response,
+                udp_reply_link, DriverFixture, TestServe, REPLY_LOCAL,
             },
-            Client,
+            Client, Endpoint,
         },
         transaction::Timers,
     };
@@ -2782,17 +3367,19 @@ mod tests {
         let (observation, _events) =
             watch::channel(server::Observation::default());
         let capacity = Budget::new(WriteLimits { messages: 1, bytes: 0 });
+        // A capability of an earlier transaction in the same slot. Its id
+        // came from the counter before this one's, which starts at 1.
         let stale = Arc::new(server::Shared {
-            id: original.id,
+            id: ServerTransactionId(0),
             slot: original.slot,
             work: server::Work::new(capacity.acquire(0).unwrap()),
-            pending: std::sync::atomic::AtomicUsize::new(1),
+            pending: AtomicUsize::new(1),
             next_operation: AtomicU64::new(1),
-            final_sent: std::sync::atomic::AtomicBool::new(false),
-            abandoned: std::sync::atomic::AtomicBool::new(false),
+            final_sent: AtomicBool::new(false),
+            abandoned: AtomicBool::new(false),
             observation,
-            transport: std::sync::atomic::AtomicUsize::new(0),
-            terminated: std::sync::atomic::AtomicBool::new(false),
+            transport: AtomicUsize::new(0),
+            terminated: AtomicBool::new(false),
         });
         let reply = route_response(&envelope.request);
         let operation =
@@ -2822,8 +3409,6 @@ mod tests {
     #[tokio::test]
     async fn acceptance_returns_submission_capacity_before_waking_a_submitter()
     {
-        use std::sync::atomic::AtomicBool;
-
         struct Noop;
         impl Wake for Noop {
             fn wake(self: Arc<Self>) {}
@@ -2997,7 +3582,10 @@ mod tests {
         assert_eq!(driver.servers.len(), 1);
         let entry = driver.servers.get_mut(old).unwrap();
         let at = entry.tx.deadline().unwrap();
-        entry.tx.on_timeout(at);
+        let ServerMachine::NonInvite(tx) = &mut entry.tx else {
+            unreachable!("an OPTIONS transaction")
+        };
+        tx.on_timeout(at);
         driver.settle_server(old, Some(at));
         assert_eq!(driver.servers.len(), 0);
 
@@ -3232,7 +3820,7 @@ mod tests {
 
         assert!(response.await.is_ok());
         assert_eq!(driver.clients.len(), 1);
-        assert!(!driver.clients.get(id).unwrap().tx.is_terminated());
+        assert!(!driver.clients.get(id).unwrap().is_terminated());
         assert!(client
             .call(route_request("SIP/2.0/UDP example.com:9;rport"))
             .await
@@ -3240,10 +3828,13 @@ mod tests {
             .is_busy());
         let timers = driver.config.timers;
         let entry = driver.clients.get_mut(id).unwrap();
-        let deadline = entry.tx.deadline().unwrap();
+        let deadline = entry.deadline().unwrap();
 
         // Drive the machine at K directly instead of waiting on a wall clock.
-        entry.tx.on_timeout(&timers, deadline);
+        let ClientMachine::NonInvite(tx) = &mut entry.tx else {
+            unreachable!("an OPTIONS transaction")
+        };
+        tx.on_timeout(&timers, deadline);
         driver.settle_client(id, Some(deadline));
 
         assert_eq!(driver.clients.len(), 0);
@@ -3465,5 +4056,327 @@ mod tests {
         assert!(poll_fn(|cx| Poll::Ready(response.as_mut().poll(cx)))
             .await
             .is_pending());
+    }
+
+    // Deterministic INVITE timers. The tests drive the driver by hand on a
+    // paused clock, so a deadline fires only when a test says so, and the
+    // production values, Timer D's 32 s included, stay as they are.
+
+    const T1: Duration = Duration::from_millis(500);
+
+    struct Noop;
+
+    impl Wake for Noop {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    fn now_or_never<F: Future>(future: F) -> Option<F::Output> {
+        let waker = Waker::from(Arc::new(Noop));
+        let mut cx = Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(output) => Some(output),
+            Poll::Pending => None,
+        }
+    }
+
+    /// Fires every timer due by the current, paused, time.
+    fn fire_due(driver: &mut Driver) {
+        let now = now();
+        while driver.timers.deadline().is_some_and(|at| at <= now) {
+            let key = driver.timers.pop().unwrap();
+            driver.on_timer(key);
+        }
+    }
+
+    struct InviteFixture {
+        fixture: DriverFixture,
+        endpoint: Endpoint,
+        peer: UdpSocket,
+    }
+
+    impl InviteFixture {
+        async fn new() -> InviteFixture {
+            let (fixture, commands, local) = reply_driver_with(Config {
+                max_pending_requests: 8,
+                ..Config::default()
+            });
+            let endpoint = fixture_endpoint(&fixture, commands, local);
+            let peer = UdpSocket::bind(REPLY_LOCAL).await.unwrap();
+            InviteFixture { fixture, endpoint, peer }
+        }
+
+        /// Starts an INVITE to the peer and returns its handles and the
+        /// request as sent.
+        fn start(&mut self) -> (ClientControl, Responses, Request<Bytes>) {
+            let target =
+                Target::new(Transport::Udp, self.peer.local_addr().unwrap());
+            let mut start = Box::pin(self.endpoint.start(invite(), target));
+            assert!(now_or_never(start.as_mut()).is_none());
+            let command = self.fixture.commands.try_recv().unwrap();
+            self.fixture.on_command(command);
+            let (control, responses) =
+                now_or_never(start).unwrap().unwrap().into_parts();
+
+            let mut sent = invite();
+            sent.headers_mut().prepend(VIA, control.via().clone());
+            (control, responses, sent)
+        }
+
+        fn deliver(&mut self, response: Response<Bytes>) {
+            let link = udp_reply_link(
+                self.endpoint.udp_addr().unwrap(),
+                self.peer.local_addr().unwrap(),
+            );
+            self.fixture.on_message(Message::Response(response), link);
+        }
+
+        fn client(&self, sent: &Request<Bytes>) -> Option<Id> {
+            let key = ClientKey::from_request(sent).unwrap();
+            self.fixture.clients.find(&key).map(|(id, _)| id)
+        }
+
+        /// Lets the driver's UDP backlog drain, which `run` would do. A first
+        /// send can wait there for the socket's readiness.
+        async fn flush(&mut self) {
+            let udp = self.fixture.udp.as_mut().unwrap();
+            poll_fn(|cx| {
+                udp.poll_flush(cx);
+                if udp.is_idle() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+        }
+
+        /// The next request the peer got, skipping INVITE retransmissions.
+        async fn received(&mut self) -> Request<Bytes> {
+            self.flush().await;
+            let mut buf = vec![0; 65536];
+            loop {
+                let n = self.peer.recv(&mut buf).await.unwrap();
+                let request = Request::from_bytes(&buf[..n]).unwrap();
+                if request.method() != Method::INVITE {
+                    return request;
+                }
+            }
+        }
+
+        /// Whether nothing but INVITE retransmissions reached the peer.
+        async fn quiet(&mut self) -> bool {
+            self.flush().await;
+            let mut buf = vec![0; 65536];
+            loop {
+                match self.peer.try_recv(&mut buf) {
+                    Ok(n) => {
+                        let request = Request::from_bytes(&buf[..n]).unwrap();
+                        if request.method() != Method::INVITE {
+                            return false;
+                        }
+                    }
+                    Err(_) => return true,
+                }
+            }
+        }
+    }
+
+    fn observed(responses: &mut Responses) -> Option<Option<u16>> {
+        now_or_never(responses.next())
+            .map(|item| item.map(|r| r.unwrap().status().as_u16()))
+    }
+
+    // RFC 6026 section 8.4. M starts at the first 2xx, a later 2xx does not
+    // restart it, and a 2xx at M's instant comes after the timer, so it is
+    // stray (section 8.9).
+    #[tokio::test(start_paused = true)]
+    async fn invite_m_is_not_restarted_and_fires_before_a_2xx_at_its_instant()
+    {
+        let mut t = InviteFixture::new().await;
+        let (_control, mut responses, sent) = t.start();
+        let first = now();
+
+        t.deliver(reply(&sent, 200, "a"));
+        assert_eq!(observed(&mut responses), Some(Some(200)));
+        let id = t.client(&sent).unwrap();
+        let m = first + 64 * T1;
+        assert_eq!(t.fixture.clients.get(id).unwrap().deadline(), Some(m));
+
+        advance(32 * T1).await;
+        t.deliver(reply(&sent, 200, "b"));
+        assert_eq!(observed(&mut responses), Some(Some(200)));
+        assert_eq!(t.fixture.clients.get(id).unwrap().deadline(), Some(m));
+
+        advance(32 * T1).await;
+        assert_eq!(now(), m);
+        t.deliver(reply(&sent, 200, "c"));
+        assert_eq!(observed(&mut responses), Some(None));
+        assert!(t.client(&sent).is_none());
+        assert_eq!(t.fixture.unanswered, 0);
+    }
+
+    // RFC 3261 section 17.1.1.2. B times out Calling only. Proceeding has no
+    // timer, and over UDP Completed keeps the cached ACK for Timer D, at
+    // least 32 s whatever T1 is.
+    #[tokio::test(start_paused = true)]
+    async fn invite_proceeding_has_no_timer_b_and_d_keeps_the_ack_32_seconds()
+    {
+        let mut t = InviteFixture::new().await;
+        let (_control, mut responses, sent) = t.start();
+
+        t.deliver(reply(&sent, 180, "a"));
+        assert_eq!(observed(&mut responses), Some(Some(180)));
+        advance(1000 * T1).await;
+        fire_due(&mut t.fixture);
+        assert_eq!(observed(&mut responses), None);
+        let id = t.client(&sent).unwrap();
+        assert_eq!(t.fixture.clients.get(id).unwrap().deadline(), None);
+
+        let busy = reply(&sent, 486, "a");
+        t.deliver(busy.clone());
+        assert_eq!(observed(&mut responses), Some(Some(486)));
+        assert_eq!(observed(&mut responses), Some(None));
+        let ack = t.received().await;
+        assert_eq!(ack.method(), Method::ACK);
+        let d = now() + Duration::from_secs(32);
+        assert_eq!(t.fixture.clients.get(id).unwrap().deadline(), Some(d));
+
+        advance(Duration::from_secs(31)).await;
+        t.deliver(busy.clone());
+        assert_eq!(t.received().await.to_bytes(), ack.to_bytes());
+
+        advance(Duration::from_secs(1)).await;
+        fire_due(&mut t.fixture);
+        assert!(t.client(&sent).is_none());
+        t.deliver(busy);
+        assert!(t.quiet().await);
+    }
+
+    // RFC 3261 section 9.1. The deadline runs 64 T1 from the CANCEL, not
+    // from the INVITE, and a final at that instant comes after it.
+    #[tokio::test(start_paused = true)]
+    async fn the_cancel_deadline_runs_64_t1_from_the_cancel() {
+        let mut t = InviteFixture::new().await;
+        let (control, mut responses, sent) = t.start();
+        t.deliver(reply(&sent, 180, "a"));
+        assert_eq!(observed(&mut responses), Some(Some(180)));
+        advance(10 * T1).await;
+
+        let mut cancel = Box::pin(control.cancel());
+        assert!(now_or_never(cancel.as_mut()).is_none());
+        let command = t.fixture.commands.try_recv().unwrap();
+        t.fixture.on_command(command);
+        let Some(Ok(CancelOutcome::Sent(_))) = now_or_never(cancel) else {
+            panic!("a CANCEL");
+        };
+        assert_eq!(t.received().await.method(), Method::CANCEL);
+        let deadline = now() + 64 * T1;
+        let id = t.client(&sent).unwrap();
+        assert_eq!(
+            t.fixture.clients.get(id).unwrap().deadline(),
+            Some(deadline)
+        );
+
+        advance(64 * T1 - Duration::from_millis(1)).await;
+        fire_due(&mut t.fixture);
+        assert_eq!(observed(&mut responses), None);
+
+        advance(Duration::from_millis(1)).await;
+        t.deliver(reply(&sent, 487, "a"));
+        let error =
+            now_or_never(responses.next()).unwrap().unwrap().unwrap_err();
+        assert!(error.is_cancel_timeout(), "{error}");
+        assert!(t.client(&sent).is_none());
+        assert_eq!(t.fixture.unanswered, 1, "only the CANCEL's own");
+    }
+
+    // RFC 6026 section 8.7. L starts at the first 2xx and a later 2xx does
+    // not restart it. Accepted absorbs INVITE retransmissions until then. At
+    // L's instant the timer runs first, so the retransmission is a new
+    // request (section 8.10).
+    #[tokio::test(start_paused = true)]
+    async fn invite_l_is_not_restarted_and_fires_before_a_retransmission() {
+        let (mut fixture, _commands, local) = reply_driver();
+        let peer = UdpSocket::bind(REPLY_LOCAL).await.unwrap();
+        let link = udp_reply_link(local, peer.local_addr().unwrap());
+        let via = format!(
+            "SIP/2.0/UDP {};branch=z9hG4bKaccepted",
+            peer.local_addr().unwrap()
+        );
+        let mut request = route_request(&via);
+        *request.method_mut() = Method::INVITE;
+        request.headers_mut().insert(CSEQ, "1 INVITE".parse().unwrap());
+
+        fixture.on_request(request.clone(), link.clone());
+        let received = fixture.take_request();
+        let slot = received.transaction.responder.shared.slot;
+        let first = now();
+        for tag in ["a", "b"] {
+            let ok = reply(&received.request, 200, tag);
+            fixture
+                .accept_response(slot, ok.status(), ok.to_bytes(), None)
+                .unwrap();
+            assert_eq!(
+                fixture.servers.get(slot).unwrap().tx.deadline(),
+                Some(first + 64 * T1)
+            );
+            advance(32 * T1).await;
+        }
+
+        // The second advance reached L exactly, and no timer has run.
+        fixture.on_request(request.clone(), link.clone());
+        let fresh = fixture.take_request();
+        assert_ne!(fresh.transaction.id(), received.transaction.id());
+        assert!(fixture.servers.get(slot).is_none());
+
+        advance(T1).await;
+        fixture.on_request(request, link);
+        assert!(fixture.incoming.receiver.try_recv().is_err());
+    }
+
+    // A cancel handle names its INVITE by table id. Once that INVITE is
+    // gone, a new one in the same slot is not cancelled by the old handle.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_cancel_handle_cannot_reach_a_reused_slot() {
+        let mut t = InviteFixture::new().await;
+        let (old, _old_responses, sent) = t.start();
+        t.deliver(reply(&sent, 486, "a"));
+        assert_eq!(t.received().await.method(), Method::ACK);
+        let old_id = t.client(&sent).unwrap();
+        advance(Duration::from_secs(32)).await;
+        fire_due(&mut t.fixture);
+        assert!(t.client(&sent).is_none());
+
+        let (current, mut responses, current_sent) = t.start();
+        let id = t.client(&current_sent).unwrap();
+        assert_eq!(
+            format!("{id:?}").split(',').next(),
+            format!("{old_id:?}").split(',').next()
+        );
+        t.deliver(reply(&current_sent, 180, "b"));
+        assert_eq!(observed(&mut responses), Some(Some(180)));
+
+        let mut stale = Box::pin(old.cancel());
+        assert!(now_or_never(stale.as_mut()).is_none());
+        let command = t.fixture.commands.try_recv().unwrap();
+        t.fixture.on_command(command);
+        assert!(matches!(
+            now_or_never(stale),
+            Some(Ok(CancelOutcome::NotNeeded))
+        ));
+        assert!(t.quiet().await);
+
+        let mut cancel = Box::pin(current.cancel());
+        assert!(now_or_never(cancel.as_mut()).is_none());
+        let command = t.fixture.commands.try_recv().unwrap();
+        t.fixture.on_command(command);
+        assert!(matches!(
+            now_or_never(cancel),
+            Some(Ok(CancelOutcome::Sent(_)))
+        ));
+        let cancel = t.received().await;
+        assert_eq!(cancel.method(), Method::CANCEL);
+        assert_eq!(cancel.headers().get(TO), current_sent.headers().get(TO));
     }
 }

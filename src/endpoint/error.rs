@@ -1,8 +1,9 @@
 /*!
 The errors of binding an endpoint and of a request sent through
-[`Endpoint::start`].
+[`Endpoint::start`] or [`Endpoint::send_request`].
 
 [`Endpoint::start`]: super::Endpoint::start
+[`Endpoint::send_request`]: super::Endpoint::send_request
 */
 
 use std::{error, fmt, io};
@@ -10,16 +11,18 @@ use std::{error, fmt, io};
 use super::driver::MAX_UDP_REQUEST;
 use crate::message::HeaderName;
 
-/// A start rejection or a terminal client response-stream failure.
+/// A send rejection or a terminal client response-stream failure.
 ///
 /// RFC 3261 section 8.1.3.1 tells a transaction user to treat a timeout as a
 /// 408 and a transport error as a 503. signa reports both as errors instead
 /// of making up a response, and [`Error::is_timeout`] and
-/// [`Error::is_transport`] tell them apart. The other cases are refusals: a
-/// request too large for UDP, a missing or invalid `CSeq`, a method this
-/// client cannot send, exhausted request or connection admission, or an
-/// endpoint that has stopped. Response delivery overflow is reported after
-/// already queued responses, without ending the underlying SIP machine.
+/// [`Error::is_transport`] tell them apart. [`Error::is_cancel_timeout`] is
+/// the deadline after a CANCEL. The other cases are refusals: a request too
+/// large for UDP, a missing or invalid `CSeq` or INVITE identity header, a
+/// method the operation cannot send, exhausted request or connection
+/// admission, or an endpoint that has stopped. Response delivery overflow is
+/// reported after already queued responses, without ending the underlying SIP
+/// machine.
 ///
 /// [`Endpoint::start`]: super::Endpoint::start
 pub struct Error {
@@ -28,11 +31,13 @@ pub struct Error {
 
 enum Kind {
     Timeout,
+    CancelTimeout,
     DeliveryOverflow,
     Transport(io::Error),
     TooLarge(usize),
     Missing(HeaderName),
     InvalidCSeq,
+    InvalidHeader(HeaderName),
     UnsupportedMethod,
     UnsupportedRouting,
     Busy,
@@ -42,6 +47,10 @@ enum Kind {
 impl Error {
     pub(super) fn timeout() -> Error {
         Error { kind: Kind::Timeout }
+    }
+
+    pub(super) fn cancel_timeout() -> Error {
+        Error { kind: Kind::CancelTimeout }
     }
 
     pub(super) fn delivery_overflow() -> Error {
@@ -64,6 +73,10 @@ impl Error {
         Error { kind: Kind::InvalidCSeq }
     }
 
+    pub(super) fn invalid_header(name: HeaderName) -> Error {
+        Error { kind: Kind::InvalidHeader(name) }
+    }
+
     pub(super) fn unsupported_method() -> Error {
         Error { kind: Kind::UnsupportedMethod }
     }
@@ -80,10 +93,21 @@ impl Error {
         Error { kind: Kind::Closed }
     }
 
-    /// Returns `true` if no final response arrived before Timer F, which is
-    /// 64 T1 after the request was sent.
+    /// Returns `true` if no response arrived in time: no final response
+    /// before Timer F for a non-INVITE, or no response at all before Timer B
+    /// for an INVITE. Both are 64 T1 after the request was sent. An INVITE
+    /// that received a provisional response has no such timer.
     pub fn is_timeout(&self) -> bool {
         matches!(self.kind, Kind::Timeout)
+    }
+
+    /// Returns `true` if an INVITE got no final response within 64 T1 of its
+    /// CANCEL, so signa stopped waiting and ended the transaction
+    /// ([RFC 3261 section 9.1]). A later final response is discarded.
+    ///
+    /// [RFC 3261 section 9.1]: https://www.rfc-editor.org/rfc/rfc3261.html#section-9.1
+    pub fn is_cancel_timeout(&self) -> bool {
+        matches!(self.kind, Kind::CancelTimeout)
     }
 
     /// Returns `true` if response count or byte capacity was exhausted.
@@ -116,8 +140,15 @@ impl Error {
         matches!(self.kind, Kind::InvalidCSeq)
     }
 
-    /// Returns `true` for INVITE, ACK or CANCEL, which this non-INVITE
-    /// client cannot send with the required transaction semantics.
+    /// Returns `true` if an INVITE lacks one valid From, To or Call-ID, which
+    /// its ACK and CANCEL copy. [`fmt::Display`] names the header.
+    pub fn is_invalid_header(&self) -> bool {
+        matches!(self.kind, Kind::InvalidHeader(_))
+    }
+
+    /// Returns `true` for a method the operation cannot send with its
+    /// required semantics: ACK or CANCEL through `start`, or anything but ACK
+    /// through `send_request`.
     pub fn is_unsupported_method(&self) -> bool {
         matches!(self.kind, Kind::UnsupportedMethod)
     }
@@ -149,6 +180,7 @@ impl fmt::Debug for Error {
         let mut debug = f.debug_tuple("signa::endpoint::Error");
         match &self.kind {
             Kind::Timeout => debug.field(&"Timeout"),
+            Kind::CancelTimeout => debug.field(&"CancelTimeout"),
             Kind::DeliveryOverflow => debug.field(&"DeliveryOverflow"),
             Kind::Transport(err) => debug.field(err),
             Kind::TooLarge(len) => {
@@ -158,6 +190,9 @@ impl fmt::Debug for Error {
                 debug.field(&format_args!("Missing({name:?})"))
             }
             Kind::InvalidCSeq => debug.field(&"InvalidCSeq"),
+            Kind::InvalidHeader(name) => {
+                debug.field(&format_args!("InvalidHeader({name:?})"))
+            }
             Kind::UnsupportedMethod => debug.field(&"UnsupportedMethod"),
             Kind::UnsupportedRouting => debug.field(&"UnsupportedRouting"),
             Kind::Busy => debug.field(&"Busy"),
@@ -170,7 +205,10 @@ impl fmt::Debug for Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.kind {
-            Kind::Timeout => f.write_str("no final response before Timer F"),
+            Kind::Timeout => f.write_str("no response before the timeout"),
+            Kind::CancelTimeout => {
+                f.write_str("no final response within 64 T1 of the CANCEL")
+            }
             Kind::DeliveryOverflow => {
                 f.write_str("client response delivery capacity is exhausted")
             }
@@ -184,8 +222,11 @@ impl fmt::Display for Error {
             Kind::InvalidCSeq => f.write_str(
                 "the request needs one valid CSeq matching its method",
             ),
+            Kind::InvalidHeader(name) => {
+                write!(f, "the request needs one valid {name}")
+            }
             Kind::UnsupportedMethod => f.write_str(
-                "the client does not support INVITE, ACK or CANCEL",
+                "this operation cannot send a request with this method",
             ),
             Kind::UnsupportedRouting => {
                 f.write_str("the endpoint has no transport for this target")

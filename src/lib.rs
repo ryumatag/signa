@@ -22,19 +22,26 @@ Its design draws heavily on the [`http`] and [`hyper`] crates.
   standard one for its code.
 * An `Endpoint` that carries messages over UDP and TCP, splits TCP streams into
   messages by `Content-Length` and answers RFC 5626 keepalives, runs the
-  non-INVITE client and server transactions of RFC 3261 section 17 as updated
-  by RFC 4320, and exposes incoming events, server responders and independent
-  transaction observation. `Endpoint::start` returns client control and a
-  bounded response stream after transport preparation and driver acceptance.
-  Application code owns server dispatch and handler tasks. These operations
-  live in `endpoint`. A graceful shutdown answers new requests with a 503 and
-  waits for the ones in hand up to a deadline.
+  INVITE and non-INVITE client and server transactions of RFC 3261 section 17
+  as updated by RFC 6026 and RFC 4320, and exposes incoming events, server
+  responders and independent transaction observation. `Endpoint::start`
+  returns client control and a bounded response stream after transport
+  preparation and driver acceptance. The transaction acknowledges a non-2xx
+  INVITE response. An INVITE is cancelled through its client control, and a
+  received CANCEL or ACK for a 2xx arrives as an event. `Endpoint::send_request`
+  sends the application's ACK for a 2xx once. Application code owns server
+  dispatch and handler tasks. These operations live in `endpoint`. A graceful
+  shutdown answers new requests with a 503 and waits for the ones in hand up
+  to a deadline.
 
 # What it does not cover yet
 
-* INVITE, ACK, and CANCEL transactions, and with them provisional responses
-  other than the 100 the endpoint sends itself. An INVITE gets a 501 and a
-  CANCEL a 481. They are planned for 0.3.0, with RFC 6026.
+* Dialogs and the rest of a UA core: building the ACK for a 2xx,
+  retransmitting a 2xx until its ACK, and deciding what a received CANCEL
+  means. signa gives the application the events, routes and operations for
+  them. Reliable provisional responses (RFC 3262) are not implemented.
+* Stateless reception and forwarding, and draining INVITEs in Accepted when
+  the endpoint shuts down. `send_request` takes only an ACK so far.
 * Choosing a next hop. RFC 3263 resolution belongs to a layer above, which
   selects an explicit `Target` for each request. [`Uri::sip`] exposes SIP/SIPS
   components without selecting a destination or transport.

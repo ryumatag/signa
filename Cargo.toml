@@ -57,7 +57,13 @@ libc = { version = "0.2", optional = true }
 tower-service = "0.3.3"
 # Keep property tests compatible with the crate's MSRV.
 quickcheck = { version = "~1.0.3", default-features = false }
-tokio = { version = "1.47", features = ["macros", "rt-multi-thread"] }
+# `test-util` pauses the clock for timer tests that drive the endpoint's
+# driver by hand, so Timer D and the other long timers keep their real values.
+tokio = { version = "1.47", features = [
+  "macros",
+  "rt-multi-thread",
+  "test-util",
+] }
 tower = { version = "0.5", features = ["limit", "util"] }
 
 # The example runs an endpoint, which needs the `tokio` feature.
