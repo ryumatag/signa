@@ -38,7 +38,10 @@ Its design draws heavily on the [`http`] and [`hyper`] crates.
 * Choosing a next hop. RFC 3263 resolution belongs to a layer above, which
   selects an explicit `Target` for each request. [`Uri::sip`] exposes SIP/SIPS
   components without selecting a destination or transport.
-* TLS, and anything that would make `sips:` mean what it says.
+* TLS. signa can build and parse `sips:` URIs, but it sends over UDP and TCP
+  only, so it cannot carry a request that requires TLS. `Endpoint::start`
+  refuses a `sips:` Request-URI and does not check Route or the target. Its
+  routing section says what that leaves to the caller.
 * Dialogs, registration, proxying, and the rest of what an application does
   with messages. Those belong in crates built on signa.
 

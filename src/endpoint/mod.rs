@@ -656,6 +656,115 @@ mod tests {
         endpoint.shutdown(Duration::ZERO).await;
     }
 
+    // RFC 3261 section 8.1.2 requires TLS for a SIPS Request-URI. Zero
+    // client capacity makes any admitted request busy, so an unsupported
+    // routing error shows the refusal came first, with nothing connected or
+    // sent on either transport.
+    #[tokio::test]
+    async fn client_tu_refuses_a_sips_request_uri_before_admission() {
+        let mut peer = Peer::new().await;
+        let listener = TcpListener::bind(LOCALHOST).await.unwrap();
+        let (endpoint, _incoming) = Endpoint::builder()
+            .udp(LOCALHOST)
+            .tcp(LOCALHOST)
+            .max_client_transactions(0)
+            .bind()
+            .unwrap();
+        let targets = [
+            Target::new(Transport::Udp, peer.socket.local_addr().unwrap()),
+            Target::new(Transport::Tcp, listener.local_addr().unwrap()),
+        ];
+
+        for target in targets {
+            for uri in ["sips:bob@example.com", "SiPs:bob@example.com"] {
+                for route in [None, Some("<sip:proxy.example.net;lr>")] {
+                    let mut request = request("OPTIONS");
+                    *request.uri_mut() = uri.parse().unwrap();
+                    if let Some(route) = route {
+                        request.headers_mut().append(
+                            "Route".parse().unwrap(),
+                            route.parse().unwrap(),
+                        );
+                    }
+
+                    let error =
+                        endpoint.start(request, target).await.unwrap_err();
+                    assert!(error.is_unsupported_routing(), "{uri} {error}");
+                }
+            }
+            let error =
+                endpoint.start(request("OPTIONS"), target).await.unwrap_err();
+            assert!(error.is_busy(), "{error}");
+        }
+
+        assert!(peer.recv().await.is_none());
+        assert!(timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err());
+
+        endpoint.shutdown(Duration::ZERO).await;
+    }
+
+    // signa's boundary. `start` sends to the explicit target, which is none
+    // of the URIs in the request, and leaves the Request-URI and every Route
+    // row as the caller built them. The request has the strict-routing form
+    // of RFC 3261 section 12.2.1.1, where the top Route has `lr` but is not
+    // the next hop. The hosts are never resolved.
+    #[tokio::test]
+    async fn client_tu_sends_to_the_target_with_request_uri_and_route_as_given(
+    ) {
+        const ROUTES: [&str; 2] = [
+            "<sip:loose.example.net;lr>, <sip:edge.example.net;lr>",
+            "<sip:bob@example.com>",
+        ];
+        let mut peer = Peer::new().await;
+        let listener = TcpListener::bind(LOCALHOST).await.unwrap();
+        let (endpoint, _incoming) = Endpoint::builder()
+            .udp(LOCALHOST)
+            .timers(short_timers())
+            .bind()
+            .unwrap();
+
+        for transport in [Transport::Udp, Transport::Tcp] {
+            let target = Target::new(
+                transport,
+                if transport == Transport::Udp {
+                    peer.socket.local_addr().unwrap()
+                } else {
+                    listener.local_addr().unwrap()
+                },
+            );
+            let mut request = request("OPTIONS");
+            *request.uri_mut() = "sip:strict.example.net".parse().unwrap();
+            for route in ROUTES {
+                request
+                    .headers_mut()
+                    .append("Route".parse().unwrap(), route.parse().unwrap());
+            }
+
+            let control = endpoint.start(request, target).await.unwrap();
+            let (control, _responses) = control.into_parts();
+
+            assert_eq!(control.flow().remote, target.address());
+            let sent = if transport == Transport::Udp {
+                Request::from_bytes(peer.recv().await.unwrap().as_bytes())
+                    .unwrap()
+            } else {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_request(&mut stream).await
+            };
+            assert_eq!(sent.uri().as_str(), "sip:strict.example.net");
+            let routes = sent
+                .headers()
+                .get_all("Route")
+                .map(HeaderValue::as_str)
+                .collect::<Vec<_>>();
+            assert_eq!(routes, ROUTES);
+        }
+
+        endpoint.shutdown(Duration::ZERO).await;
+    }
+
     // Without a TCP listener the Via names the connection's own port, so no
     // response can come once that connection closes.
     #[tokio::test]

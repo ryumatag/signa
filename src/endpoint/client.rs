@@ -29,7 +29,11 @@ use crate::{
     },
 };
 
-/// An explicit next-hop address and transport. URI routing belongs to the TU.
+/// An explicit next-hop address and transport.
+///
+/// The caller picks it after its own routing and RFC 3263 resolution.
+/// [`Endpoint::start`] sends to it without comparing it with the request's
+/// URIs. Its Routing section says what that leaves to the caller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Target {
     transport: Transport,
@@ -382,6 +386,31 @@ impl Endpoint {
     /// acceptance, failures belong to [`Responses`], including ones that occur
     /// before this future resumes. See [RFC 3261 section 17].
     ///
+    /// # Routing
+    ///
+    /// The request is one the caller has already routed, and `target` is its
+    /// next hop. This is the split of [RFC 3261 section 17.1], where the TU
+    /// hands a client transaction the request together with the address, port
+    /// and transport to send it to. `start` does not pick a hop from the
+    /// Request-URI or Route, apply strict or loose routing, resolve a URI as
+    /// [RFC 3263 section 4] does, or check that `target` matches either URI.
+    /// The Request-URI and Route rows go out as given.
+    ///
+    /// Plaintext never satisfies SIPS, but the only SIPS check here is on the
+    /// scheme of the Request-URI. A `sips:` Request-URI, in any letter case,
+    /// is refused before admission. [RFC 3261 section 8.1.2] requires TLS for
+    /// it whichever URI the next hop came from, and signa sends over UDP and
+    /// TCP only. A `sip:` Request-URI does not make plaintext acceptable,
+    /// though. A `sips:` route can require TLS too ([RFC 5630 section 5.1.1]),
+    /// and a built request does not say which entry is the next hop. With a
+    /// strict router first in the route set, that hop is the Request-URI, and
+    /// the top Route may still carry `lr` ([RFC 3261 section 12.2.1.1]).
+    ///
+    /// So the caller chooses a target and transport that meet the security
+    /// requirements of its routing, and does not use this endpoint for a
+    /// request that needs TLS. Accepting a request does not mean that its
+    /// Route, its target, or its SIPS requirements were checked.
+    ///
     /// # TCP
     ///
     /// The `sent-by` of the Via is the connection's local address with the
@@ -408,8 +437,9 @@ impl Endpoint {
     /// * [`Error::is_unsupported_method`] for INVITE, ACK and CANCEL. ACK and
     ///   CANCEL need explicit protocol operations, and INVITE waits for its
     ///   endpoint machine. Extension methods are supported.
-    /// * [`Error::is_unsupported_routing`] for a SIPS request, a multicast
-    ///   target, or a UDP target on an endpoint without a UDP socket.
+    /// * [`Error::is_unsupported_routing`] for a `sips:` Request-URI, a
+    ///   multicast target, or a UDP target on an endpoint without a UDP
+    ///   socket. Route is not checked, as Routing above explains.
     /// * [`Error::is_too_large`] for a UDP request over 1300 bytes.
     /// * [`Error::is_busy`] when client admission, handle capacity or
     ///   transport output is full.
@@ -418,6 +448,11 @@ impl Endpoint {
     ///   shut down.
     ///
     /// [RFC 3261 section 17]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17
+    /// [RFC 3261 section 17.1]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17.1
+    /// [RFC 3263 section 4]: https://www.rfc-editor.org/rfc/rfc3263.html#section-4
+    /// [RFC 3261 section 8.1.2]: https://www.rfc-editor.org/rfc/rfc3261.html#section-8.1.2
+    /// [RFC 5630 section 5.1.1]: https://www.rfc-editor.org/rfc/rfc5630.html#section-5.1.1
+    /// [RFC 3261 section 12.2.1.1]: https://www.rfc-editor.org/rfc/rfc3261.html#section-12.2.1.1
     /// [`Builder::tcp`]: super::Builder::tcp
     #[allow(clippy::manual_async_fn)] // Expose the Send guarantee on Rust 1.71.
     pub fn start(
@@ -476,7 +511,9 @@ impl Endpoint {
 
 /// Checks the request before `start` reserves any capacity.
 fn validate(request: &Request<Bytes>) -> Result<(), Error> {
-    // The current transports cannot satisfy a SIPS request's TLS requirement.
+    // The current transports cannot satisfy the TLS that a SIPS Request-URI
+    // requires. This is the only SIPS check. Route and the target are the
+    // caller's, as the routing section of `Endpoint::start` says.
     if request
         .uri()
         .as_str()
@@ -812,16 +849,51 @@ mod tests {
         }
     }
 
+    fn routed(uri: &str, routes: &[&str]) -> Request<Bytes> {
+        let mut builder = Request::builder()
+            .method("OPTIONS")
+            .uri(uri)
+            .header("CSeq", "1 OPTIONS");
+        for route in routes {
+            builder = builder.header("Route", *route);
+        }
+        builder.body(Bytes::new()).unwrap()
+    }
+
+    // RFC 3261 section 8.1.2. A SIPS Request-URI needs TLS whichever URI
+    // the next hop came from, so a `sip:` Route does not change the answer.
     #[test]
-    fn plaintext_transports_cannot_submit_sips_requests() {
-        for uri in ["sips:alice@example.com", "SIPS:alice@example.com"] {
-            let request = Request::builder()
-                .method("OPTIONS")
-                .uri(uri)
-                .header("CSeq", "1 OPTIONS")
-                .body(Bytes::new())
-                .unwrap();
-            assert!(validate(&request).unwrap_err().is_unsupported_routing());
+    fn plaintext_transports_cannot_submit_sips_request_uris() {
+        for uri in
+            ["sips:alice@example.com", "SIPS:alice@example.com", "SiPs:alice"]
+        {
+            for routes in [&[][..], &["<sip:proxy.example.net;lr>"]] {
+                let request = routed(uri, routes);
+                assert!(
+                    validate(&request).unwrap_err().is_unsupported_routing(),
+                    "{uri} {routes:?}"
+                );
+            }
+        }
+    }
+
+    // signa's boundary, not an RFC rule. The caller owns routing and the
+    // security it requires, so `validate` does not read Route. Passing here
+    // does not make plaintext right for these requests. RFC 5630 section
+    // 5.1.1 requires TLS for a `sips:` loose route, which a caller of this
+    // endpoint cannot provide.
+    #[test]
+    fn sips_routes_are_left_to_the_caller() {
+        for routes in [
+            &["<sips:proxy.example.net;lr>"][..],
+            &["<sips:strict.example.net>"],
+            &["<SIPS:proxy.example.net;lr>"],
+            &["<sip:proxy.example.net;lr>, <sips:edge.example.net;lr>"],
+            &["<sip:proxy.example.net;lr>", "<sips:edge.example.net;lr>"],
+            &["<sips:a.example.net;lr>", "<sips:b.example.net;lr>"],
+        ] {
+            let request = routed("sip:alice@example.com", routes);
+            assert!(validate(&request).is_ok(), "{routes:?}");
         }
     }
 
