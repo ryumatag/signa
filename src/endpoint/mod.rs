@@ -135,9 +135,15 @@ quarter of output capacity for transaction output and responses. See
 earliest requested deadline. Once shutdown starts, new requests get a 503 and
 existing reply routes and responders keep working while admitted work drains.
 Matched CANCELs, ACKs, `send_request` and `forward_response` still work then.
-The drain does not wait for INVITEs in Accepted or for their 2xx and ACKs yet.
-A stateless endpoint has no admitted work, so it stops once its writes in
-flight finish, and keeps delivering events until then.
+The drain lasts until every transaction has reached Terminated on its own
+timers, including an INVITE in Accepted until Timer L or M, so it can take 32
+seconds with the default timers. Work the TU does outside a transaction, such
+as retransmitting a 2xx until its ACK, holds the drain only through a
+[`WorkGuard`]. [`ShutdownOutcome`] says whether the endpoint drained or hit
+its deadline, and the [`Shutdown`] future resolves only after the endpoint's
+TCP listener and connection tasks have ended. A stateless endpoint has no
+transactions, and its unread events do not hold the drain, so it stops once
+its writes in flight finish, and keeps delivering events until then.
 
 Transaction timers remain under [`crate::transaction`], without an endpoint
 alias:
@@ -233,7 +239,7 @@ pub use self::{
         ServerEvent, ServerEvents, ServerRequest, ServerTransaction,
         ServerTransactionId, SubmitError,
     },
-    shutdown::Shutdown,
+    shutdown::{Shutdown, ShutdownOutcome, WorkGuard},
 };
 
 mod admission;
@@ -253,11 +259,13 @@ mod timer;
 /// A handle to a running endpoint.
 ///
 /// The endpoint runs while an `Endpoint`, [`ClientControl`], [`Responder`],
-/// [`ReplyRoute`] or [`Shutdown`] exists, and while a one-shot reply is in
-/// flight. [`ServerEvents`] and [`Incoming`] do not keep it running, and
-/// dropping `Incoming` starts an immediate shutdown. When the last of those
-/// handles drops, the driver stops, closes its sockets and drops its
-/// transactions. [`Endpoint::shutdown`] stops it with a grace period instead.
+/// [`ReplyRoute`], [`WorkGuard`] or [`Shutdown`] exists, and while a one-shot
+/// reply is in flight. [`ServerEvents`] and [`Incoming`] do not keep it
+/// running, and dropping `Incoming` starts an immediate shutdown. When the
+/// last of those handles drops, the driver stops, closes its sockets and drops
+/// its transactions, and its TCP connections get five seconds to write what is
+/// already queued. [`Endpoint::shutdown`] stops it with a grace period instead.
+/// Keeping a handle does not hold a graceful shutdown, except a [`WorkGuard`].
 ///
 /// See the [module docs](self) for what it does.
 #[derive(Clone)]
@@ -269,7 +277,7 @@ pub struct Endpoint {
     client_response_limits: WriteLimits,
     shutdown_control: Arc<shutdown::Control>,
     control: mpsc::Sender<()>,
-    shutdown_wait: watch::Receiver<()>,
+    shutdown_wait: watch::Receiver<Option<ShutdownOutcome>>,
     connection_stats: Arc<driver::ConnectionCounters>,
     reception_stats: Arc<driver::ReceptionCounters>,
     /// The one-shot slots and bytes that reply routes share, for
@@ -393,20 +401,60 @@ impl Endpoint {
     }
 
     /// Stops the endpoint once what it has in hand is done, or after
-    /// `timeout`, and returns a future that resolves when it has stopped.
+    /// `timeout`, and returns a future that resolves with how it stopped.
     ///
     /// From this call on, the endpoint answers a new request with a 503 and
-    /// rejects [`Endpoint::start`] with [`Error::is_closed`].
-    /// It waits until every admitted request has a final response, its own
-    /// requests have theirs, and pending writes and connects finish, then
-    /// stops. It does not wait out Timer J, or Timer L or M of an INVITE that
-    /// got a 2xx, so a 2xx retransmission or ACK after that finds the endpoint
-    /// gone. At `timeout` it stops regardless,
-    /// and whatever still waits fails with [`Error::is_closed`]. See the
-    /// [module docs](self#client-operations-and-shutdown).
+    /// rejects [`Endpoint::start`] with [`Error::is_closed`]. What it already
+    /// has goes on:
+    ///
+    /// * Client transactions keep receiving responses, including further 2xx
+    ///   to an INVITE in Accepted, and keep retransmitting and acknowledging a
+    ///   non-2xx.
+    /// * Server transactions keep retransmitting, absorbing retransmissions,
+    ///   and taking responses from their responders.
+    /// * ACKs and CANCELs that match a transaction arrive as before, on their
+    ///   own capacity, and [`ClientControl::cancel`] still cancels an INVITE.
+    ///   No ACK gets a response.
+    /// * [`ReplyRoute::send`], [`Endpoint::send_request`] and
+    ///   [`Endpoint::forward_response`] still send, reconnecting over TCP if
+    ///   they need to.
+    ///
+    /// The endpoint has drained when every transaction has reached
+    /// Terminated, every [`WorkGuard`] has dropped, and every accepted write
+    /// and connect has finished. A transaction ends on its own timers, not
+    /// when its handles drop or its final response goes out. An INVITE that
+    /// got a 2xx stays in Accepted for Timer L or M, 64 T1, to take further
+    /// 2xx and ACKs ([RFC 6026 sections 8.4 and 8.7]), a UDP INVITE that got a
+    /// non-2xx keeps Timer D of at least 32 seconds, and a UDP non-INVITE
+    /// keeps Timer J or K. With the default timers a drain can therefore take
+    /// 32 seconds after the last final response. Reply routes, endpoint
+    /// clones and unread events in [`Incoming`] do not hold it. Neither does
+    /// the TU's own work, such as retransmitting a 2xx until its ACK arrives
+    /// ([RFC 3261 section 13.3.1.4]), unless it holds a [`WorkGuard`].
+    ///
+    /// Once drained, the endpoint stops taking commands and guards, runs the
+    /// operations already queued, closes its listener and idle connections,
+    /// lets each TCP writer finish its queue, and resolves with
+    /// [`ShutdownOutcome::Drained`]. At `timeout` it stops instead, with
+    /// [`ShutdownOutcome::DeadlineExpired`]. What is left then sees
+    /// [`Error::is_closed`], [`ReplyError::Closed`] or
+    /// [`ServerEvent::EndpointClosed`], and no response is made up for it. In
+    /// both cases the future resolves only after the endpoint's TCP tasks
+    /// have ended, so no write the endpoint owned continues after it.
     ///
     /// Other handles to the endpoint go on working until it stops, and calling
-    /// this on more than one of them is fine. The earliest deadline wins.
+    /// this on more than one of them is fine. Every caller waits for the same
+    /// stop and gets the same outcome. The earliest deadline wins, and a later
+    /// call cannot extend it. A `timeout` too large to represent means no
+    /// deadline, and zero stops at once unless nothing is left. Dropping
+    /// [`Incoming`] asks for a zero timeout. The graceful shutdown itself is
+    /// signa's contract. The RFCs define the transaction lifetimes it waits
+    /// for.
+    ///
+    /// # Cancellation
+    ///
+    /// The request takes effect when this is called. Dropping the returned
+    /// [`Shutdown`] gives up the wait, not the shutdown.
     ///
     /// # Example
     ///
@@ -415,17 +463,83 @@ impl Endpoint {
     ///
     /// # use signa::endpoint::Endpoint;
     /// # async fn run(endpoint: Endpoint) {
-    /// // Say on SIGTERM. Nothing waits past 30 seconds, which is just
-    /// // short of Timer F with the default T1.
-    /// endpoint.shutdown(Duration::from_secs(30)).await;
+    /// // Say on SIGTERM. Timer L of an INVITE answered just before takes 32
+    /// // seconds with the default T1, so allow a little more.
+    /// let outcome = endpoint.shutdown(Duration::from_secs(40)).await;
+    /// if !outcome.is_drained() {
+    ///     eprintln!("stopped with work left");
+    /// }
     /// # }
     /// ```
+    ///
+    /// [RFC 6026 sections 8.4 and 8.7]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.4
+    /// [RFC 3261 section 13.3.1.4]: https://www.rfc-editor.org/rfc/rfc3261.html#section-13.3.1.4
     pub fn shutdown(self, timeout: Duration) -> Shutdown {
         self.client_admission.close();
         if self.shutdown_control.request(timeout) {
             let _ = self.control.try_send(());
         }
         Shutdown::new(self.commands, self.shutdown_wait)
+    }
+
+    /// Takes a guard that keeps a graceful shutdown waiting until it drops.
+    ///
+    /// Take it before starting work that the endpoint does not otherwise see
+    /// and that should finish before a graceful shutdown completes, and drop
+    /// it when that work is done. A UAS takes one before it submits a 2xx and
+    /// drops it when the ACK arrives or it gives up retransmitting. See
+    /// [`WorkGuard`].
+    ///
+    /// Taking a guard works until the endpoint stops, including during a
+    /// shutdown. Once a shutdown has drained, the endpoint refuses new guards
+    /// in the same step in which it decides to stop, so a guard is either
+    /// counted before that decision or refused. A guard taken while the TU
+    /// still holds live work, such as an unanswered server transaction,
+    /// cannot be refused that way, since that work keeps the endpoint from
+    /// draining. Only the deadline can refuse it then.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::is_closed`] once the endpoint has drained or passed its
+    ///   deadline, or has stopped.
+    /// * [`Error::is_busy`] if `isize::MAX` guards are alive, which only
+    ///   leaked guards can cause.
+    ///
+    /// # Example
+    ///
+    /// A UAS's ACK wait, which holds a shutdown open until the ACK arrives or
+    /// 64 T1 pass. The 2xx retransmissions, here left out, would run in the
+    /// same task through the request's [`ReplyRoute`].
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    ///
+    /// use signa::endpoint::{Endpoint, Error, ReceivedAck};
+    /// use tokio::sync::oneshot;
+    ///
+    /// # async fn run(endpoint: Endpoint) -> Result<(), Error> {
+    /// // Before the 2xx goes out.
+    /// let guard = endpoint.work_guard()?;
+    /// let (ack_tx, ack_rx) = oneshot::channel::<ReceivedAck>();
+    /// // The receive loop sends the dialog's ACK to `ack_tx`.
+    /// # drop(ack_tx);
+    ///
+    /// tokio::spawn(async move {
+    ///     let _guard = guard;
+    ///     let _ = tokio::time::timeout(Duration::from_secs(32), ack_rx).await;
+    /// });
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn work_guard(&self) -> Result<WorkGuard, Error> {
+        if self.commands.is_closed() {
+            return Err(Error::closed());
+        }
+        WorkGuard::new(
+            self.shutdown_control.clone(),
+            self.control.clone(),
+            self.commands.clone(),
+        )
     }
 }
 
@@ -467,6 +581,7 @@ pub fn reply_driver(
         tcp_tx,
         rx,
         commands.downgrade(),
+        tcp::Tasks::new(),
     );
     let (request, route) =
         driver.prepare_reply(request, Link { flow, writer })?;
@@ -497,9 +612,9 @@ mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream, UdpSocket},
-        sync::{mpsc, Notify},
-        task::yield_now,
-        time::{sleep, timeout},
+        sync::{mpsc, oneshot, Notify},
+        task::{spawn_blocking, yield_now, JoinHandle},
+        time::{sleep, timeout, timeout_at},
     };
     use tower::{limit::ConcurrencyLimit, service_fn, ServiceExt};
     use tower_service::Service;
@@ -513,7 +628,7 @@ mod tests {
             Branch, Builder, CancelError, CancelOutcome, Endpoint, Incoming,
             IncomingEvent, ReceivedRequest, ReceivedResponse, Reception,
             ReplyError, Responses, ServerEvent, ServerEvents, ServerRequest,
-            SubmitError, Target, ViaMode,
+            ShutdownOutcome, SubmitError, Target, ViaMode, WorkGuard,
         },
         message::{
             header::{
@@ -1064,7 +1179,7 @@ mod tests {
         let route = responder.reply_route();
 
         let shutdown = endpoint.shutdown(Duration::from_secs(1));
-        tokio::task::yield_now().await;
+        yield_now().await;
 
         let response = Response::reply_to(&envelope.request)
             .status(200)
@@ -1509,6 +1624,7 @@ mod tests {
             tx,
             rx,
             commands.downgrade(),
+            tcp::Tasks::new(),
         );
         let incoming = Incoming::new(
             events,
@@ -2296,7 +2412,7 @@ mod tests {
 
         drop(client);
         for _ in 0..10 {
-            tokio::task::yield_now().await;
+            yield_now().await;
         }
         assert!(UdpSocket::bind(addr).await.is_ok(), "the socket was closed");
     }
@@ -2412,7 +2528,8 @@ mod tests {
         let response = peer.recv_final().await.unwrap();
         assert!(response.starts_with("SIP/2.0 200 OK\r\n"), "{response}");
         assert!(response.contains("branch=z9hG4bK1"), "{response}");
-        timeout(Duration::from_secs(1), shutdown).await.unwrap();
+        let outcome = timeout(Duration::from_secs(1), shutdown).await;
+        assert_eq!(outcome.unwrap(), ShutdownOutcome::Drained);
         assert!(UdpSocket::bind(to).await.is_ok(), "the socket was closed");
     }
 
@@ -2447,8 +2564,10 @@ mod tests {
 
         // The second handle asking too makes no difference.
         let again = other.shutdown(Duration::from_secs(5));
-        timeout(Duration::from_secs(1), shutdown).await.unwrap();
-        timeout(Duration::from_secs(1), again).await.unwrap();
+        let first = timeout(Duration::from_secs(1), shutdown).await.unwrap();
+        let second = timeout(Duration::from_secs(1), again).await.unwrap();
+        assert_eq!(first, ShutdownOutcome::Drained);
+        assert_eq!(second, first);
     }
 
     #[tokio::test]
@@ -2472,12 +2591,12 @@ mod tests {
         assert!(peer.recv().await.is_some());
 
         let started = tokio::time::Instant::now();
-        timeout(
+        let outcome = timeout(
             Duration::from_secs(1),
             server.shutdown(Duration::from_millis(100)),
         )
-        .await
-        .unwrap();
+        .await;
+        assert_eq!(outcome.unwrap(), ShutdownOutcome::DeadlineExpired);
         assert!(started.elapsed() >= Duration::from_millis(100));
         let err = call.await.unwrap().unwrap_err();
         assert!(err.is_closed(), "{err}");
@@ -2542,7 +2661,8 @@ mod tests {
         gate.notify_one();
         let response = read_final(&mut stream).await;
         assert!(response.starts_with("SIP/2.0 200 OK\r\n"), "{response}");
-        timeout(Duration::from_secs(1), shutdown).await.unwrap();
+        let outcome = timeout(Duration::from_secs(1), shutdown).await;
+        assert_eq!(outcome.unwrap(), ShutdownOutcome::Drained);
         let mut buf = [0; 1];
         let n = timeout(Duration::from_secs(1), stream.read(&mut buf))
             .await
@@ -2900,6 +3020,43 @@ mod tests {
                 }
             }
         }
+
+        /// The next message, however long it takes, with the clock held
+        /// still. Paused-clock tests use this for what must arrive.
+        async fn arrival(&mut self) -> Message<Bytes> {
+            still(self.arrival_now()).await
+        }
+
+        async fn arrival_now(&mut self) -> Message<Bytes> {
+            match self {
+                Remote::Udp(peer, _) => {
+                    let (len, _) =
+                        peer.socket.recv_from(&mut peer.buf).await.unwrap();
+                    Message::from_bytes(&peer.buf[..len]).unwrap()
+                }
+                Remote::Tcp(stream) => loop {
+                    if let Some(message) = stream.take() {
+                        return message;
+                    }
+                    let read = stream.stream.read_buf(&mut stream.buf).await;
+                    assert!(read.unwrap() > 0, "EOF");
+                },
+            }
+        }
+
+        /// As `arrival`, skipping retransmissions of `method`.
+        async fn arrival_except(&mut self, method: &str) -> Message<Bytes> {
+            loop {
+                let message = self.arrival().await;
+                let skipped = matches!(
+                    &message,
+                    Message::Request(request) if request.method() == method
+                );
+                if !skipped {
+                    return message;
+                }
+            }
+        }
     }
 
     /// A UAS for client tests, listening on UDP and TCP.
@@ -3205,6 +3362,38 @@ mod tests {
             .expect("an open observation")
     }
 
+    /// Runs `future` with a paused clock held still.
+    ///
+    /// A paused clock moves to the next timer whenever the runtime is idle,
+    /// including while a loopback datagram is on its way, so a test waiting
+    /// for one could find Timer M already run. Tokio does not move the clock
+    /// while a blocking task runs, which this holds for the wait.
+    async fn still<F: Future>(future: F) -> F::Output {
+        let (release, hold) = oneshot::channel::<()>();
+        let held = spawn_blocking(move || {
+            let _ = hold.blocking_recv();
+        });
+        let output = future.await;
+        drop(release);
+        held.await.unwrap();
+        output
+    }
+
+    async fn arrived(responses: &mut Responses) -> Response<Bytes> {
+        still(responses.next()).await.expect("an open stream").unwrap()
+    }
+
+    async fn arrived_event(incoming: &mut Incoming) -> IncomingEvent {
+        still(incoming.recv()).await.expect("an open endpoint")
+    }
+
+    async fn arrived_request(incoming: &mut Incoming) -> ServerRequest {
+        match arrived_event(incoming).await {
+            IncomingEvent::Request(request) => request,
+            other => panic!("a request, got {other:?}"),
+        }
+    }
+
     fn status_of(message: Option<Message<Bytes>>) -> u16 {
         into_response(message.expect("a response")).status().as_u16()
     }
@@ -3506,7 +3695,7 @@ mod tests {
 
     // A shutdown refuses new requests with a 503 but still hands the TU an
     // ACK, and never answers it. The unanswered INVITE keeps the endpoint
-    // draining. Draining Accepted transactions themselves is later work.
+    // draining.
     #[tokio::test]
     async fn acks_reach_the_tu_during_shutdown_without_a_response() {
         let (endpoint, mut incoming) = invite_endpoint(Timers::default());
@@ -4664,7 +4853,8 @@ mod tests {
         forward.await.unwrap();
         assert!(peer.recv().await.is_some());
 
-        timeout(Duration::from_secs(1), stopped).await.unwrap();
+        let outcome = timeout(Duration::from_secs(1), stopped).await;
+        assert_eq!(outcome.unwrap(), ShutdownOutcome::Drained);
         let error = endpoint.forward_response(response).await.unwrap_err();
         assert!(error.is_closed(), "{error}");
     }
@@ -4790,5 +4980,576 @@ mod tests {
         let (_, second) = forwarded.recv().await.unwrap();
         assert_eq!(first, second);
         drop(transaction);
+    }
+
+    // Graceful shutdown. The RFCs set the transaction lifetimes the drain
+    // waits for. The drain itself, work guards, the deadline and the outcome
+    // are signa's contract. These run on a paused clock with the default
+    // timers, so Timers D, J, L and M keep their real lengths.
+
+    const DEFAULT_T1: Duration = Duration::from_millis(500);
+
+    fn virtual_now() -> tokio::time::Instant {
+        tokio::time::Instant::now()
+    }
+
+    /// Every event of a server observation, up to its end.
+    async fn server_events(events: &mut ServerEvents) -> Vec<ServerEvent> {
+        let mut seen = Vec::new();
+        while let Some(event) =
+            timeout(Duration::from_secs(1), events.next()).await.unwrap()
+        {
+            seen.push(event);
+        }
+        seen
+    }
+
+    fn terminated_not_closed(seen: &[ServerEvent]) -> bool {
+        seen.iter().any(|event| matches!(event, ServerEvent::Terminated))
+            && !seen
+                .iter()
+                .any(|event| matches!(event, ServerEvent::EndpointClosed))
+    }
+
+    // RFC 6026 section 8.7. An INVITE in Accepted keeps its transaction for
+    // Timer L, 64 T1 from the first 2xx, after the TU's final response and
+    // with its responder dropped. It takes another fork's 2xx without
+    // restarting L, absorbs the retransmitted INVITE, and hands the ACK to
+    // the TU. The drain waits for L, and the observer sees the transaction
+    // end rather than the endpoint close.
+    #[tokio::test(start_paused = true)]
+    async fn a_graceful_shutdown_waits_for_timer_l() {
+        let (endpoint, mut incoming) = invite_endpoint(Timers::default());
+        let (mut remote, via) =
+            uac(Transport::Udp, &endpoint, "accepted").await;
+        let invite = raw("INVITE", &via, None);
+        remote.send(&invite).await;
+        assert_eq!(status_of(Some(remote.arrival().await)), 100);
+        let ServerRequest { request, transaction, .. } =
+            arrived_request(&mut incoming).await;
+        let (responder, mut events) = transaction.into_parts();
+
+        let first = virtual_now();
+        responder.respond(reply(&request, 200, "a")).await.unwrap();
+        assert_eq!(status_of(Some(remote.arrival().await)), 200);
+        let mut shutdown = Box::pin(endpoint.clone().shutdown(Duration::MAX));
+
+        sleep(Duration::from_secs(20)).await;
+        responder.respond(reply(&request, 200, "b")).await.unwrap();
+        assert_eq!(status_of(Some(remote.arrival().await)), 200);
+        drop(responder);
+        remote.send(&invite).await;
+        assert!(remote.next().await.is_none());
+        let ack = via.replace("z9hG4bKaccepted", "z9hG4bKacceptedack");
+        remote.send(&raw("ACK", &ack, Some("a"))).await;
+        assert!(matches!(
+            arrived_event(&mut incoming).await,
+            IncomingEvent::Ack(_)
+        ));
+        assert!(remote.next().await.is_none());
+
+        let l = first + 64 * DEFAULT_T1;
+        let early = l - Duration::from_millis(1);
+        assert!(timeout_at(early, &mut shutdown).await.is_err());
+        assert_eq!(shutdown.await, ShutdownOutcome::Drained);
+        assert!(virtual_now() >= l);
+        let seen = server_events(&mut events).await;
+        assert!(terminated_not_closed(&seen), "{seen:?}");
+    }
+
+    // RFC 6026 section 8.4. The client keeps an INVITE in Accepted until
+    // Timer M and delivers every 2xx until then, including a fork's that
+    // arrives during the shutdown. Dropping its control does not end it.
+    // The stream ends without an error at M, and the drain finishes then.
+    #[tokio::test(start_paused = true)]
+    async fn a_graceful_shutdown_waits_for_timer_m() {
+        let (endpoint, _incoming) = invite_endpoint(Timers::default());
+        let far = Far::new().await;
+        let target = far.target(Transport::Udp);
+        let (control, mut responses) =
+            endpoint.start(invite(), target).await.unwrap().into_parts();
+        let mut remote = far.remote(Transport::Udp, &endpoint).await;
+        let sent = into_request(remote.arrival().await);
+
+        let first = virtual_now();
+        remote.send(&reply(&sent, 200, "a")).await;
+        assert_eq!(arrived(&mut responses).await.status(), StatusCode::OK);
+        drop(control);
+        let other = endpoint.clone();
+        let mut shutdown = Box::pin(endpoint.shutdown(Duration::MAX));
+        assert!(other.start(invite(), target).await.unwrap_err().is_closed());
+
+        sleep(Duration::from_secs(20)).await;
+        remote.send(&reply(&sent, 200, "b")).await;
+        let fork = arrived(&mut responses).await;
+        assert!(fork.headers().get(TO).unwrap().as_str().ends_with("tag=b"));
+
+        let m = first + 64 * DEFAULT_T1;
+        let early = m - Duration::from_millis(1);
+        assert!(timeout_at(early, &mut shutdown).await.is_err());
+        assert_eq!(shutdown.await, ShutdownOutcome::Drained);
+        assert!(virtual_now() >= m);
+        assert!(responses.next().await.is_none());
+    }
+
+    // A deadline before L and M stops both transactions. Their observers see
+    // the endpoint close, with no SIP response made up for it.
+    #[tokio::test(start_paused = true)]
+    async fn a_deadline_before_l_and_m_closes_the_observers() {
+        let (endpoint, mut incoming) = invite_endpoint(Timers::default());
+        let far = Far::new().await;
+        let (_control, mut responses) = endpoint
+            .start(invite(), far.target(Transport::Udp))
+            .await
+            .unwrap()
+            .into_parts();
+        let mut far = far.remote(Transport::Udp, &endpoint).await;
+        let sent = into_request(far.arrival().await);
+        far.send(&reply(&sent, 200, "a")).await;
+        assert_eq!(arrived(&mut responses).await.status(), StatusCode::OK);
+
+        let (mut remote, via) = uac(Transport::Udp, &endpoint, "forced").await;
+        remote.send(&raw("INVITE", &via, None)).await;
+        assert_eq!(status_of(Some(remote.arrival().await)), 100);
+        let ServerRequest { request, transaction, .. } =
+            arrived_request(&mut incoming).await;
+        let (responder, mut events) = transaction.into_parts();
+        responder.respond(reply(&request, 200, "a")).await.unwrap();
+
+        let started = virtual_now();
+        let outcome = endpoint.shutdown(Duration::from_secs(5)).await;
+        assert_eq!(outcome, ShutdownOutcome::DeadlineExpired);
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+        assert!(responses.next().await.unwrap().unwrap_err().is_closed());
+        assert!(responses.next().await.is_none());
+        let seen = server_events(&mut events).await;
+        assert!(
+            matches!(seen.last(), Some(ServerEvent::EndpointClosed)),
+            "{seen:?}"
+        );
+        // The only message after the 100 is the 200 itself.
+        assert_eq!(status_of(remote.next().await), 200);
+        assert!(remote.next().await.is_none());
+    }
+
+    // RFC 3261 sections 9.1 and 17.1.1.3. A shutdown leaves an INVITE that
+    // is already out cancellable. The CANCEL is a transaction of its own, the
+    // transaction acknowledges the 487 and its retransmission, and the drain
+    // waits for Timer D, at least 32 seconds over UDP.
+    #[tokio::test(start_paused = true)]
+    async fn an_invite_is_cancelled_and_acknowledged_during_a_shutdown() {
+        let (endpoint, _incoming) = invite_endpoint(Timers::default());
+        let far = Far::new().await;
+        let (control, mut responses) = endpoint
+            .start(invite(), far.target(Transport::Udp))
+            .await
+            .unwrap()
+            .into_parts();
+        let mut remote = far.remote(Transport::Udp, &endpoint).await;
+        let sent = into_request(remote.arrival().await);
+        remote.send(&reply(&sent, 180, "b")).await;
+        assert_eq!(arrived(&mut responses).await.status().as_u16(), 180);
+
+        let mut shutdown = Box::pin(endpoint.clone().shutdown(Duration::MAX));
+        let CancelOutcome::Sent(cancel) = control.cancel().await.unwrap()
+        else {
+            panic!("a CANCEL");
+        };
+        let (_, mut cancel_responses) = cancel.into_parts();
+        let cancel = into_request(remote.arrival_except("INVITE").await);
+        assert_eq!(cancel.method(), Method::CANCEL);
+        remote.send(&reply(&cancel, 200, "b")).await;
+        assert_eq!(
+            arrived(&mut cancel_responses).await.status(),
+            StatusCode::OK
+        );
+
+        let completed = virtual_now();
+        for _ in 0..2 {
+            remote.send(&reply(&sent, 487, "b")).await;
+            let ack = loop {
+                let request =
+                    into_request(remote.arrival_except("INVITE").await);
+                if request.method() != Method::CANCEL {
+                    break request;
+                }
+            };
+            assert_eq!(ack.method(), Method::ACK);
+        }
+        assert_eq!(arrived(&mut responses).await.status().as_u16(), 487);
+        assert!(responses.next().await.is_none());
+
+        let d = completed + Duration::from_secs(32);
+        let early = d - Duration::from_millis(1);
+        assert!(timeout_at(early, &mut shutdown).await.is_err());
+        assert_eq!(shutdown.await, ShutdownOutcome::Drained);
+        assert!(virtual_now() >= d);
+    }
+
+    // With ordinary admission full and a shutdown under way, a matched CANCEL
+    // and the ACK of a non-2xx still progress on their own capacity, a client
+    // transaction still gets its response, a new request gets a 503, and an
+    // ACK gets no response on any path. Completed entries then hold the
+    // drain until their timers, Timer J of the CANCEL's the longest.
+    #[tokio::test(start_paused = true)]
+    async fn protocol_work_progresses_with_admission_full_during_a_shutdown() {
+        let (endpoint, mut incoming) = Endpoint::builder()
+            .udp(LOCALHOST)
+            .max_pending_requests(1)
+            .bind()
+            .unwrap();
+        let (mut remote, via) = uac(Transport::Udp, &endpoint, "full").await;
+        remote.send(&raw("INVITE", &via, None)).await;
+        assert_eq!(status_of(Some(remote.arrival().await)), 100);
+        let invite = arrived_request(&mut incoming).await;
+        let far = Far::new().await;
+        let (_options, mut responses) = endpoint
+            .start(request("OPTIONS"), far.target(Transport::Udp))
+            .await
+            .unwrap()
+            .into_parts();
+        let mut far = far.remote(Transport::Udp, &endpoint).await;
+        let options = into_request(far.arrival().await);
+        let (mut late, late_via) =
+            uac(Transport::Udp, &endpoint, "late").await;
+        late.send(&raw("OPTIONS", &late_via, None)).await;
+        assert_eq!(status_of(Some(late.arrival().await)), 503);
+
+        let mut shutdown = Box::pin(endpoint.clone().shutdown(Duration::MAX));
+        far.send(&reply(&options, 200, "far")).await;
+        assert_eq!(arrived(&mut responses).await.status(), StatusCode::OK);
+        remote.send(&raw("CANCEL", &via, None)).await;
+        let IncomingEvent::Cancel(cancel) = arrived_event(&mut incoming).await
+        else {
+            panic!("a matched CANCEL");
+        };
+        assert_eq!(cancel.target, invite.transaction.id());
+        let (cancel_responder, _) = cancel.transaction.into_parts();
+        cancel_responder
+            .respond(reply(&cancel.request, 200, "uas"))
+            .await
+            .unwrap();
+        assert_eq!(status_of(Some(remote.arrival().await)), 200);
+        let completed = virtual_now();
+        let (responder, mut events) = invite.transaction.into_parts();
+        responder.respond(reply(&invite.request, 487, "uas")).await.unwrap();
+        assert_eq!(status_of(Some(remote.arrival().await)), 487);
+        remote.send(&raw("ACK", &via, Some("uas"))).await;
+        assert!(remote.next().await.is_none());
+
+        let stray = late_via.replace("z9hG4bKlate", "z9hG4bKlateack");
+        late.send(&raw("ACK", &stray, Some("x"))).await;
+        assert!(matches!(
+            arrived_event(&mut incoming).await,
+            IncomingEvent::Ack(_)
+        ));
+        late.send(&raw("OPTIONS", &stray, None)).await;
+        assert_eq!(status_of(Some(late.arrival().await)), 503);
+        assert!(late.next().await.is_none());
+
+        let j = completed + 64 * DEFAULT_T1;
+        let early = j - Duration::from_millis(1);
+        assert!(timeout_at(early, &mut shutdown).await.is_err());
+        assert_eq!(shutdown.await, ShutdownOutcome::Drained);
+        let seen = server_events(&mut events).await;
+        assert!(terminated_not_closed(&seen), "{seen:?}");
+    }
+
+    // A UAS that retransmits its 2xx until the ACK holds a guard from before
+    // the 2xx until the ACK, as the TU's own work. The retransmissions go
+    // through the request's reply route during the shutdown, and dropping
+    // the guard does not end the drain before Timer L.
+    #[tokio::test(start_paused = true)]
+    async fn a_uas_retransmits_its_2xx_under_a_guard_until_the_ack() {
+        let (endpoint, mut incoming) = invite_endpoint(Timers::default());
+        let (mut remote, via) = uac(Transport::Udp, &endpoint, "uas").await;
+        remote.send(&raw("INVITE", &via, None)).await;
+        assert_eq!(status_of(Some(remote.arrival().await)), 100);
+        let ServerRequest { request, transaction, .. } =
+            arrived_request(&mut incoming).await;
+        let (responder, _events) = transaction.into_parts();
+        let route = responder.reply_route();
+        let ok = reply(&request, 200, "uas");
+
+        // RFC 3261 section 13.3.1.4: T1 doubling to T2, for at most 64 T1.
+        let guard = endpoint.work_guard().unwrap();
+        let first = virtual_now();
+        responder.respond(ok.clone()).await.unwrap();
+        let (ack_tx, mut ack_rx) = oneshot::channel::<()>();
+        let retransmitting = tokio::spawn(async move {
+            let _guard = guard;
+            let give_up = sleep(64 * DEFAULT_T1);
+            tokio::pin!(give_up);
+            let mut interval = DEFAULT_T1;
+            loop {
+                tokio::select! {
+                    _ = &mut ack_rx => return true,
+                    _ = &mut give_up => return false,
+                    _ = sleep(interval) => {
+                        route.send(ok.clone()).await.unwrap();
+                        interval = (interval * 2).min(Duration::from_secs(4));
+                    }
+                }
+            }
+        });
+        assert_eq!(status_of(Some(remote.arrival().await)), 200);
+        let mut shutdown = Box::pin(endpoint.clone().shutdown(Duration::MAX));
+
+        sleep(DEFAULT_T1).await;
+        assert_eq!(status_of(Some(remote.arrival().await)), 200);
+        let ack = via.replace("z9hG4bKuas", "z9hG4bKuasack");
+        remote.send(&raw("ACK", &ack, Some("uas"))).await;
+        assert!(matches!(
+            arrived_event(&mut incoming).await,
+            IncomingEvent::Ack(_)
+        ));
+        ack_tx.send(()).unwrap();
+        assert!(retransmitting.await.unwrap());
+
+        let l = first + 64 * DEFAULT_T1;
+        let early = l - Duration::from_millis(1);
+        assert!(timeout_at(early, &mut shutdown).await.is_err());
+        assert_eq!(shutdown.await, ShutdownOutcome::Drained);
+    }
+
+    // A guard holds a drain that has no transaction left. Each guard counts
+    // on its own, a guard taken during the drain counts too, and the last
+    // drop lets the drain finish. Many guards cost no queued wakeups. A
+    // drained endpoint refuses new guards.
+    #[tokio::test(start_paused = true)]
+    async fn work_guards_hold_a_drain_until_the_last_one_drops() {
+        let (endpoint, _incoming) = invite_endpoint(Timers::default());
+        let first = endpoint.work_guard().unwrap();
+        let many: Vec<WorkGuard> =
+            (0..10_000).map(|_| endpoint.work_guard().unwrap()).collect();
+        let other = endpoint.clone();
+        let mut shutdown = Box::pin(endpoint.shutdown(Duration::MAX));
+        let hour = Duration::from_secs(3600);
+
+        assert!(timeout(hour, &mut shutdown).await.is_err());
+        drop(many);
+        assert!(timeout(hour, &mut shutdown).await.is_err());
+        let late = other.work_guard().unwrap();
+        drop(first);
+        assert!(timeout(hour, &mut shutdown).await.is_err());
+        drop(late);
+        let outcome = timeout(Duration::from_millis(1), shutdown).await;
+        assert_eq!(outcome.unwrap(), ShutdownOutcome::Drained);
+        assert!(other.work_guard().unwrap_err().is_closed());
+    }
+
+    // The deadline does not wait for guards. Every caller gets the same
+    // outcome at the earliest deadline, a later call does not extend it, and
+    // a guard dropped after it does nothing.
+    #[tokio::test(start_paused = true)]
+    async fn the_earliest_deadline_ends_a_drain_held_by_a_guard() {
+        let (endpoint, _incoming) = invite_endpoint(Timers::default());
+        let guard = endpoint.work_guard().unwrap();
+        let started = virtual_now();
+        let waits = [
+            endpoint.clone().shutdown(Duration::MAX),
+            endpoint.clone().shutdown(Duration::from_secs(2)),
+            endpoint.clone().shutdown(Duration::from_secs(10)),
+        ];
+        let later = endpoint.clone().shutdown(Duration::from_secs(60));
+
+        for wait in waits {
+            assert_eq!(wait.await, ShutdownOutcome::DeadlineExpired);
+        }
+        assert_eq!(later.await, ShutdownOutcome::DeadlineExpired);
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        drop(guard);
+        assert!(endpoint.work_guard().unwrap_err().is_closed());
+    }
+
+    // A zero timeout, and dropping Incoming, which asks for one, stop at
+    // once. The outcome is a drain only when nothing was left.
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_timeout_drains_only_an_idle_endpoint() {
+        let (endpoint, _incoming) = invite_endpoint(Timers::default());
+        assert_eq!(
+            endpoint.shutdown(Duration::ZERO).await,
+            ShutdownOutcome::Drained
+        );
+
+        let (endpoint, incoming) = invite_endpoint(Timers::default());
+        let wait = endpoint.clone().shutdown(Duration::MAX);
+        drop(incoming);
+        assert_eq!(wait.await, ShutdownOutcome::Drained);
+
+        let (endpoint, incoming) = invite_endpoint(Timers::default());
+        let guard = endpoint.work_guard().unwrap();
+        let wait = endpoint.clone().shutdown(Duration::MAX);
+        let started = virtual_now();
+        drop(incoming);
+        assert_eq!(wait.await, ShutdownOutcome::DeadlineExpired);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        drop(guard);
+    }
+
+    // Dropping a Shutdown gives up the wait, not the shutdown. The endpoint
+    // still stops at the deadline while other handles keep it running.
+    #[tokio::test(start_paused = true)]
+    async fn dropping_the_shutdown_future_keeps_the_request() {
+        let (endpoint, _incoming) = invite_endpoint(Timers::default());
+        let guard = endpoint.work_guard().unwrap();
+        drop(endpoint.clone().shutdown(Duration::from_secs(1)));
+
+        sleep(Duration::from_secs(2)).await;
+
+        assert!(endpoint.work_guard().unwrap_err().is_closed());
+        let target = Target::new(Transport::Udp, LOCALHOST);
+        let err =
+            endpoint.start(request("OPTIONS"), target).await.unwrap_err();
+        assert!(err.is_closed(), "{err}");
+        drop(guard);
+    }
+
+    // A reply route and an endpoint clone kept by the TU do not hold the
+    // drain. Once drained, the endpoint closes its idle connection and its
+    // listener before the future resolves, and the route reports the close.
+    #[tokio::test]
+    async fn routes_and_clones_do_not_hold_a_drain_and_tcp_closes() {
+        let (endpoint, mut incoming) = invite_endpoint(Timers::default());
+        let (mut remote, via) = uac(Transport::Tcp, &endpoint, "route").await;
+        remote.send(&raw("OPTIONS", &via, None)).await;
+        let ServerRequest { request, transaction, .. } =
+            arrived_request(&mut incoming).await;
+        let (responder, _events) = transaction.into_parts();
+        let route = responder.reply_route();
+        responder.respond(reply(&request, 200, "uas")).await.unwrap();
+        assert_eq!(status_of(Some(remote.arrival().await)), 200);
+        let clone = endpoint.clone();
+        let listener = endpoint.tcp_addr().unwrap();
+
+        let outcome = timeout(
+            Duration::from_secs(1),
+            endpoint.shutdown(Duration::from_secs(30)),
+        )
+        .await;
+
+        assert_eq!(outcome.unwrap(), ShutdownOutcome::Drained);
+        let Remote::Tcp(stream) = &mut remote else { unreachable!() };
+        let mut buf = [0; 1];
+        assert_eq!(stream.stream.read(&mut buf).await.unwrap(), 0);
+        assert!(TcpStream::connect(listener).await.is_err());
+        let resent = route.send(reply(&request, 200, "uas")).await;
+        assert!(matches!(resent, Err(ReplyError::Closed)), "{resent:?}");
+        assert!(clone.work_guard().unwrap_err().is_closed());
+    }
+
+    /// A TCP request answered by the TU, and a task that keeps sending large
+    /// copies of the answer through its reply route to a peer that does not
+    /// read. Returns once a send has stalled.
+    async fn stalled_tcp_reply(
+        endpoint: &Endpoint,
+        incoming: &mut Incoming,
+    ) -> (TcpStream, JoinHandle<Result<(), ReplyError>>) {
+        let (remote, via) = uac(Transport::Tcp, endpoint, "stall").await;
+        let Remote::Tcp(mut stream) = remote else { unreachable!() };
+        stream.send(&raw("OPTIONS", &via, None)).await;
+        let ServerRequest { request, transaction, .. } =
+            arrived_request(incoming).await;
+        let (responder, _) = transaction.into_parts();
+        let route = responder.reply_route();
+        responder.respond(reply(&request, 200, "uas")).await.unwrap();
+        let large = Response::reply_to(&request)
+            .status(200)
+            .to_tag("uas")
+            .body(Bytes::from(vec![b'x'; 64 * 1024]))
+            .unwrap();
+
+        let sent = Arc::new(AtomicUsize::new(0));
+        let counted = sent.clone();
+        let sending = tokio::spawn(async move {
+            loop {
+                route.send(large.clone()).await?;
+                counted.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let mut last = usize::MAX;
+        loop {
+            sleep(Duration::from_millis(100)).await;
+            let now = sent.load(Ordering::Relaxed);
+            if now == last {
+                break;
+            }
+            last = now;
+        }
+        assert!(!sending.is_finished());
+
+        (stream.stream, sending)
+    }
+
+    // A local TCP write the peer has not taken holds a graceful shutdown.
+    // Once the peer reads, the write completes, the endpoint drains, and the
+    // connection closes.
+    #[tokio::test]
+    async fn an_unfinished_tcp_write_holds_the_drain_until_it_completes() {
+        let (endpoint, mut incoming) = invite_endpoint(Timers::default());
+        let (mut stream, sending) =
+            stalled_tcp_reply(&endpoint, &mut incoming).await;
+        let mut shutdown =
+            Box::pin(endpoint.shutdown(Duration::from_secs(30)));
+
+        assert!(timeout(Duration::from_millis(200), &mut shutdown)
+            .await
+            .is_err());
+        let reading = tokio::spawn(async move {
+            let mut all = Vec::new();
+            stream.read_to_end(&mut all).await.unwrap();
+            all.len()
+        });
+
+        let outcome = timeout(Duration::from_secs(5), shutdown).await;
+        assert_eq!(outcome.unwrap(), ShutdownOutcome::Drained);
+        let result = sending.await.unwrap();
+        assert!(matches!(result, Err(ReplyError::Closed)), "{result:?}");
+        assert!(reading.await.unwrap() > 64 * 1024);
+    }
+
+    // At the deadline the endpoint aborts a stalled writer. The waiting
+    // reply fails, the connection closes, and nothing is written after the
+    // future resolves.
+    #[tokio::test]
+    async fn the_deadline_aborts_a_stalled_tcp_writer() {
+        let (endpoint, mut incoming) = invite_endpoint(Timers::default());
+        let (mut stream, sending) =
+            stalled_tcp_reply(&endpoint, &mut incoming).await;
+        let listener = endpoint.tcp_addr().unwrap();
+
+        let outcome = timeout(
+            Duration::from_secs(5),
+            endpoint.shutdown(Duration::from_millis(200)),
+        )
+        .await;
+
+        assert_eq!(outcome.unwrap(), ShutdownOutcome::DeadlineExpired);
+        let result = timeout(Duration::from_secs(1), sending).await;
+        assert!(result.unwrap().unwrap().is_err());
+        assert!(TcpStream::connect(listener).await.is_err());
+        // The writer is gone, so the stream ends, mid-message or not, with
+        // EOF or a reset.
+        let mut all = Vec::new();
+        let read =
+            timeout(Duration::from_secs(5), stream.read_to_end(&mut all));
+        assert!(read.await.is_ok(), "the stream ends");
+    }
+
+    // Stateless reception has no transactions, and its unread events do not
+    // hold a drain.
+    #[tokio::test(start_paused = true)]
+    async fn unread_stateless_events_do_not_hold_a_drain() {
+        let (proxy, _incoming) = stateless_endpoint();
+        let peer = Peer::new().await;
+        let via = format!("SIP/2.0/UDP {};branch=z9hG4bKunread", peer.addr());
+        peer.send(proxy.udp_addr().unwrap(), &peer.request("OPTIONS", &via))
+            .await;
+        sleep(Duration::from_millis(10)).await;
+
+        let outcome =
+            timeout(Duration::from_millis(1), proxy.shutdown(Duration::MAX))
+                .await;
+        assert_eq!(outcome.unwrap(), ShutdownOutcome::Drained);
     }
 }

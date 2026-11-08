@@ -34,7 +34,8 @@ use crate::{
 ///
 /// `recv` is cancellation-safe. Taking an event does not release its place in
 /// [`Builder::max_pending_requests`]. That lasts until the request has a final
-/// response or its transaction ends.
+/// response or its transaction ends. Events left unread do not hold a graceful
+/// shutdown, although a request event's transaction does until it ends.
 ///
 /// Dropping this receiver starts an immediate shutdown, as
 /// [`Endpoint::shutdown`] with a zero deadline does, because no transaction
@@ -836,7 +837,7 @@ mod integration {
     use crate::{
         endpoint::{
             tests::{route_request, route_response},
-            Builder, Endpoint,
+            Builder, Endpoint, ShutdownOutcome,
         },
         message::header::{HeaderValue, TO, VIA},
         transport::WriteLimits,
@@ -1392,13 +1393,13 @@ mod integration {
             Some(ServerEvent::EndpointClosed)
         ));
         // The earliest deadline wins, so a longer graceful request cannot
-        // extend the drop's immediate one.
-        timeout(
+        // extend the drop's immediate one. The unanswered request was left.
+        let outcome = timeout(
             Duration::from_secs(1),
             endpoint.shutdown(Duration::from_secs(60)),
         )
-        .await
-        .unwrap();
+        .await;
+        assert_eq!(outcome.unwrap(), ShutdownOutcome::DeadlineExpired);
         assert_eq!(
             responder.respond(route_response(&envelope.request)).await,
             Err(SubmitError::Closed)
@@ -1419,7 +1420,10 @@ mod integration {
         send(&peer, &endpoint, "first").await;
         let envelope = request(&mut incoming).await;
         let (responder, mut events) = envelope.transaction.into_parts();
-        endpoint.shutdown(Duration::ZERO).await;
+        assert_eq!(
+            endpoint.shutdown(Duration::ZERO).await,
+            ShutdownOutcome::DeadlineExpired
+        );
 
         assert!(matches!(
             observe(&mut events).await,

@@ -26,14 +26,15 @@ independent transaction observation. Client requests start asynchronously and
 return split control and bounded response streams. An INVITE is cancelled
 through its control, the transaction acknowledges a non-2xx, and the
 application sends the ACK for a 2xx once, without a transaction. ACKs for a 2xx
-and CANCELs reach the application as events of their own. The endpoint
-supports graceful shutdown. A stateless endpoint receives requests and
+and CANCELs reach the application as events of their own. A graceful shutdown
+waits for every transaction to reach Terminated, including INVITEs in Accepted,
+and for work the application registers with a guard, then reports whether it
+drained or hit its deadline. A stateless endpoint receives requests and
 responses over UDP without transactions, and forwards requests with a branch
-the application computes and responses by their remaining Via. Draining INVITEs
-in Accepted at shutdown, stateless TCP, TLS and next-hop selection are later
-work. signa is not a complete UA or proxy. Dialogs, 2xx retransmission, the
-meaning of a CANCEL, and a proxy's validation and routing stay with the
-application.
+the application computes and responses by their remaining Via. Stateless TCP,
+TLS and next-hop selection are later work. signa is not a complete UA or
+proxy. Dialogs, 2xx retransmission, the meaning of a CANCEL, and a proxy's
+validation and routing stay with the application.
 
 The [API documentation on docs.rs] says what is covered in detail.
 

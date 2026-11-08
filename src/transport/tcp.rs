@@ -17,10 +17,14 @@ decode error, or when a write fails. Bytes left in the read buffer at EOF are
 an unfinished message and are dropped. The listener holds at most
 `max_connections` open and leaves the rest in the OS backlog.
 
-A connection also ends when the endpoint is gone, which the reader sees as the
-channel closing. That is how every connection closes when the endpoint stops.
-The writer then finishes what is queued before the stream is dropped, since the
-endpoint's last responses are in that queue.
+A connection also ends when the endpoint closes the channel, which is how every
+connection closes when the endpoint stops. The endpoint owns its listener and
+connection tasks through a `Tasks` handle and tells them how to stop with a
+`Phase`. At `Phase::Closing` the listener stops accepting and each writer
+closes its queue and finishes what is in it, since the endpoint's last
+responses are there. At `Phase::Abort` everything stops at once, and unwritten
+messages fail their receipts. The endpoint waits for every task to end before it
+reports that it has stopped, so nothing it owns writes after that.
 */
 
 use std::{
@@ -29,7 +33,10 @@ use std::{
     io,
     net::SocketAddr,
     pin::pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Weak,
+    },
     task::Poll,
     time::Duration,
 };
@@ -38,7 +45,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use tokio::{
     io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{tcp::OwnedReadHalf, TcpListener, TcpStream},
-    sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore},
+    sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore},
     task::JoinHandle,
     time::{sleep, timeout},
 };
@@ -61,9 +68,116 @@ const WRITE_BATCH: usize = 64;
 /// The answer to an RFC 5626 ping.
 const PONG: Bytes = Bytes::from_static(b"\r\n");
 
-/// How long the writer gets to finish its queue once the endpoint is gone. A
-/// peer that takes longer to read a few messages is not reading at all.
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the writer of a connection without an endpoint gets to finish its
+/// queue once its channel closes. See [`run_connection`].
+const UNOWNED_DRAIN: Duration = Duration::from_secs(5);
+
+/// How far the endpoint that owns a set of connections has got in stopping.
+///
+/// The phases only move forward.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum Phase {
+    /// The connections serve the endpoint.
+    Running,
+    /// The endpoint has stopped taking work. The listener stops accepting,
+    /// and each writer closes its queue and ends once the queue is written.
+    Closing,
+    /// Everything stops now. A writer drops what it has not written, which
+    /// fails those receipts and returns their reservations.
+    Abort,
+}
+
+/// The owner's side of a set of transport tasks.
+///
+/// Every task holds a [`Teardown`] from [`Tasks::handle`], so the tasks have
+/// all ended once [`Tasks::finished`] resolves. A connection's writer is the
+/// exception. Its supervisor holds the handle and waits for it. That counts
+/// tasks without a lock or a registry, and a task started late, such as a
+/// connection that a connect attempt opened after the owner began closing,
+/// still counts until it ends. Dropping `Tasks` is [`Phase::Abort`].
+#[derive(Debug)]
+pub(crate) struct Tasks {
+    phase: watch::Sender<Phase>,
+    discarded: Arc<AtomicBool>,
+}
+
+impl Tasks {
+    pub(crate) fn new() -> Tasks {
+        Tasks {
+            phase: watch::channel(Phase::Running).0,
+            discarded: Arc::default(),
+        }
+    }
+
+    /// A handle for a new task.
+    pub(crate) fn handle(&self) -> Teardown {
+        Teardown {
+            phase: self.phase.subscribe(),
+            discarded: self.discarded.clone(),
+        }
+    }
+
+    /// Moves to `phase`, unless the tasks are already past it.
+    pub(crate) fn advance(&self, phase: Phase) {
+        self.phase.send_if_modified(|current| {
+            let later = *current < phase;
+            if later {
+                *current = phase;
+            }
+            later
+        });
+    }
+
+    /// Resolves once every task has ended and dropped its handle.
+    pub(crate) async fn finished(&self) {
+        self.phase.closed().await;
+    }
+
+    /// Whether an aborted writer dropped messages it had not written.
+    pub(crate) fn discarded(&self) -> bool {
+        self.discarded.load(Ordering::Acquire)
+    }
+}
+
+/// A task's view of its owner's [`Phase`].
+///
+/// Holding one is what keeps [`Tasks::finished`] waiting.
+#[derive(Clone, Debug)]
+pub(crate) struct Teardown {
+    phase: watch::Receiver<Phase>,
+    discarded: Arc<AtomicBool>,
+}
+
+impl Teardown {
+    /// A handle whose owner never stops, for connections that tests and
+    /// benchmarks open without an endpoint. They end when their channels do.
+    #[cfg(any(test, feature = "__bench"))]
+    pub(crate) fn detached() -> Teardown {
+        static DETACHED: std::sync::OnceLock<Tasks> =
+            std::sync::OnceLock::new();
+        DETACHED.get_or_init(Tasks::new).handle()
+    }
+
+    /// The current phase. An owner that is gone without moving the phase on,
+    /// such as an endpoint whose runtime dropped its task, counts as
+    /// [`Phase::Abort`].
+    fn phase(&self) -> Phase {
+        match self.phase.has_changed() {
+            Ok(_) => *self.phase.borrow(),
+            Err(_) => Phase::Abort,
+        }
+    }
+
+    /// Resolves once the phase is `phase` or later.
+    async fn reached(&mut self, phase: Phase) {
+        let _ = self.phase.wait_for(|current| *current >= phase).await;
+    }
+
+    /// Records that a writer was aborted with output left.
+    fn discard(&self) {
+        self.discarded.store(true, Ordering::Release);
+    }
+}
 
 /// Settings for every connection a listener accepts or [`connect`] opens.
 #[derive(Clone, Copy, Debug)]
@@ -151,7 +265,7 @@ impl Writer {
     /// Queues `bytes` to be written. Returns at once.
     pub fn send(&self, bytes: Bytes) -> Result<(), SendError> {
         let permit = self.reserve(bytes.len())?;
-        self.enqueue(Write { bytes, done: None, permit: Some(permit) })
+        self.enqueue(Write::reserved(bytes, permit, None))
     }
 
     /// Queues a new client request without consuming protocol headroom.
@@ -164,7 +278,7 @@ impl Writer {
             .capacity
             .acquire_request(bytes.len())
             .ok_or(SendError::Full)?;
-        self.enqueue(Write { bytes, done: None, permit: Some(permit) })
+        self.enqueue(Write::reserved(bytes, permit, None))
     }
 
     /// Queues a client request with reserved protocol headroom and a receipt.
@@ -181,7 +295,7 @@ impl Writer {
             .acquire_request(bytes.len())
             .ok_or(SendError::Full)?;
         let (done, result) = oneshot::channel();
-        self.enqueue(Write { bytes, done: Some(done), permit: Some(permit) })?;
+        self.enqueue(Write::reserved(bytes, permit, Some(done)))?;
         Ok(Receipt(result))
     }
 
@@ -204,7 +318,7 @@ impl Writer {
     pub fn submit(&self, bytes: Bytes) -> Result<Receipt, SendError> {
         let permit = self.reserve(bytes.len())?;
         let (done, result) = oneshot::channel();
-        self.enqueue(Write { bytes, done: Some(done), permit: Some(permit) })?;
+        self.enqueue(Write::reserved(bytes, permit, Some(done)))?;
         Ok(Receipt(result))
     }
 
@@ -237,11 +351,11 @@ pub(crate) struct PreparedWrite {
 impl PreparedWrite {
     pub(crate) fn submit(self) -> Result<Receipt, SendError> {
         let (done, result) = oneshot::channel();
-        self.writer.enqueue(Write {
-            bytes: self.bytes,
-            done: Some(done),
-            permit: Some(self.permit),
-        })?;
+        self.writer.enqueue(Write::reserved(
+            self.bytes,
+            self.permit,
+            Some(done),
+        ))?;
         Ok(Receipt(result))
     }
 }
@@ -277,9 +391,27 @@ struct Write {
     bytes: Bytes,
     permit: Option<Permit>,
     done: Option<oneshot::Sender<io::Result<()>>>,
+    /// Marks the end of the queue. See [`run_connection`].
+    close: bool,
 }
 
 impl Write {
+    /// A message holding its share of the connection's write capacity.
+    fn reserved(
+        bytes: Bytes,
+        permit: Permit,
+        done: Option<oneshot::Sender<io::Result<()>>>,
+    ) -> Write {
+        Write { bytes, permit: Some(permit), done, close: false }
+    }
+
+    /// The marker that tells the writer to close its queue once it gets here.
+    /// It carries nothing and holds no reservation, and only a connection's
+    /// supervisor sends one, once.
+    fn close() -> Write {
+        Write { bytes: Bytes::new(), permit: None, done: None, close: true }
+    }
+
     fn complete(&mut self, result: io::Result<()>) {
         // The caller may send again from its completion waker. Release the
         // buffer and its reservation before making that next write possible.
@@ -293,7 +425,7 @@ impl Write {
 
 impl From<Bytes> for Write {
     fn from(bytes: Bytes) -> Self {
-        Write { bytes, done: None, permit: None }
+        Write { bytes, done: None, permit: None, close: false }
     }
 }
 
@@ -316,6 +448,7 @@ pub struct Listener {
     config: Config,
     permits: Arc<Semaphore>,
     inbound: mpsc::Sender<Inbound>,
+    teardown: Teardown,
 }
 
 impl Listener {
@@ -323,11 +456,24 @@ impl Listener {
     /// to `inbound`.
     ///
     /// Must be called from within a tokio runtime, since the listener
-    /// registers with its reactor.
+    /// registers with its reactor. The listener and its connections belong to
+    /// no endpoint, so only the closing of `inbound` stops them.
+    #[cfg(any(test, feature = "__bench"))]
     pub fn bind(
         addr: SocketAddr,
         config: Config,
         inbound: mpsc::Sender<Inbound>,
+    ) -> io::Result<Listener> {
+        Listener::bind_owned(addr, config, inbound, Teardown::detached())
+    }
+
+    /// Binds a listener whose task and connections belong to the owner of
+    /// `teardown`.
+    pub(crate) fn bind_owned(
+        addr: SocketAddr,
+        config: Config,
+        inbound: mpsc::Sender<Inbound>,
+        teardown: Teardown,
     ) -> io::Result<Listener> {
         let listener = std::net::TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
@@ -337,7 +483,7 @@ impl Listener {
             config.max_connections.min(Semaphore::MAX_PERMITS),
         ));
 
-        Ok(Listener { inner, local, config, permits, inbound })
+        Ok(Listener { inner, local, config, permits, inbound, teardown })
     }
 
     /// The address the listener is bound to.
@@ -366,23 +512,28 @@ impl Listener {
             &self.config,
             &self.inbound,
             permit,
+            &self.teardown,
         )?;
 
         Ok(flow)
     }
 
-    /// Accepts connections until the receiver of `inbound` is gone, which is
-    /// how the endpoint ends.
+    /// Accepts connections until the receiver of `inbound` is gone or the
+    /// owner reaches `Phase::Closing`, which is how the endpoint ends.
     ///
     /// An accept error is usually the process being out of descriptors. The
     /// loop waits a moment and tries again, as hyper does, rather than ending
     /// the listener over it.
     pub async fn run(self) {
+        let mut teardown = self.teardown.clone();
+        let mut closing = pin!(teardown.reached(Phase::Closing));
         let mut closed = pin!(self.inbound.closed());
         loop {
             let mut accept = pin!(self.accept());
             let accepted = poll_fn(|cx| {
-                if closed.as_mut().poll(cx).is_ready() {
+                if closing.as_mut().poll(cx).is_ready()
+                    || closed.as_mut().poll(cx).is_ready()
+                {
                     return Poll::Ready(None);
                 }
                 accept.as_mut().poll(cx).map(Some)
@@ -405,20 +556,24 @@ pub async fn connect(
     config: &Config,
     inbound: &mpsc::Sender<Inbound>,
 ) -> io::Result<(Flow, Writer)> {
-    connect_reserved(remote, config, inbound, None).await
+    connect_reserved(remote, config, inbound, None, &Teardown::detached())
+        .await
 }
 
 /// Opens a connection with a reservation held through reader and writer exit.
+/// Its tasks belong to the owner of `teardown`.
 pub(crate) async fn connect_reserved(
     remote: SocketAddr,
     config: &Config,
     inbound: &mpsc::Sender<Inbound>,
     permit: Option<OwnedSemaphorePermit>,
+    teardown: &Teardown,
 ) -> io::Result<(Flow, Writer)> {
     let stream = TcpStream::connect(remote).await?;
     let local = stream.local_addr()?;
     let flow = Flow { transport: Transport::Tcp, local, remote };
-    let writer = start(stream, flow, Role::Client, config, inbound, permit)?;
+    let writer =
+        start(stream, flow, Role::Client, config, inbound, permit, teardown)?;
 
     Ok((flow, writer))
 }
@@ -427,6 +582,7 @@ pub(crate) async fn connect_reserved(
 ///
 /// `permit` is the admission slot for the connection. It is released when the
 /// reader and writer have both ended, including drain and abort completion.
+/// The supervisor holds a clone of `teardown` until both have ended.
 fn start(
     stream: TcpStream,
     flow: Flow,
@@ -434,6 +590,7 @@ fn start(
     config: &Config,
     inbound: &mpsc::Sender<Inbound>,
     permit: impl Into<Option<OwnedSemaphorePermit>>,
+    teardown: &Teardown,
 ) -> io::Result<Writer> {
     // SIP messages are small and each one is a round trip, so coalescing only
     // adds latency.
@@ -447,6 +604,10 @@ fn start(
     }));
     let permit = Arc::new(permit.into());
     let writer_permit = permit.clone();
+    // The writer holds no `Teardown` of its own, so its path from queue to
+    // socket never touches the owner's phase channel. Its supervisor tells it
+    // to close through the queue, waits for it, which keeps it within the
+    // owner's join, and aborts it at `Phase::Abort`.
     let writing = tokio::spawn(async move {
         write_loop(write, pending).await;
         drop(writer_permit);
@@ -468,24 +629,34 @@ fn start(
     let closed_writer = Arc::downgrade(&writer.0);
     let closed_inbound = inbound.clone();
     let closed_permit = permit.clone();
+    let mut supervisor = teardown.clone();
     tokio::spawn(async move {
-        run_connection(reading, writing, permit).await;
+        let queue = closed_writer.clone();
+        run_connection(reading, writing, permit, &mut supervisor, queue).await;
         if let Some(writer) = closed_writer.upgrade() {
             let _ = closed_inbound
                 .send(Inbound { message: None, flow, writer: Writer(writer) })
                 .await;
         }
         drop(closed_permit);
+        drop(supervisor);
     });
 
     Ok(writer)
 }
 
 /// Owns connection teardown and keeps admission charged until both halves end.
+///
+/// The reader ends with [`End::Endpoint`] when the endpoint closes its channel,
+/// which it does once it is stopping. The supervisor then has the writer close
+/// its queue and finish it, and aborts the writer at [`Phase::Abort`]. A writer
+/// still running then had something left to write, which is recorded.
 async fn run_connection(
     reading: impl Future<Output = End>,
     mut writing: JoinHandle<()>,
     permit: Arc<Option<OwnedSemaphorePermit>>,
+    teardown: &mut Teardown,
+    queue: Weak<WriteSender>,
 ) {
     let end = {
         let mut reading = pin!(reading);
@@ -501,20 +672,43 @@ async fn run_connection(
     };
     // Drop the reader, including its socket half and pending inbound send,
     // before releasing admission or waiting for the writer to drain.
-    let abort = match end {
-        None => false,
+    match end {
+        None => {}
         // The connection is over. A write still in flight is lost, which
         // is no worse than the peer having gone away.
-        Some(End::Peer) => true,
-        // The endpoint's last responses still get a chance to drain. Dropping
-        // the reader above releases its Writer so it cannot keep the queue open.
-        Some(End::Endpoint) => {
-            timeout(DRAIN_TIMEOUT, &mut writing).await.is_err()
+        Some(End::Peer) => {
+            writing.abort();
+            let _ = writing.await;
         }
-    };
-    if abort {
-        writing.abort();
-        let _ = writing.await;
+        // Dropping the reader above released its Writer. The marker closes
+        // the queue once the writer reaches it, so no Writer the application
+        // still holds keeps it open. With every Writer gone, the queue is
+        // closed already.
+        Some(End::Endpoint) => {
+            if let Some(sender) = queue.upgrade() {
+                let _ = sender.queue.send(Write::close());
+            }
+            let finished = if teardown.phase() == Phase::Running {
+                // Only a connection opened without an endpoint sees its
+                // channel close while its owner runs. Nothing will abort it,
+                // so it gets a few seconds, as every connection once did.
+                timeout(UNOWNED_DRAIN, &mut writing).await.is_ok()
+            } else {
+                let mut abort = pin!(teardown.reached(Phase::Abort));
+                poll_fn(|cx| {
+                    if std::pin::Pin::new(&mut writing).poll(cx).is_ready() {
+                        return Poll::Ready(true);
+                    }
+                    abort.as_mut().poll(cx).map(|()| false)
+                })
+                .await
+            };
+            if !finished {
+                teardown.discard();
+                writing.abort();
+                let _ = writing.await;
+            }
+        }
     }
     drop(permit);
 }
@@ -589,18 +783,30 @@ async fn read_loop(
 }
 
 /// Writes queued messages until the queue closes or a write fails.
+///
+/// A [`Write::close`] marker closes the queue, after which the writer ends
+/// once the queue is written. Aborting the task drops what is unwritten, which
+/// fails those receipts and returns their reservations.
 async fn write_loop(
     mut write: impl AsyncWrite + Unpin,
     mut pending: mpsc::UnboundedReceiver<Write>,
 ) {
     let mut queue = Queue::default();
     while pending.recv_many(&mut queue.items, WRITE_BATCH).await > 0 {
-        queue.remaining =
-            queue.items.iter().map(|item| item.bytes.len()).sum();
+        let mut close = false;
+        queue.remaining = 0;
+        for item in &queue.items {
+            queue.remaining += item.bytes.len();
+            close |= item.close;
+        }
+        if close {
+            pending.close();
+        }
         // An empty write at the head is already complete, including when
         // the following nonempty write fails before making progress.
         queue.advance(0);
-        if let Err(error) = write.write_all_buf(&mut queue).await {
+        let written = write.write_all_buf(&mut queue).await;
+        if let Err(error) = written {
             // Stop admission before draining failures. Fully written messages
             // already completed in advance(), even if this batch later fails.
             pending.close();
@@ -676,7 +882,7 @@ impl Buf for Queue {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
-    use tokio::{net::TcpStream, time::sleep};
+    use tokio::{net::TcpStream, task::yield_now, time::sleep};
 
     use super::*;
     use crate::message::{Method, StatusCode};
@@ -750,6 +956,36 @@ mod tests {
         }
     }
 
+    /// Takes no bytes, and tells when it was first polled.
+    struct Stalled(Option<oneshot::Sender<()>>);
+
+    impl AsyncWrite for Stalled {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if let Some(started) = self.0.take() {
+                let _ = started.send(());
+            }
+            Poll::Pending
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
     // The async receipt tests build runtimes without an I/O driver to run
     // under Miri. #[tokio::test] initializes kqueue, which Miri does not
     // support. Channels and mock writers need no I/O driver.
@@ -776,9 +1012,13 @@ mod tests {
         writer.send(Bytes::new()).unwrap();
     }
 
+    // An application can hold a `Writer` in a reply route for as long as it
+    // likes. Closing still ends the connection once the queue is written, and
+    // the connection keeps its reservation until then.
     #[tokio::test]
     #[cfg_attr(miri, ignore)]
-    async fn connection_reservation_survives_drain_and_writer_abort() {
+    async fn closing_writes_the_queue_and_ends_the_connection() {
+        let tasks = Tasks::new();
         let (tx, rx) = mpsc::channel(1);
         let listener = TcpListener::bind(LOCALHOST).await.unwrap();
         let permits = Arc::new(Semaphore::new(1));
@@ -788,22 +1028,156 @@ mod tests {
             &Config::default(),
             &tx,
             Some(permit),
+            &tasks.handle(),
         )
         .await
         .unwrap();
-        let (_peer, _) = listener.accept().await.unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
 
-        // A retained Writer keeps the queue open after the reader notices
-        // endpoint shutdown. Its reservation lasts through the drain timeout.
+        let receipt = writer.submit(Bytes::from_static(RESPONSE)).unwrap();
+        tasks.advance(Phase::Closing);
         drop(rx);
-        tokio::task::yield_now().await;
-        assert_eq!(permits.available_permits(), 0);
-        timeout(DRAIN_TIMEOUT + Duration::from_secs(1), async {
-            let _permit = permits.acquire().await.unwrap();
-            assert!(writer.is_closed());
-        })
-        .await
+
+        receipt.await.unwrap();
+        assert_eq!(read_all(&mut peer).await, RESPONSE);
+        timeout(Duration::from_secs(1), tasks.finished()).await.unwrap();
+        assert_eq!(permits.available_permits(), 1);
+        assert!(writer.is_closed());
+        assert_eq!(writer.send(Bytes::new()), Err(SendError::Closed));
+        assert!(!tasks.discarded());
+    }
+
+    /// A writer that stalls on its first write, under the supervisor of a
+    /// connection whose endpoint has already closed its channel.
+    fn stalled_connection(
+        tasks: &Tasks,
+        messages: usize,
+        bytes: usize,
+    ) -> (Writer, Receipt, oneshot::Receiver<()>, JoinHandle<()>) {
+        let (writer, pending) = test_writer(messages, bytes);
+        let (started, waiting) = oneshot::channel();
+        let stalled = writer.submit(Bytes::from_static(b"abc")).unwrap();
+        let writing =
+            tokio::spawn(write_loop(Stalled(Some(started)), pending));
+        let mut teardown = tasks.handle();
+        let queue = Arc::downgrade(&writer.0);
+        let supervisor = tokio::spawn(async move {
+            run_connection(
+                std::future::ready(End::Endpoint),
+                writing,
+                Arc::new(None),
+                &mut teardown,
+                queue,
+            )
+            .await;
+        });
+
+        (writer, stalled, waiting, supervisor)
+    }
+
+    // The owner's deadline is the only bound on a writer the peer does not
+    // read from. Closing waits for it, and aborting drops what is left.
+    #[test]
+    fn abort_stops_a_stalled_writer_and_fails_its_receipts() {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let tasks = Tasks::new();
+                tasks.advance(Phase::Closing);
+                let (writer, stalled, waiting, supervisor) =
+                    stalled_connection(&tasks, 2, 6);
+                waiting.await.unwrap();
+                yield_now().await;
+
+                assert!(!supervisor.is_finished());
+                let queued =
+                    writer.submit(Bytes::from_static(b"def")).unwrap();
+
+                tasks.advance(Phase::Abort);
+                tasks.finished().await;
+                supervisor.await.unwrap();
+
+                assert!(stalled.await.is_err());
+                assert!(queued.await.is_err());
+                assert!(writer.is_closed());
+                assert!(writer.0.capacity.acquire(6).is_some());
+                assert!(tasks.discarded());
+            });
+    }
+
+    // A writer whose owner is gone without a phase, such as an endpoint task
+    // its runtime dropped, stops as if aborted.
+    #[test]
+    fn a_vanished_owner_aborts_the_writer() {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let tasks = Tasks::new();
+                tasks.advance(Phase::Closing);
+                let (writer, stalled, waiting, supervisor) =
+                    stalled_connection(&tasks, 1, 3);
+                waiting.await.unwrap();
+
+                drop(tasks);
+                supervisor.await.unwrap();
+
+                assert!(stalled.await.is_err());
+                assert!(writer.0.capacity.acquire(3).is_some());
+            });
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn closing_stops_a_listener_waiting_to_accept() {
+        let tasks = Tasks::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let listener =
+            Listener::bind_owned(LOCALHOST, config(), tx, tasks.handle())
+                .unwrap();
+        let addr = listener.local_addr();
+        tokio::spawn(listener.run());
+        yield_now().await;
+
+        tasks.advance(Phase::Closing);
+
+        timeout(Duration::from_secs(1), tasks.finished()).await.unwrap();
+        assert!(TcpStream::connect(addr).await.is_err());
+    }
+
+    // The reader waits for room in the endpoint's channel. Closing that
+    // channel ends the wait, so a peer that keeps sending cannot hold the
+    // endpoint's teardown.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn a_reader_held_by_backpressure_ends_with_the_channel() {
+        let tasks = Tasks::new();
+        let (tx, mut rx) = mpsc::channel(1);
+        let listener = Listener::bind_owned(
+            LOCALHOST,
+            config(),
+            tx.clone(),
+            tasks.handle(),
+        )
         .unwrap();
+        let addr = listener.local_addr();
+        tokio::spawn(listener.run());
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        for _ in 0..3 {
+            client.write_all(REQUEST).await.unwrap();
+        }
+        assert!(rx.recv().await.unwrap().message.is_some());
+        // The channel holds one message, and the reader waits to send the
+        // third.
+        sleep(Duration::from_millis(50)).await;
+
+        tasks.advance(Phase::Closing);
+        rx.close();
+
+        timeout(Duration::from_secs(1), tasks.finished()).await.unwrap();
+        assert!(read_all(&mut client).await.is_empty());
+        drop(tx);
     }
 
     #[test]
@@ -849,8 +1223,17 @@ mod tests {
                         write_loop(FailsAfter(1), pending).await;
                         drop(writer_permit);
                     });
-                    let connection =
-                        tokio::spawn(run_connection(reading, writing, permit));
+                    let connection = tokio::spawn(async move {
+                        let mut teardown = Teardown::detached();
+                        run_connection(
+                            reading,
+                            writing,
+                            permit,
+                            &mut teardown,
+                            Weak::new(),
+                        )
+                        .await;
+                    });
                     ready.await.unwrap();
                     assert_eq!(slots.available_permits(), 0);
                     let partial =
@@ -1096,33 +1479,6 @@ mod tests {
 
     #[test]
     fn failed_and_aborted_writes_return_their_full_budget() {
-        struct Stalled(Option<oneshot::Sender<()>>);
-
-        impl AsyncWrite for Stalled {
-            fn poll_write(
-                mut self: std::pin::Pin<&mut Self>,
-                _: &mut std::task::Context<'_>,
-                _: &[u8],
-            ) -> Poll<io::Result<usize>> {
-                if let Some(started) = self.0.take() {
-                    let _ = started.send(());
-                }
-                Poll::Pending
-            }
-            fn poll_flush(
-                self: std::pin::Pin<&mut Self>,
-                _: &mut std::task::Context<'_>,
-            ) -> Poll<io::Result<()>> {
-                Poll::Pending
-            }
-            fn poll_shutdown(
-                self: std::pin::Pin<&mut Self>,
-                _: &mut std::task::Context<'_>,
-            ) -> Poll<io::Result<()>> {
-                Poll::Pending
-            }
-        }
-
         tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()

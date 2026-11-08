@@ -722,10 +722,16 @@ impl Builder {
             .transpose()
             .map_err(BindError::io)?;
         let (tcp_tx, tcp_rx) = mpsc::channel(TCP_INBOUND);
+        let tasks = tcp::Tasks::new();
         let listener = self
             .tcp
             .map(|addr| {
-                tcp::Listener::bind(addr, self.config.tcp, tcp_tx.clone())
+                tcp::Listener::bind_owned(
+                    addr,
+                    self.config.tcp,
+                    tcp_tx.clone(),
+                    tasks.handle(),
+                )
             })
             .transpose()
             .map_err(BindError::io)?;
@@ -745,6 +751,7 @@ impl Builder {
             tcp_tx,
             commands_rx,
             commands.downgrade(),
+            tasks,
         );
         let endpoint = Endpoint {
             client_admission: driver.client_admission(),

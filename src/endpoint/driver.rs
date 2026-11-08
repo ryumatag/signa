@@ -16,12 +16,24 @@ before its time, and one whose transaction is gone finds nothing. The timer
 queue also compacts stale entries and shrinks its allocation relative to live
 table entries, so fast transaction churn cannot retain an unbounded history.
 
-A shutdown is a deadline on the heap too. From the command on, the driver
-answers new requests with a 503 and refuses new sends, and it stops as soon as
-nothing is open any more, or at the deadline. Stopping is dropping the driver.
-That drops the transactions, answers the client futures with a closed error,
-and closes the sockets. The TCP readers see their channel close and end their
-connections.
+A shutdown is a deadline on the heap too. From the request on, the driver
+answers new requests with a 503 and refuses new client transactions, while the
+transactions it has go on to Terminated on their own timers. Once nothing is
+left, which [`Driver::is_drained`] decides, it closes the command queue and
+the TU work guards together and runs what was queued before that. The queue is
+the commit point of every operation, so an operation is either run or refused
+with a closed error, never dropped after its caller was told it was taken. If
+it is still drained after that, the driver stops gracefully. At the deadline
+it stops whatever is left. The deadline waits for the transaction timers due
+at the same instant, as input does.
+
+Stopping has two steps. The driver first drops itself apart from what the
+second step needs, which drops the transactions, answers the waiting futures
+with a closed error and closes the sockets. It then moves its TCP tasks to
+[`tcp::Phase::Closing`], or to [`tcp::Phase::Abort`] when it was forced, and
+waits for them all to end, still bounded by the deadline. Only then does it
+publish the [`ShutdownOutcome`]. Waiting there is fine, since nothing else is
+left for the driver to do.
 */
 
 use std::{
@@ -30,7 +42,7 @@ use std::{
     io, mem,
     net::{IpAddr, SocketAddr},
     ops::{Deref, DerefMut},
-    pin::Pin,
+    pin::{pin, Pin},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc,
@@ -43,7 +55,7 @@ use bytes::Bytes;
 use foldhash::fast::RandomState;
 use tokio::{
     sync::{mpsc, oneshot, watch, Semaphore},
-    time::Sleep,
+    time::{sleep_until, Sleep},
 };
 
 use crate::{
@@ -66,7 +78,7 @@ use crate::{
             self, IncomingEvent, ReceivedRequest, ServerRequest,
             ServerTransactionId, SubmitError,
         },
-        shutdown,
+        shutdown::{self, ShutdownOutcome},
         table::{Id, Table},
         timer::{Key, TimerQueue},
     },
@@ -155,9 +167,6 @@ pub(super) enum Command {
         result: io::Result<(Flow, tcp::Writer)>,
         _attempt: crate::transport::budget::Permit,
     },
-    /// An `Endpoint` asks the driver to stop once nothing is open, or after
-    /// the shared deadline. Waiters observe the shared completion channel.
-    Shutdown,
 }
 
 struct ServerEntry {
@@ -525,8 +534,79 @@ enum Event {
     Datagram(Bytes, Flow),
     /// Every handle is gone.
     Stop,
+    /// A shutdown request, or the last work guard's drop.
+    Control,
+    /// A shutdown has nothing left to wait for.
+    Drained,
     /// A responder was dropped before an accepted final response.
     Abandon(Arc<server::Shared>, ReplyRoute),
+}
+
+/// Why [`Driver::serve`] returned.
+enum End {
+    /// A shutdown found nothing left.
+    Drained,
+    /// The shutdown deadline came first.
+    Expired,
+    /// Every handle is gone, so nobody waits for the outcome.
+    Abandoned,
+}
+
+/// How long the TCP writers of an endpoint whose last handle dropped get to
+/// write what is queued. A peer that takes longer to read a few messages is
+/// not reading at all.
+const ABANDONED_FLUSH: Duration = Duration::from_secs(5);
+
+/// What is left of a stopping driver while its transport tasks end.
+struct Stopping {
+    tasks: tcp::Tasks,
+    done: watch::Sender<Option<ShutdownOutcome>>,
+    shutdown: Arc<shutdown::Control>,
+    /// Another shutdown call can still bring the deadline forward. `None`
+    /// once every handle that could make one is gone.
+    control: Option<mpsc::Receiver<()>>,
+    sleep: Option<Pin<Box<Sleep>>>,
+}
+
+impl Stopping {
+    /// Waits for the transport tasks to end, aborting them at the deadline.
+    async fn join(&mut self) {
+        let Stopping { tasks, shutdown, control, sleep, .. } = self;
+        let mut finished = pin!(tasks.finished());
+        poll_fn(|cx| loop {
+            if finished.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(());
+            }
+            if let Some(receiver) = control {
+                match receiver.poll_recv(cx) {
+                    Poll::Ready(Some(())) => {
+                        if let Some(Some(at)) = shutdown.take() {
+                            let at = tokio::time::Instant::from_std(at);
+                            match sleep {
+                                Some(sleep) if sleep.deadline() <= at => {}
+                                Some(sleep) => sleep.as_mut().reset(at),
+                                None => {
+                                    *sleep = Some(Box::pin(sleep_until(at)))
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    Poll::Ready(None) => *control = None,
+                    Poll::Pending => {}
+                }
+            }
+            if let Some(deadline) = sleep {
+                if deadline.as_mut().poll(cx).is_ready() {
+                    tasks.advance(tcp::Phase::Abort);
+                    *sleep = None;
+                    continue;
+                }
+            }
+            return Poll::Pending;
+        })
+        .await;
+    }
 }
 
 pub(super) struct Driver {
@@ -590,11 +670,16 @@ pub(super) struct Driver {
     sleep: Pin<Box<Sleep>>,
     /// Client transactions without a final response or an error yet.
     unanswered: usize,
-    /// Set by the first shutdown command. New requests get a 503 from then on,
+    /// Set by the first shutdown request. New requests get a 503 from then on,
     /// and the driver stops once `is_drained` says so.
     shutting_down: bool,
-    /// Closing this single sender wakes every caller-owned shutdown receiver.
-    pub(super) shutdown_done: watch::Sender<()>,
+    /// Set once a drained shutdown has closed the command queue and the work
+    /// guards. The queued commands still run.
+    stopping: bool,
+    /// Every shutdown waiter reads the outcome from this one value.
+    pub(super) shutdown_done: watch::Sender<Option<ShutdownOutcome>>,
+    /// The listener and connection tasks.
+    tasks: tcp::Tasks,
     pub(super) shutdown_control: Arc<shutdown::Control>,
     next_source: usize,
     pub(super) control: mpsc::Sender<()>,
@@ -627,6 +712,7 @@ pub(super) struct Driver {
 
 impl Driver {
     /// Must be called from within a tokio runtime, for the timer.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         incoming: mpsc::UnboundedSender<server::Queued>,
         config: Config,
@@ -635,6 +721,7 @@ impl Driver {
         tcp_tx: mpsc::Sender<tcp::Inbound>,
         commands: mpsc::UnboundedReceiver<Command>,
         command_sender: mpsc::WeakUnboundedSender<Command>,
+        tasks: tcp::Tasks,
     ) -> Driver {
         let (internal_tx, internal) = mpsc::unbounded_channel();
         let (control, control_rx) = mpsc::channel(32);
@@ -710,7 +797,9 @@ impl Driver {
             sleep: Box::pin(tokio::time::sleep(std::time::Duration::ZERO)),
             unanswered: 0,
             shutting_down: false,
-            shutdown_done: watch::channel(()).0,
+            stopping: false,
+            shutdown_done: watch::channel(None).0,
+            tasks,
             shutdown_control: Arc::default(),
             next_source: 0,
             control,
@@ -744,6 +833,12 @@ impl Driver {
     }
 
     pub(super) async fn run(mut self) {
+        let end = self.serve().await;
+        self.stop(end).await;
+    }
+
+    /// Runs until the endpoint stops, and says why.
+    async fn serve(&mut self) -> End {
         let mut turns = 0;
         loop {
             if turns == 64 {
@@ -763,7 +858,7 @@ impl Driver {
             turns += 1;
 
             match poll_fn(|cx| self.poll_event(cx)).await {
-                Event::Timer(Key::Shutdown) => return,
+                Event::Timer(Key::Shutdown) => return self.at_deadline(),
                 Event::Timer(key) => self.on_timer(key),
                 Event::Command(command) => self.on_command(command),
                 Event::Inbound(inbound) => {
@@ -788,8 +883,102 @@ impl Driver {
                     }
                 }
                 Event::Abandon(shared, _route) => self.abandon(&shared),
-                Event::Stop => return,
+                Event::Control => self.on_control(),
+                Event::Drained => return End::Drained,
+                Event::Stop => return End::Abandoned,
             }
+        }
+    }
+
+    /// Handles the shutdown deadline. Timers due by then run first, so a
+    /// transaction that ends at the deadline ends before it, as it would
+    /// before input at the same instant. A timer due after the deadline does
+    /// not count, even if the driver woke late.
+    fn at_deadline(&mut self) -> End {
+        let deadline = self.timers.shutdown_deadline().unwrap_or_else(now);
+        while self.timers.deadline().is_some_and(|at| at <= deadline) {
+            match self.timers.pop() {
+                Some(Key::Shutdown) | None => {}
+                Some(key) => self.on_timer(key),
+            }
+        }
+
+        if !self.is_drained() || !self.shutdown_control.close_guards_if_idle()
+        {
+            return End::Expired;
+        }
+        // As in `poll_event`, closing the queue is the decision. A command
+        // that got in before it was committed by its caller and runs, and a
+        // later one is refused. One that leaves work behind, such as a write,
+        // makes the outcome an expiry, since nothing waits for it now.
+        self.commands.close();
+        while let Ok(command) = self.commands.try_recv() {
+            self.on_command(command);
+        }
+        if self.is_drained() {
+            End::Drained
+        } else {
+            End::Expired
+        }
+    }
+
+    /// Stops the transport tasks and publishes the outcome.
+    ///
+    /// See the module docs. The driver drops what it no longer needs before it
+    /// waits, so observers learn that the endpoint closed without waiting for
+    /// the TCP connections.
+    async fn stop(self, end: End) {
+        self.shutdown_control.close_guards();
+        let phase = match end {
+            End::Drained | End::Abandoned => tcp::Phase::Closing,
+            End::Expired => tcp::Phase::Abort,
+        };
+        self.tasks.advance(phase);
+        // The last handle's drop forces the protocol work, but writes queued
+        // before it still get the time they always had.
+        let deadline = match end {
+            End::Abandoned => {
+                let flush = now().checked_add(ABANDONED_FLUSH);
+                match (self.timers.shutdown_deadline(), flush) {
+                    (Some(at), Some(flush)) => Some(at.min(flush)),
+                    (at, flush) => at.or(flush),
+                }
+            }
+            End::Drained | End::Expired => self.timers.shutdown_deadline(),
+        };
+        let mut stopping = self.into_stopping(deadline);
+
+        stopping.join().await;
+
+        let drained =
+            matches!(end, End::Drained) && !stopping.tasks.discarded();
+        stopping.done.send_replace(Some(if drained {
+            ShutdownOutcome::Drained
+        } else {
+            ShutdownOutcome::DeadlineExpired
+        }));
+    }
+
+    /// Keeps what the transport teardown needs and drops the rest.
+    fn into_stopping(self, deadline: Option<Instant>) -> Stopping {
+        let Driver {
+            tasks,
+            shutdown_done,
+            shutdown_control,
+            control_rx,
+            mut sleep,
+            ..
+        } = self;
+        if let Some(at) = deadline {
+            sleep.as_mut().reset(tokio::time::Instant::from_std(at));
+        }
+
+        Stopping {
+            tasks,
+            done: shutdown_done,
+            shutdown: shutdown_control,
+            control: Some(control_rx),
+            sleep: deadline.map(|_| sleep),
         }
     }
 
@@ -799,7 +988,7 @@ impl Driver {
     /// sees the tables after everything that arrived has been handled.
     fn poll_event(&mut self, cx: &mut Context<'_>) -> Poll<Event> {
         if let Poll::Ready(Some(())) = self.control_rx.poll_recv(cx) {
-            return Poll::Ready(Event::Command(Command::Shutdown));
+            return Poll::Ready(Event::Control);
         }
 
         let servers = &self.servers;
@@ -918,9 +1107,16 @@ impl Driver {
                     .internal
                     .poll_recv(cx)
                     .map(|command| command.map(Event::Command)),
-                2 => self.commands.poll_recv(cx).map(|command| {
-                    Some(command.map_or(Event::Stop, Event::Command))
-                }),
+                // The queue ends either because every handle is gone or
+                // because a drained shutdown closed it and ran what was left.
+                2 => {
+                    let stopping = self.stopping;
+                    self.commands.poll_recv(cx).map(|command| match command {
+                        Some(command) => Some(Event::Command(command)),
+                        None if stopping => None,
+                        None => Some(Event::Stop),
+                    })
+                }
                 3 => self
                     .tcp
                     .poll_recv(cx)
@@ -960,7 +1156,16 @@ impl Driver {
         }
 
         if self.shutting_down && self.is_drained() {
-            return Poll::Ready(Event::Stop);
+            if self.stopping {
+                return Poll::Ready(Event::Drained);
+            }
+            // A guard taken after `is_drained` looked wins, and its drop wakes
+            // the driver again.
+            if self.shutdown_control.close_guards_if_idle() {
+                self.stopping = true;
+                self.commands.close();
+                cx.waker().wake_by_ref();
+            }
         }
 
         Poll::Pending
@@ -982,9 +1187,19 @@ impl Driver {
         Poll::Pending
     }
 
-    /// Returns whether protocol and transport work has drained.
+    /// Returns whether protocol, TU and transport work has drained.
+    ///
+    /// A transaction counts until its machine reaches Terminated and leaves
+    /// the table, whatever its handles and observers do. That includes an
+    /// INVITE in Accepted until Timer L or M, and every Completed or Confirmed
+    /// entry until its timer. Unread events in `Incoming` do not count, since
+    /// reading them is the TU's business, and neither do reply routes and
+    /// endpoint handles. A work guard is how the TU says that it has more.
     fn is_drained(&self) -> bool {
-        self.client_writes.is_empty()
+        self.servers.len() == 0
+            && self.clients.len() == 0
+            && self.shutdown_control.guards_idle()
+            && self.client_writes.is_empty()
             && self.writes.is_empty()
             && self.server_writes.is_empty()
             && self.live_work_is_drained()
@@ -1025,13 +1240,17 @@ impl Driver {
             Command::Connected { remote, result, _attempt } => {
                 self.on_connected(remote, result);
             }
-            Command::Shutdown => {
-                self.client_admission.0.close();
-                self.shutting_down = true;
-                if let Some(at) = self.shutdown_control.take() {
-                    self.timers.push(at, Key::Shutdown);
-                }
-            }
+        }
+    }
+
+    /// Takes a shutdown request. A wakeup without one, such as the last work
+    /// guard's drop, only makes the driver check whether it has drained.
+    fn on_control(&mut self) {
+        let Some(deadline) = self.shutdown_control.take() else { return };
+        self.client_admission.0.close();
+        self.shutting_down = true;
+        if let Some(at) = deadline {
+            self.timers.push(at, Key::Shutdown);
         }
     }
 
@@ -1324,12 +1543,14 @@ impl Driver {
         let deadline = self.config.connect_timeout;
         let inbound = self.tcp_tx.clone();
         let internal = self.internal_tx.clone();
+        let teardown = self.tasks.handle();
         tokio::spawn(async move {
             let connect = tcp::connect_reserved(
                 remote,
                 &config,
                 &inbound,
                 Some(connection),
+                &teardown,
             );
             let result = connect_until(connect, &inbound, deadline).await;
             let _ = internal.send(Command::Connected {
@@ -2779,8 +3000,8 @@ async fn connect_until<T>(
     inbound: &mpsc::Sender<tcp::Inbound>,
     deadline: Duration,
 ) -> io::Result<T> {
-    let mut connect = std::pin::pin!(tokio::time::timeout(deadline, connect));
-    let mut closed = std::pin::pin!(inbound.closed());
+    let mut connect = pin!(tokio::time::timeout(deadline, connect));
+    let mut closed = pin!(inbound.closed());
     poll_fn(|cx| {
         if closed.as_mut().poll(cx).is_ready() {
             return Poll::Ready(Err(io::Error::new(
@@ -2894,6 +3115,7 @@ mod tests {
 
     use tokio::{
         net::UdpSocket,
+        task::yield_now,
         time::{advance, timeout},
     };
     use tower_service::Service;
@@ -3115,7 +3337,7 @@ mod tests {
         drop(peer);
         timeout(Duration::from_secs(1), async {
             while !writer.is_closed() {
-                tokio::task::yield_now().await;
+                yield_now().await;
             }
         })
         .await
@@ -3212,8 +3434,17 @@ mod tests {
     #[tokio::test]
     async fn ready_internal_commands_do_not_starve_udp() {
         let (mut driver, _commands, local) = reply_driver();
+        // A connect result for a route nobody waits for is a no-op.
+        let attempts = Budget::new(WriteLimits { messages: 100, bytes: 0 });
         for _ in 0..100 {
-            driver.internal_tx.send(Command::Shutdown).unwrap();
+            driver
+                .internal_tx
+                .send(Command::Connected {
+                    remote: SocketAddr::from(([127, 0, 0, 1], 9)),
+                    result: Err(io::ErrorKind::ConnectionRefused.into()),
+                    _attempt: attempts.acquire(0).unwrap(),
+                })
+                .unwrap();
         }
 
         let peer = UdpSocket::bind(REPLY_LOCAL).await.unwrap();
@@ -3257,13 +3488,43 @@ mod tests {
         assert!(driver.commands.is_empty());
         assert!(matches!(
             poll_fn(|cx| driver.poll_event(cx)).await,
-            Event::Command(Command::Shutdown)
+            Event::Control
         ));
 
-        driver.on_command(Command::Shutdown);
+        driver.on_control();
         assert!(driver.shutting_down);
         assert!(!driver.shutdown_control.request(Duration::from_secs(60)));
         assert!(driver.shutdown_control.request(Duration::ZERO));
+    }
+
+    // A guard's drop wakes the driver through the same control queue without
+    // starting a shutdown, and a full queue still wakes it once.
+    #[tokio::test]
+    async fn the_last_guard_wakes_the_driver_without_a_command() {
+        let (mut driver, commands, _) = reply_driver();
+        let guards: Vec<_> = (0..100)
+            .map(|_| {
+                shutdown::WorkGuard::new(
+                    driver.shutdown_control.clone(),
+                    driver.control.clone(),
+                    commands.clone(),
+                )
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(driver.control_rx.len(), 0);
+
+        drop(guards);
+
+        assert_eq!(driver.control_rx.len(), 1);
+        assert!(driver.commands.is_empty());
+        assert!(matches!(
+            poll_fn(|cx| driver.poll_event(cx)).await,
+            Event::Control
+        ));
+        driver.on_control();
+        assert!(!driver.shutting_down);
+        assert!(driver.shutdown_control.guards_idle());
     }
 
     #[tokio::test]
@@ -3277,7 +3538,7 @@ mod tests {
         drop(endpoint);
         timeout(Duration::from_secs(1), async {
             for wait in waits {
-                wait.await;
+                assert_eq!(wait.await, ShutdownOutcome::Drained);
             }
         })
         .await
@@ -3566,7 +3827,7 @@ mod tests {
         drop(peer);
         timeout(Duration::from_secs(1), async {
             while !writer.is_closed() {
-                tokio::task::yield_now().await;
+                yield_now().await;
             }
         })
         .await
@@ -3717,7 +3978,7 @@ mod tests {
         let all = capacity.clone().acquire_many_owned(64).await.unwrap();
 
         {
-            let mut send = std::pin::pin!(route.send(response.clone()));
+            let mut send = pin!(route.send(response.clone()));
             poll_fn(|cx| {
                 assert!(send.as_mut().poll(cx).is_pending());
                 Poll::Ready(())
@@ -3729,7 +3990,7 @@ mod tests {
         drop(all);
 
         {
-            let mut send = std::pin::pin!(route.send(response.clone()));
+            let mut send = pin!(route.send(response.clone()));
             poll_fn(|cx| {
                 assert!(send.as_mut().poll(cx).is_pending());
                 Poll::Ready(())
@@ -3771,7 +4032,7 @@ mod tests {
         let capacity = driver.reply_admission.0.clone();
         let all = capacity.acquire_many_owned(64).await.unwrap();
 
-        let mut send = std::pin::pin!(route.send(route_response(&request)));
+        let mut send = pin!(route.send(route_response(&request)));
         poll_fn(|cx| {
             assert!(send.as_mut().poll(cx).is_pending());
             Poll::Ready(())
@@ -4049,26 +4310,27 @@ mod tests {
         );
     }
 
+    /// Lets the driver's UDP backlog drain, which `run` would do.
+    async fn flush(driver: &mut Driver) {
+        timeout(
+            Duration::from_secs(3),
+            poll_fn(|cx| {
+                let udp = driver.udp.as_mut().unwrap();
+                udp.poll_flush(cx);
+                if udp.is_idle() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn a_retransmission_without_receipt_capacity_keeps_the_transaction()
     {
-        async fn flush(driver: &mut Driver) {
-            timeout(
-                Duration::from_secs(3),
-                poll_fn(|cx| {
-                    let udp = driver.udp.as_mut().unwrap();
-                    udp.poll_flush(cx);
-                    if udp.is_idle() {
-                        Poll::Ready(())
-                    } else {
-                        Poll::Pending
-                    }
-                }),
-            )
-            .await
-            .unwrap();
-        }
-
         let (mut driver, commands, _local) = reply_driver_with(Config {
             timers: Timers::builder()
                 .t1(Duration::from_millis(10))
@@ -4137,7 +4399,7 @@ mod tests {
     fn now_or_never<F: Future>(future: F) -> Option<F::Output> {
         let waker = Waker::from(Arc::new(Noop));
         let mut cx = Context::from_waker(&waker);
-        let mut future = std::pin::pin!(future);
+        let mut future = pin!(future);
         match future.as_mut().poll(&mut cx) {
             Poll::Ready(output) => Some(output),
             Poll::Pending => None,
@@ -4442,5 +4704,172 @@ mod tests {
         let cancel = t.received().await;
         assert_eq!(cancel.method(), Method::CANCEL);
         assert_eq!(cancel.headers().get(TO), current_sent.headers().get(TO));
+    }
+
+    /// An INVITE answered with a 200 by a TU that then dropped its handles,
+    /// with a shutdown requested at `first` that ends at `deadline`.
+    async fn accepted_and_shutting_down(
+        deadline: Duration,
+    ) -> (DriverFixture, mpsc::UnboundedSender<Command>, Id, Instant) {
+        let (mut fixture, commands, local) = reply_driver();
+        let peer = UdpSocket::bind(REPLY_LOCAL).await.unwrap();
+        let link = udp_reply_link(local, peer.local_addr().unwrap());
+        let via = format!(
+            "SIP/2.0/UDP {};branch=z9hG4bKdrain",
+            peer.local_addr().unwrap()
+        );
+        let mut request = route_request(&via);
+        *request.method_mut() = Method::INVITE;
+        request.headers_mut().insert(CSEQ, "1 INVITE".parse().unwrap());
+
+        fixture.on_request(request, link);
+        let received = fixture.take_request();
+        let slot = received.transaction.responder.shared.slot;
+        let first = now();
+        let ok = reply(&received.request, 200, "a");
+        fixture
+            .accept_response(slot, ok.status(), ok.to_bytes(), None)
+            .unwrap();
+        drop(received);
+        flush(&mut fixture).await;
+        assert!(fixture.shutdown_control.request(deadline));
+        fixture.on_control();
+
+        (fixture, commands, slot, first)
+    }
+
+    // RFC 6026 section 8.7. The server keeps an INVITE in Accepted until
+    // Timer L, after its final response and with its handles dropped, and
+    // the drain waits for it. A deadline at L's instant runs L first, as a
+    // timer does before input at the same instant, so the outcome is a
+    // drain. A deadline before L is not.
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_waits_for_timer_l_and_runs_it_before_a_deadline_at_l()
+    {
+        let (mut fixture, commands, slot, first) =
+            accepted_and_shutting_down(64 * T1).await;
+        assert!(fixture.shutting_down);
+        assert!(fixture.work.is_idle());
+        assert!(fixture.servers.get(slot).is_some());
+        assert!(!fixture.is_drained());
+
+        advance(64 * T1 - Duration::from_millis(1)).await;
+        fire_due(&mut fixture);
+        assert!(!fixture.is_drained());
+        advance(Duration::from_millis(1)).await;
+        assert_eq!(now(), first + 64 * T1);
+        assert!(matches!(fixture.at_deadline(), End::Drained));
+        assert!(fixture.servers.get(slot).is_none());
+        let guard = shutdown::WorkGuard::new(
+            fixture.shutdown_control.clone(),
+            fixture.control.clone(),
+            commands,
+        );
+        assert!(guard.unwrap_err().is_closed());
+
+        let (mut fixture, _commands, slot, _) =
+            accepted_and_shutting_down(64 * T1 - Duration::from_millis(1))
+                .await;
+        advance(64 * T1 - Duration::from_millis(1)).await;
+        assert!(matches!(fixture.at_deadline(), End::Expired));
+        assert!(fixture.servers.get(slot).is_some());
+    }
+
+    // Once drained, the driver closes its command queue and its work guards
+    // in one step. A guard taken before still holds the drain, and the last
+    // guard's drop lets the driver decide.
+    #[tokio::test(start_paused = true)]
+    async fn the_stop_decision_closes_commands_and_guards_together() {
+        let (mut fixture, commands, local) = reply_driver();
+        let endpoint = fixture_endpoint(&fixture, commands, local);
+        let guard = endpoint.work_guard().unwrap();
+        drop(endpoint.clone().shutdown(Duration::from_secs(1)));
+        assert!(matches!(
+            poll_fn(|cx| fixture.poll_event(cx)).await,
+            Event::Control
+        ));
+        fixture.on_control();
+        assert!(!fixture.is_drained());
+
+        let waker = Waker::from(Arc::new(Noop));
+        let mut cx = Context::from_waker(&waker);
+        assert!(fixture.poll_event(&mut cx).is_pending());
+        assert!(!fixture.stopping);
+        drop(guard);
+        assert!(matches!(
+            poll_fn(|cx| fixture.poll_event(cx)).await,
+            Event::Control
+        ));
+        fixture.on_control();
+
+        // With nothing left, the driver decides, and refuses from then on.
+        assert!(fixture.poll_event(&mut cx).is_pending());
+        assert!(fixture.stopping);
+        assert!(endpoint.work_guard().unwrap_err().is_closed());
+        let refused = now_or_never(endpoint.send_request(
+            route_request("SIP/2.0/UDP example.com:9"),
+            Target::new(Transport::Udp, local),
+            ViaMode::Fresh,
+        ));
+        assert!(refused.unwrap().unwrap_err().is_closed());
+    }
+
+    // At the deadline the same decision runs a command queued before it, so
+    // its caller is not told that the endpoint closed, and refuses a later
+    // one.
+    #[tokio::test(start_paused = true)]
+    async fn the_deadline_runs_commands_queued_before_its_decision() {
+        let (mut fixture, commands, local) = reply_driver();
+        let endpoint = fixture_endpoint(&fixture, commands, local);
+        drop(endpoint.clone().shutdown(Duration::from_secs(1)));
+        assert!(matches!(
+            poll_fn(|cx| fixture.poll_event(cx)).await,
+            Event::Control
+        ));
+        fixture.on_control();
+        let mut queued = Box::pin(endpoint.send_request(
+            route_request("SIP/2.0/UDP example.com:9"),
+            Target::new(Transport::Udp, local),
+            ViaMode::Fresh,
+        ));
+        assert!(now_or_never(queued.as_mut()).is_none());
+
+        advance(Duration::from_secs(1)).await;
+        fixture.at_deadline();
+
+        assert!(fixture.commands.is_empty());
+        // It ran. The fixture's wildcard address makes the send itself fail.
+        let ran = now_or_never(queued.as_mut());
+        let closed = matches!(&ran, Some(Err(error)) if error.is_closed());
+        assert!(!closed, "{ran:?}");
+        let refused = now_or_never(endpoint.send_request(
+            route_request("SIP/2.0/UDP example.com:9"),
+            Target::new(Transport::Udp, local),
+            ViaMode::Fresh,
+        ));
+        assert!(refused.unwrap().unwrap_err().is_closed());
+    }
+
+    // A connect in progress is accepted work, so it holds the drain, and the
+    // deadline gives up on it. The attempt itself ends with the endpoint's
+    // channel, see `connect_deadline_and_endpoint_close_drop_the_attempt`.
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_connect_holds_the_drain_until_the_deadline() {
+        let (mut fixture, _commands, _) = reply_driver();
+        assert!(fixture.shutdown_control.request(Duration::from_secs(1)));
+        fixture.on_control();
+        assert!(fixture.is_drained());
+
+        fixture.routes.insert(
+            SocketAddr::from(([127, 0, 0, 1], 9)),
+            Route {
+                tcp: TcpState::Connecting(Vec::new()),
+                ..Route::default()
+            },
+        );
+
+        assert!(!fixture.is_drained());
+        advance(Duration::from_secs(1)).await;
+        assert!(matches!(fixture.at_deadline(), End::Expired));
     }
 }

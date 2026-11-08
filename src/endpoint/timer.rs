@@ -73,6 +73,11 @@ impl TimerQueue {
         self.heap.peek().map(|entry| entry.at)
     }
 
+    /// The earliest shutdown deadline pushed so far.
+    pub(super) fn shutdown_deadline(&self) -> Option<Instant> {
+        self.shutdown
+    }
+
     pub(super) fn pop(&mut self) -> Option<Key> {
         self.heap.pop().map(|entry| entry.key)
     }
