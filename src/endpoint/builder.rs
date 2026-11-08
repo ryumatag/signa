@@ -15,9 +15,75 @@ use crate::{
     transport::{budget::Budget, tcp, udp, MessageLimits, WriteLimits},
 };
 
+/// How an endpoint receives messages, fixed when it is bound.
+///
+/// # Stateful
+///
+/// The default, for a UA or a stateful proxy. A new request with an RFC 3261
+/// branch starts a server transaction, and a retransmission is absorbed by
+/// it. A response goes only to the client transaction it matches, and one
+/// that matches none is discarded ([RFC 6026 section 8.9]). See the
+/// [module docs](super#reception) for the events.
+///
+/// # Stateless
+///
+/// For a stateless proxy ([RFC 3261 section 16.11]). Every received request,
+/// including INVITE, CANCEL, ACK and retransmissions, arrives as
+/// [`IncomingEvent::StatelessRequest`], and every response as
+/// [`IncomingEvent::StatelessResponse`]. The endpoint creates no server or
+/// client transactions, absorbs no retransmissions, and sends no response of
+/// its own: no 100 Trying, no 500 for a dropped handle, and no 503 under
+/// overload. [`Endpoint::start`] reports [`Error::is_unsupported_reception`].
+/// The TU forwards with [`Endpoint::send_request`] and
+/// [`Endpoint::forward_response`].
+///
+/// Stateless reception is UDP-only. [`Builder::bind`] refuses it with a TCP
+/// listener, and `send_request` refuses a TCP target. A TCP stateless proxy
+/// needs a way to find the upstream connection again when a response comes
+/// back, and a response's Via does not identify a connection, so signa does
+/// not offer one yet. Mixing stateful and stateless reception on one endpoint
+/// is not supported either. Bind two endpoints for that.
+///
+/// The limits of stateful reception bound the events waiting in [`Incoming`]
+/// instead:
+///
+/// * [`Builder::max_pending_requests`] and
+///   [`Builder::max_server_request_bytes`] bound requests other than ACK and
+///   CANCEL.
+/// * [`Builder::control_event_limits`] bounds ACK and CANCEL, so a flood of
+///   new requests cannot stop them.
+/// * [`Builder::client_response_budget`] bounds responses.
+///
+/// Each counts from receipt until [`Incoming::recv`] returns the event. A
+/// reply route also holds [`Builder::max_responder_handles`] and
+/// [`Builder::max_responder_bytes`] until its last clone drops. A message that
+/// does not fit is discarded without a response and counted in
+/// [`Endpoint::reception_stats`]. UDP retransmissions recover it once the TU
+/// catches up.
+///
+/// [RFC 6026 section 8.9]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.9
+/// [RFC 3261 section 16.11]: https://www.rfc-editor.org/rfc/rfc3261.html#section-16.11
+/// [`IncomingEvent::StatelessRequest`]: super::IncomingEvent::StatelessRequest
+/// [`IncomingEvent::StatelessResponse`]: super::IncomingEvent::StatelessResponse
+/// [`Endpoint::start`]: super::Endpoint::start
+/// [`Endpoint::send_request`]: super::Endpoint::send_request
+/// [`Endpoint::forward_response`]: super::Endpoint::forward_response
+/// [`Endpoint::reception_stats`]: super::Endpoint::reception_stats
+/// [`Error::is_unsupported_reception`]: super::Error::is_unsupported_reception
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Reception {
+    /// Transactions for requests and responses.
+    #[default]
+    Stateful,
+    /// Requests and responses straight from UDP, without transactions.
+    Stateless,
+}
+
 /// Settings shared by endpoint startup and the protocol driver.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Config {
+    pub(super) reception: Reception,
     pub(super) timers: Timers,
     pub(super) tcp: tcp::Config,
     pub(super) max_pending_requests: usize,
@@ -47,6 +113,7 @@ pub(super) struct Config {
 impl Default for Config {
     fn default() -> Config {
         Config {
+            reception: Reception::Stateful,
             timers: Timers::default(),
             tcp: tcp::Config::default(),
             max_pending_requests: 1024,
@@ -147,6 +214,24 @@ impl Builder {
     /// [RFC 3261 section 18.2.2]: https://www.rfc-editor.org/rfc/rfc3261.html#section-18.2.2
     pub fn tcp(mut self, addr: SocketAddr) -> Builder {
         self.tcp = Some(addr);
+        self
+    }
+
+    /// Sets how the endpoint receives messages. The default is
+    /// [`Reception::Stateful`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use signa::endpoint::{Endpoint, Reception};
+    ///
+    /// let builder = Endpoint::builder()
+    ///     .udp("127.0.0.1:5060".parse().unwrap())
+    ///     .reception(Reception::Stateless);
+    /// # drop(builder);
+    /// ```
+    pub fn reception(mut self, reception: Reception) -> Builder {
+        self.config.reception = reception;
         self
     }
 
@@ -303,9 +388,14 @@ impl Builder {
     /// enqueue and lasts through connect setup and local write completion.
     /// Saturation returns [`ReplyError::Busy`] without enqueue.
     /// The existing limit of 64 outstanding one-shot replies also applies.
+    /// [`Endpoint::send_request`] and [`Endpoint::forward_response`] share
+    /// both limits and report saturation as [`Error::is_busy`].
     /// A dropped completion future does not return either reservation.
     ///
     /// [`ReplyError::Busy`]: super::ReplyError::Busy
+    /// [`Endpoint::send_request`]: super::Endpoint::send_request
+    /// [`Endpoint::forward_response`]: super::Endpoint::forward_response
+    /// [`Error::is_busy`]: super::Error::is_busy
     ///
     /// # Example
     ///
@@ -329,6 +419,10 @@ impl Builder {
     /// handlers hold capacity. A request still waiting in [`Incoming`] counts
     /// even after its transaction ends. A new request beyond the limit gets a
     /// stateless 503.
+    ///
+    /// A stateless endpoint counts its requests other than ACK and CANCEL here
+    /// only until `recv`, and discards one beyond the limit without a
+    /// response. See [`Reception::Stateless`].
     pub fn max_pending_requests(mut self, limit: usize) -> Builder {
         self.config.max_pending_requests = limit;
         self
@@ -338,9 +432,11 @@ impl Builder {
     ///
     /// An ACK for the transaction user, and a CANCEL that matches a server
     /// transaction, take their place in this limit from admission until
-    /// [`Incoming::recv`] returns them. A matched CANCEL also holds one of
-    /// these slots and its bytes until its final response or the end of its
-    /// transaction, and one for its reply route until the last clone drops.
+    /// [`Incoming::recv`] returns them. On a stateless endpoint every ACK and
+    /// CANCEL does, and nothing else, see [`Reception::Stateless`]. A matched
+    /// CANCEL also holds one of these slots and its bytes until its final
+    /// response or the end of its transaction, and one for its reply route
+    /// until the last clone drops.
     /// So a full [`Builder::max_pending_requests`], held by handlers waiting
     /// for exactly these ACKs and CANCELs, does not stop them. Past the limit
     /// an ACK is discarded without a response and a CANCEL gets a stateless
@@ -440,7 +536,8 @@ impl Builder {
     /// line, header names and values, and body of each request, not the
     /// allocations behind them. A request still waiting in [`Incoming`] counts
     /// even after its transaction ends. A new request beyond the limit gets a
-    /// stateless 503.
+    /// stateless 503. On a stateless endpoint it bounds the same requests as
+    /// [`Builder::max_pending_requests`] does there.
     pub fn max_server_request_bytes(mut self, bytes: usize) -> Builder {
         self.config.max_server_request_bytes = bytes;
         self
@@ -452,7 +549,8 @@ impl Builder {
     /// creates one route, which its responder holds. Clones of a route share
     /// it, and it counts until the last clone drops, even after the request
     /// is answered. Keep routes only as long as needed, for example for UAS
-    /// 2xx retransmission. A new request beyond the limit gets a stateless 503.
+    /// 2xx retransmission. A new request beyond the limit gets a stateless 503,
+    /// or on a stateless endpoint is discarded without one.
     pub fn max_responder_handles(mut self, limit: usize) -> Builder {
         self.config.max_responder_handles = limit;
         self
@@ -507,7 +605,8 @@ impl Builder {
     ///
     /// The default is 4096 messages and 64 MiB. Both values must be positive.
     /// Shared `Bytes` backing allocations and application `Extensions` are not
-    /// measured.
+    /// measured. A stateless endpoint has no response streams, and bounds the
+    /// responses waiting in [`Incoming`] with this instead.
     pub fn client_response_budget(mut self, limits: WriteLimits) -> Builder {
         self.config.client_response_budget = limits;
         self
@@ -545,8 +644,22 @@ impl Builder {
     /// `max_client_handles`, or a zero count or byte limit in
     /// `client_response_limits` or `client_response_budget`. Zero client
     /// transaction, table and transport limits are valid and refuse that work
-    /// instead.
+    /// instead. [`Reception::Stateless`] without a UDP socket is invalid, and
+    /// with a TCP listener it is [`BindError::is_unsupported_config`]. Both
+    /// are refused before any socket is bound.
     pub fn bind(mut self) -> Result<(Endpoint, Incoming), BindError> {
+        if self.config.reception == Reception::Stateless {
+            if self.tcp.is_some() {
+                return Err(BindError::unsupported_config(
+                    "stateless reception is UDP-only",
+                ));
+            }
+            if self.udp.is_none() {
+                return Err(BindError::invalid_config(
+                    "stateless reception needs a UDP socket",
+                ));
+            }
+        }
         for (reason, value) in [
             (
                 "max_pending_requests must be positive",
@@ -647,8 +760,10 @@ impl Builder {
             control: driver.control.clone(),
             shutdown_wait: driver.shutdown_done.subscribe(),
             connection_stats: driver.connection_stats.clone(),
+            reception_stats: driver.reception_counters.clone(),
             oneshot_capacity: driver.oneshot_capacity(),
             oneshot_bytes: driver.oneshot_bytes(),
+            reception: self.config.reception,
             commands,
             udp: udp_addr,
             tcp: tcp_addr,

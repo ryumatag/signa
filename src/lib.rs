@@ -29,10 +29,16 @@ Its design draws heavily on the [`http`] and [`hyper`] crates.
   preparation and driver acceptance. The transaction acknowledges a non-2xx
   INVITE response. An INVITE is cancelled through its client control, and a
   received CANCEL or ACK for a 2xx arrives as an event. `Endpoint::send_request`
-  sends the application's ACK for a 2xx once. Application code owns server
-  dispatch and handler tasks. These operations live in `endpoint`. A graceful
-  shutdown answers new requests with a 503 and waits for the ones in hand up
-  to a deadline.
+  sends a request once without a transaction, such as the application's ACK
+  for a 2xx. Application code owns server dispatch and handler tasks. These
+  operations live in `endpoint`. A graceful shutdown answers new requests with
+  a 503 and waits for the ones in hand up to a deadline.
+* Stateless reception over UDP for a stateless proxy (RFC 3261 section 16.11).
+  Every request and response arrives as an event without a transaction. The
+  application forwards requests with `send_request` and a branch it computed,
+  and responses with `Endpoint::forward_response`, which routes by the
+  remaining Via. Proxy validation, routing and branch computation stay with
+  the application. `examples/stateless_proxy.rs` shows the pieces.
 
 # What it does not cover yet
 
@@ -40,8 +46,9 @@ Its design draws heavily on the [`http`] and [`hyper`] crates.
   retransmitting a 2xx until its ACK, and deciding what a received CANCEL
   means. signa gives the application the events, routes and operations for
   them. Reliable provisional responses (RFC 3262) are not implemented.
-* Stateless reception and forwarding, and draining INVITEs in Accepted when
-  the endpoint shuts down. `send_request` takes only an ACK so far.
+* Draining INVITEs in Accepted when the endpoint shuts down.
+* Stateless reception over TCP, and stateful and stateless reception on one
+  endpoint.
 * Choosing a next hop. RFC 3263 resolution belongs to a layer above, which
   selects an explicit `Target` for each request. [`Uri::sip`] exposes SIP/SIPS
   components without selecting a destination or transport.
@@ -49,8 +56,9 @@ Its design draws heavily on the [`http`] and [`hyper`] crates.
   only, so it cannot carry a request that requires TLS. `Endpoint::start`
   refuses a `sips:` Request-URI and does not check Route or the target. Its
   routing section says what that leaves to the caller.
-* Dialogs, registration, proxying, and the rest of what an application does
-  with messages. Those belong in crates built on signa.
+* Dialogs, registration, proxy request processing and routing, and the rest
+  of what an application does with messages. Those belong in crates built on
+  signa.
 
 # Features
 

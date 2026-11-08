@@ -49,7 +49,7 @@ use tokio::{
 use crate::{
     endpoint::{
         admission::{AdmissionOwner, ClientAdmission, Permit},
-        builder::Config,
+        builder::{Config, Reception},
         client::{
             CancelError, CancelHandle, CancelOutcome, Delivery, Intent,
             Observation, Reserved, Starting, Target,
@@ -59,8 +59,9 @@ use crate::{
         reply::{Admission, Completion, ReplyError, ReplyRoute},
         routing::{
             mark_via, reply_flow, sent_by, sent_by_is, source_toward,
-            via_value, Branches, Link,
+            via_value, via_value_with, Branches, Link,
         },
+        send::ViaMode,
         server::{
             self, IncomingEvent, ReceivedRequest, ServerRequest,
             ServerTransactionId, SubmitError,
@@ -88,6 +89,7 @@ use crate::{
 
 mod cancels;
 mod invites;
+mod stateless;
 
 /// The most bytes of a request that go over UDP. RFC 3261 section 18.1.1
 /// sends a larger one over a congestion-controlled transport. The limit is
@@ -138,7 +140,15 @@ pub(super) enum Command {
         done: oneshot::Sender<Result<CancelOutcome, CancelError>>,
     },
     /// A TU sends a request once, without a transaction.
-    Request { request: Request<Bytes>, target: Target, completion: Completion },
+    Request {
+        request: Request<Bytes>,
+        target: Target,
+        via: ViaMode,
+        completion: Completion,
+    },
+    /// A stateless TU forwards an encoded response to the address its top
+    /// Via names.
+    Forward { bytes: Bytes, remote: SocketAddr, completion: Completion },
     /// A connection the driver asked for is open, or could not be opened.
     Connected {
         remote: SocketAddr,
@@ -413,7 +423,7 @@ enum Pending {
     /// A CANCEL whose INVITE connection had closed.
     Cancel(CancelStart),
     /// A request sent once, which gets its Via when the connection is open.
-    OneShotRequest(Request<Bytes>, Completion),
+    OneShotRequest(Request<Bytes>, ViaMode, Completion),
     /// An encoded response whose request came on a connection that has closed
     /// since. It goes to `sent-by` on a new connection
     /// (RFC 3261 section 18.2.2).
@@ -465,6 +475,15 @@ enum PreparedServerOutput {
 pub(super) struct ConnectionCounters {
     pub(super) rejected: AtomicU64,
     pub(super) dropped: AtomicU64,
+}
+
+/// Messages the receive path discarded for want of capacity, shared with
+/// endpoint handles. See `Endpoint::reception_stats`.
+#[derive(Default, Debug)]
+pub(super) struct ReceptionCounters {
+    pub(super) acks: AtomicU64,
+    pub(super) stateless_requests: AtomicU64,
+    pub(super) stateless_responses: AtomicU64,
 }
 
 pub(super) fn increment(counter: &AtomicU64) {
@@ -599,6 +618,11 @@ pub(super) struct Driver {
     control_routes: Budget,
     /// INVITE server entries that hold a table entry for their CANCEL.
     reserved_cancels: usize,
+    /// Stateless responses between receipt and `recv`. Stateless requests use
+    /// `event_admission` and `control_events`, which a stateless endpoint has
+    /// no other use for.
+    stateless_responses: Budget,
+    pub(super) reception_counters: Arc<ReceptionCounters>,
 }
 
 impl Driver {
@@ -700,6 +724,8 @@ impl Driver {
             control_work: Budget::new(config.control_event_limits),
             control_routes: Budget::new(config.control_event_limits),
             reserved_cancels: 0,
+            stateless_responses: Budget::new(config.client_response_budget),
+            reception_counters: Arc::default(),
         }
     }
 
@@ -990,8 +1016,11 @@ impl Driver {
             Command::Cancel { id, intent, done } => {
                 self.on_cancel(id, &intent, done);
             }
-            Command::Request { request, target, completion } => {
-                self.on_oneshot_request(request, target, completion);
+            Command::Request { request, target, via, completion } => {
+                self.on_oneshot_request(request, target, via, completion);
+            }
+            Command::Forward { bytes, remote, completion } => {
+                self.on_forward(bytes, remote, completion);
             }
             Command::Connected { remote, result, _attempt } => {
                 self.on_connected(remote, result);
@@ -1358,7 +1387,7 @@ impl Driver {
                 drop(bytes);
                 completion.finish(Err(ReplyError::Busy));
             }
-            Pending::OneShotRequest(request, completion) => {
+            Pending::OneShotRequest(request, _, completion) => {
                 drop(request);
                 completion.finish(Err(ReplyError::Busy));
             }
@@ -1420,10 +1449,11 @@ impl Driver {
             Pending::Cancel(start) => {
                 self.start_cancel(start, Link { flow, writer: Some(writer) });
             }
-            Pending::OneShotRequest(request, completion) => {
+            Pending::OneShotRequest(request, via, completion) => {
                 self.send_oneshot(
                     request,
                     Link { flow, writer: Some(writer) },
+                    via,
                     completion,
                 );
             }
@@ -1501,54 +1531,78 @@ impl Driver {
         &mut self,
         request: Request<Bytes>,
         target: Target,
+        via: ViaMode,
         completion: Completion,
     ) {
         match target.transport() {
-            Transport::Udp => {
-                let Some(udp) = &self.udp else {
-                    completion.fail(Error::unsupported_routing());
-                    return;
-                };
-                let port = udp.local_addr().port();
-                let source = match self.udp_source(target.address()) {
-                    Ok(source) => source,
-                    Err(error) => {
-                        completion.fail(Error::transport(error));
-                        return;
-                    }
-                };
-                let flow = Flow {
-                    transport: Transport::Udp,
-                    local: SocketAddr::new(source, port),
-                    remote: target.address(),
-                };
-                self.send_oneshot(
+            Transport::Udp => match self.udp_flow(target.address()) {
+                Ok(flow) => self.send_oneshot(
                     request,
                     Link { flow, writer: None },
+                    via,
                     completion,
-                );
-            }
+                ),
+                Err(error) => completion.fail(error),
+            },
             Transport::Tcp => {
                 self.send_over_tcp(
                     target.address(),
-                    Pending::OneShotRequest(request, completion),
+                    Pending::OneShotRequest(request, via, completion),
                 );
             }
         }
     }
 
-    /// Adds a fresh Via for `link` and writes the request once.
+    /// Writes a forwarded response once, over UDP. See
+    /// `Endpoint::forward_response`.
+    fn on_forward(
+        &mut self,
+        bytes: Bytes,
+        remote: SocketAddr,
+        completion: Completion,
+    ) {
+        match self.udp_flow(remote) {
+            Ok(flow) => self
+                .udp
+                .as_mut()
+                .expect("`udp_flow` found a socket")
+                .submit(bytes, flow, completion),
+            Err(error) => completion.fail(error),
+        }
+    }
+
+    /// The UDP flow from this endpoint's socket to `remote`.
+    fn udp_flow(&mut self, remote: SocketAddr) -> Result<Flow, Error> {
+        let Some(udp) = &self.udp else {
+            return Err(Error::unsupported_routing());
+        };
+        let port = udp.local_addr().port();
+        let source = self.udp_source(remote).map_err(Error::transport)?;
+
+        Ok(Flow {
+            transport: Transport::Udp,
+            local: SocketAddr::new(source, port),
+            remote,
+        })
+    }
+
+    /// Adds the Via that `via` asks for on `link` and writes the request once.
     fn send_oneshot(
         &mut self,
         mut request: Request<Bytes>,
         link: Link,
+        via: ViaMode,
         mut completion: Completion,
     ) {
-        let via = via_value(
-            link.flow.transport,
-            sent_by(&link.flow, self.config.tcp_listener),
-            &mut self.branches,
-        );
+        let sent_by = sent_by(&link.flow, self.config.tcp_listener);
+        let via = match via {
+            ViaMode::Fresh => {
+                via_value(link.flow.transport, sent_by, &mut self.branches)
+            }
+            ViaMode::Branch(branch) => {
+                via_value_with(link.flow.transport, sent_by, branch.as_str())
+            }
+        };
         request.headers_mut().prepend(VIA, via.clone());
         let bytes = request.to_bytes();
         drop(request);
@@ -1811,7 +1865,7 @@ impl Driver {
                                 ));
                             }
                         }
-                        Pending::OneShotRequest(_, completion) => {
+                        Pending::OneShotRequest(_, _, completion) => {
                             completion.finish(Err(ReplyError::Transport(
                                 io::Error::new(
                                     source.kind(),
@@ -1926,9 +1980,19 @@ impl Driver {
     }
 
     fn on_message(&mut self, message: Message<Bytes>, link: Link) {
-        match message {
-            Message::Request(request) => self.on_request(request, link),
-            Message::Response(response) => self.on_received_response(response),
+        match (self.config.reception, message) {
+            (Reception::Stateful, Message::Request(request)) => {
+                self.on_request(request, link)
+            }
+            (Reception::Stateful, Message::Response(response)) => {
+                self.on_received_response(response)
+            }
+            (Reception::Stateless, Message::Request(request)) => {
+                self.on_stateless_request(request, link)
+            }
+            (Reception::Stateless, Message::Response(response)) => {
+                self.on_stateless_response(response, link.flow)
+            }
         }
     }
 

@@ -1,7 +1,8 @@
 use std::{
-    collections::HashMap,
+    collections::{hash_map::DefaultHasher, HashMap},
     convert::Infallible,
     future,
+    hash::{Hash, Hasher},
     hint::black_box as bb,
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -14,10 +15,10 @@ use criterion::Criterion;
 use signa::{
     bench::{reply_driver, tcp, udp, Flow},
     endpoint::{
-        Builder, CancelOutcome, Endpoint, Error, Incoming, IncomingEvent,
-        ReplyRoute, Responder, Target, ViaMode,
+        Branch, Builder, CancelOutcome, Endpoint, Error, Incoming,
+        IncomingEvent, Reception, ReplyRoute, Responder, Target, ViaMode,
     },
-    message::header::CSEQ,
+    message::header::{HeaderValue, CSEQ, VIA},
     transaction::Timers,
     transport::Transport,
     Request, Response, StatusCode,
@@ -133,6 +134,106 @@ pub(super) fn round_trip(c: &mut Criterion) {
             });
         });
     });
+}
+
+// The round trip of `round_trip` over UDP with a stateless proxy between the
+// endpoints, so the difference is the proxy hop: a receive, an event, the TU's
+// branch and Via work, and a send, each way. The proxy's TU runs on the same
+// runtime and does what a stateless proxy must at the least. It hashes the
+// received top Via into a branch, and checks and removes its own Via from a
+// response before forwarding it.
+pub(super) fn stateless_forward(c: &mut Criterion) {
+    let rt = runtime();
+    let (server, client_end, proxy_addr) = {
+        let _guard = rt.enter();
+        let server = Endpoint::builder()
+            .udp(LOCALHOST)
+            .timers(short_timers())
+            .max_server_transactions(1 << 20)
+            .serve(Ok200)
+            .unwrap();
+        let client_end = Endpoint::builder()
+            .udp(LOCALHOST)
+            .timers(short_timers())
+            .max_client_transactions(1 << 20)
+            .serve(Ok200)
+            .unwrap();
+        let (proxy, incoming) = Builder::new()
+            .udp(LOCALHOST)
+            .reception(Reception::Stateless)
+            .bind()
+            .unwrap();
+        let proxy_addr = proxy.udp_addr().unwrap();
+        tokio::spawn(stateless_proxy(
+            proxy,
+            incoming,
+            server.udp_addr().unwrap(),
+        ));
+        (server, client_end, proxy_addr)
+    };
+    let request = Request::builder()
+        .method("OPTIONS")
+        .uri("sip:bob@biloxi.example.com")
+        .header("From", "Alice <sip:alice@atlanta.example.com>;tag=1928301774")
+        .header("To", "Bob <sip:bob@biloxi.example.com>")
+        .header("Call-ID", "a84b4c76e66710@pc33.atlanta.example.com")
+        .header("CSeq", "314159 OPTIONS")
+        .header("Max-Forwards", "70")
+        .body(Bytes::new())
+        .unwrap();
+    let len = request.to_bytes().len() as u64;
+
+    let mut udp = client_end.client(Transport::Udp, proxy_addr);
+    benchmark(c, "endpoint/udp/stateless_forward", len, |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let response = udp.call(bb(request.clone())).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+            });
+        });
+    });
+    drop(server);
+}
+
+/// The proxy of `stateless_forward`.
+async fn stateless_proxy(
+    proxy: Endpoint,
+    mut incoming: Incoming,
+    downstream: SocketAddr,
+) {
+    let target = Target::new(Transport::Udp, downstream);
+    let own = format!("SIP/2.0/UDP {};", proxy.udp_addr().unwrap());
+    while let Some(event) = incoming.recv().await {
+        match event {
+            IncomingEvent::StatelessRequest(received) => {
+                let request = received.request;
+                let mut hasher = DefaultHasher::new();
+                request.headers().get(VIA).unwrap().as_str().hash(&mut hasher);
+                let branch: Branch =
+                    format!("z9hG4bK-sl-{:016x}", hasher.finish())
+                        .parse()
+                        .unwrap();
+                proxy
+                    .send_request(request, target, ViaMode::Branch(branch))
+                    .await
+                    .unwrap();
+            }
+            IncomingEvent::StatelessResponse(received) => {
+                let mut response = received.response;
+                let headers = response.headers_mut();
+                // The endpoint prepends its Via as a row of its own.
+                assert!(headers.get(VIA).unwrap().as_str().starts_with(&own));
+                let rest: Vec<HeaderValue> =
+                    headers.get_all(VIA).skip(1).cloned().collect();
+                headers.remove(VIA);
+                for value in rest {
+                    headers.append(VIA, value);
+                }
+                proxy.forward_response(response).await.unwrap();
+            }
+            _ => unreachable!("a stateless endpoint"),
+        }
+    }
 }
 
 /// A UAS for the INVITE benchmarks. The Request-URI user says what it does:

@@ -6,6 +6,12 @@ The driver owns transaction and connection lifetimes. This module applies
 metadata it gets. It preserves the original TCP writer even when the fallback
 destination differs from the received flow.
 
+A response has two kinds of destination. One to a request this endpoint
+received goes where the request came from, see [`reply_flow`]. One that a
+stateless proxy forwards goes where its remaining top Via says, see
+[`forward_destination`], since the proxy never saw that request's source
+itself. The two share the Via parser and the default port, not the rule.
+
 [RFC 3261 sections 18.1 and 18.2]: https://www.rfc-editor.org/rfc/rfc3261.html#section-18
 [RFC 3581 section 4]: https://www.rfc-editor.org/rfc/rfc3581.html#section-4
 */
@@ -18,8 +24,9 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
 };
 
+use super::Error;
 use crate::{
-    message::header::{via::Via, HeaderValue},
+    message::header::{via::Via, HeaderValue, VIA},
     transport::{tcp, Flow, Transport},
 };
 
@@ -130,6 +137,19 @@ pub(super) fn via_value(
     HeaderValue::from_built(value)
 }
 
+/// As [`via_value`], with a branch the caller chose and validated.
+pub(super) fn via_value_with(
+    transport: Transport,
+    sent_by: SocketAddr,
+    branch: &str,
+) -> HeaderValue {
+    let mut value = String::with_capacity(48 + branch.len());
+    let _ =
+        write!(value, "SIP/2.0/{transport} {sent_by};rport;branch={branch}");
+
+    HeaderValue::from_built(value)
+}
+
 /// Returns `true` if the `sent-by` of `via` is `local`.
 pub(super) fn sent_by_is(via: &Via<'_>, local: SocketAddr) -> bool {
     via.host.parse::<IpAddr>().is_ok_and(|ip| ip == local.ip())
@@ -162,19 +182,26 @@ pub(super) fn reply_flow(via: &Via<'_>, flow: &Flow) -> Flow {
 /// neither is called for.
 ///
 /// `received` is added at the end of the first `via-parm` when `sent-by` names
-/// a host other than the source address (RFC 3261 section 18.2.1). A valueless
-/// `rport` is given the source port in place (RFC 3581 section 4). An `rport`
-/// that came with a value is left alone. The response goes to the source port
-/// either way, see [`reply_flow`].
+/// a host other than the source address (RFC 3261 section 18.2.1), or when the
+/// parm already has a `received` that signa did not write. A valueless
+/// `rport` is given the source port in place, and then `received` is added
+/// even when it equals the host, as RFC 3581 section 4 requires. A proxy that
+/// forwards the response later routes by the pair, see
+/// [`forward_destination`]. An `rport` that came with a value is left alone.
+/// The response to this request goes to the source port either way, see
+/// [`reply_flow`].
 pub(super) fn mark_via(
     value: &HeaderValue,
     via: &Via<'_>,
     flow: &Flow,
 ) -> Option<HeaderValue> {
     let source = flow.remote;
-    let received =
-        via.host.parse::<IpAddr>().map_or(true, |host| host != source.ip());
-    if !received && via.rport_at.is_none() {
+    // A `received` the sender wrote itself is outvoted by one appended after
+    // it, see `Via::received`.
+    let received = via.rport_at.is_some()
+        || via.received.is_some()
+        || via.host.parse::<IpAddr>().map_or(true, |host| host != source.ip());
+    if !received {
         return None;
     }
 
@@ -187,12 +214,66 @@ pub(super) fn mark_via(
         copied = at;
     }
     marked.push_str(&src[copied..via.end]);
-    if received {
-        let _ = write!(marked, ";received={}", source.ip());
-    }
+    let _ = write!(marked, ";received={}", source.ip());
     marked.push_str(&src[via.end..]);
 
     Some(HeaderValue::from_built(marked))
+}
+
+/// Where a stateless proxy sends a response it forwards, from the response's
+/// top `Via` once the TU has removed its own ([RFC 3261 section 16.11]).
+///
+/// Only an unreliable unicast reply is supported. The rules are those of
+/// [RFC 3261 section 18.2.2] for UDP and [RFC 3581 section 4]:
+///
+/// * With `received`, the response goes to that address, and to the port of
+///   `rport` when it has one. Otherwise it goes to the `sent-by` port, or
+///   5060 without one.
+/// * Without `received`, `sent-by` must be an IP address, and the response
+///   goes to its port or 5060. An `rport` without `received` is not one a
+///   server filled in, so it does not count.
+///
+/// Anything else is an error without a send. A transport other than UDP needs
+/// the original connection or RFC 3263 to find one, `maddr` names a multicast
+/// group, and a host name needs a DNS lookup, all of which are out of scope.
+/// A multicast or unspecified address is refused as well. A `received` that
+/// is not an IP address, or a port of zero, makes the `Via` invalid.
+///
+/// [RFC 3261 section 16.11]: https://www.rfc-editor.org/rfc/rfc3261.html#section-16.11
+/// [RFC 3261 section 18.2.2]: https://www.rfc-editor.org/rfc/rfc3261.html#section-18.2.2
+/// [RFC 3581 section 4]: https://www.rfc-editor.org/rfc/rfc3581.html#section-4
+pub(super) fn forward_destination(via: &Via<'_>) -> Result<SocketAddr, Error> {
+    if !via.transport.eq_ignore_ascii_case("UDP") || via.maddr.is_some() {
+        return Err(Error::unsupported_routing());
+    }
+
+    let (ip, port) = match via.received {
+        Some(received) => {
+            let ip = received
+                .parse::<IpAddr>()
+                .map_err(|_| Error::invalid_header(VIA))?;
+            let port = match via.rport {
+                Some(Some(port)) => port,
+                _ => via.port.unwrap_or(DEFAULT_PORT),
+            };
+            (ip, port)
+        }
+        None => {
+            let ip = via
+                .host
+                .parse::<IpAddr>()
+                .map_err(|_| Error::unsupported_routing())?;
+            (ip, via.port.unwrap_or(DEFAULT_PORT))
+        }
+    };
+
+    if port == 0 {
+        return Err(Error::invalid_header(VIA));
+    }
+    if ip.is_multicast() || ip.is_unspecified() {
+        return Err(Error::unsupported_routing());
+    }
+    Ok(SocketAddr::new(ip, port))
 }
 
 #[cfg(test)]
@@ -331,5 +412,140 @@ mod tests {
                 "SIP/2.0/UDP older.example.com;branch=z9hG4bKsecond",
             )
         );
+    }
+
+    // RFC 3581 section 4. A server that fills in `rport` adds `received` even
+    // when it equals the `sent-by` host. A `received` the sender wrote is
+    // outvoted by the one appended after it.
+    #[test]
+    fn rport_and_a_sender_s_received_always_get_the_source_address() {
+        let flow = Flow {
+            transport: Transport::Udp,
+            local: "192.0.2.2:5060".parse().unwrap(),
+            remote: "192.0.2.1:40000".parse().unwrap(),
+        };
+        for (via, marked) in [
+            (
+                "SIP/2.0/UDP 192.0.2.1:5060;rport;branch=z9hG4bKa",
+                Some(
+                    "SIP/2.0/UDP 192.0.2.1:5060;rport=40000;branch=z9hG4bKa\
+                     ;received=192.0.2.1",
+                ),
+            ),
+            (
+                "SIP/2.0/UDP 192.0.2.1:40000;received=198.51.100.7\
+                 ;branch=z9hG4bKa",
+                Some(
+                    "SIP/2.0/UDP 192.0.2.1:40000;received=198.51.100.7\
+                     ;branch=z9hG4bKa;received=192.0.2.1",
+                ),
+            ),
+            ("SIP/2.0/UDP 192.0.2.1:40000;branch=z9hG4bKa", None),
+        ] {
+            let value = HeaderValue::from_bytes(via.as_bytes()).unwrap();
+            let parsed = Via::top(&value).unwrap();
+
+            let result = mark_via(&value, &parsed, &flow);
+
+            assert_eq!(
+                result.as_ref().map(HeaderValue::as_str),
+                marked,
+                "{via}"
+            );
+            if let Some(result) = result {
+                assert_eq!(
+                    Via::top(&result).unwrap().received,
+                    Some("192.0.2.1")
+                );
+            }
+        }
+    }
+
+    // RFC 3261 section 18.2.2 for unreliable unicast, with RFC 3581 section 4.
+    #[test]
+    fn a_forwarded_response_goes_where_its_remaining_top_via_says() {
+        for (via, destination) in [
+            ("SIP/2.0/UDP 192.0.2.1:5070;branch=z9hG4bKa", "192.0.2.1:5070"),
+            ("SIP/2.0/UDP 192.0.2.1;branch=z9hG4bKa", "192.0.2.1:5060"),
+            ("sip/2.0/udp 192.0.2.1;branch=z9hG4bKa", "192.0.2.1:5060"),
+            (
+                "SIP/2.0/UDP pc33.example.com:5070;received=192.0.2.9",
+                "192.0.2.9:5070",
+            ),
+            (
+                "SIP/2.0/UDP pc33.example.com;received=192.0.2.9",
+                "192.0.2.9:5060",
+            ),
+            (
+                "SIP/2.0/UDP pc33.example.com:5070;rport=40000\
+                 ;received=192.0.2.9",
+                "192.0.2.9:40000",
+            ),
+            // Without `received`, `rport` does not count.
+            ("SIP/2.0/UDP 192.0.2.1:5070;rport=40000", "192.0.2.1:5070"),
+            ("SIP/2.0/UDP 192.0.2.1:5070;rport", "192.0.2.1:5070"),
+            (
+                "SIP/2.0/UDP [2001:db8::1]:5070;branch=z9hG4bKa",
+                "[2001:db8::1]:5070",
+            ),
+            (
+                "SIP/2.0/UDP [2001:db8::1];branch=z9hG4bKa",
+                "[2001:db8::1]:5060",
+            ),
+            (
+                "SIP/2.0/UDP host.example.com;rport=40000\
+                 ;received=2001:db8::9",
+                "[2001:db8::9]:40000",
+            ),
+            // Only the first value of a row is the top Via.
+            (
+                "SIP/2.0/UDP 192.0.2.1:5070, SIP/2.0/UDP 192.0.2.2:5080",
+                "192.0.2.1:5070",
+            ),
+        ] {
+            let value = HeaderValue::from_bytes(via.as_bytes()).unwrap();
+            let via = Via::top(&value).unwrap();
+
+            assert_eq!(
+                forward_destination(&via).unwrap(),
+                destination.parse::<SocketAddr>().unwrap(),
+                "{}",
+                value.as_str()
+            );
+        }
+    }
+
+    // signa's scope, not an RFC rule. What would need DNS, a connection,
+    // multicast or nothing at all is refused rather than guessed.
+    #[test]
+    fn a_forwarded_response_signa_cannot_route_is_refused() {
+        for via in [
+            "SIP/2.0/UDP pc33.example.com:5070",
+            "SIP/2.0/UDP pc33.example.com;rport=40000",
+            "SIP/2.0/TCP 192.0.2.1:5070",
+            "SIP/2.0/TLS 192.0.2.1:5061",
+            "SIP/2.0/SCTP 192.0.2.1:5070",
+            "SIP/2.0/UDP 192.0.2.1;maddr=224.0.1.75;ttl=1",
+            "SIP/2.0/UDP 224.0.1.75",
+            "SIP/2.0/UDP pc33.example.com;received=224.0.1.75",
+            "SIP/2.0/UDP 0.0.0.0:5060",
+            "SIP/2.0/UDP [::]:5060",
+        ] {
+            let value = HeaderValue::from_bytes(via.as_bytes()).unwrap();
+            let error =
+                forward_destination(&Via::top(&value).unwrap()).unwrap_err();
+            assert!(error.is_unsupported_routing(), "{via}: {error}");
+        }
+
+        for via in [
+            "SIP/2.0/UDP pc33.example.com;received=1.2.3",
+            "SIP/2.0/UDP 192.0.2.1:0",
+            "SIP/2.0/UDP pc33.example.com;received=192.0.2.9;rport=0",
+        ] {
+            let value = HeaderValue::from_bytes(via.as_bytes()).unwrap();
+            let error =
+                forward_destination(&Via::top(&value).unwrap()).unwrap_err();
+            assert!(error.is_invalid_header(), "{via}: {error}");
+        }
     }
 }

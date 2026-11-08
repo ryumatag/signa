@@ -1,9 +1,11 @@
 /*!
-The errors of binding an endpoint and of a request sent through
-[`Endpoint::start`] or [`Endpoint::send_request`].
+The errors of binding an endpoint and of a message sent through
+[`Endpoint::start`], [`Endpoint::send_request`] or
+[`Endpoint::forward_response`].
 
 [`Endpoint::start`]: super::Endpoint::start
 [`Endpoint::send_request`]: super::Endpoint::send_request
+[`Endpoint::forward_response`]: super::Endpoint::forward_response
 */
 
 use std::{error, fmt, io};
@@ -18,13 +20,15 @@ use crate::message::HeaderName;
 /// of making up a response, and [`Error::is_timeout`] and
 /// [`Error::is_transport`] tell them apart. [`Error::is_cancel_timeout`] is
 /// the deadline after a CANCEL. The other cases are refusals: a request too
-/// large for UDP, a missing or invalid `CSeq` or INVITE identity header, a
-/// method the operation cannot send, exhausted request or connection
-/// admission, or an endpoint that has stopped. Response delivery overflow is
-/// reported after already queued responses, without ending the underlying SIP
-/// machine.
+/// large for UDP, a missing or invalid `CSeq`, INVITE identity header or
+/// forwarded `Via`, a method the operation cannot send, an operation the
+/// endpoint's [`Reception`] does not offer, a destination signa cannot route
+/// to, exhausted request or connection admission, or an endpoint that has
+/// stopped. Response delivery overflow is reported after already queued
+/// responses, without ending the underlying SIP machine.
 ///
 /// [`Endpoint::start`]: super::Endpoint::start
+/// [`Reception`]: super::Reception
 pub struct Error {
     kind: Kind,
 }
@@ -40,6 +44,7 @@ enum Kind {
     InvalidHeader(HeaderName),
     UnsupportedMethod,
     UnsupportedRouting,
+    UnsupportedReception,
     Busy,
     Closed,
 }
@@ -83,6 +88,10 @@ impl Error {
 
     pub(super) fn unsupported_routing() -> Error {
         Error { kind: Kind::UnsupportedRouting }
+    }
+
+    pub(super) fn unsupported_reception() -> Error {
+        Error { kind: Kind::UnsupportedReception }
     }
 
     pub(super) fn busy() -> Error {
@@ -141,22 +150,39 @@ impl Error {
     }
 
     /// Returns `true` if an INVITE lacks one valid From, To or Call-ID, which
-    /// its ACK and CANCEL copy. [`fmt::Display`] names the header.
+    /// its ACK and CANCEL copy, or a forwarded response has no top Via that
+    /// signa can read an address from. [`fmt::Display`] names the header.
     pub fn is_invalid_header(&self) -> bool {
         matches!(self.kind, Kind::InvalidHeader(_))
     }
 
     /// Returns `true` for a method the operation cannot send with its
-    /// required semantics: ACK or CANCEL through `start`, or anything but ACK
-    /// through `send_request`.
+    /// required semantics: ACK or CANCEL through `start`.
     pub fn is_unsupported_method(&self) -> bool {
         matches!(self.kind, Kind::UnsupportedMethod)
     }
 
-    /// Returns `true` if the request needs TLS, targets multicast, or targets
-    /// UDP on an endpoint without a UDP socket. The request was not sent.
+    /// Returns `true` if the message needs a transport or a destination the
+    /// endpoint cannot provide. Nothing was sent.
+    ///
+    /// That covers a `sips:` Request-URI, which needs TLS, a multicast target,
+    /// a UDP target on an endpoint without a UDP socket, and a TCP target on a
+    /// stateless endpoint. For a forwarded response it covers a top Via that
+    /// names a transport other than UDP, has `maddr`, or names a host that is
+    /// not an IP address and has no `received`, which would need DNS.
     pub fn is_unsupported_routing(&self) -> bool {
         matches!(self.kind, Kind::UnsupportedRouting)
+    }
+
+    /// Returns `true` if the operation is not available with the endpoint's
+    /// [`Reception`](super::Reception): [`Endpoint::start`] on a stateless
+    /// endpoint, or [`Endpoint::forward_response`] on a stateful one. Nothing
+    /// was sent.
+    ///
+    /// [`Endpoint::start`]: super::Endpoint::start
+    /// [`Endpoint::forward_response`]: super::Endpoint::forward_response
+    pub fn is_unsupported_reception(&self) -> bool {
+        matches!(self.kind, Kind::UnsupportedReception)
     }
 
     /// Returns `true` if request or connection admission is exhausted.
@@ -195,6 +221,7 @@ impl fmt::Debug for Error {
             }
             Kind::UnsupportedMethod => debug.field(&"UnsupportedMethod"),
             Kind::UnsupportedRouting => debug.field(&"UnsupportedRouting"),
+            Kind::UnsupportedReception => debug.field(&"UnsupportedReception"),
             Kind::Busy => debug.field(&"Busy"),
             Kind::Closed => debug.field(&"Closed"),
         };
@@ -223,14 +250,17 @@ impl fmt::Display for Error {
                 "the request needs one valid CSeq matching its method",
             ),
             Kind::InvalidHeader(name) => {
-                write!(f, "the request needs one valid {name}")
+                write!(f, "the message needs one valid {name}")
             }
             Kind::UnsupportedMethod => f.write_str(
                 "this operation cannot send a request with this method",
             ),
-            Kind::UnsupportedRouting => {
-                f.write_str("the endpoint has no transport for this target")
-            }
+            Kind::UnsupportedRouting => f.write_str(
+                "the endpoint has no transport or route for this destination",
+            ),
+            Kind::UnsupportedReception => f.write_str(
+                "the endpoint's reception mode does not offer this operation",
+            ),
             Kind::Busy => {
                 f.write_str("client admission capacity is exhausted")
             }
@@ -251,9 +281,11 @@ impl error::Error for Error {
 /// Why [`Builder::bind`] could not start an endpoint.
 ///
 /// [`BindError::is_invalid_config`] separates a configuration that no socket
-/// could satisfy from a socket that failed to bind. It converts into an
-/// [`io::Error`] for callers that report I/O errors, with `InvalidInput` for
-/// an invalid configuration.
+/// could satisfy from a socket that failed to bind, and
+/// [`BindError::is_unsupported_config`] a combination signa does not support
+/// yet. It converts into an [`io::Error`] for callers that report I/O errors,
+/// with `InvalidInput` for an invalid configuration and `Unsupported` for an
+/// unsupported one.
 ///
 /// [`Builder::bind`]: super::Builder::bind
 pub struct BindError {
@@ -263,6 +295,7 @@ pub struct BindError {
 enum BindKind {
     Io(io::Error),
     InvalidConfig(&'static str),
+    UnsupportedConfig(&'static str),
 }
 
 impl BindError {
@@ -274,10 +307,23 @@ impl BindError {
         BindError { kind: BindKind::InvalidConfig(reason) }
     }
 
+    pub(super) fn unsupported_config(reason: &'static str) -> BindError {
+        BindError { kind: BindKind::UnsupportedConfig(reason) }
+    }
+
     /// Returns `true` if the configuration is invalid, such as a zero
     /// capacity where the endpoint needs a positive one. No socket was bound.
     pub fn is_invalid_config(&self) -> bool {
         matches!(self.kind, BindKind::InvalidConfig(_))
+    }
+
+    /// Returns `true` if the configuration asks for something signa does not
+    /// support yet, such as [`Reception::Stateless`] with a TCP listener. No
+    /// socket was bound.
+    ///
+    /// [`Reception::Stateless`]: super::Reception::Stateless
+    pub fn is_unsupported_config(&self) -> bool {
+        matches!(self.kind, BindKind::UnsupportedConfig(_))
     }
 
     /// Returns `true` if binding or setting up a socket failed.
@@ -297,6 +343,9 @@ impl fmt::Debug for BindError {
             BindKind::InvalidConfig(reason) => {
                 debug.field(&format_args!("InvalidConfig({reason:?})"))
             }
+            BindKind::UnsupportedConfig(reason) => {
+                debug.field(&format_args!("UnsupportedConfig({reason:?})"))
+            }
         };
         debug.finish()
     }
@@ -309,6 +358,9 @@ impl fmt::Display for BindError {
             BindKind::InvalidConfig(reason) => {
                 write!(f, "invalid endpoint configuration: {reason}")
             }
+            BindKind::UnsupportedConfig(reason) => {
+                write!(f, "unsupported endpoint configuration: {reason}")
+            }
         }
     }
 }
@@ -317,7 +369,9 @@ impl error::Error for BindError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match &self.kind {
             BindKind::Io(err) => Some(err),
-            BindKind::InvalidConfig(_) => None,
+            BindKind::InvalidConfig(_) | BindKind::UnsupportedConfig(_) => {
+                None
+            }
         }
     }
 }
@@ -328,6 +382,9 @@ impl From<BindError> for io::Error {
             BindKind::Io(err) => err,
             BindKind::InvalidConfig(_) => {
                 io::Error::new(io::ErrorKind::InvalidInput, err)
+            }
+            BindKind::UnsupportedConfig(_) => {
+                io::Error::new(io::ErrorKind::Unsupported, err)
             }
         }
     }

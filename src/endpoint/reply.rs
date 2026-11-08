@@ -95,6 +95,26 @@ impl ReplyRoute {
         }))
     }
 
+    /// A route for an ACK, which refuses every response. It copies nothing
+    /// from the request, since nothing is ever checked against it.
+    pub(super) fn refusing(
+        link: Link,
+        commands: mpsc::UnboundedSender<Command>,
+        capacity: Arc<Semaphore>,
+        bytes: Budget,
+    ) -> ReplyRoute {
+        ReplyRoute(Arc::new(Route {
+            link,
+            headers: HeaderMap::new(),
+            ack: true,
+            commands,
+            capacity,
+            bytes,
+            _identity: None,
+            work: None,
+        }))
+    }
+
     pub(super) fn with_reservations(
         mut self,
         identity: Permit,
@@ -330,6 +350,20 @@ impl Completion {
         }
     }
 
+    pub(super) fn forward(
+        done: oneshot::Sender<Result<(), Error>>,
+        permit: OwnedSemaphorePermit,
+        endpoint: mpsc::UnboundedSender<Command>,
+        reservation: Permit,
+    ) -> Completion {
+        Completion {
+            done: Done::Forward(done),
+            _permit: permit,
+            _endpoint: endpoint,
+            reservation,
+        }
+    }
+
     /// Records what a request goes out with, before its write is queued.
     pub(super) fn sent(&mut self, via: HeaderValue, flow: Flow) {
         if let Done::Request { sent, .. } = &mut self.done {
@@ -345,6 +379,9 @@ impl Completion {
         drop(_endpoint);
         match done {
             Done::Request { done, .. } => {
+                let _ = done.send(Err(error));
+            }
+            Done::Forward(done) => {
                 let _ = done.send(Err(error));
             }
             Done::Reply(done) => {
@@ -363,32 +400,42 @@ impl Completion {
                 let _ = done.send(result);
             }
             Done::Request { done, sent } => {
-                let _ = done.send(match result {
-                    Ok(()) => sent.ok_or_else(Error::closed),
-                    Err(ReplyError::Busy) => Err(Error::busy()),
-                    Err(ReplyError::Transport(error)) => {
-                        Err(Error::transport(error))
-                    }
-                    Err(
-                        ReplyError::Closed
-                        | ReplyError::InvalidResponse
-                        | ReplyError::Unsupported,
-                    ) => Err(Error::closed()),
-                });
+                let _ = done.send(
+                    result
+                        .map_err(request_error)
+                        .and_then(|()| sent.ok_or_else(Error::closed)),
+                );
+            }
+            Done::Forward(done) => {
+                let _ = done.send(result.map_err(request_error));
             }
         }
     }
 }
 
-/// Who waits for a one-shot write: a reply route, or
+/// The error a one-shot request or forwarded response reports for a write
+/// result. Only `Busy` and `Transport` come from a write.
+fn request_error(error: ReplyError) -> Error {
+    match error {
+        ReplyError::Busy => Error::busy(),
+        ReplyError::Transport(error) => Error::transport(error),
+        ReplyError::Closed
+        | ReplyError::InvalidResponse
+        | ReplyError::Unsupported => Error::closed(),
+    }
+}
+
+/// Who waits for a one-shot write: a reply route,
 /// [`Endpoint::send_request`](super::Endpoint::send_request), which also
-/// learns the Via and flow the driver chose.
+/// learns the Via and flow the driver chose, or
+/// [`Endpoint::forward_response`](super::Endpoint::forward_response).
 enum Done {
     Reply(oneshot::Sender<Result<(), ReplyError>>),
     Request {
         done: oneshot::Sender<Result<SentRequest, Error>>,
         sent: Option<SentRequest>,
     },
+    Forward(oneshot::Sender<Result<(), Error>>),
 }
 
 pub(super) struct Admission(pub(super) Arc<Semaphore>);

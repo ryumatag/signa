@@ -63,6 +63,27 @@ Dropping [`Incoming`] starts an immediate shutdown. An application that only
 sends requests keeps it anyway, because peers can still send it requests, such
 as a BYE within a dialog.
 
+# Stateless reception
+
+All of the above is [`Reception::Stateful`], the default.
+[`Reception::Stateless`] makes the endpoint the transport of a stateless proxy
+([RFC 3261 section 16.11]). Every request arrives as
+[`IncomingEvent::StatelessRequest`] and every response as
+[`IncomingEvent::StatelessResponse`], retransmissions and stray responses
+included. No transaction is created or matched, and the endpoint sends no
+100, 500 or 503 of its own. A stateless request's [`ReplyRoute`] answers it
+once if the TU wants to, and the route of an ACK refuses every response.
+
+The TU forwards a request with [`Endpoint::send_request`] and
+[`ViaMode::Branch`], and a response with [`Endpoint::forward_response`] once it
+has checked and removed its own Via value. Request validation, Max-Forwards,
+Route and Record-Route, target selection and the branch are the TU's
+(sections 16.3 to 16.6), and signa does not claim to do them. Stateless
+reception is UDP-only. [`Reception`] says which limits bound it, and
+[`Endpoint::reception_stats`] counts what they discard.
+
+[RFC 3261 section 16.11]: https://www.rfc-editor.org/rfc/rfc3261.html#section-16.11
+
 # Admission and completion
 
 Each limit below refuses a new request with a stateless 503 while existing
@@ -113,8 +134,10 @@ quarter of output capacity for transaction output and responses. See
 [`Endpoint::shutdown`] closes new admission and drains current work until the
 earliest requested deadline. Once shutdown starts, new requests get a 503 and
 existing reply routes and responders keep working while admitted work drains.
-Matched CANCELs, ACKs and `send_request` still work then. The drain does not
-wait for INVITEs in Accepted or for their 2xx and ACKs yet.
+Matched CANCELs, ACKs, `send_request` and `forward_response` still work then.
+The drain does not wait for INVITEs in Accepted or for their 2xx and ACKs yet.
+A stateless endpoint has no admitted work, so it stops once its writes in
+flight finish, and keeps delivering events until then.
 
 Transaction timers remain under [`crate::transaction`], without an endpoint
 alias:
@@ -170,7 +193,12 @@ while let Some(event) = incoming.recv().await {
 ```
 */
 
-use std::{fmt, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    net::SocketAddr,
+    sync::{atomic::Ordering, Arc},
+    time::Duration,
+};
 
 #[cfg(feature = "__bench")]
 use bytes::Bytes;
@@ -191,18 +219,19 @@ use crate::{
 };
 
 pub use self::{
-    builder::Builder,
+    builder::{Builder, Reception},
     client::{
         CancelError, CancelOutcome, ClientControl, ClientTransaction,
         ClientTransactionId, Responses, Target,
     },
     error::{BindError, Error},
     reply::{ReplyError, ReplyRoute},
-    send::{SentRequest, ViaMode},
+    send::{Branch, InvalidBranch, SentRequest, ViaMode},
     server::{
         Incoming, IncomingCancel, IncomingEvent, ReceivedAck, ReceivedRequest,
-        Responder, ResponseId, ResponseSubmission, ServerEvent, ServerEvents,
-        ServerRequest, ServerTransaction, ServerTransactionId, SubmitError,
+        ReceivedResponse, Responder, ResponseId, ResponseSubmission,
+        ServerEvent, ServerEvents, ServerRequest, ServerTransaction,
+        ServerTransactionId, SubmitError,
     },
     shutdown::Shutdown,
 };
@@ -242,10 +271,12 @@ pub struct Endpoint {
     control: mpsc::Sender<()>,
     shutdown_wait: watch::Receiver<()>,
     connection_stats: Arc<driver::ConnectionCounters>,
+    reception_stats: Arc<driver::ReceptionCounters>,
     /// The one-shot slots and bytes that reply routes share, for
-    /// [`Endpoint::send_request`].
+    /// [`Endpoint::send_request`] and [`Endpoint::forward_response`].
     oneshot_capacity: Arc<Semaphore>,
     oneshot_bytes: Budget,
+    reception: Reception,
     udp: Option<SocketAddr>,
     tcp: Option<SocketAddr>,
 }
@@ -267,7 +298,59 @@ pub struct ConnectionStats {
     pub dropped: u64,
 }
 
+/// Cumulative counts of received messages discarded because their queue was
+/// full.
+///
+/// Each counts a message once, when it is discarded. A message that waits in
+/// a queue is not counted, and a retransmission that is admitted later does
+/// not undo an earlier count. Malformed messages, stray stateful responses and
+/// messages that arrive after [`Incoming`] has been dropped are not counted.
+/// Counters saturate at `u64::MAX`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct ReceptionStats {
+    /// ACKs discarded without a response because
+    /// [`Builder::control_event_limits`] or, on a stateless endpoint,
+    /// [`Builder::max_responder_handles`] was full. Both receptions count
+    /// here.
+    pub dropped_acks: u64,
+    /// Stateless requests other than ACK discarded because their queue or
+    /// the reply-route limits were full. See [`Reception::Stateless`].
+    pub dropped_stateless_requests: u64,
+    /// Stateless responses discarded because
+    /// [`Builder::client_response_budget`] was full.
+    pub dropped_stateless_responses: u64,
+}
+
 impl Endpoint {
+    /// Returns the counts of received messages discarded for capacity.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # fn inspect(endpoint: &signa::endpoint::Endpoint) {
+    /// let stats = endpoint.reception_stats();
+    /// println!("{} ACKs discarded", stats.dropped_acks);
+    /// # }
+    /// ```
+    pub fn reception_stats(&self) -> ReceptionStats {
+        let counters = &self.reception_stats;
+        ReceptionStats {
+            dropped_acks: counters.acks.load(Ordering::Relaxed),
+            dropped_stateless_requests: counters
+                .stateless_requests
+                .load(Ordering::Relaxed),
+            dropped_stateless_responses: counters
+                .stateless_responses
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    /// Returns how this endpoint receives messages.
+    pub fn reception(&self) -> Reception {
+        self.reception
+    }
+
     /// Returns connection-admission and ordinary fallback counters.
     ///
     /// ```no_run
@@ -277,7 +360,6 @@ impl Endpoint {
     /// # }
     /// ```
     pub fn connection_stats(&self) -> ConnectionStats {
-        use std::sync::atomic::Ordering;
         ConnectionStats {
             rejected: self.connection_stats.rejected.load(Ordering::Relaxed),
             dropped: self.connection_stats.dropped.load(Ordering::Relaxed),
@@ -396,10 +478,12 @@ pub fn reply_driver(
 #[cfg(all(test, not(miri)))]
 mod tests {
     use std::{
+        collections::{hash_map::DefaultHasher, HashMap},
         convert::Infallible,
         future::{self, poll_fn, Future, Ready},
+        hash::{Hash, Hasher},
         io,
-        net::{IpAddr, Ipv4Addr, SocketAddr},
+        net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
         pin::{self, Pin},
         sync::{
             atomic::{AtomicUsize, Ordering},
@@ -414,6 +498,7 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream, UdpSocket},
         sync::{mpsc, Notify},
+        task::yield_now,
         time::{sleep, timeout},
     };
     use tower::{limit::ConcurrencyLimit, service_fn, ServiceExt};
@@ -424,16 +509,20 @@ mod tests {
             builder::Config,
             driver::{Command, Driver, TCP_INBOUND},
             error::Error,
-            routing::Link,
-            Builder, CancelError, CancelOutcome, Endpoint, Incoming,
-            IncomingEvent, ReplyError, Responses, ServerEvent, ServerEvents,
-            ServerRequest, SubmitError, Target, ViaMode,
+            routing::{sent_by_is, Link},
+            Branch, Builder, CancelError, CancelOutcome, Endpoint, Incoming,
+            IncomingEvent, ReceivedRequest, ReceivedResponse, Reception,
+            ReplyError, Responses, ServerEvent, ServerEvents, ServerRequest,
+            SubmitError, Target, ViaMode,
         },
         message::{
-            header::{HeaderValue, Tag, CALL_ID, CSEQ, FROM, ROUTE, TO, VIA},
+            header::{
+                via::Via, HeaderMap, HeaderValue, Tag, CALL_ID, CSEQ, FROM,
+                ROUTE, TO, VIA,
+            },
             request::Request,
             response::Response,
-            Message, Method, StatusCode,
+            HeaderName, Message, Method, StatusCode,
         },
         transaction::Timers,
         transport::{budget::Budget, tcp, udp, Flow, Transport, WriteLimits},
@@ -1454,8 +1543,10 @@ mod tests {
             control: fixture.control.clone(),
             shutdown_wait: fixture.shutdown_done.subscribe(),
             connection_stats: fixture.connection_stats.clone(),
+            reception_stats: fixture.reception_counters.clone(),
             oneshot_capacity: fixture.oneshot_capacity(),
             oneshot_bytes: fixture.oneshot_bytes(),
+            reception: Reception::Stateful,
             udp: Some(udp),
             tcp: None,
         }
@@ -1505,17 +1596,19 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers().get(CSEQ).unwrap(), "1 OPTIONS");
 
-        // The endpoint wrote the Via, and the server filled in rport.
+        // The endpoint wrote the Via, and the server filled in rport, with
+        // `received` beside it although it equals the host
+        // (RFC 3581 section 4).
         let via = response.headers().get(VIA).unwrap().as_str();
         let client_port = client_end.udp_addr().unwrap().port();
         assert!(
             via.starts_with(&format!(
-                "SIP/2.0/UDP 127.0.0.1:{client_port};rport="
+                "SIP/2.0/UDP 127.0.0.1:{client_port};rport={client_port}"
             )),
             "{via}"
         );
         assert!(via.contains(";branch=z9hG4bK"), "{via}");
-        assert!(!via.contains("received"), "{via}");
+        assert!(via.ends_with(";received=127.0.0.1"), "{via}");
 
         // The service saw the flow.
         assert_eq!(service.requests.load(Ordering::SeqCst), 1);
@@ -1748,7 +1841,9 @@ mod tests {
         assert!(response.contains(&expected), "{response}");
 
         // With `rport` and a port that is not the source port, the response
-        // comes to the source port anyway, and says so in place.
+        // comes to the source port anyway, and says so in place. `received`
+        // goes with it even though the host is the source address
+        // (RFC 3581 section 4).
         let request = peer.request(
             "OPTIONS",
             "SIP/2.0/UDP 127.0.0.1:1;rport;branch=z9hG4bK2,SIP/2.0/UDP x;branch=z9hG4bK3",
@@ -1756,7 +1851,8 @@ mod tests {
         peer.send(to, &request).await;
         let response = peer.recv().await.unwrap();
         let expected = format!(
-            "Via: SIP/2.0/UDP 127.0.0.1:1;rport={};branch=z9hG4bK2,SIP/2.0/UDP x;branch=z9hG4bK3\r\n",
+            "Via: SIP/2.0/UDP 127.0.0.1:1;rport={};branch=z9hG4bK2\
+             ;received=127.0.0.1,SIP/2.0/UDP x;branch=z9hG4bK3\r\n",
             peer.port()
         );
         assert!(response.contains(&expected), "{response}");
@@ -3401,9 +3497,11 @@ mod tests {
             .await
             .is_err());
         assert!(remote.next().await.is_none());
+        assert_eq!(endpoint.reception_stats().dropped_acks, 1);
 
         remote.send(&raw("ACK", &via, Some("third"))).await;
         assert!(matches!(event(&mut incoming).await, IncomingEvent::Ack(_)));
+        assert_eq!(endpoint.reception_stats().dropped_acks, 1);
     }
 
     // A shutdown refuses new requests with a 503 but still hands the TU an
@@ -3830,5 +3928,867 @@ mod tests {
         remote.send(&reply(&sent, 603, "a")).await;
         let ack = into_request(remote.next_except("INVITE").await.unwrap());
         assert_eq!(ack.method(), Method::ACK);
+    }
+
+    // Stateless reception and forwarding (RFC 3261 section 16.11). The tests
+    // that name an RFC section check that section. The rest check signa's own
+    // scope and resource policy, as their comments say.
+
+    fn stateless_endpoint() -> (Endpoint, Incoming) {
+        Endpoint::builder()
+            .udp(LOCALHOST)
+            .reception(Reception::Stateless)
+            .bind()
+            .unwrap()
+    }
+
+    async fn stateless_request(incoming: &mut Incoming) -> ReceivedRequest {
+        match event(incoming).await {
+            IncomingEvent::StatelessRequest(request) => request,
+            other => panic!("a stateless request, got {other:?}"),
+        }
+    }
+
+    async fn stateless_response(incoming: &mut Incoming) -> ReceivedResponse {
+        match event(incoming).await {
+            IncomingEvent::StatelessResponse(response) => response,
+            other => panic!("a stateless response, got {other:?}"),
+        }
+    }
+
+    /// Waits until `condition` holds, polling the endpoint's state rather than
+    /// guessing how long the driver takes.
+    async fn until(mut condition: impl FnMut() -> bool) {
+        timeout(Duration::from_secs(2), async {
+            while !condition() {
+                yield_now().await;
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the condition within two seconds");
+    }
+
+    /// The branch a test proxy computes for `request`: a hash of the branch
+    /// and `sent-by` of its top Via, which a retransmission, its CANCEL and
+    /// its non-2xx ACK share (RFC 3261 sections 16.11 and 17.2.3). The method
+    /// is not hashed.
+    fn stable_branch(request: &Request<Bytes>) -> Branch {
+        let via = Via::top(request.headers().get(VIA).unwrap()).unwrap();
+        let mut hasher = DefaultHasher::new();
+        (via.branch.unwrap(), via.host.to_ascii_lowercase(), via.port)
+            .hash(&mut hasher);
+        format!("z9hG4bK-sl-{:016x}", hasher.finish()).parse().unwrap()
+    }
+
+    /// Removes the top Via value when its `sent-by` is `own`, as a stateless
+    /// proxy does before it forwards a response (RFC 3261 section 16.11). The
+    /// rest of a comma-separated first row stays first.
+    fn pop_own_via(headers: &mut HeaderMap, own: SocketAddr) -> bool {
+        let Some(first) = headers.get(VIA) else { return false };
+        let Some(via) = Via::top(first) else { return false };
+        if !sent_by_is(&via, own) {
+            return false;
+        }
+        let rest = first.as_str()[via.end..].trim_start();
+        let rest = rest.strip_prefix(',').map(str::trim_start);
+
+        let mut values: Vec<HeaderValue> =
+            headers.get_all(VIA).skip(1).cloned().collect();
+        if let Some(rest) = rest.filter(|rest| !rest.is_empty()) {
+            values
+                .insert(0, HeaderValue::from_bytes(rest.as_bytes()).unwrap());
+        }
+        headers.remove(VIA);
+        for value in values {
+            headers.append(VIA, value);
+        }
+        true
+    }
+
+    /// Runs a stateless proxy that sends every request to `downstream` with
+    /// [`stable_branch`] and every response with its Via on top to the next
+    /// Via. It reports the method and Via of each request it forwards.
+    fn spawn_proxy(
+        proxy: Endpoint,
+        mut incoming: Incoming,
+        downstream: SocketAddr,
+    ) -> mpsc::UnboundedReceiver<(Method, HeaderValue)> {
+        let (forwarded, report) = mpsc::unbounded_channel();
+        let target = Target::new(Transport::Udp, downstream);
+        let own = proxy.udp_addr().unwrap();
+        tokio::spawn(async move {
+            while let Some(event) = incoming.recv().await {
+                match event {
+                    IncomingEvent::StatelessRequest(received) => {
+                        let request = received.request;
+                        let method = request.method().clone();
+                        let via = ViaMode::Branch(stable_branch(&request));
+                        let sent =
+                            proxy.send_request(request, target, via).await;
+                        let _ = forwarded.send((method, sent.unwrap().via));
+                    }
+                    IncomingEvent::StatelessResponse(received) => {
+                        let mut response = received.response;
+                        if pop_own_via(response.headers_mut(), own) {
+                            proxy.forward_response(response).await.unwrap();
+                        }
+                    }
+                    other => panic!("a stateless event, got {other:?}"),
+                }
+            }
+        });
+        report
+    }
+
+    // signa's scope. Stateful is the default, stateless takes UDP only, and
+    // the refusal comes before any socket is bound.
+    #[tokio::test]
+    async fn stateless_reception_binds_udp_only() {
+        assert_eq!(Reception::default(), Reception::Stateful);
+        let (stateful, _incoming) =
+            Endpoint::builder().udp(LOCALHOST).bind().unwrap();
+        assert_eq!(stateful.reception(), Reception::Stateful);
+        let (stateless, _incoming) = stateless_endpoint();
+        assert_eq!(stateless.reception(), Reception::Stateless);
+
+        // The UDP address is taken, so binding it would fail with I/O.
+        let taken = UdpSocket::bind(LOCALHOST).await.unwrap();
+        let taken = taken.local_addr().unwrap();
+        for builder in [
+            Endpoint::builder().tcp(LOCALHOST),
+            Endpoint::builder().udp(taken).tcp(LOCALHOST),
+        ] {
+            let error =
+                builder.reception(Reception::Stateless).bind().unwrap_err();
+            assert!(error.is_unsupported_config(), "{error}");
+            assert!(!error.is_invalid_config());
+            assert_eq!(
+                io::Error::from(error).kind(),
+                io::ErrorKind::Unsupported
+            );
+        }
+        let error = Endpoint::builder()
+            .reception(Reception::Stateless)
+            .bind()
+            .unwrap_err();
+        assert!(error.is_invalid_config(), "{error}");
+    }
+
+    // signa's scope. A stateless endpoint has no client transactions, and a
+    // stateful one has no stateless forwarding. Neither sends anything.
+    #[tokio::test]
+    async fn each_reception_refuses_the_other_s_operations() {
+        let mut peer = Peer::new().await;
+        let target = Target::new(Transport::Udp, peer.addr());
+        let (stateless, _incoming) = stateless_endpoint();
+        let error = stateless.start(request("OPTIONS"), target).await;
+        assert!(error.unwrap_err().is_unsupported_reception());
+        let error = stateless.start(invite(), target).await;
+        assert!(error.unwrap_err().is_unsupported_reception());
+
+        let (stateful, _incoming) =
+            Endpoint::builder().udp(LOCALHOST).bind().unwrap();
+        let mut response = ok(&request("OPTIONS"));
+        response.headers_mut().append(
+            VIA,
+            HeaderValue::from_bytes(
+                format!("SIP/2.0/UDP {}", peer.addr()).as_bytes(),
+            )
+            .unwrap(),
+        );
+        let error = stateful.forward_response(response).await.unwrap_err();
+        assert!(error.is_unsupported_reception(), "{error}");
+
+        assert!(peer.recv().await.is_none());
+    }
+
+    // RFC 3261 section 16.11 with the 0.3.0 contract. Every method arrives,
+    // retransmissions included, without a transaction and without any
+    // automatic response: no 100, no 500 for a dropped route, nothing to an
+    // ACK. The transport still marks the top Via (sections 18.2.1 and
+    // RFC 3581 section 4).
+    #[tokio::test]
+    async fn stateless_requests_of_every_method_arrive_without_transactions() {
+        let (endpoint, mut incoming) = stateless_endpoint();
+        let to = endpoint.udp_addr().unwrap();
+        let mut peer = Peer::new().await;
+        let via =
+            format!("SIP/2.0/UDP {};branch=z9hG4bKsl;rport", peer.addr());
+
+        let invite = peer.request("INVITE", &via);
+        let sends = [
+            invite.clone(),
+            invite.clone(),
+            peer.request("CANCEL", &via),
+            peer.request("ACK", &via),
+            peer.request("OPTIONS", &via),
+            peer.request("PUBLISH", &via),
+            peer.request("FROBNICATE", &via),
+        ];
+        for message in &sends {
+            peer.send(to, message).await;
+        }
+
+        let mut received = Vec::new();
+        for message in &sends {
+            let event = stateless_request(&mut incoming).await;
+            let method = message.split(' ').next().unwrap();
+            assert_eq!(event.request.method().as_str(), method);
+            assert_eq!(event.flow.remote, peer.addr());
+            assert_eq!(event.flow.local, to);
+            assert_eq!(
+                event.request.headers().get(VIA).unwrap(),
+                format!(
+                    "SIP/2.0/UDP {};branch=z9hG4bKsl;rport={}\
+                     ;received=127.0.0.1",
+                    peer.addr(),
+                    peer.port()
+                )
+                .as_str()
+            );
+            received.push(event);
+        }
+        assert!(peer.recv().await.is_none(), "no automatic response");
+
+        drop(received);
+        assert!(peer.recv().await.is_none(), "no response on drop");
+        assert!(timeout(Duration::from_millis(50), incoming.recv())
+            .await
+            .is_err());
+    }
+
+    // The 0.3.0 contract. A stateless request's route answers it once, and
+    // the route of an ACK refuses every response (RFC 3261 section 17.1.1.3
+    // gives an ACK no response).
+    #[tokio::test]
+    async fn stateless_routes_answer_requests_but_not_acks() {
+        let (endpoint, mut incoming) = stateless_endpoint();
+        let to = endpoint.udp_addr().unwrap();
+        let mut peer = Peer::new().await;
+        let via = format!("SIP/2.0/UDP {};branch=z9hG4bKrt", peer.addr());
+
+        peer.send(to, &peer.request("OPTIONS", &via)).await;
+        let options = stateless_request(&mut incoming).await;
+        let response = reply(&options.request, 404, "stateless");
+        options.reply.send(response.clone()).await.unwrap();
+        assert_eq!(
+            peer.recv().await.unwrap().as_bytes(),
+            response.to_bytes().as_ref()
+        );
+
+        peer.send(to, &peer.request("ACK", &via)).await;
+        let ack = stateless_request(&mut incoming).await;
+        let response = reply(&ack.request, 200, "stateless");
+        assert!(matches!(
+            ack.reply.send(response).await,
+            Err(ReplyError::Unsupported)
+        ));
+        assert!(peer.recv().await.is_none());
+    }
+
+    // RFC 3261 section 16.11 against RFC 6026 section 8.9. A stateless
+    // endpoint delivers every response, stray or not, with its flow. A
+    // stateful one discards a response that matches no client transaction.
+    #[tokio::test]
+    async fn only_a_stateless_endpoint_delivers_stray_responses() {
+        let (stateless, mut incoming) = stateless_endpoint();
+        let peer = Peer::new().await;
+        let via = format!("SIP/2.0/UDP {};branch=z9hG4bKstray", peer.addr());
+        let request = into_request(
+            Message::from_bytes(peer.request("INVITE", &via).as_bytes())
+                .unwrap(),
+        );
+
+        for code in [100, 180, 200, 486] {
+            let response = reply(&request, code, "uas");
+            peer.send_message(stateless.udp_addr().unwrap(), &response).await;
+            let received = stateless_response(&mut incoming).await;
+            assert_eq!(received.response.status().as_u16(), code);
+            assert_eq!(received.response.to_bytes(), response.to_bytes());
+            assert_eq!(received.flow.remote, peer.addr());
+            assert_eq!(received.flow.local, stateless.udp_addr().unwrap());
+            assert_eq!(received.flow.transport, Transport::Udp);
+        }
+
+        let (stateful, mut incoming) =
+            Endpoint::builder().udp(LOCALHOST).bind().unwrap();
+        for code in [180, 200] {
+            let response = reply(&request, code, "uas");
+            peer.send_message(stateful.udp_addr().unwrap(), &response).await;
+        }
+        assert!(timeout(Duration::from_millis(100), incoming.recv())
+            .await
+            .is_err());
+    }
+
+    // RFC 3261 sections 16.6 and 16.11. The caller's branch is the top Via as
+    // given, the received rows stay below in order, and the same request,
+    // branch and target go out the same each time. `Fresh` makes a new branch
+    // per call, which is why a proxy must not forward with it.
+    #[tokio::test]
+    async fn a_caller_branch_tops_the_received_via_rows() {
+        let (endpoint, _incoming) = stateless_endpoint();
+        let local = endpoint.udp_addr().unwrap();
+        let mut peer = Peer::new().await;
+        let target = Target::new(Transport::Udp, peer.addr());
+        let mut request = request("INVITE");
+        let rows = [
+            "SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bKa;received=192.0.2.9, \
+             SIP/2.0/UDP 192.0.2.2;branch=z9hG4bKb",
+            "SIP/2.0/UDP 192.0.2.3;branch=z9hG4bKc",
+        ];
+        for row in rows {
+            request
+                .headers_mut()
+                .append(VIA, HeaderValue::from_bytes(row.as_bytes()).unwrap());
+        }
+        let branch: Branch = "z9hG4bK-proxy-7f3a".parse().unwrap();
+        let top = format!("SIP/2.0/UDP {local};rport;branch={branch}");
+
+        let mut sent = Vec::new();
+        for _ in 0..2 {
+            let mode = ViaMode::Branch(branch.clone());
+            let result = endpoint
+                .send_request(request.clone(), target, mode)
+                .await
+                .unwrap();
+            assert_eq!(result.via(), top.as_str());
+            assert_eq!(result.flow().local, local);
+            assert_eq!(result.flow().remote, peer.addr());
+            sent.push(peer.recv().await.unwrap());
+        }
+        assert_eq!(sent[0], sent[1]);
+        let forwarded =
+            into_request(Message::from_bytes(sent[0].as_bytes()).unwrap());
+        let sent_rows: Vec<_> = forwarded.headers().get_all(VIA).collect();
+        assert_eq!(sent_rows, [top.as_str(), rows[0], rows[1]]);
+
+        let first = endpoint
+            .send_request(request.clone(), target, ViaMode::Fresh)
+            .await
+            .unwrap();
+        let second = endpoint
+            .send_request(request, target, ViaMode::Fresh)
+            .await
+            .unwrap();
+        assert_ne!(first.via(), second.via());
+    }
+
+    // signa's scope for one-shot requests. Every method goes once, with no
+    // client transaction: no retransmission at Timer E or A, and a stateful
+    // endpoint discards the response as stray (RFC 6026 section 8.9).
+    #[tokio::test]
+    async fn send_request_takes_any_method_without_a_transaction() {
+        let (endpoint, mut incoming) = Endpoint::builder()
+            .udp(LOCALHOST)
+            .timers(short_timers())
+            .bind()
+            .unwrap();
+        let mut peer = Peer::new().await;
+        let target = Target::new(Transport::Udp, peer.addr());
+
+        for method in ["OPTIONS", "INVITE", "BYE", "CANCEL", "FROBNICATE"] {
+            let sent = endpoint
+                .send_request(request(method), target, ViaMode::Fresh)
+                .await
+                .unwrap();
+            let received = peer.message().await.unwrap();
+            let received = into_request(received);
+            assert_eq!(received.method().as_str(), method);
+            assert_eq!(received.headers().get(VIA), Some(sent.via()));
+
+            peer.send_message(endpoint.udp_addr().unwrap(), &ok(&received))
+                .await;
+        }
+        // Timer E would have fired several times by now with these timers.
+        assert!(peer.recv().await.is_none());
+        assert!(timeout(Duration::from_millis(50), incoming.recv())
+            .await
+            .is_err());
+    }
+
+    /// A request size that fits 1300 bytes alone but not with the Via a
+    /// stateless send adds.
+    const MAX_REQUEST_WITHOUT_VIA: usize = 1290;
+
+    // RFC 3261 sections 8.1.1.5, 8.1.2 and 18.1.1, and signa's UDP-only
+    // stateless scope. Each refusal comes before anything is sent.
+    #[tokio::test]
+    async fn send_request_refuses_before_sending() {
+        let (stateless, _incoming) = stateless_endpoint();
+        let mut peer = Peer::new().await;
+        let udp = Target::new(Transport::Udp, peer.addr());
+        let branch = || ViaMode::Branch("z9hG4bK-refused".parse().unwrap());
+
+        let mut mismatched = request("CANCEL");
+        mismatched
+            .headers_mut()
+            .insert(CSEQ, HeaderValue::from_static("1 INVITE"));
+        let error = stateless
+            .send_request(mismatched, udp, branch())
+            .await
+            .unwrap_err();
+        assert!(error.is_invalid_cseq(), "{error}");
+
+        let mut sips = request("OPTIONS");
+        *sips.uri_mut() = "SIPS:bob@example.com".parse().unwrap();
+        let error =
+            stateless.send_request(sips, udp, branch()).await.unwrap_err();
+        assert!(error.is_unsupported_routing(), "{error}");
+
+        let tcp = Target::new(Transport::Tcp, peer.addr());
+        let error = stateless
+            .send_request(request("OPTIONS"), tcp, branch())
+            .await
+            .unwrap_err();
+        assert!(error.is_unsupported_routing(), "{error}");
+
+        // The Via added here counts toward the 1300 bytes.
+        let base = request("OPTIONS").to_bytes().len();
+        let fill = MAX_REQUEST_WITHOUT_VIA - base;
+        let mut large = request("OPTIONS");
+        large.headers_mut().append(
+            HeaderName::from_static("x-fill"),
+            HeaderValue::from_bytes("x".repeat(fill).as_bytes()).unwrap(),
+        );
+        assert!(large.to_bytes().len() <= 1300);
+        let error =
+            stateless.send_request(large, udp, branch()).await.unwrap_err();
+        assert!(error.is_too_large(), "{error}");
+
+        assert!(peer.recv().await.is_none());
+    }
+
+    // RFC 3261 sections 16.11 and 18.2.2 and RFC 3581 section 4. The response
+    // goes where its remaining top Via says, as it is, including a body and
+    // a size above 1300 bytes, which section 18.1.1 limits for requests only.
+    #[tokio::test]
+    async fn forward_response_routes_by_the_remaining_top_via() {
+        let (endpoint, _incoming) = stateless_endpoint();
+        let mut sent_by = Peer::new().await;
+        let mut rport = Peer::new().await;
+        let request = request("INVITE");
+        let body = Bytes::from(vec![b'v'; 3000]);
+
+        for (via, expected) in [
+            (format!("SIP/2.0/UDP {};branch=z9hG4bKa", sent_by.addr()), 0),
+            (
+                format!(
+                    "SIP/2.0/UDP uac.example.com:9;rport={}\
+                     ;received=127.0.0.1;branch=z9hG4bKb, \
+                     SIP/2.0/UDP 192.0.2.1",
+                    rport.port()
+                ),
+                1,
+            ),
+        ] {
+            let mut response = Response::reply_to(&request)
+                .status(200)
+                .to_tag("uas")
+                .header("Via", via.as_str())
+                .header("Content-Type", "application/sdp")
+                .body(body.clone())
+                .unwrap();
+            response.headers_mut().append(
+                VIA,
+                HeaderValue::from_static("SIP/2.0/UDP 192.0.2.2"),
+            );
+
+            endpoint.forward_response(response.clone()).await.unwrap();
+
+            let peer = if expected == 0 { &mut sent_by } else { &mut rport };
+            let received = peer.recv().await.unwrap();
+            assert_eq!(received.as_bytes(), response.to_bytes().as_ref());
+            assert!(received.len() > 3000);
+        }
+        assert!(sent_by.recv().await.is_none());
+        assert!(rport.recv().await.is_none());
+    }
+
+    // RFC 3261 section 18.2.2 over IPv6. Skipped where the host has no IPv6
+    // loopback.
+    #[tokio::test]
+    async fn forward_response_routes_to_an_ipv6_sent_by() {
+        let loopback = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0);
+        let Ok(socket) = UdpSocket::bind(loopback).await else { return };
+        let (endpoint, _incoming) = Endpoint::builder()
+            .udp(loopback)
+            .reception(Reception::Stateless)
+            .bind()
+            .unwrap();
+        let mut peer = Peer { socket, buf: vec![0; 65536] };
+        let mut response = ok(&request("OPTIONS"));
+        let via = format!("SIP/2.0/UDP {};branch=z9hG4bKv6", peer.addr());
+        response
+            .headers_mut()
+            .append(VIA, HeaderValue::from_bytes(via.as_bytes()).unwrap());
+
+        endpoint.forward_response(response.clone()).await.unwrap();
+
+        assert_eq!(
+            peer.recv().await.unwrap().as_bytes(),
+            response.to_bytes().as_ref()
+        );
+    }
+
+    // signa's scope. A response the endpoint cannot route by its remaining Via
+    // is refused without a send, and never goes to where it came from.
+    #[tokio::test]
+    async fn forward_response_refuses_what_it_cannot_route() {
+        let (endpoint, _incoming) = stateless_endpoint();
+        let mut peer = Peer::new().await;
+        let base = ok(&request("OPTIONS"));
+
+        let error = endpoint.forward_response(base.clone()).await.unwrap_err();
+        assert!(error.is_invalid_header(), "{error}");
+
+        for (via, unsupported) in [
+            ("SIP/2.0/UDP uac.example.com:5060".to_owned(), true),
+            (format!("SIP/2.0/TCP {}", peer.addr()), true),
+            (format!("SIP/2.0/UDP {};maddr=224.0.1.75", peer.addr()), true),
+            ("SIP/2.0/UDP 224.0.1.75:5060".to_owned(), true),
+            ("SIP/2.0/UDP 127.0.0.1:0".to_owned(), false),
+            ("SIP/2.0/UDP".to_owned(), false),
+        ] {
+            let mut response = base.clone();
+            response
+                .headers_mut()
+                .append(VIA, HeaderValue::from_bytes(via.as_bytes()).unwrap());
+            let error = endpoint.forward_response(response).await.unwrap_err();
+            if unsupported {
+                assert!(error.is_unsupported_routing(), "{via}: {error}");
+            } else {
+                assert!(error.is_invalid_header(), "{via}: {error}");
+            }
+        }
+        assert!(peer.recv().await.is_none());
+    }
+
+    // signa's resource policy. Each stateless queue is bounded in count, and
+    // what does not fit is discarded without a response and counted once.
+    // Capacity comes back when the TU takes an event.
+    #[tokio::test]
+    async fn stateless_queues_are_bounded_in_count_and_count_drops() {
+        let (endpoint, mut incoming) = Builder::new()
+            .udp(LOCALHOST)
+            .reception(Reception::Stateless)
+            .max_pending_requests(1)
+            .control_event_limits(WriteLimits { messages: 1, bytes: 1 << 20 })
+            .client_response_budget(WriteLimits {
+                messages: 1,
+                bytes: 1 << 20,
+            })
+            .bind()
+            .unwrap();
+        let to = endpoint.udp_addr().unwrap();
+        let mut peer = Peer::new().await;
+        let via = format!("SIP/2.0/UDP {};branch=z9hG4bKq", peer.addr());
+        let response = reply(
+            &into_request(
+                Message::from_bytes(peer.request("INVITE", &via).as_bytes())
+                    .unwrap(),
+            ),
+            180,
+            "uas",
+        );
+
+        // An ACK and a CANCEL share control capacity, apart from the OPTIONS.
+        for method in ["OPTIONS", "OPTIONS", "ACK", "ACK", "CANCEL"] {
+            peer.send(to, &peer.request(method, &via)).await;
+        }
+        for _ in 0..2 {
+            peer.send_message(to, &response).await;
+        }
+        until(|| {
+            let stats = endpoint.reception_stats();
+            stats.dropped_stateless_requests == 2
+                && stats.dropped_acks == 1
+                && stats.dropped_stateless_responses == 1
+        })
+        .await;
+
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            held.push(event(&mut incoming).await);
+        }
+        assert!(timeout(Duration::from_millis(50), incoming.recv())
+            .await
+            .is_err());
+        assert!(peer.recv().await.is_none(), "a full queue sends nothing");
+
+        // The TU has taken every event, so each queue has room again, even
+        // while the TU still holds the requests and their routes.
+        for method in ["OPTIONS", "ACK"] {
+            peer.send(to, &peer.request(method, &via)).await;
+        }
+        peer.send_message(to, &response).await;
+        for _ in 0..3 {
+            event(&mut incoming).await;
+        }
+        let stats = endpoint.reception_stats();
+        assert_eq!(stats.dropped_stateless_requests, 2);
+        assert_eq!(stats.dropped_acks, 1);
+        assert_eq!(stats.dropped_stateless_responses, 1);
+        drop(held);
+    }
+
+    // signa's resource policy. The byte limits bound the same queues, and a
+    // stateless reply route holds the responder limits until it drops.
+    #[tokio::test]
+    async fn stateless_queues_and_routes_are_bounded_in_bytes() {
+        let (endpoint, mut incoming) = Builder::new()
+            .udp(LOCALHOST)
+            .reception(Reception::Stateless)
+            .max_server_request_bytes(64)
+            .control_event_limits(WriteLimits { messages: 16, bytes: 64 })
+            .client_response_budget(WriteLimits { messages: 16, bytes: 64 })
+            .bind()
+            .unwrap();
+        let to = endpoint.udp_addr().unwrap();
+        let peer = Peer::new().await;
+        let via = format!("SIP/2.0/UDP {};branch=z9hG4bKb", peer.addr());
+        let request = peer.request("INVITE", &via);
+        let response = reply(
+            &into_request(Message::from_bytes(request.as_bytes()).unwrap()),
+            180,
+            "uas",
+        );
+
+        for method in ["OPTIONS", "ACK", "CANCEL"] {
+            peer.send(to, &peer.request(method, &via)).await;
+        }
+        peer.send_message(to, &response).await;
+        until(|| {
+            let stats = endpoint.reception_stats();
+            stats.dropped_stateless_requests == 2
+                && stats.dropped_acks == 1
+                && stats.dropped_stateless_responses == 1
+        })
+        .await;
+        assert!(timeout(Duration::from_millis(50), incoming.recv())
+            .await
+            .is_err());
+
+        let (endpoint, mut incoming) = Builder::new()
+            .udp(LOCALHOST)
+            .reception(Reception::Stateless)
+            .max_responder_handles(1)
+            .bind()
+            .unwrap();
+        let to = endpoint.udp_addr().unwrap();
+        peer.send(to, &peer.request("OPTIONS", &via)).await;
+        let route = stateless_request(&mut incoming).await.reply;
+        peer.send(to, &peer.request("OPTIONS", &via)).await;
+        until(|| endpoint.reception_stats().dropped_stateless_requests == 1)
+            .await;
+
+        drop(route);
+        peer.send(to, &peer.request("OPTIONS", &via)).await;
+        stateless_request(&mut incoming).await;
+    }
+
+    // The 0.3.0 completion contract for one-shot sends. An unpolled future
+    // and one waiting for a one-shot slot send nothing. Once enqueued, the
+    // send goes out even if its future is dropped.
+    #[tokio::test]
+    async fn stateless_sends_commit_at_enqueue() {
+        let (endpoint, _incoming) = stateless_endpoint();
+        let mut peer = Peer::new().await;
+        let target = Target::new(Transport::Udp, peer.addr());
+        let branch = || ViaMode::Branch("z9hG4bK-commit".parse().unwrap());
+        let mut response = ok(&request("OPTIONS"));
+        let via = format!("SIP/2.0/UDP {};branch=z9hG4bKc", peer.addr());
+        response
+            .headers_mut()
+            .append(VIA, HeaderValue::from_bytes(via.as_bytes()).unwrap());
+
+        drop(endpoint.send_request(request("OPTIONS"), target, branch()));
+        drop(endpoint.forward_response(response.clone()));
+
+        let all = endpoint
+            .oneshot_capacity
+            .clone()
+            .acquire_many_owned(64)
+            .await
+            .unwrap();
+        {
+            let mut send = pin::pin!(endpoint.send_request(
+                request("OPTIONS"),
+                target,
+                branch()
+            ));
+            poll_once(&mut send).await;
+            let mut forward =
+                pin::pin!(endpoint.forward_response(response.clone()));
+            poll_once(&mut forward).await;
+        }
+        drop(all);
+        assert!(peer.recv().await.is_none());
+
+        {
+            let mut send = pin::pin!(endpoint.send_request(
+                request("OPTIONS"),
+                target,
+                branch()
+            ));
+            poll_once(&mut send).await;
+            let mut forward =
+                pin::pin!(endpoint.forward_response(response.clone()));
+            poll_once(&mut forward).await;
+        }
+        let request = into_request(peer.message().await.unwrap());
+        assert_eq!(request.method(), Method::OPTIONS);
+        let response = into_response(peer.message().await.unwrap());
+        assert_eq!(response.status(), StatusCode::OK);
+        until(|| endpoint.oneshot_capacity.available_permits() == 64).await;
+    }
+
+    // The 0.3.0 shutdown contract as it applies to a stateless endpoint.
+    // Nothing stateless holds the drain, a send committed before the shutdown
+    // still reports its write, and the stopped endpoint refuses new sends.
+    #[tokio::test]
+    async fn a_stateless_shutdown_keeps_committed_sends() {
+        let (endpoint, _incoming) = stateless_endpoint();
+        let mut peer = Peer::new().await;
+        let mut response = ok(&request("OPTIONS"));
+        let via = format!("SIP/2.0/UDP {};branch=z9hG4bKs", peer.addr());
+        response
+            .headers_mut()
+            .append(VIA, HeaderValue::from_bytes(via.as_bytes()).unwrap());
+
+        let mut forward =
+            Box::pin(endpoint.forward_response(response.clone()));
+        poll_once(&mut forward).await;
+        let stopped = endpoint.clone().shutdown(Duration::from_secs(1));
+        forward.await.unwrap();
+        assert!(peer.recv().await.is_some());
+
+        timeout(Duration::from_secs(1), stopped).await.unwrap();
+        let error = endpoint.forward_response(response).await.unwrap_err();
+        assert!(error.is_closed(), "{error}");
+    }
+
+    // RFC 3261 section 16.11 over real endpoints: UAC, stateless proxy, UAS
+    // and back, all on loopback. The UAS's own transaction matching checks the
+    // proxy's branches. The INVITE's CANCEL matches it (section 9.2), and the
+    // non-2xx ACK reaches the INVITE in Completed (section 17.2.1), because
+    // the proxy gives them the INVITE's branch and sent-by.
+    #[tokio::test]
+    async fn a_stateless_proxy_relays_between_real_endpoints() {
+        let (uas, mut uas_incoming) = Endpoint::builder()
+            .udp(LOCALHOST)
+            .timers(short_timers())
+            .bind()
+            .unwrap();
+        let (proxy, proxy_incoming) = stateless_endpoint();
+        let proxy_addr = proxy.udp_addr().unwrap();
+        let mut forwarded =
+            spawn_proxy(proxy, proxy_incoming, uas.udp_addr().unwrap());
+        let (uac, _uac_incoming) = Endpoint::builder()
+            .udp(LOCALHOST)
+            .timers(short_timers())
+            .bind()
+            .unwrap();
+        let target = Target::new(Transport::Udp, proxy_addr);
+
+        // A non-INVITE round trip.
+        let (_, mut responses) =
+            uac.start(request("OPTIONS"), target).await.unwrap().into_parts();
+        let ServerRequest { request: options, transaction, .. } =
+            server_request(&mut uas_incoming).await;
+        let vias: Vec<_> = options.headers().get_all(VIA).collect();
+        assert_eq!(vias.len(), 2);
+        assert!(vias[0].as_str().contains(&proxy_addr.to_string()));
+        let (responder, _) = transaction.into_parts();
+        responder.respond(reply(&options, 200, "uas")).await.unwrap();
+        let response = next(&mut responses).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get_all(VIA).count(), 1);
+
+        // An INVITE, cancelled after its 180.
+        let (control, mut responses) =
+            uac.start(invite(), target).await.unwrap().into_parts();
+        let ServerRequest { request: invite, transaction, .. } =
+            server_request(&mut uas_incoming).await;
+        let invite_id = transaction.id();
+        let (responder, mut events) = transaction.into_parts();
+        responder.respond(reply(&invite, 180, "uas")).await.unwrap();
+        assert_eq!(next(&mut responses).await.status().as_u16(), 100);
+        assert_eq!(next(&mut responses).await.status().as_u16(), 180);
+
+        let Ok(CancelOutcome::Sent(cancel)) = control.cancel().await else {
+            panic!("a CANCEL");
+        };
+        let (_, mut cancel_responses) = cancel.into_parts();
+        let IncomingEvent::Cancel(matched) = event(&mut uas_incoming).await
+        else {
+            panic!("a CANCEL that matches the INVITE");
+        };
+        assert_eq!(matched.target, invite_id);
+        let (cancel_responder, _) = matched.transaction.into_parts();
+        cancel_responder
+            .respond(reply(&matched.request, 200, "uas"))
+            .await
+            .unwrap();
+        responder.respond(reply(&invite, 487, "uas")).await.unwrap();
+        assert_eq!(next(&mut cancel_responses).await.status(), StatusCode::OK);
+        assert_eq!(next(&mut responses).await.status().as_u16(), 487);
+
+        // The ACK of the 487 confirms the INVITE, which then ends at Timer I
+        // instead of reporting a missing ACK at Timer H.
+        assert!(matches!(
+            server_event(&mut events).await,
+            ServerEvent::Terminated
+        ));
+        assert!(timeout(Duration::from_millis(50), uas_incoming.recv())
+            .await
+            .is_err());
+
+        let mut branches = HashMap::new();
+        while let Ok((method, via)) = forwarded.try_recv() {
+            let branch = Via::top(&via).unwrap().branch.unwrap().to_owned();
+            branches.entry(method).or_insert_with(Vec::new).push(branch);
+        }
+        let invite = &branches[&Method::INVITE];
+        assert_eq!(branches[&Method::CANCEL], [invite[0].clone()]);
+        assert_eq!(branches[&Method::ACK], [invite[0].clone()]);
+        assert_ne!(branches[&Method::OPTIONS][0], invite[0]);
+    }
+
+    // RFC 3261 section 16.11. A retransmitted INVITE arrives at the proxy as
+    // a new event, and the proxy's stable branch makes the UAS absorb it in
+    // the transaction of the first (section 17.2.3), answering it from there.
+    #[tokio::test]
+    async fn a_retransmission_through_a_stateless_proxy_reaches_one_transaction(
+    ) {
+        let (uas, mut uas_incoming) = Endpoint::builder()
+            .udp(LOCALHOST)
+            .timers(short_timers())
+            .bind()
+            .unwrap();
+        let (proxy, proxy_incoming) = stateless_endpoint();
+        let proxy_addr = proxy.udp_addr().unwrap();
+        let mut forwarded =
+            spawn_proxy(proxy, proxy_incoming, uas.udp_addr().unwrap());
+        let mut uac = Peer::new().await;
+        let via =
+            format!("SIP/2.0/UDP {};branch=z9hG4bKrtx;rport", uac.addr());
+        let invite = uac.request("INVITE", &via);
+
+        uac.send(proxy_addr, &invite).await;
+        let ServerRequest { transaction, .. } =
+            server_request(&mut uas_incoming).await;
+        assert_eq!(status_of(uac.message().await), 100);
+        uac.send(proxy_addr, &invite).await;
+        assert_eq!(status_of(uac.message().await), 100);
+
+        assert!(timeout(Duration::from_millis(50), uas_incoming.recv())
+            .await
+            .is_err());
+        let (_, first) = forwarded.recv().await.unwrap();
+        let (_, second) = forwarded.recv().await.unwrap();
+        assert_eq!(first, second);
+        drop(transaction);
     }
 }

@@ -28,9 +28,14 @@ pub struct Via<'a> {
     pub port: Option<u16>,
     /// The `branch` parameter.
     pub branch: Option<&'a str>,
-    /// The `received` parameter. RFC 3261 only allows an IP address here, but
-    /// this does not check that it is one. The caller that uses it as an
-    /// address parses it.
+    /// The last `received` parameter. RFC 3261 only allows an IP address
+    /// here, but this does not check that it is one. The caller that uses it
+    /// as an address parses it.
+    ///
+    /// Unlike the other parameters, a repeated `received` keeps its last
+    /// value. The endpoint appends its own after anything the sender wrote,
+    /// so a `received` the sender made up cannot pick where a response is
+    /// forwarded.
     pub received: Option<&'a str>,
     /// The `rport` parameter. `Some(None)` is `rport` without a value, by
     /// which a client asks for the port (RFC 3581 section 4).
@@ -55,10 +60,11 @@ impl<'a> Via<'a> {
     /// `Via`. Returns `None` if the parm does not match the grammar in
     /// RFC 3261 section 25.1, with the `rport` parameter from RFC 3581.
     ///
-    /// A parameter that appears twice keeps its first value. The protocol
-    /// name and version in `sent-protocol` are not checked beyond being
-    /// tokens. signa cannot route by a `Via` it does not understand, but it
-    /// has no reason to reject the message for it either.
+    /// A parameter that appears twice keeps its first value, except
+    /// `received`, which keeps its last. The protocol name and version in
+    /// `sent-protocol` are not checked beyond being tokens. signa cannot route
+    /// by a `Via` it does not understand, but it has no reason to reject the
+    /// message for it either.
     pub fn top(value: &'a HeaderValue) -> Option<Via<'a>> {
         let src = value.as_str();
 
@@ -138,7 +144,7 @@ impl<'a> Via<'a> {
                 return None;
             }
             let (received, rest) = value.split_at(n);
-            self.received.get_or_insert(received);
+            self.received = Some(received);
             return Some(rest);
         }
         if name.eq_ignore_ascii_case("rport") {
@@ -326,6 +332,18 @@ mod tests {
             .unwrap();
         assert_eq!(via.branch, Some("z9hG4bKa"));
         assert_eq!(via.rport, Some(Some(1)));
+    }
+
+    // The endpoint appends its own `received`, so the last one is the one the
+    // receiving transport wrote.
+    #[test]
+    fn a_repeated_received_keeps_its_last_value() {
+        let via = top!(
+            "SIP/2.0/UDP a.example.com;received=192.0.2.9;branch=z9hG4bKa\
+             ;received=192.0.2.1"
+        )
+        .unwrap();
+        assert_eq!(via.received, Some("192.0.2.1"));
     }
 
     #[test]

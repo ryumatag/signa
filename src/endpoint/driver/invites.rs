@@ -20,8 +20,8 @@ use std::{io, time::Instant};
 use bytes::Bytes;
 
 use super::{
-    has_identity, send_on, Cancel, ClientEntry, ClientMachine, Driver, Link,
-    Pending, ServerMachine,
+    has_identity, increment, send_on, Cancel, ClientEntry, ClientMachine,
+    Driver, Link, Pending, ServerMachine,
 };
 use crate::{
     endpoint::{
@@ -283,7 +283,10 @@ impl Driver {
             return;
         }
         let Some(bytes) = request_bytes(&request) else { return };
-        let Some(permit) = self.control_events.acquire(bytes) else { return };
+        let Some(permit) = self.control_events.acquire(bytes) else {
+            increment(&self.reception_counters.acks);
+            return;
+        };
         let _ = self.incoming.send(server::Queued {
             event: IncomingEvent::Ack(ReceivedAck { request, flow }),
             _permit: permit,

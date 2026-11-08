@@ -27,10 +27,13 @@ return split control and bounded response streams. An INVITE is cancelled
 through its control, the transaction acknowledges a non-2xx, and the
 application sends the ACK for a 2xx once, without a transaction. ACKs for a 2xx
 and CANCELs reach the application as events of their own. The endpoint
-supports graceful shutdown. Stateless forwarding, draining INVITEs in Accepted
-at shutdown, TLS and next-hop selection are later work. signa is not a
-complete UA or proxy. Dialogs, 2xx retransmission and the meaning of a CANCEL
-stay with the application.
+supports graceful shutdown. A stateless endpoint receives requests and
+responses over UDP without transactions, and forwards requests with a branch
+the application computes and responses by their remaining Via. Draining INVITEs
+in Accepted at shutdown, stateless TCP, TLS and next-hop selection are later
+work. signa is not a complete UA or proxy. Dialogs, 2xx retransmission, the
+meaning of a CANCEL, and a proxy's validation and routing stay with the
+application.
 
 The [API documentation on docs.rs] says what is covered in detail.
 
@@ -108,7 +111,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 application-owned Tower dispatch with a non-Clone service. The endpoint starts
 no application handler tasks. Response acceptance is distinct from local write
 completion and transaction termination. Dropping an unanswered responder
-requests a 500. A stateless endpoint mode remains planned.
+requests a 500.
+
+`examples/stateless_proxy.rs` runs a UDP stateless proxy between a raw UAC and
+a stateful UAS. It shows a stable branch, CANCEL and ACK forwarding, and
+response forwarding, and lists the proxy duties it leaves out.
 
 ### License
 

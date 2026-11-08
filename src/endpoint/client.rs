@@ -19,7 +19,9 @@ use std::{
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 
-use super::{admission, driver::Command, table::Id, Endpoint, Error};
+use super::{
+    admission, builder::Reception, driver::Command, table::Id, Endpoint, Error,
+};
 use crate::{
     message::{
         header::{
@@ -711,6 +713,9 @@ impl Endpoint {
         target: Target,
     ) -> Result<oneshot::Receiver<Result<ClientTransaction, Error>>, Error>
     {
+        if self.reception == Reception::Stateless {
+            return Err(Error::unsupported_reception());
+        }
         if self.commands.is_closed() {
             return Err(Error::closed());
         }

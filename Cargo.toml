@@ -80,3 +80,8 @@ required-features = ["tokio"]
 [[example]]
 name = "server_adapter"
 required-features = ["tokio"]
+
+# A UDP stateless proxy between a raw UAC and a stateful UAS.
+[[example]]
+name = "stateless_proxy"
+required-features = ["tokio"]

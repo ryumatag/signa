@@ -87,10 +87,14 @@ pub(super) struct Queued {
     pub(super) _permit: Permit,
 }
 
-/// A request delivered by a stateful endpoint.
+/// A message delivered by an endpoint.
 ///
-/// See the [module docs](super#reception) for which event each request
-/// becomes.
+/// A [`Reception::Stateful`] endpoint delivers the first five, see the
+/// [module docs](super#reception) for which event each request becomes. A
+/// [`Reception::Stateless`] endpoint delivers only the last two.
+///
+/// [`Reception::Stateful`]: super::Reception::Stateful
+/// [`Reception::Stateless`]: super::Reception::Stateless
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum IncomingEvent {
@@ -108,6 +112,18 @@ pub enum IncomingEvent {
     /// A request without an RFC 3261 branch, which gets no transaction. Its
     /// retransmissions arrive as new events.
     Untracked(ReceivedRequest),
+    /// A request received by a stateless endpoint, of any method.
+    ///
+    /// No transaction exists for it, so each retransmission is a new event,
+    /// and nothing answers it unless the TU does through its reply route. The
+    /// route of an ACK refuses every response.
+    StatelessRequest(ReceivedRequest),
+    /// A response received by a stateless endpoint, whether or not it sent
+    /// the request. Its Via is as it arrived, with this endpoint's value still
+    /// on top. See [`Endpoint::forward_response`] for what a proxy does next.
+    ///
+    /// [`Endpoint::forward_response`]: super::Endpoint::forward_response
+    StatelessResponse(ReceivedResponse),
 }
 
 /// An owned request with its response and observation capabilities.
@@ -166,7 +182,8 @@ pub struct ReceivedAck {
     pub flow: Flow,
 }
 
-/// An owned request that could not be tracked as an RFC 3261 transaction.
+/// An owned request without a server transaction: one that could not be
+/// tracked, an unmatched CANCEL, or any request on a stateless endpoint.
 ///
 /// Dropping it sends nothing.
 #[derive(Debug)]
@@ -178,6 +195,21 @@ pub struct ReceivedRequest {
     pub flow: Flow,
     /// One-shot reply capability retaining the received route.
     pub reply: ReplyRoute,
+}
+
+/// An owned response received by a stateless endpoint.
+///
+/// It has no reply capability. Forwarding it is
+/// [`Endpoint::forward_response`], once the TU has checked and removed its own
+/// Via value. Dropping it sends nothing.
+///
+/// [`Endpoint::forward_response`]: super::Endpoint::forward_response
+#[derive(Debug)]
+pub struct ReceivedResponse {
+    /// The received response, as it arrived.
+    pub response: Response<Bytes>,
+    /// Descriptive metadata for the flow it arrived on.
+    pub flow: Flow,
 }
 
 /// Identifies a server transaction within this process.

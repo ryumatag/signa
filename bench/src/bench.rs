@@ -44,6 +44,8 @@ criterion::criterion_group! {
         // The same round trips between two endpoints, which adds the
         // transactions, the service, and the message layer on both sides.
         endpoint::round_trip,
+        // The UDP round trip through a stateless proxy between them.
+        endpoint::stateless_forward,
         // INVITE and CANCEL through the TU API, each to the point its
         // comment names, which is not the end of the transaction.
         endpoint::invite,
