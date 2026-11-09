@@ -17,6 +17,7 @@ include = [
   "/src/**/*.rs",
   "/docs/rustdoc/**/*.md",
   "/examples/**/*.rs",
+  "/tests/**/*.rs",
   "/README.md",
   "LICENSE-APACHE",
   "LICENSE-MIT",
