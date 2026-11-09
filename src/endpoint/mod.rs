@@ -344,6 +344,9 @@ impl Endpoint {
     /// # Example
     ///
     /// ```
+    /// # #[cfg(miri)] // Miri has no sockets.
+    /// # fn main() {}
+    /// # #[cfg(not(miri))]
     /// # #[tokio::main(flavor = "current_thread")]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let (endpoint, _incoming) = signa::endpoint::Endpoint::builder()
@@ -377,6 +380,9 @@ impl Endpoint {
     /// # Example
     ///
     /// ```
+    /// # #[cfg(miri)] // Miri has no sockets.
+    /// # fn main() {}
+    /// # #[cfg(not(miri))]
     /// # #[tokio::main(flavor = "current_thread")]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let (endpoint, _incoming) = signa::endpoint::Endpoint::builder()
@@ -481,6 +487,9 @@ impl Endpoint {
     /// ```
     /// use std::time::Duration;
     ///
+    /// # #[cfg(miri)] // Miri has no sockets.
+    /// # fn main() {}
+    /// # #[cfg(not(miri))]
     /// # #[tokio::main(flavor = "current_thread")]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let (endpoint, _incoming) = signa::endpoint::Endpoint::builder()
@@ -543,6 +552,9 @@ impl Endpoint {
     /// use signa::endpoint::ReceivedAck;
     /// use tokio::sync::oneshot;
     ///
+    /// # #[cfg(miri)] // Miri has no sockets.
+    /// # fn main() {}
+    /// # #[cfg(not(miri))]
     /// # #[tokio::main(flavor = "current_thread")]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let (endpoint, _incoming) = signa::endpoint::Endpoint::builder()

@@ -15,6 +15,9 @@ use signa::{
     Request, Response, StatusCode,
 };
 
+# #[cfg(miri)] // Miri has no sockets.
+# fn main() {}
+# #[cfg(not(miri))]
 # #[tokio::main(flavor = "current_thread")]
 # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 // Port 0 lets the system pick one. Keep each `Incoming`, since dropping it

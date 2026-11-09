@@ -340,8 +340,8 @@ pub mod transaction;
 pub mod transport;
 
 // Runs the README's quick start with the doctests, so it cannot drift from the
-// API.
-#[cfg(all(doctest, feature = "tokio"))]
+// API. Miri has no sockets to run it on.
+#[cfg(all(doctest, feature = "tokio", not(miri)))]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 
