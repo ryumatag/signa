@@ -629,10 +629,19 @@ fn start(
     let closed_writer = Arc::downgrade(&writer.0);
     let closed_inbound = inbound.clone();
     let closed_permit = permit.clone();
+    let output = writer.0.capacity.clone();
     let mut supervisor = teardown.clone();
     tokio::spawn(async move {
         let queue = closed_writer.clone();
-        run_connection(reading, writing, permit, &mut supervisor, queue).await;
+        run_connection(
+            reading,
+            writing,
+            permit,
+            &mut supervisor,
+            queue,
+            output,
+        )
+        .await;
         if let Some(writer) = closed_writer.upgrade() {
             let _ = closed_inbound
                 .send(Inbound { message: None, flow, writer: Writer(writer) })
@@ -649,14 +658,15 @@ fn start(
 ///
 /// The reader ends with [`End::Endpoint`] when the endpoint closes its channel,
 /// which it does once it is stopping. The supervisor then has the writer close
-/// its queue and finish it, and aborts the writer at [`Phase::Abort`]. A writer
-/// still running then had something left to write, which is recorded.
+/// its queue and finish it, and aborts the writer at [`Phase::Abort`]. If
+/// `output` still has reservations out then, the discard is recorded.
 async fn run_connection(
     reading: impl Future<Output = End>,
     mut writing: JoinHandle<()>,
     permit: Arc<Option<OwnedSemaphorePermit>>,
     teardown: &mut Teardown,
     queue: Weak<WriteSender>,
+    output: Budget,
 ) {
     let end = {
         let mut reading = pin!(reading);
@@ -704,7 +714,13 @@ async fn run_connection(
                 .await
             };
             if !finished {
-                teardown.discard();
+                // A running writer may have nothing left, such as one that
+                // has not reached the close marker yet. Every queued write
+                // holds a reservation until it completes, so only a writer
+                // with reservations out drops anything.
+                if !output.is_idle() {
+                    teardown.discard();
+                }
                 writing.abort();
                 let _ = writing.await;
             }
@@ -882,7 +898,7 @@ impl Buf for Queue {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
-    use tokio::{net::TcpStream, task::yield_now, time::sleep};
+    use tokio::{io::sink, net::TcpStream, task::yield_now, time::sleep};
 
     use super::*;
     use crate::message::{Method, StatusCode};
@@ -1061,6 +1077,7 @@ mod tests {
             tokio::spawn(write_loop(Stalled(Some(started)), pending));
         let mut teardown = tasks.handle();
         let queue = Arc::downgrade(&writer.0);
+        let output = writer.0.capacity.clone();
         let supervisor = tokio::spawn(async move {
             run_connection(
                 std::future::ready(End::Endpoint),
@@ -1068,6 +1085,7 @@ mod tests {
                 Arc::new(None),
                 &mut teardown,
                 queue,
+                output,
             )
             .await;
         });
@@ -1103,6 +1121,47 @@ mod tests {
                 assert!(writer.is_closed());
                 assert!(writer.0.capacity.acquire(6).is_some());
                 assert!(tasks.discarded());
+            });
+    }
+
+    // A deadline can reach a connection whose writer has nothing left but
+    // has not yet run to its close marker. Aborting that writer drops
+    // nothing, so it is not recorded as discarded output.
+    #[test]
+    fn abort_of_a_writer_with_nothing_left_discards_nothing() {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let tasks = Tasks::new();
+                let (writer, pending) = test_writer(4, 64);
+                let writing = tokio::spawn(write_loop(sink(), pending));
+                writer
+                    .submit(Bytes::from_static(b"abc"))
+                    .unwrap()
+                    .await
+                    .unwrap();
+                let mut teardown = tasks.handle();
+                let queue = Arc::downgrade(&writer.0);
+                let output = writer.0.capacity.clone();
+
+                tasks.advance(Phase::Abort);
+                let supervisor = tokio::spawn(async move {
+                    run_connection(
+                        std::future::ready(End::Endpoint),
+                        writing,
+                        Arc::new(None),
+                        &mut teardown,
+                        queue,
+                        output,
+                    )
+                    .await;
+                });
+                tasks.finished().await;
+                supervisor.await.unwrap();
+
+                assert!(!tasks.discarded());
+                assert_eq!(writer.send(Bytes::new()), Err(SendError::Closed));
             });
     }
 
@@ -1223,6 +1282,7 @@ mod tests {
                         write_loop(FailsAfter(1), pending).await;
                         drop(writer_permit);
                     });
+                    let output = writer.0.capacity.clone();
                     let connection = tokio::spawn(async move {
                         let mut teardown = Teardown::detached();
                         run_connection(
@@ -1231,6 +1291,7 @@ mod tests {
                             permit,
                             &mut teardown,
                             Weak::new(),
+                            output,
                         )
                         .await;
                     });

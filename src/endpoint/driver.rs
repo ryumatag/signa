@@ -570,6 +570,9 @@ struct Stopping {
 
 impl Stopping {
     /// Waits for the transport tasks to end, aborting them at the deadline.
+    ///
+    /// The tasks are checked before the deadline, so tasks that have ended by
+    /// the poll that sees the deadline are not aborted.
     async fn join(&mut self) {
         let Stopping { tasks, shutdown, control, sleep, .. } = self;
         let mut finished = pin!(tasks.finished());
@@ -950,6 +953,9 @@ impl Driver {
 
         stopping.join().await;
 
+        // The deadline can stop a task that was still closing. That is still
+        // a drain unless it dropped output, which only a writer has. A writer
+        // aborted with reservations out records it in `discarded`.
         let drained =
             matches!(end, End::Drained) && !stopping.tasks.discarded();
         stopping.done.send_replace(Some(if drained {
@@ -3116,7 +3122,7 @@ mod tests {
     use tokio::{
         net::UdpSocket,
         task::yield_now,
-        time::{advance, timeout},
+        time::{advance, sleep, timeout},
     };
     use tower_service::Service;
 
@@ -3455,7 +3461,7 @@ mod tests {
         .await
         .unwrap();
 
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        sleep(Duration::from_millis(1)).await;
         let received = timeout(
             Duration::from_secs(1),
             poll_fn(|cx| {
@@ -4368,7 +4374,7 @@ mod tests {
             id,
             observation,
         ));
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        sleep(Duration::from_millis(20)).await;
         driver.on_timer(Key::Client(id));
         flush(&mut driver).await;
 
@@ -4773,6 +4779,32 @@ mod tests {
         advance(64 * T1 - Duration::from_millis(1)).await;
         assert!(matches!(fixture.at_deadline(), End::Expired));
         assert!(fixture.servers.get(slot).is_some());
+    }
+
+    // The outcome classifies the endpoint's work, not the instant its last
+    // transport task returned. Here every machine, guard and write finished
+    // before the deadline, and a transport task is still ending when the
+    // deadline comes. The deadline moves it to Abort, which drops nothing
+    // here, and the future still waits for the task. A task that drops
+    // output records it, as in `the_deadline_aborts_a_stalled_tcp_writer`.
+    #[tokio::test(start_paused = true)]
+    async fn a_teardown_past_the_deadline_with_nothing_left_is_a_drain() {
+        let (fixture, commands, local) = reply_driver();
+        let endpoint = fixture_endpoint(&fixture, commands, local);
+        let teardown = fixture.tasks.handle();
+        let started = now();
+        let ending = tokio::spawn(async move {
+            sleep(Duration::from_secs(2)).await;
+            drop(teardown);
+        });
+        let driver = tokio::spawn(fixture.run());
+
+        let outcome = endpoint.shutdown(Duration::from_secs(1)).await;
+
+        assert_eq!(outcome, ShutdownOutcome::Drained);
+        assert_eq!(now(), started + Duration::from_secs(2));
+        assert!(ending.is_finished());
+        driver.await.unwrap();
     }
 
     // Once drained, the driver closes its command queue and its work guards

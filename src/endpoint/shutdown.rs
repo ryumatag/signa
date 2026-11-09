@@ -28,9 +28,13 @@ use super::{driver::Command, Error};
 #[non_exhaustive]
 pub enum ShutdownOutcome {
     /// Everything the endpoint had taken on finished before the deadline:
-    /// every transaction reached Terminated, every [`WorkGuard`] dropped,
-    /// every accepted write and connect completed, and every listener and
-    /// connection task ended. No observer saw a closed error for it.
+    /// every transaction reached Terminated, every [`WorkGuard`] dropped, and
+    /// every accepted write and connect completed. No observer saw a closed
+    /// error for it.
+    ///
+    /// The listener and connection tasks have ended too. One still closing at
+    /// the deadline is stopped then, which leaves this a drain as long as it
+    /// had no output left to drop.
     Drained,
     /// The deadline came first. The endpoint dropped what was left, observers
     /// of it saw [`Error::is_closed`] or [`ServerEvent::EndpointClosed`], and
