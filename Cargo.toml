@@ -64,7 +64,7 @@ tokio = { version = "1.47", features = [
   "rt-multi-thread",
   "test-util",
 ] }
-tower = { version = "0.5", features = ["limit", "util"] }
+tower = { version = "0.5", features = ["limit", "timeout", "util"] }
 
 # The example runs an endpoint, which needs the `tokio` feature.
 [[example]]
@@ -76,12 +76,32 @@ required-features = ["tokio"]
 name = "tables"
 required-features = ["tokio"]
 
-# Application-owned Tower dispatch and responder composition.
-[[example]]
-name = "server_adapter"
-required-features = ["tokio"]
-
 # A UDP stateless proxy between a raw UAC and a stateful UAS.
 [[example]]
 name = "stateless_proxy"
+required-features = ["tokio"]
+
+# An INVITE UAS with its 2xx retransmission, ACK wait and work guard.
+[[example]]
+name = "invite_uas"
+required-features = ["tokio"]
+
+# An INVITE UAC with forked 2xx, its own ACKs, and cancellation.
+[[example]]
+name = "invite_uac"
+required-features = ["tokio"]
+
+# A stateful proxy that forks INVITEs, relays 2xx and cancels branches.
+[[example]]
+name = "fork_proxy"
+required-features = ["tokio"]
+
+# An external Tower adapter and bounded dispatcher on the public API.
+[[test]]
+name = "tower_fixture"
+required-features = ["tokio"]
+
+# Reply routing through the public API.
+[[test]]
+name = "reply_routing"
 required-features = ["tokio"]

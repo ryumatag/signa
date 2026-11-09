@@ -1,13 +1,13 @@
 use std::{
     collections::{hash_map::DefaultHasher, HashMap},
     convert::Infallible,
-    future,
+    future::{self, Future},
     hash::{Hash, Hasher},
     hint::black_box as bb,
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -333,8 +333,9 @@ fn ack_for(invite: &Request<Bytes>, ok: &Response<Bytes>) -> Request<Bytes> {
 // steady number of Accepted entries instead of growing for the whole run.
 // Over UDP a non-2xx leaves the client in Completed for Timer D, which is at
 // least 32 s whatever T1 is. At this rate that grows the table for the whole
-// measurement, so the non-2xx and CANCEL paths run over TCP only, where D is
-// zero. Retained state belongs to `scripts/tables`.
+// measurement, so here the non-2xx and CANCEL paths run over TCP only, where D
+// is zero. `invite_udp` runs them over UDP with the UAC replaced in batches.
+// Retained state belongs to `scripts/tables`.
 pub(super) fn invite(c: &mut Criterion) {
     let rt = runtime();
     let (server, uac) = {
@@ -457,6 +458,140 @@ pub(super) fn invite(c: &mut Criterion) {
             });
         });
     });
+}
+
+/// How many INVITEs one UAC endpoint starts before `invite_udp` replaces it.
+const ROTATION: u64 = 4096;
+
+// The non-2xx and CANCEL paths of `invite` over UDP.
+//
+// Over UDP a non-2xx leaves the client INVITE in Completed for Timer D, at
+// least 32 s whatever T1 is, and `Timers` does not go below that. At this rate
+// one UAC would grow its table and timer heap for the whole run. So the UAC is
+// replaced every `ROTATION` INVITEs, outside the measured time, and its
+// shutdown with a zero deadline drops its Completed entries, each with the ACK
+// it keeps for retransmitted finals. At most `ROTATION` of them are live, as
+// on a UAC that starts that many calls in 32 s. Timer D keeps its RFC value.
+// The UAS is the one of `invite`, whose short T1 and T4 clear its Confirmed
+// INVITEs (Timer I) and CANCELs (Timer J) as it goes.
+//
+// Each benchmark measures from `start` to the INVITE's final in `Responses`.
+// The driver queues the ACK of a non-2xx for writing before it delivers the
+// final, so that write is included up to its submission to the socket, not
+// its completion. Neither measurement includes Timer D or the end of the
+// transaction.
+pub(super) fn invite_udp(c: &mut Criterion) {
+    let rt = runtime();
+    let server = {
+        let _guard = rt.enter();
+        let (server, incoming) = Endpoint::builder()
+            .udp(LOCALHOST)
+            .timers(short_timers())
+            .max_server_transactions(1 << 20)
+            .bind()
+            .unwrap();
+        invite_uas(incoming);
+        server
+    };
+    let target = Target::new(Transport::Udp, server.udp_addr().unwrap());
+    let uac = || {
+        Endpoint::builder()
+            .udp(LOCALHOST)
+            .timers(short_timers())
+            .max_client_transactions(2 * ROTATION as usize)
+            .max_client_handles(2 * ROTATION as usize)
+            .bind()
+            .unwrap()
+    };
+
+    let request = &invite_request("reject");
+    let len = request.to_bytes().len() as u64;
+    benchmark(c, "endpoint/invite/udp/rejected", len, |b| {
+        b.iter_custom(|iters| {
+            rt.block_on(rotating(iters, &uac, |uac| async move {
+                let (_control, mut responses) = uac
+                    .start(bb(request.clone()), target)
+                    .await
+                    .unwrap()
+                    .into_parts();
+                let busy = loop {
+                    let response = responses.next().await.unwrap().unwrap();
+                    if response.status().is_final() {
+                        break response;
+                    }
+                };
+                assert_eq!(busy.status().as_u16(), 486);
+            }))
+        });
+    });
+
+    // Through the 180, `cancel`, the CANCEL's 200 in its own stream, and the
+    // 487 in the INVITE's.
+    let request = &invite_request("ring");
+    let len = request.to_bytes().len() as u64;
+    benchmark(c, "endpoint/cancel/udp/ringing", len, |b| {
+        b.iter_custom(|iters| {
+            rt.block_on(rotating(iters, &uac, |uac| async move {
+                let (control, mut responses) = uac
+                    .start(bb(request.clone()), target)
+                    .await
+                    .unwrap()
+                    .into_parts();
+                loop {
+                    let response = responses.next().await.unwrap().unwrap();
+                    if response.status().as_u16() == 180 {
+                        break;
+                    }
+                }
+                let CancelOutcome::Sent(cancel) =
+                    control.cancel().await.unwrap()
+                else {
+                    panic!("a CANCEL after the 180");
+                };
+                let (_, mut cancel_responses) = cancel.into_parts();
+                let terminated = loop {
+                    let response = responses.next().await.unwrap().unwrap();
+                    if response.status().is_final() {
+                        break response;
+                    }
+                };
+                assert_eq!(terminated.status().as_u16(), 487);
+                let ok = cancel_responses.next().await.unwrap().unwrap();
+                assert_eq!(ok.status(), StatusCode::OK);
+            }))
+        });
+    });
+}
+
+/// Runs `iters` transactions, replacing the UAC every `ROTATION`, and returns
+/// the time spent in `transaction` alone.
+async fn rotating<F, T>(
+    iters: u64,
+    bind: &impl Fn() -> (Endpoint, Incoming),
+    mut transaction: T,
+) -> Duration
+where
+    T: FnMut(Endpoint) -> F,
+    F: Future<Output = ()>,
+{
+    let mut measured = Duration::ZERO;
+    let mut done = 0;
+    while done < iters {
+        let (uac, incoming) = bind();
+        let batch = ROTATION.min(iters - done);
+        for _ in 0..batch {
+            let uac = uac.clone();
+            let started = Instant::now();
+            transaction(uac).await;
+            measured += started.elapsed();
+        }
+        done += batch;
+        // A zero deadline drops the Completed INVITEs now, and waits until
+        // the endpoint has stopped.
+        let _ = uac.shutdown(Duration::ZERO).await;
+        drop(incoming);
+    }
+    measured
 }
 
 fn transport_name(transport: Transport) -> &'static str {

@@ -120,7 +120,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     run_uac(proxy_addr).await?;
 
     // The UAS reports how its INVITE ended.
-    timeout(Duration::from_secs(5), uas_done).await??;
+    let confirmed = timeout(Duration::from_secs(5), uas_done).await??;
+    assert!(confirmed, "the ACK through the proxy confirmed the INVITE");
     drop(uas);
 
     Ok(())
@@ -315,8 +316,8 @@ fn sent_by_address(sent_by: &str) -> Option<SocketAddr> {
 }
 
 /// The UAS: rings, then takes a CANCEL with a 200 and ends the INVITE with a
-/// 487. It reports whether the ACK of the 487 confirmed the INVITE.
-async fn run_uas(mut incoming: Incoming) {
+/// 487. It returns whether the ACK of the 487 confirmed the INVITE.
+async fn run_uas(mut incoming: Incoming) -> bool {
     let mut ringing = None;
     while let Some(event) = incoming.recv().await {
         match event {
@@ -346,19 +347,21 @@ async fn run_uas(mut incoming: Incoming) {
                     match events.next().await {
                         Some(ServerEvent::AckTimeout) => {
                             println!("uas: no ACK reached the INVITE");
+                            return false;
                         }
                         Some(ServerEvent::Terminated) => {
                             println!("uas: the ACK confirmed the INVITE");
-                            return;
+                            return true;
                         }
                         Some(_) => {}
-                        None => return,
+                        None => return false,
                     }
                 }
             }
             _ => {}
         }
     }
+    false
 }
 
 fn reply(request: &Request<Bytes>, status: u16) -> Response<Bytes> {

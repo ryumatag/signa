@@ -5,17 +5,24 @@
 # Runs `examples/tables`, which does many round trips on RFC timers so that
 # every transaction is still in the tables at the end, under `/usr/bin/time`
 # for the maximum RSS and the time per round trip. On macOS, `-H` also samples
-# the heap with `heap -s` right after the last round trip, while Timer K and
-# Timer J still hold every transaction, and prints the size histogram.
+# the heap with `heap -s` right after the last round trip, while the timers
+# still hold every transaction, and prints the size histogram.
 #
 #   scripts/tables                this checkout, three runs
 #   scripts/tables -c main        a copy of `main` against this checkout
 #   scripts/tables -H -c 0.2.1    and the heap histograms
+#   scripts/tables -m invite -o   INVITEs in Accepted, with handles kept
+#
+# `-m` picks what each transaction is, see `examples/tables.rs`: `options`
+# (the default), `invite` or `reject`. `-o` keeps the TU's handles. With either,
+# the copy of a ref measures this checkout's `examples/tables.rs`, which uses
+# the public API only, so an older ref can run a mode its own fixture lacks.
 #
 # The runs alternate between the trees, so that a drift of the machine shows
 # in both. A copy of a ref is made with `git archive` under `tmp/tables/` and
 # keeps its `target/`, so the next comparison against the same ref rebuilds
-# only what changed.
+# only what changed. It gets this checkout's `Cargo.lock`, so both trees build
+# with the same dependencies.
 #
 # You'll need Bash, Cargo, Git, and GNU or BSD time at `/usr/bin/time`. On
 # Debian and Ubuntu that is the `time` package.
@@ -24,11 +31,14 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<EOF
-Usage: $(basename "$0") [-n ROUND_TRIPS] [-r RUNS] [-c REF]... [-H] [TREE]...
+Usage: $(basename "$0") [-n ROUND_TRIPS] [-r RUNS] [-c REF]... [-m MODE] [-o]
+       [-H] [TREE]...
 
   -n  round trips per run, 200000 by default
   -r  runs per tree, 3 by default
   -c  measure a copy of the Git ref REF too, made under tmp/tables/
+  -m  options (the default), invite or reject
+  -o  keep the TU's transaction handles
   -H  sample the heap once per tree with the tables full (macOS)
 
 Each TREE is a checkout of signa. Without one, this checkout is measured.
@@ -45,18 +55,32 @@ repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 round_trips=200000
 runs=3
 heap=false
+mode=
+observe=false
 refs=()
-while getopts 'n:r:c:H' opt; do
+while getopts 'n:r:c:m:oH' opt; do
   case "$opt" in
     n) round_trips="$OPTARG" ;;
     r) runs="$OPTARG" ;;
     c) refs+=("$OPTARG") ;;
+    m) mode="$OPTARG" ;;
+    o) observe=true ;;
     H) heap=true ;;
     *) usage ;;
   esac
 done
 shift $((OPTIND - 1))
 [[ "$round_trips" =~ ^[0-9]+$ && "$runs" =~ ^[0-9]+$ ]] || usage
+case "$mode" in
+  '' | options | invite | reject) ;;
+  *) usage ;;
+esac
+# The fixture reads these. An older one ignores them, which is why a ref copy
+# gets this checkout's fixture when either is set.
+export SIGNA_TABLES_MODE="${mode:-options}"
+if $observe; then
+  export SIGNA_TABLES_OBSERVE=1
+fi
 
 # BSD time prints the maximum RSS in bytes, GNU time in kilobytes.
 case "$(uname -s)" in
@@ -90,6 +114,10 @@ for ref in ${refs[@]+"${refs[@]}"}; do
   mkdir -p "$dir"
   find "$dir" -mindepth 1 -maxdepth 1 ! -name target -exec rm -rf {} +
   git -C "$repo" archive "$ref" | tar -xf - -C "$dir"
+  cp "$repo/Cargo.lock" "$dir/Cargo.lock"
+  if [[ -n "$mode" ]] || $observe; then
+    cp "$repo/examples/tables.rs" "$dir/examples/tables.rs"
+  fi
   dirs+=("$dir")
   # A ref that is a hash already is shown short, as `git log` would.
   if [[ "$ref" =~ ^[0-9a-f]{7,40}$ ]]; then
@@ -161,7 +189,13 @@ for label in "${labels[@]}"; do
   (( ${#label} > width )) && width=${#label}
 done
 
-printf '%s round trips, 16 in flight, RFC 3261 timers\n\n' "$round_trips"
+handles=dropped
+if $observe; then
+  handles=kept
+fi
+printf '%s round trips of %s, 16 in flight, UDP, RFC 3261 timers, ' \
+  "$round_trips" "$SIGNA_TABLES_MODE"
+printf 'handles %s\n\n' "$handles"
 printf '%-*s %4s %16s %9s\n' "$width" tree run 'us/round trip' 'max RSS'
 for ((run = 1; run <= runs; run++)); do
   for i in "${!bins[@]}"; do

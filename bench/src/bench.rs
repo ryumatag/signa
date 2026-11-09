@@ -49,6 +49,9 @@ criterion::criterion_group! {
         // INVITE and CANCEL through the TU API, each to the point its
         // comment names, which is not the end of the transaction.
         endpoint::invite,
+        // The UDP non-2xx and CANCEL paths, with the UAC replaced in batches
+        // so that Timer D does not grow its table for the whole run.
+        endpoint::invite_udp,
         endpoint::reply_route,
         endpoint::client_admission,
         endpoint::connection_admission,

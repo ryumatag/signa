@@ -106,17 +106,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`examples/options.rs` runs both endpoints over UDP and TCP.
+Each example below runs on the loopback, checks its own outcome, and says
+which transaction-user duties it takes on and which it leaves out. CI runs
+them with RFC 3261's timers.
 
-`examples/server_adapter.rs` demonstrates a responder wrapper and bounded,
-application-owned Tower dispatch with a non-Clone service. The endpoint starts
-no application handler tasks. Response acceptance is distinct from local write
-completion and transaction termination. Dropping an unanswered responder
-requests a 500.
+* `examples/options.rs` answers non-INVITE requests over UDP and TCP, observes
+  the transactions, and shuts down gracefully.
+* `examples/invite_uas.rs` answers INVITEs, retransmits its 2xx until the ACK
+  under a work guard, and compares a drained shutdown with a forced one.
+* `examples/invite_uac.rs` handles forked and retransmitted 2xx, acknowledges
+  each, and cancels calls, including a CANCEL that loses to a 2xx.
+* `examples/fork_proxy.rs` is a stateful proxy that forks an INVITE to two
+  UASes, relays every 2xx, and cancels the other branches.
+* `examples/stateless_proxy.rs` runs a UDP stateless proxy between a raw UAC
+  and a stateful UAS, with a stable branch for the INVITE, its CANCEL and its
+  ACK.
 
-`examples/stateless_proxy.rs` runs a UDP stateless proxy between a raw UAC and
-a stateful UAS. It shows a stable branch, CANCEL and ACK forwarding, and
-response forwarding, and lists the proxy duties it leaves out.
+`tests/tower_fixture.rs` builds a Tower adapter outside signa, against its
+public API: response-sender wrappers applied by layers, and a bounded
+dispatcher that keeps ACK and CANCEL moving while handlers wait. signa itself
+has no Tower dependency.
+
+`docs/rfc-test-map.md` maps each requirement signa takes on to its tests.
 
 ### License
 

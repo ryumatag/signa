@@ -43,6 +43,32 @@ jobs:
       - name: Test without default features
         run: cargo test --no-default-features --verbose
 
+  # Runs the examples, which check their own outcomes and fail otherwise. They
+  # use RFC 3261's timers, so each one's graceful shutdown waits about 32 s for
+  # Timer J, L, M or D. The external Tower fixture in `tests/` runs with the
+  # tests above.
+  examples:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        example:
+          - options
+          - invite_uas
+          - invite_uac
+          - fork_proxy
+          - stateless_proxy
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - name: Run the example
+        run: cargo run --example ${{ matrix.example }}
+
   # Runs every benchmark once and checks its assertions, so a change that
   # breaks a benchmark fails here instead of in a later comparison.
   test-bench:
