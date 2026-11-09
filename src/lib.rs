@@ -12,7 +12,10 @@ Its design draws heavily on the [`http`] and [`hyper`] crates.
 */
 // The transaction-user API lives in `endpoint`, which needs the `tokio`
 // feature, and so do the links of this section.
-#![cfg_attr(feature = "tokio", doc = include_str!("doc/transaction_user.md"))]
+#![cfg_attr(
+    feature = "tokio",
+    doc = include_str!("../docs/rustdoc/transaction_user.md")
+)]
 #![cfg_attr(
     not(feature = "tokio"),
     doc = "The transaction-user API, `endpoint`, needs the `tokio` \
@@ -251,7 +254,10 @@ The minimum supported Rust version is 1.71.
 */
 // The endpoint examples exist only with the `tokio` feature, since the
 // doctests would not compile without it.
-#![cfg_attr(feature = "tokio", doc = include_str!("doc/endpoint_examples.md"))]
+#![cfg_attr(
+    feature = "tokio",
+    doc = include_str!("../docs/rustdoc/endpoint_examples.md")
+)]
 /*!
 ### The message layer alone
 

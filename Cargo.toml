@@ -15,7 +15,7 @@ edition = "2021"
 rust-version = "1.71"
 include = [
   "/src/**/*.rs",
-  "/src/**/*.md",
+  "/docs/rustdoc/**/*.md",
   "/examples/**/*.rs",
   "/README.md",
   "LICENSE-APACHE",
