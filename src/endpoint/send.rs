@@ -1,10 +1,10 @@
 /*!
 Messages sent once, outside any transaction.
 
-[`Endpoint::send_request`] and [`Endpoint::forward_response`] are the
-transport operations of the 0.3.0 design. A stateful endpoint uses the first
-for the ACK a UAC core sends for each 2xx ([RFC 3261 section 13.2.2.4]), which
-no transaction carries, and for requests whose responses it does not observe.
+[`Endpoint::send_request`] sends a request and [`Endpoint::forward_response`]
+forwards a response. A stateful endpoint uses the first for the ACK a UAC core
+sends for each 2xx ([RFC 3261 section 13.2.2.4]), which no transaction
+carries, and for requests whose responses it does not observe.
 A stateless proxy forwards requests with a branch it computed, and responses
 by their remaining Via ([RFC 3261 section 16.11]).
 

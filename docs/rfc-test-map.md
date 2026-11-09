@@ -1,19 +1,17 @@
 # RFC and contract test map
 
-This maps each requirement signa takes on, and each API decision of the 0.3.0
-design, to the tests that show it. A section link names the rule a test checks.
-It is not a claim that signa implements the whole section, and nothing here
-claims conformance to an RFC as a whole. Rows marked as signa policy are
-decisions of this crate, not RFC rules.
+This maps each requirement signa takes on, and each decision of its API, to
+the tests that show it. A section link names the rule a test checks. It is not
+a claim that signa implements the whole section, and nothing here claims
+conformance to an RFC as a whole. Rows whose basis is signa policy or design
+are decisions of this crate, not RFC rules.
 
-Keep it current. A change to a contract updates its row and its tests in the
-same branch. Test names are the function names, and the file says where to
-find them.
+Test names are the function names, and the file says where to find them.
 
 The crate documentation's "Supported RFC scope" section sums these rows up by
 RFC as supported, partial, the TU's, or not supported. Each item it lists as
 supported or partial has a row here, and its omissions are in "Deliberate
-omissions in 0.3.0".
+omissions" below.
 
 ## Reading the table
 
@@ -34,7 +32,8 @@ Status:
 
 * covered: the behavior is tested on the transports and receptions listed.
 * partial: tested, with the limit stated.
-* omitted: deliberately not in 0.3.0. The scope section of the design says why.
+* omitted: deliberately not in 0.3.0. The crate documentation's "Deliberate
+  omissions" section says why.
 
 Unless a row says otherwise, the transport is UDP and TCP and the reception is
 stateful.
@@ -146,14 +145,14 @@ Unless a row says otherwise, these are unit tests in `src/message/mod.rs`.
 | Requirement | Basis | Expected behavior | Evidence | Type | Scope | Status |
 | --- | --- | --- | --- | --- | --- | --- |
 | Reception is fixed and explicit | design | Each reception refuses the other's operations. Stateless is UDP-only. | `stateless_reception_binds_udp_only`, `each_reception_refuses_the_other_s_operations` | loopback | both receptions | covered |
-| Owned envelopes, Send handles | design | Envelopes destructure, handles split, operations are `Send`, and `ResponseSubmission` is `Unpin` as its docs promise. | `public_operations_are_send_and_envelopes_are_owned`, `submissions_are_send_and_unpin` (`tests/tower_fixture.rs`) | driver, external | - | covered |
+| Owned envelopes, Send handles | design | Envelopes destructure, handles split, operations are `Send`, and `ResponseSubmission` is `Unpin`. | `public_operations_are_send_and_envelopes_are_owned`, `submissions_are_send_and_unpin` (`tests/tower_fixture.rs`) | driver, external | - | covered |
 | Commit points | design | Dropping before enqueue has no effect. After enqueue the operation runs. | `cancellation_before_enqueue_has_no_effect_and_after_enqueue_keeps_the_write`, `client_tu_start_and_receive_cancellation_preserve_committed_work`, `queued_submissions_keep_their_count_after_waiters_drop`, `stateless_sends_commit_at_enqueue`, `shared_reply_bytes_remain_charged_after_the_future_is_dropped` | driver, loopback | both | covered |
 | Responder drop | design | An unanswered responder drop sends a 500 with a stable tag, ordered after queued submissions. | `unanswered_drop_reuses_the_provisional_to_tag`, `a_dropped_invite_responder_sends_a_500_with_the_provisional_tag`, `cancelled_waiter_and_responder_drop_cannot_race_a_queued_final`, `a_panicking_application_releases_work_through_responder_drop`, `a_tower_timeout_drops_the_handler_but_cancels_nothing` (`tests/tower_fixture.rs`) | driver, loopback, external | both | covered |
 | Stale IDs | design | A reused slot cannot be reached through an old handle. | `a_reused_numeric_slot_cannot_redirect_a_tu_capability`, `a_stale_cancel_handle_cannot_reach_a_reused_slot`, `timer_j_returns_server_capacity_and_old_ids_do_not_touch_reused_slots`, `a_removed_id_finds_nothing_even_when_its_slot_is_reused` | driver, unit | - | covered |
 | Response stream overflow | design | Queued responses stay, then one `DeliveryOverflow`. The machine goes on. | `overflow_preserves_queued_responses_and_reserved_terminal_error`, `client_tu_overflow_does_not_end_the_machine_or_free_its_slot`, `invite_client_overflow_keeps_acknowledging` | unit, loopback | UDP | covered |
 | Server observation | design | Failures before termination, coalesced with a count, termination never lost, late write failures after it. | `accepted_io_failure_precedes_termination_and_retains_operation_id`, `failure_overflow_does_not_consume_terminal_capacity`, `local_write_failure_remains_observable_after_machine_termination`, `teardown_reports_an_unknown_write_outcome_as_endpoint_close` | driver | both | covered |
 | Resource bounds | design | Tables, unanswered work, event bytes, routes, writes, connects, timer history and control capacity are bounded through their lifetime. | `work_lasts_beyond_recv_and_returns_at_accepted_final`, `a_retained_route_has_its_own_lifetime_bound`, `saturated_response_retention_rejects_without_changing_state`, `completed_servers_refuse_new_transactions_but_answer_retransmissions`, `route_churn_is_bounded_and_response_entries_have_reserved_room`, `arbitrary_deadline_changes_preserve_live_timers_and_bound_history`, `an_invite_reserves_its_cancel_or_nothing`, `stateless_queues_are_bounded_in_count_and_count_drops`, `stateless_queues_and_routes_are_bounded_in_bytes` | driver, unit, loopback | both | covered |
-| Overload | design, [3261 §21.5.4](https://www.rfc-editor.org/rfc/rfc3261.html#section-21.5.4) | A new request beyond admission gets a stateless 503. ACK and CANCEL go on in control capacity. | `overload_gets_a_stateless_503`, `ack_and_cancel_progress_while_ordinary_admission_is_full`, `protocol_work_progresses_with_admission_full_during_a_shutdown` | loopback | UDP | partial: the stateless 503 has no reproducible To tag yet (signa-decided.md) |
+| Overload | design, [3261 §21.5.4](https://www.rfc-editor.org/rfc/rfc3261.html#section-21.5.4) | A new request beyond admission gets a stateless 503. ACK and CANCEL go on in control capacity. | `overload_gets_a_stateless_503`, `ack_and_cancel_progress_while_ordinary_admission_is_full`, `protocol_work_progresses_with_admission_full_during_a_shutdown` | loopback | UDP | partial: the stateless 503 has no reproducible To tag yet |
 | Adapter dispatch keeps control live | design | ACK and CANCEL progress while handlers wait for an ACK or readiness is Pending. Handlers and buffered calls are bounded. Readiness and call on one non-`Clone` instance. | `acks_progress_while_every_handler_waits_for_one`, `a_cancel_is_answered_while_the_request_service_is_not_ready`, `buffered_calls_are_bounded_and_overflow_gets_a_503` (`tests/tower_fixture.rs`) | external | UDP | covered |
 | Response middleware | design | Wrappers see each TU 1xx and every 2xx, keep watching after the first final, and see neither the automatic 100 nor retransmissions. Acceptance is not delivery. | `wrappers_see_every_submission_and_no_protocol_output` (`tests/tower_fixture.rs`) | external | UDP | covered |
 | Handler end is not transaction end | design | A handler's future can finish long before its transaction. | `handler_end_comes_before_transaction_end` (`tests/tower_fixture.rs`), `examples/fork_proxy.rs` | external, example | UDP | covered |
@@ -169,9 +168,9 @@ Unless a row says otherwise, these are unit tests in `src/message/mod.rs`.
 | Routes and clones do not hold a drain | design | Only guards, machines and writes do. | `routes_and_clones_do_not_hold_a_drain_and_tcp_closes`, `unread_stateless_events_do_not_hold_a_drain` | loopback | both | covered |
 | Protocol work during the drain | design | ACK, matched CANCEL, responders, reply routes and `send_request` keep working. New requests get 503. | `protocol_work_progresses_with_admission_full_during_a_shutdown`, `reply_routes_keep_sending_while_existing_work_drains`, `a_stateless_shutdown_keeps_committed_sends` | loopback | both | covered |
 
-## Deliberate omissions in 0.3.0
+## Deliberate omissions
 
-Each of these is a decision recorded in the 0.3.0 design, not a missing test:
+These are left out of 0.3.0 on purpose. They are not missing tests:
 
 * Dialog and call state, 2xx ACK construction from route sets, UAS 2xx
   retransmission helpers, proxy Timer C and fork selection. The examples show

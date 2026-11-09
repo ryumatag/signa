@@ -99,8 +99,8 @@ pub(super) fn round_trip(c: &mut Criterion) {
             .unwrap();
         (server, client_end)
     };
-    // An OPTIONS, since 0.2.0 answers an INVITE with a 501 before the service.
-    // The endpoint adds the Via.
+    // An OPTIONS, so each round trip is one non-INVITE transaction with no
+    // ACK. The endpoint adds the Via.
     let request = Request::builder()
         .method("OPTIONS")
         .uri("sip:bob@biloxi.example.com")

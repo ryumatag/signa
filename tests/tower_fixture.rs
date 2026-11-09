@@ -1,9 +1,9 @@
 /*!
 An external Tower adapter for signa's transaction-user API.
 
-This test crate sees only signa's public API, as tower-sip will. It builds the
-pieces that `milestones/tower-sip.md` plans and runs them against real
-endpoints on the loopback:
+This test crate sees only signa's public API, as any crate built on it would.
+It builds the pieces of a Tower adapter and runs them against real endpoints
+on the loopback:
 
 * `Exchange<R>`, the adapter's handler envelope, made by destructuring
   signa's `ServerRequest` and splitting its transaction.

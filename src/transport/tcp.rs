@@ -701,7 +701,7 @@ async fn run_connection(
             let finished = if teardown.phase() == Phase::Running {
                 // Only a connection opened without an endpoint sees its
                 // channel close while its owner runs. Nothing will abort it,
-                // so it gets a few seconds, as every connection once did.
+                // so it gets a few seconds.
                 timeout(UNOWNED_DRAIN, &mut writing).await.is_ok()
             } else {
                 let mut abort = pin!(teardown.reached(Phase::Abort));

@@ -249,9 +249,8 @@ macro_rules! status_codes {
     }
 }
 
-// This list is aligned with the current IANA SIP Response Codes registry. Core
-// codes come from RFC 3261, and later RFC extensions are added here as they
-// appear in the registry.
+// This list follows the IANA SIP Response Codes registry. Core codes come
+// from RFC 3261 and the rest from later RFCs.
 // https://www.iana.org/assignments/sip-parameters/sip-parameters.xhtml#sip-parameters-7
 status_codes! {
     /// 100 Trying ([RFC 3261, Section 21.1.1]).

@@ -993,9 +993,9 @@ fn validate_identity(request: &Request<Bytes>) -> Result<(), Error> {
     Ok(())
 }
 
-// The final-response `Service` client that driver and transport tests were
-// written against. It runs on the TU operations and is not public API. Only
-// the socket tests use it, and Miri skips those.
+// A final-response `Service` client for the driver and transport tests. It
+// runs on the TU operations and is not public API. Only the socket tests use
+// it, and Miri skips those.
 #[cfg(all(test, not(miri)))]
 pub(super) mod compatibility {
     use std::pin::Pin;
@@ -1045,7 +1045,7 @@ pub(super) mod compatibility {
                 return ResponseFuture::failed(Error::closed());
             }
             // The final-only adapter cannot cancel or acknowledge a 2xx, so
-            // it keeps refusing INVITE as the pre-TU client did.
+            // it refuses INVITE.
             if request.method() == Method::INVITE {
                 return ResponseFuture::failed(Error::unsupported_method());
             }

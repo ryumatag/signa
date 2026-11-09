@@ -1617,7 +1617,7 @@ mod tests {
         send::<Incoming>();
         send::<IncomingEvent>();
         send::<ResponseSubmission<'static>>();
-        // Promised in its docs, for wrappers that poll it in place.
+        // Part of its API, so a wrapper can poll it in place.
         unpin::<ResponseSubmission<'static>>();
         send::<ServerTransaction>();
         sync::<Responder>();

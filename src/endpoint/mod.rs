@@ -4384,10 +4384,10 @@ mod tests {
         assert!(peer.recv().await.is_none());
     }
 
-    // RFC 3261 section 16.11 with the 0.3.0 contract. Every method arrives,
-    // retransmissions included, without a transaction and without any
-    // automatic response: no 100, no 500 for a dropped route, nothing to an
-    // ACK. The transport still marks the top Via (sections 18.2.1 and
+    // RFC 3261 section 16.11 and `Reception::Stateless`. Every method
+    // arrives, retransmissions included, without a transaction and without
+    // any automatic response: no 100, no 500 for a dropped route, nothing to
+    // an ACK. The transport still marks the top Via (sections 18.2.1 and
     // RFC 3581 section 4).
     #[tokio::test]
     async fn stateless_requests_of_every_method_arrive_without_transactions() {
@@ -4439,9 +4439,9 @@ mod tests {
             .is_err());
     }
 
-    // The 0.3.0 contract. A stateless request's route answers it once, and
-    // the route of an ACK refuses every response (RFC 3261 section 17.1.1.3
-    // gives an ACK no response).
+    // A stateless request's route answers it once, and the route of an ACK
+    // refuses every response (RFC 3261 section 17.1.1.3 gives an ACK no
+    // response).
     #[tokio::test]
     async fn stateless_routes_answer_requests_but_not_acks() {
         let (endpoint, mut incoming) = stateless_endpoint();
@@ -4869,9 +4869,9 @@ mod tests {
         stateless_request(&mut incoming).await;
     }
 
-    // The 0.3.0 completion contract for one-shot sends. An unpolled future
-    // and one waiting for a one-shot slot send nothing. Once enqueued, the
-    // send goes out even if its future is dropped.
+    // When a one-shot send commits. An unpolled future and one waiting for a
+    // one-shot slot send nothing. Once enqueued, the send goes out even if
+    // its future is dropped.
     #[tokio::test]
     async fn stateless_sends_commit_at_enqueue() {
         let (endpoint, _incoming) = stateless_endpoint();
@@ -4925,7 +4925,7 @@ mod tests {
         until(|| endpoint.oneshot_capacity.available_permits() == 64).await;
     }
 
-    // The 0.3.0 shutdown contract as it applies to a stateless endpoint.
+    // The shutdown contract as it applies to a stateless endpoint.
     // Nothing stateless holds the drain, a send committed before the shutdown
     // still reports its write, and the stopped endpoint refuses new sends.
     #[tokio::test]

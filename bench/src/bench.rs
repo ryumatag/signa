@@ -57,8 +57,8 @@ criterion::criterion_group! {
         endpoint::connection_admission,
         endpoint::shutdown_coalescing,
         endpoint::server_admission,
-        // One value at a time. These cover the checks that will move to
-        // siparse, so they show what the switch changes for each type.
+        // One value at a time, through the check each type runs on its
+        // input.
         header_name::from_bytes,
         header_value::from_shared,
         method::from_bytes,

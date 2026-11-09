@@ -25,8 +25,7 @@ use crate::message::{
 /// The most header rows a message can have.
 ///
 /// The rows live on the stack during parsing. At two `&str` each, 100 rows
-/// take about 3 KiB, and hyper uses the same limit for HTTP/1. A configurable
-/// limit can come with the transport settings in 0.2.0.
+/// take about 3 KiB, and hyper uses the same limit for HTTP/1.
 pub(crate) const MAX_HEADERS: usize = 100;
 
 pub(crate) fn request(src: Bytes) -> Result<Request<Bytes>, InvalidMessage> {

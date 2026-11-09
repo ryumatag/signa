@@ -938,7 +938,8 @@ impl Driver {
         };
         self.tasks.advance(phase);
         // The last handle's drop forces the protocol work, but writes queued
-        // before it still get the time they always had.
+        // before it still get `ABANDONED_FLUSH`, or less if a shutdown
+        // deadline comes first.
         let deadline = match end {
             End::Abandoned => {
                 let flush = now().checked_add(ABANDONED_FLUSH);
@@ -1607,8 +1608,8 @@ impl Driver {
             }
             Pending::Response(..) | Pending::Ack(_) => {}
             // Server output reserves its route and connection before commit
-            // and never passes through `send_over_tcp`. Report a rejection
-            // rather than a transport failure if that ever changes.
+            // and never passes through `send_over_tcp`. Refusing it here
+            // would be a rejection, not a transport failure.
             Pending::Server(_, observation, _) => observation.reject(),
             Pending::OneShot(bytes, completion) => {
                 drop(bytes);
@@ -2300,7 +2301,7 @@ impl Driver {
         let Some(value) = request.headers().get(VIA) else { return };
         let Some(via) = Via::top(value) else { return };
         // RFC 3261 section 18.2.2 sends the response to `maddr`, normally a
-        // multicast group. Multicast is out of scope for 0.3.0, and answering
+        // multicast group. signa does not support multicast, and answering
         // the source instead would break that rule, so the request is dropped.
         if via.maddr.is_some() {
             return;
