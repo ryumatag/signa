@@ -2540,6 +2540,7 @@ impl Driver {
             pending: AtomicUsize::new(0),
             next_operation: AtomicU64::new(1),
             final_sent: AtomicBool::new(false),
+            accepted: AtomicBool::new(false),
             abandoned: AtomicBool::new(false),
             observation,
             transport: AtomicUsize::new(0),
@@ -2803,12 +2804,23 @@ impl Driver {
         let result = if self.owns_server(&shared) {
             self.accept_response(shared.slot, status, bytes, Some(operation))
         } else {
+            // The entry is gone. Accepted took a further 2xx until Timer L,
+            // so L alone refuses one now (RFC 6026 section 7.3). Any other
+            // response after a final was refused for its kind, and keeps that
+            // answer whether the transaction ended at once, as a non-INVITE
+            // does over TCP, or after a timer.
             drop(bytes);
-            Err(if shared.final_sent.load(Ordering::Acquire) {
-                SubmitError::FinalAlreadySent
-            } else {
-                SubmitError::Terminated
-            })
+            Err(
+                if status.is_success()
+                    && shared.accepted.load(Ordering::Acquire)
+                {
+                    SubmitError::Terminated
+                } else if shared.final_sent.load(Ordering::Acquire) {
+                    SubmitError::FinalAlreadySent
+                } else {
+                    SubmitError::Terminated
+                },
+            )
         };
         shared.pending.fetch_sub(1, Ordering::Release);
         // Return command capacity before acceptance can wake a new submitter.
@@ -2904,6 +2916,9 @@ impl Driver {
 
         if status.is_final() {
             shared.final_sent.store(true, Ordering::Release);
+            if accepting {
+                shared.accepted.store(true, Ordering::Release);
+            }
             shared.work.finish();
             // An unobserved non-INVITE UDP cache needs only its response and
             // capability identity. No observer can reappear after count zero.
@@ -3708,6 +3723,7 @@ mod tests {
             pending: AtomicUsize::new(1),
             next_operation: AtomicU64::new(1),
             final_sent: AtomicBool::new(false),
+            accepted: AtomicBool::new(false),
             abandoned: AtomicBool::new(false),
             observation,
             transport: AtomicUsize::new(0),

@@ -3545,6 +3545,15 @@ mod tests {
                 .await
                 .is_err());
 
+            // The state never allowed these, so the end of the transaction
+            // does not change why they are refused.
+            for code in [180, 200, 486] {
+                assert_eq!(
+                    responder.respond(reply(&request, code, "uas")).await,
+                    Err(SubmitError::FinalAlreadySent)
+                );
+            }
+
             endpoint.shutdown(Duration::ZERO).await;
         }
     }
@@ -3596,8 +3605,6 @@ mod tests {
                 };
                 assert_eq!(ack.request.method(), Method::ACK);
             }
-            drop(responder);
-            assert!(remote.next().await.is_none());
 
             // The machine-level and driver tests pin L exactly. Here it is
             // enough that neither the ACK nor the second 2xx ended it.
@@ -3606,6 +3613,64 @@ mod tests {
                 ServerEvent::Terminated
             ));
             assert!(accepted.elapsed() >= 64 * short_timers().t1());
+
+            // Accepted took a further 2xx until L, so L is why this one is
+            // refused (RFC 6026 section 7.3). The others were refused before.
+            assert_eq!(
+                responder.respond(reply(&request, 200, "c")).await,
+                Err(SubmitError::Terminated)
+            );
+            for code in [180, 486] {
+                assert_eq!(
+                    responder.respond(reply(&request, code, "a")).await,
+                    Err(SubmitError::FinalAlreadySent)
+                );
+            }
+            drop(responder);
+            assert!(remote.next().await.is_none());
+
+            endpoint.shutdown(Duration::ZERO).await;
+        }
+    }
+
+    // RFC 3261 section 17.2.2. A non-INVITE takes one final. TCP ends the
+    // transaction at it and UDP keeps Completed until Timer J, but a second
+    // final gets the same error on both, before and after the end.
+    #[tokio::test]
+    async fn a_second_non_invite_final_is_refused_alike_on_both_transports() {
+        for transport in [Transport::Udp, Transport::Tcp] {
+            let (endpoint, mut incoming) = invite_endpoint(short_timers());
+            let (mut remote, via) = uac(transport, &endpoint, "twice").await;
+            remote.send(&raw("OPTIONS", &via, None)).await;
+            let ServerRequest { request, transaction, .. } =
+                server_request(&mut incoming).await;
+            let (responder, mut events) = transaction.into_parts();
+
+            responder.respond(reply(&request, 200, "uas")).await.unwrap();
+            let status = loop {
+                let status = status_of(remote.next().await);
+                if status != 100 {
+                    break status;
+                }
+            };
+            assert_eq!(status, 200);
+
+            for ended in [false, true] {
+                if ended {
+                    assert!(matches!(
+                        server_event(&mut events).await,
+                        ServerEvent::Terminated
+                    ));
+                }
+                for code in [200, 486] {
+                    assert_eq!(
+                        responder.respond(reply(&request, code, "uas")).await,
+                        Err(SubmitError::FinalAlreadySent),
+                        "{transport:?} {code}, ended: {ended}"
+                    );
+                }
+            }
+            assert!(remote.next().await.is_none());
 
             endpoint.shutdown(Duration::ZERO).await;
         }

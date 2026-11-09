@@ -375,8 +375,9 @@ impl Responder {
     ///
     /// An INVITE takes provisional responses until its first final response.
     /// After a 2xx it takes further 2xx, including those of other forks with
-    /// other To tags, until Timer L ([RFC 6026 section 8.7]). The transaction
-    /// does not retransmit a 2xx itself. A non-INVITE takes one final response
+    /// other To tags, until Timer L ([RFC 6026 section 8.7]), and refuses one
+    /// after L with [`SubmitError::Terminated`]. The transaction does not
+    /// retransmit a 2xx itself. A non-INVITE takes one final response
     /// and the 100 that [RFC 4320 section 4] allows.
     ///
     /// An unpolled future has no effect. The first poll checks the response
@@ -555,9 +556,13 @@ pub enum SubmitError {
     /// than 100, or a 408 (RFC 4320 section 4).
     ProhibitedStatus,
     /// A final response was already accepted, and this is not another 2xx
-    /// for an INVITE in Accepted.
+    /// for an INVITE in Accepted. The answer stays the same after the
+    /// transaction ends, which over TCP a non-INVITE does at its final.
     FinalAlreadySent,
-    /// The transaction has terminated.
+    /// The transaction has terminated. For an INVITE that sent a 2xx, this
+    /// is a further 2xx after Timer L ([RFC 6026 section 7.3]).
+    ///
+    /// [RFC 6026 section 7.3]: https://www.rfc-editor.org/rfc/rfc6026.html#section-7.3
     Terminated,
     /// The endpoint's submission queue is full. It holds up to 64 submissions
     /// and [`Builder::max_server_response_bytes`] of encoded responses waiting
@@ -812,6 +817,8 @@ pub(super) struct Shared {
     pub(super) pending: AtomicUsize,
     pub(super) next_operation: std::sync::atomic::AtomicU64,
     pub(super) final_sent: AtomicBool,
+    /// An INVITE sent a 2xx and so took further 2xx until Timer L.
+    pub(super) accepted: AtomicBool,
     pub(super) abandoned: AtomicBool,
     pub(super) observation: watch::Sender<Observation>,
     pub(super) transport: AtomicUsize,
@@ -1592,6 +1599,7 @@ mod tests {
             pending: AtomicUsize::new(0),
             next_operation: std::sync::atomic::AtomicU64::new(1),
             final_sent: AtomicBool::new(false),
+            accepted: AtomicBool::new(false),
             abandoned: AtomicBool::new(false),
             observation,
             transport: AtomicUsize::new(0),
