@@ -244,9 +244,9 @@ impl Endpoint {
     ///
     /// # Errors
     ///
-    /// * [`Error::is_invalid_cseq`] unless the request has one CSeq with its
-    ///   own method. A request without CSeq gets an error that no predicate
-    ///   matches and whose `Display` names it.
+    /// * [`Error::is_missing_header`] for a request without CSeq.
+    /// * [`Error::is_invalid_cseq`] unless the request's CSeq is one value
+    ///   with its own method.
     /// * [`Error::is_unsupported_routing`] for a `sips:` Request-URI, a
     ///   multicast target, a UDP target on an endpoint without a UDP socket,
     ///   or a TCP target on a stateless endpoint.
@@ -541,6 +541,16 @@ mod tests {
                 validate(&request(method, "sip:bob@example.com", cseq))
                     .unwrap_err();
             assert!(error.is_invalid_cseq(), "{method} with {cseq}");
+            assert!(!error.is_missing_header(), "{method} with {cseq}");
+        }
+
+        for method in ["ACK", "CANCEL", "OPTIONS"] {
+            let cseq = format!("1 {method}");
+            let mut request = request(method, "sip:bob@example.com", &cseq);
+            request.headers_mut().remove(CSEQ);
+            let error = validate(&request).unwrap_err();
+            assert!(error.is_missing_header(), "{method}: {error}");
+            assert!(!error.is_invalid_cseq(), "{method}: {error}");
         }
     }
 

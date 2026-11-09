@@ -754,10 +754,10 @@ impl Endpoint {
     ///
     /// # Errors
     ///
-    /// * [`Error::is_invalid_cseq`] unless the request has one parseable CSeq
-    ///   with its own method, below 2<sup>31</sup> for an INVITE. A request
-    ///   without CSeq, or an INVITE without From, To or Call-ID, gets an error
-    ///   that no predicate matches and whose `Display` names the header.
+    /// * [`Error::is_missing_header`] for a request without CSeq, or an INVITE
+    ///   without From, To or Call-ID.
+    /// * [`Error::is_invalid_cseq`] unless the request's CSeq is one parseable
+    ///   value with its own method, below 2<sup>31</sup> for an INVITE.
     /// * [`Error::is_invalid_header`] for an INVITE with more than one From,
     ///   To or Call-ID, or one that does not parse.
     /// * [`Error::is_unsupported_method`] for ACK and CANCEL. An ACK for a 2xx
@@ -1339,15 +1339,21 @@ mod tests {
             assert!(validate(&request).is_ok(), "{name}: {value}");
         }
 
-        for name in [FROM, TO, CALL_ID] {
+        // A missing header has a predicate of its own, apart from a duplicated
+        // or malformed one.
+        for name in [CSEQ, FROM, TO, CALL_ID] {
             let mut request = invite();
             request.headers_mut().remove(&name);
             let error = validate(&request).unwrap_err();
+            assert!(error.is_missing_header(), "{name}: {error}");
+            assert!(!error.is_invalid_cseq() && !error.is_invalid_header());
             assert_eq!(
                 error.to_string(),
-                Error::missing(name.clone()).to_string()
+                format!("the request has no {name}")
             );
+        }
 
+        for name in [FROM, TO, CALL_ID] {
             let mut request = invite();
             let value = request.headers().get(&name).unwrap().clone();
             request.headers_mut().append(name.clone(), value);

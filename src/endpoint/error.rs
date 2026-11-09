@@ -21,16 +21,12 @@ use crate::message::HeaderName;
 /// of making up a response, and [`Error::is_timeout`] and
 /// [`Error::is_transport`] tell them apart. [`Error::is_cancel_timeout`] is
 /// the deadline after a CANCEL. The other cases are refusals: a request too
-/// large for UDP, a missing or invalid `CSeq`, INVITE identity header or
-/// forwarded `Via`, a method the operation cannot send, an operation the
-/// endpoint's [`Reception`] does not offer, a destination signa cannot route
-/// to, exhausted request or connection admission, or an endpoint that has
-/// stopped. Response delivery overflow is reported after already queued
-/// responses, without ending the underlying SIP machine.
-///
-/// A request without a CSeq, or an INVITE without a From, To or Call-ID, is
-/// refused with an error that none of the predicates below matches. Its
-/// [`fmt::Display`] names the header.
+/// large for UDP, a missing request header, an invalid `CSeq`, INVITE
+/// identity header or forwarded `Via`, a method the operation cannot send, an
+/// operation the endpoint's [`Reception`] does not offer, a destination signa
+/// cannot route to, exhausted request or connection admission, or an endpoint
+/// that has stopped. Response delivery overflow is reported after already
+/// queued responses, without ending the underlying SIP machine.
 ///
 /// # Example
 ///
@@ -174,6 +170,16 @@ impl Error {
         matches!(self.kind, Kind::TooLarge(_))
     }
 
+    /// Returns `true` if a request has no CSeq, or an INVITE has no From, To
+    /// or Call-ID. [`fmt::Display`] names the header. The request was not
+    /// sent.
+    ///
+    /// A header that is present but duplicated or malformed is
+    /// [`Error::is_invalid_cseq`] or [`Error::is_invalid_header`] instead.
+    pub fn is_missing_header(&self) -> bool {
+        matches!(self.kind, Kind::Missing(_))
+    }
+
     /// Returns `true` if CSeq is duplicated, malformed, or names a method
     /// other than the request's method, or if an INVITE's number is
     /// 2<sup>31</sup> or more. The request was not sent.
@@ -186,8 +192,7 @@ impl Error {
     /// forwarded response has no top Via, or one whose `received` is not an
     /// IP address or whose port is zero. [`fmt::Display`] names the header.
     ///
-    /// An INVITE missing one of the three gets an error that this does not
-    /// match. See [`Error`].
+    /// An INVITE missing one of the three is [`Error::is_missing_header`].
     pub fn is_invalid_header(&self) -> bool {
         matches!(self.kind, Kind::InvalidHeader(_))
     }

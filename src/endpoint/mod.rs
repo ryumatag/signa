@@ -2446,6 +2446,7 @@ mod tests {
         request.headers_mut().remove(CSEQ);
         let mut client = client_end.client(Transport::Udp, LOCALHOST);
         let err = client.call(request).await.unwrap_err();
+        assert!(err.is_missing_header(), "{err}");
         assert_eq!(err.to_string(), "the request has no CSeq");
 
         // A port nobody listens on.
@@ -4623,6 +4624,12 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.is_invalid_cseq(), "{error}");
+
+        let mut missing = request("ACK");
+        missing.headers_mut().remove(CSEQ);
+        let error =
+            stateless.send_request(missing, udp, branch()).await.unwrap_err();
+        assert!(error.is_missing_header(), "{error}");
 
         let mut sips = request("OPTIONS");
         *sips.uri_mut() = "SIPS:bob@example.com".parse().unwrap();
