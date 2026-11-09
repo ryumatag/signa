@@ -108,12 +108,9 @@ Supported:
 * An INVITE server keeps its state after a transport error ([8.8]).
 * A stateful endpoint discards a response that matches no transaction
   ([8.9]).
-
-Partial:
-
 * A stateful proxy forwards only through a live transaction ([7.3], [8.3]).
-  The responder refuses a response its transaction no longer allows. No
-  loopback test sends one after Timer L.
+  The responder refuses a response its transaction no longer allows, such
+  as a branch's 2xx after Timer L.
 
 The TU's:
 

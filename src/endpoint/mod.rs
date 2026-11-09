@@ -3676,6 +3676,80 @@ mod tests {
         }
     }
 
+    // RFC 6026 sections 7.3 and 8.3. A stateful proxy forwards a response
+    // only through a live server transaction. One branch answers, Timer L
+    // ends the upstream INVITE, and then the other branch answers. Its
+    // client transaction still delivers the 2xx, but the responder refuses
+    // to forward it, and nothing reaches the caller.
+    #[tokio::test]
+    async fn a_stateful_response_after_timer_l_is_refused() {
+        for transport in [Transport::Udp, Transport::Tcp] {
+            let (proxy, mut incoming) = invite_endpoint(short_timers());
+            let (mut caller, via) = uac(transport, &proxy, "late").await;
+            caller.send(&raw("INVITE", &via, None)).await;
+            assert_eq!(status_of(caller.next().await), 100);
+            let ServerRequest { request, transaction, .. } =
+                server_request(&mut incoming).await;
+            let (responder, mut events) = transaction.into_parts();
+
+            let mut branches = Vec::new();
+            for _ in 0..2 {
+                let far = Far::new().await;
+                let target = far.target(transport);
+                let (_control, responses) =
+                    proxy.start(invite(), target).await.unwrap().into_parts();
+                let mut callee = far.remote(transport, &proxy).await;
+                let sent = into_request(callee.next().await.unwrap());
+                branches.push((callee, sent, responses));
+            }
+            let (mut late, late_invite, mut late_responses) =
+                branches.pop().unwrap();
+            let (mut first, first_invite, mut first_responses) =
+                branches.pop().unwrap();
+
+            // The late branch rings first, which ends its Timer B, so its
+            // client transaction outlives L.
+            late.send(&reply(&late_invite, 180, "late")).await;
+            assert_eq!(next(&mut late_responses).await.status().as_u16(), 180);
+            responder.respond(reply(&request, 180, "late")).await.unwrap();
+            assert_eq!(status_of(caller.next_except("INVITE").await), 180);
+
+            let accepted = Instant::now();
+            first.send(&reply(&first_invite, 200, "first")).await;
+            assert_eq!(
+                next(&mut first_responses).await.status(),
+                StatusCode::OK
+            );
+            responder.respond(reply(&request, 200, "first")).await.unwrap();
+            assert_eq!(status_of(caller.next_except("INVITE").await), 200);
+
+            assert!(matches!(
+                server_event(&mut events).await,
+                ServerEvent::Terminated
+            ));
+            assert!(accepted.elapsed() >= 64 * short_timers().t1());
+
+            late.send(&reply(&late_invite, 200, "late")).await;
+            assert_eq!(
+                next(&mut late_responses).await.status(),
+                StatusCode::OK
+            );
+            // Accepted would have taken the 2xx, so L alone refuses it. The
+            // 183 was refused from the first 2xx on.
+            assert_eq!(
+                responder.respond(reply(&request, 200, "late")).await,
+                Err(SubmitError::Terminated)
+            );
+            assert_eq!(
+                responder.respond(reply(&request, 183, "late")).await,
+                Err(SubmitError::FinalAlreadySent)
+            );
+            assert!(caller.next_except("INVITE").await.is_none());
+
+            proxy.shutdown(Duration::ZERO).await;
+        }
+    }
+
     // RFC 3261 section 17.2.1. Timer G retransmits the non-2xx over UDP, and
     // Timer H reports the missing ACK before the transaction ends.
     #[tokio::test]
