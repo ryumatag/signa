@@ -2,7 +2,8 @@
 
 signa
 =====
-A fast and correct low-level SIP library in Rust.
+A low-level SIP library for Rust that handles transactions, down to the last
+retransmission.
 
 [![Build status](https://github.com/ryumatag/signa/actions/workflows/ci.yml/badge.svg)](https://github.com/ryumatag/signa/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/signa.svg)](https://crates.io/crates/signa)
@@ -12,9 +13,9 @@ A fast and correct low-level SIP library in Rust.
 
 <br>
 
-signa does for SIP roughly what **hyper** does for HTTP. It carries messages
-over UDP and TCP, runs the RFC 3261 transactions, and hands requests and
-responses to application code at the transaction-user boundary of
+**signa** does for SIP roughly what **hyper** does for HTTP. It carries
+messages over UDP and TCP, runs the RFC 3261 transactions, and hands requests
+and responses to application code at the transaction-user boundary of
 [RFC 3261 section 17]. It is a base for user agents, proxies, registrars and
 B2BUAs. It is not one of them, and it is not a PBX.
 

@@ -1,5 +1,6 @@
 /*!
-signa is a fast and correct low-level SIP library.
+**signa** is a low-level SIP library for Rust that handles transactions, down
+to the last retransmission.
 
 It does for SIP roughly what `hyper` does for HTTP. It carries messages over
 UDP and TCP, runs the RFC 3261 transactions, and hands requests and responses

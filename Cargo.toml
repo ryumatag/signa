@@ -6,7 +6,9 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/ryumatag/signa"
 documentation = "https://docs.rs/signa"
 readme = "README.md"
-description = "A fast and correct low-level SIP library"
+description = '''
+A low-level SIP library for Rust that handles transactions, down to the last retransmission.
+'''
 keywords = ["sip", "rfc3261", "voip", "telephony"]
 categories = ["network-programming"]
 edition = "2021"
