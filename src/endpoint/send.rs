@@ -245,7 +245,8 @@ impl Endpoint {
     /// # Errors
     ///
     /// * [`Error::is_invalid_cseq`] unless the request has one CSeq with its
-    ///   own method. A request without CSeq gets an error naming it.
+    ///   own method. A request without CSeq gets an error that no predicate
+    ///   matches and whose `Display` names it.
     /// * [`Error::is_unsupported_routing`] for a `sips:` Request-URI, a
     ///   multicast target, a UDP target on an endpoint without a UDP socket,
     ///   or a TCP target on a stateless endpoint.
@@ -258,7 +259,7 @@ impl Endpoint {
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```
     /// use bytes::Bytes;
     /// use signa::{
     ///     endpoint::{Endpoint, Error, Target, ViaMode},
@@ -403,7 +404,7 @@ impl Endpoint {
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```
     /// use bytes::Bytes;
     /// use signa::{endpoint::{Endpoint, Error}, Response};
     ///

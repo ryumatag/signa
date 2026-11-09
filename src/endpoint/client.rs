@@ -178,6 +178,62 @@ impl ClientControl {
     ///   opened. Nothing was sent.
     /// * [`CancelError::Closed`] once the endpoint has stopped.
     ///
+    /// # Example
+    ///
+    /// signa has no ringing limit of its own, so the TU sets one. The control
+    /// cancels in a task of its own while the caller goes on reading
+    /// responses, since `cancel` waits for a provisional response first.
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// use bytes::Bytes;
+    /// use signa::{
+    ///     endpoint::{CancelOutcome, ClientTransaction},
+    ///     Response,
+    /// };
+    ///
+    /// // Builds and sends the ACK for a 2xx, as the `Responses` example does.
+    /// async fn acknowledge(_response: &Response<Bytes>) {}
+    ///
+    /// // Returns the INVITE's first final status, if it got one.
+    /// async fn call(
+    ///     invite: ClientTransaction,
+    ///     ringing: Duration,
+    /// ) -> Option<u16> {
+    ///     let (control, mut responses) = invite.into_parts();
+    ///     let canceller = tokio::spawn(async move {
+    ///         tokio::time::sleep(ringing).await;
+    ///         match control.cancel().await {
+    ///             // The CANCEL runs as a transaction of its own, here
+    ///             // unobserved. Its 200 does not end the INVITE.
+    ///             Ok(CancelOutcome::Sent(_cancel)) => {}
+    ///             // A final response came first.
+    ///             Ok(_) => {}
+    ///             Err(error) => eprintln!("no CANCEL sent: {error}"),
+    ///         }
+    ///     });
+    ///
+    ///     let mut status = None;
+    ///     while let Some(Ok(response)) = responses.next().await {
+    ///         if response.status().is_final() && status.is_none() {
+    ///             status = Some(response.status().as_u16());
+    ///             // Aborting cannot withdraw a cancellation already
+    ///             // asked for.
+    ///             canceller.abort();
+    ///         }
+    ///         // A 2xx can still win the race with the CANCEL. The TU
+    ///         // acknowledges it and every later 2xx, so it reads on until
+    ///         // Timer M ends the stream. A non-2xx, usually a 487, is
+    ///         // signa's to acknowledge, and the stream ends after it.
+    ///         if response.status().is_success() {
+    ///             acknowledge(&response).await;
+    ///         }
+    ///     }
+    ///     status
+    /// }
+    /// ```
+    ///
     /// [RFC 3261 section 9.1]: https://www.rfc-editor.org/rfc/rfc3261.html#section-9.1
     #[allow(clippy::manual_async_fn)] // Expose the Send guarantee on Rust 1.71.
     pub fn cancel(
@@ -309,6 +365,41 @@ impl CancelHandle {
 ///
 /// Receiving is cancellation-safe and fused. Dropping observation never
 /// cancels SIP work.
+///
+/// # Example
+///
+/// A UAC follows its INVITE past the first 2xx and acknowledges each one.
+///
+/// ```
+/// use bytes::Bytes;
+/// use signa::{
+///     endpoint::{Endpoint, Error, Responses, Target, ViaMode},
+///     Request, Response,
+/// };
+///
+/// // The UAC core builds the ACK and picks its next hop from the dialog that
+/// // the 2xx creates, with the 2xx's To tag and the dialog's route set.
+/// fn ack_for(_response: &Response<Bytes>) -> (Request<Bytes>, Target) {
+///     todo!()
+/// }
+///
+/// async fn follow(
+///     endpoint: &Endpoint,
+///     mut responses: Responses,
+/// ) -> Result<(), Error> {
+///     while let Some(response) = responses.next().await {
+///         let response = response?;
+///         if response.status().is_success() {
+///             // A retransmission and another fork's 2xx need an ACK as
+///             // well. It goes without a client transaction.
+///             let (ack, target) = ack_for(&response);
+///             endpoint.send_request(ack, target, ViaMode::Fresh).await?;
+///         }
+///     }
+///     // A non-2xx final, or Timer M after a 2xx, ended the stream.
+///     Ok(())
+/// }
+/// ```
 ///
 /// [RFC 3261 sections 17.1.1 and 17.1.2]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17.1.1
 /// [RFC 6026 section 8.4]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.4
@@ -645,10 +736,11 @@ impl Endpoint {
     /// port of the endpoint's TCP listener, when [`Builder::tcp`] has one that
     /// accepts connections on that address. A server whose connection has
     /// closed can then answer on a new connection, so a closed connection does
-    /// not end the transaction, and Timer F does if no final arrives. Without
-    /// such a listener the Via names the connection's own port, and the
-    /// transaction fails with a transport error as soon as the connection
-    /// closes, since no response can reach it any more.
+    /// not end the transaction. Timer F ends a non-INVITE without a final
+    /// response, and Timer B an INVITE without any. Without such a listener
+    /// the Via names the connection's own port, and the transaction fails
+    /// with a transport error as soon as the connection closes, since no
+    /// response can reach it any more.
     ///
     /// # Cancellation
     ///
@@ -665,7 +757,7 @@ impl Endpoint {
     /// * [`Error::is_invalid_cseq`] unless the request has one parseable CSeq
     ///   with its own method, below 2<sup>31</sup> for an INVITE. A request
     ///   without CSeq, or an INVITE without From, To or Call-ID, gets an error
-    ///   naming the header.
+    ///   that no predicate matches and whose `Display` names the header.
     /// * [`Error::is_invalid_header`] for an INVITE with more than one From,
     ///   To or Call-ID, or one that does not parse.
     /// * [`Error::is_unsupported_method`] for ACK and CANCEL. An ACK for a 2xx
@@ -680,6 +772,44 @@ impl Endpoint {
     /// * [`Error::is_transport`] when the transport cannot be prepared.
     /// * [`Error::is_closed`] once the endpoint has stopped or started to
     ///   shut down.
+    ///
+    /// # Example
+    ///
+    /// An OPTIONS to a next hop the caller has already picked. The stream
+    /// yields provisional responses, then the final one or a terminal error.
+    ///
+    /// ```
+    /// use std::error::Error;
+    ///
+    /// use bytes::Bytes;
+    /// use signa::{
+    ///     endpoint::{Endpoint, Target},
+    ///     transport::Transport,
+    ///     Request,
+    /// };
+    ///
+    /// async fn ping(endpoint: &Endpoint) -> Result<(), Box<dyn Error>> {
+    ///     let next_hop = "192.0.2.4:5060".parse()?;
+    ///     let target = Target::new(Transport::Udp, next_hop);
+    ///     let request = Request::builder()
+    ///         .method("OPTIONS")
+    ///         .uri("sip:bob@192.0.2.4")
+    ///         .header("From", "<sip:alice@192.0.2.1>;tag=1928301774")
+    ///         .header("To", "<sip:bob@192.0.2.4>")
+    ///         .header("Call-ID", "a84b4c76e66710")
+    ///         .header("CSeq", "1 OPTIONS")
+    ///         .header("Max-Forwards", "70")
+    ///         .body(Bytes::new())?;
+    ///
+    ///     let (control, mut responses) =
+    ///         endpoint.start(request, target).await?.into_parts();
+    ///     println!("sent from {}", control.flow().local);
+    ///     while let Some(response) = responses.next().await {
+    ///         println!("{}", response?.status());
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
     ///
     /// [RFC 3261 section 17]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17
     /// [RFC 3261 section 17.1]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17.1

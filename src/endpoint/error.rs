@@ -13,7 +13,8 @@ use std::{error, fmt, io};
 use super::driver::MAX_UDP_REQUEST;
 use crate::message::HeaderName;
 
-/// A send rejection or a terminal client response-stream failure.
+/// The error of an endpoint operation, or the terminal error of a client
+/// response stream.
 ///
 /// RFC 3261 section 8.1.3.1 tells a transaction user to treat a timeout as a
 /// 408 and a transport error as a 503. signa reports both as errors instead
@@ -27,8 +28,38 @@ use crate::message::HeaderName;
 /// stopped. Response delivery overflow is reported after already queued
 /// responses, without ending the underlying SIP machine.
 ///
+/// A request without a CSeq, or an INVITE without a From, To or Call-ID, is
+/// refused with an error that none of the predicates below matches. Its
+/// [`fmt::Display`] names the header.
+///
+/// # Example
+///
+/// What a terminal error on a client's [`Responses`] means. None of them is a
+/// SIP response, and none comes from the peer.
+///
+/// ```
+/// use signa::endpoint::Error;
+///
+/// fn describe(error: &Error) -> &'static str {
+///     if error.is_timeout() {
+///         "no response before Timer B or F, which RFC 3261 treats as a 408"
+///     } else if error.is_cancel_timeout() {
+///         "no final response within 64 T1 of the CANCEL"
+///     } else if error.is_transport() {
+///         "the transport failed, which RFC 3261 treats as a 503"
+///     } else if error.is_delivery_overflow() {
+///         "responses came faster than they were read, and the rest is lost"
+///     } else if error.is_closed() {
+///         "the endpoint stopped"
+///     } else {
+///         "refused before anything was sent"
+///     }
+/// }
+/// ```
+///
 /// [`Endpoint::start`]: super::Endpoint::start
 /// [`Reception`]: super::Reception
+/// [`Responses`]: super::Responses
 pub struct Error {
     kind: Kind,
 }
@@ -144,14 +175,19 @@ impl Error {
     }
 
     /// Returns `true` if CSeq is duplicated, malformed, or names a method
-    /// other than the request's method. The request was not sent.
+    /// other than the request's method, or if an INVITE's number is
+    /// 2<sup>31</sup> or more. The request was not sent.
     pub fn is_invalid_cseq(&self) -> bool {
         matches!(self.kind, Kind::InvalidCSeq)
     }
 
-    /// Returns `true` if an INVITE lacks one valid From, To or Call-ID, which
-    /// its ACK and CANCEL copy, or a forwarded response has no top Via that
-    /// signa can read an address from. [`fmt::Display`] names the header.
+    /// Returns `true` if an INVITE has more than one From, To or Call-ID, or
+    /// one that does not parse, which its ACK and CANCEL would copy, or if a
+    /// forwarded response has no top Via, or one whose `received` is not an
+    /// IP address or whose port is zero. [`fmt::Display`] names the header.
+    ///
+    /// An INVITE missing one of the three gets an error that this does not
+    /// match. See [`Error`].
     pub fn is_invalid_header(&self) -> bool {
         matches!(self.kind, Kind::InvalidHeader(_))
     }

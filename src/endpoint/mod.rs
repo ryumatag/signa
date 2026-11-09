@@ -23,7 +23,7 @@ ACK, and reports [`ServerEvent::AckTimeout`] if none comes. After a 2xx it
 stays in Accepted for Timer L, takes further 2xx, including other forks', and
 absorbs INVITE retransmissions without sending anything
 ([RFC 6026 section 8.7]). It does not retransmit a 2xx. A UAS does that through
-[`Responder::reply_route`] until its ACK arrives
+[`Responder::reply_route`] until its ACK arrives, over TCP as well as UDP
 ([RFC 3261 section 13.3.1.4]).
 
 An ACK never gets a response. One for a non-2xx is the transaction's. One
@@ -119,7 +119,7 @@ ends once its accepted writes finish. Dropping the observer has no protocol
 effect. A responder drop is ordered after the submissions it already queued,
 and a queued submission may still run after its waiting future is dropped.
 
-# Client operations and shutdown
+# Client operations
 
 [`Endpoint::start`] accepts an explicit [`Target`] and returns split control
 and response observation. All accepted provisional responses are delivered.
@@ -130,6 +130,8 @@ live transactions, and reserves a CANCEL with each INVITE. Initial sends leave a
 quarter of output capacity for transaction output and responses. See
 [`Builder::tcp_write_limits`], [`Builder::udp_write_limits`] and
 [`Builder::fallback_limits`].
+
+# Shutdown
 
 [`Endpoint::shutdown`] closes new admission and drains current work until the
 earliest requested deadline. Once shutdown starts, new requests get a 503 and
@@ -154,12 +156,14 @@ use signa::endpoint::Timers;
 
 # Example
 
-This UAS answers each non-INVITE request with a 200 and refuses INVITE.
+This UAS answers each non-INVITE request with a 200 and refuses INVITE. The
+[crate docs](crate#quick-start) have a complete UAS and UAC that run on the
+loopback, and [`IncomingEvent`] a loop over every event.
 
 `to_tag` adds a fresh To tag to an initial request's response and keeps the tag
-of a request within a dialog. It ignores untracked requests, which then get no
-answer. A failed submission is logged rather than returned, since leaving the
-loop would drop `incoming` and shut the endpoint down.
+of a request within a dialog. The loop ignores untracked requests, which then
+get no answer. A failed submission is logged rather than returned, since
+leaving the loop would drop `incoming` and shut the endpoint down.
 
 ```no_run
 use bytes::Bytes;
@@ -171,9 +175,10 @@ use signa::{
 
 # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 let (_endpoint, mut incoming) = Endpoint::builder()
-    .udp("127.0.0.1:5060".parse()?)
+    .udp("127.0.0.1:0".parse()?)
     .bind()?;
 
+// Runs until the endpoint stops.
 while let Some(event) = incoming.recv().await {
     if let IncomingEvent::Request(envelope) = event {
         // A 2xx to an INVITE starts a dialog, whose 2xx retransmissions and
@@ -187,10 +192,13 @@ while let Some(event) = incoming.recv().await {
         let response = Response::reply_to(&envelope.request)
             .status(status)
             .to_tag(Tag::random())
-            .body(Bytes::new())?;
+            .body(Bytes::new());
 
-        if let Err(error) = responder.respond(response).await {
-            eprintln!("response not accepted: {error}");
+        // Without a response, dropping the responder sends signa's 500.
+        if let Ok(response) = response {
+            if let Err(error) = responder.respond(response).await {
+                eprintln!("response not accepted: {error}");
+            }
         }
     }
 }
@@ -335,10 +343,15 @@ impl Endpoint {
     ///
     /// # Example
     ///
-    /// ```no_run
-    /// # fn inspect(endpoint: &signa::endpoint::Endpoint) {
+    /// ```
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let (endpoint, _incoming) = signa::endpoint::Endpoint::builder()
+    /// #     .udp("127.0.0.1:0".parse()?)
+    /// #     .bind()?;
     /// let stats = endpoint.reception_stats();
     /// println!("{} ACKs discarded", stats.dropped_acks);
+    /// # Ok(())
     /// # }
     /// ```
     pub fn reception_stats(&self) -> ReceptionStats {
@@ -361,10 +374,17 @@ impl Endpoint {
 
     /// Returns connection-admission and ordinary fallback counters.
     ///
-    /// ```no_run
-    /// # fn inspect(endpoint: &signa::endpoint::Endpoint) {
+    /// # Example
+    ///
+    /// ```
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let (endpoint, _incoming) = signa::endpoint::Endpoint::builder()
+    /// #     .udp("127.0.0.1:0".parse()?)
+    /// #     .bind()?;
     /// let stats = endpoint.connection_stats();
     /// println!("{} refusals, {} fallback drops", stats.rejected, stats.dropped);
+    /// # Ok(())
     /// # }
     /// ```
     pub fn connection_stats(&self) -> ConnectionStats {
@@ -458,17 +478,23 @@ impl Endpoint {
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```
     /// use std::time::Duration;
     ///
-    /// # use signa::endpoint::Endpoint;
-    /// # async fn run(endpoint: Endpoint) {
-    /// // Say on SIGTERM. Timer L of an INVITE answered just before takes 32
-    /// // seconds with the default T1, so allow a little more.
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let (endpoint, _incoming) = signa::endpoint::Endpoint::builder()
+    /// #     .udp("127.0.0.1:0".parse()?)
+    /// #     .bind()?;
+    /// // Called on SIGTERM, say. An INVITE answered just before takes 32
+    /// // seconds to leave Accepted with the default T1, so allow a little
+    /// // more. This endpoint has nothing to drain, so it stops at once.
     /// let outcome = endpoint.shutdown(Duration::from_secs(40)).await;
     /// if !outcome.is_drained() {
     ///     eprintln!("stopped with work left");
     /// }
+    /// # assert!(outcome.is_drained());
+    /// # Ok(())
     /// # }
     /// ```
     ///
@@ -511,13 +537,17 @@ impl Endpoint {
     /// 64 T1 pass. The 2xx retransmissions, here left out, would run in the
     /// same task through the request's [`ReplyRoute`].
     ///
-    /// ```no_run
+    /// ```
     /// use std::time::Duration;
     ///
-    /// use signa::endpoint::{Endpoint, Error, ReceivedAck};
+    /// use signa::endpoint::ReceivedAck;
     /// use tokio::sync::oneshot;
     ///
-    /// # async fn run(endpoint: Endpoint) -> Result<(), Error> {
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let (endpoint, _incoming) = signa::endpoint::Endpoint::builder()
+    /// #     .udp("127.0.0.1:0".parse()?)
+    /// #     .bind()?;
     /// // Before the 2xx goes out.
     /// let guard = endpoint.work_guard()?;
     /// let (ack_tx, ack_rx) = oneshot::channel::<ReceivedAck>();
@@ -528,6 +558,8 @@ impl Endpoint {
     ///     let _guard = guard;
     ///     let _ = tokio::time::timeout(Duration::from_secs(32), ack_rx).await;
     /// });
+    /// # let outcome = endpoint.shutdown(Duration::from_secs(5)).await;
+    /// # assert!(outcome.is_drained());
     /// # Ok(())
     /// # }
     /// ```
@@ -758,6 +790,66 @@ mod tests {
             endpoint.shutdown(Duration::ZERO).await;
             server.shutdown(Duration::ZERO).await;
         }
+    }
+
+    // RFC 3261 section 17 runs every method other than INVITE and ACK as a
+    // non-INVITE transaction, an extension method included. Both endpoints
+    // keep one for it, and the server absorbs the request's retransmissions.
+    #[tokio::test]
+    async fn an_extension_method_runs_as_a_non_invite_transaction() {
+        let (server, mut incoming) = Endpoint::builder()
+            .udp(LOCALHOST)
+            .timers(short_timers())
+            .bind()
+            .unwrap();
+        let (client, _incoming) = Endpoint::builder()
+            .udp(LOCALHOST)
+            .timers(short_timers())
+            .bind()
+            .unwrap();
+        let target = Target::new(Transport::Udp, server.udp_addr().unwrap());
+
+        let (_control, mut responses) = client
+            .start(request("FROBNICATE"), target)
+            .await
+            .unwrap()
+            .into_parts();
+        let IncomingEvent::Request(envelope) = incoming.recv().await.unwrap()
+        else {
+            panic!("request")
+        };
+        let (responder, _events) = envelope.transaction.into_parts();
+        assert_eq!(responder.method().as_str(), "FROBNICATE");
+
+        // Timer E resends the request at 10 and 30 ms.
+        sleep(Duration::from_millis(50)).await;
+        responder
+            .respond(
+                Response::reply_to(&envelope.request)
+                    .status(StatusCode::OK)
+                    .to_tag(Tag::random())
+                    .body(Bytes::new())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // RFC 4320's 100 may come first, at 70 ms.
+        let last = loop {
+            let response = responses.next().await.unwrap().unwrap();
+            if response.status().is_final() {
+                break response;
+            }
+        };
+        assert_eq!(last.status(), StatusCode::OK);
+        assert!(responses.next().await.is_none());
+        assert!(
+            timeout(Duration::from_millis(50), incoming.recv()).await.is_err(),
+            "a retransmission reached the TU"
+        );
+
+        client.shutdown(Duration::ZERO).await;
+        server.shutdown(Duration::ZERO).await;
     }
 
     #[tokio::test]

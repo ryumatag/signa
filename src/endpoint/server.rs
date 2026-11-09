@@ -94,6 +94,71 @@ pub(super) struct Queued {
 /// [module docs](super#reception) for which event each request becomes. A
 /// [`Reception::Stateless`] endpoint delivers only the last two.
 ///
+/// # Example
+///
+/// The receive loop of a small stateful UAS. Ordinary requests go to tasks of
+/// their own, so a slow handler does not hold up the loop, which ACK and
+/// CANCEL also come through. The enum is non-exhaustive, so the loop ends with
+/// a `_` arm.
+///
+/// ```
+/// use bytes::Bytes;
+/// use signa::{
+///     endpoint::{Incoming, IncomingCancel, IncomingEvent, ReceivedAck},
+///     message::header::Tag,
+///     Method, Response,
+/// };
+///
+/// // The UAS core's CANCEL and ACK handling, which needs its dialogs.
+/// async fn cancel_call(_cancel: IncomingCancel) {}
+/// async fn dispatch_ack(_ack: ReceivedAck) {}
+///
+/// async fn serve(mut incoming: Incoming) {
+///     while let Some(event) = incoming.recv().await {
+///         match event {
+///             IncomingEvent::Request(envelope) => {
+///                 tokio::spawn(async move {
+///                     let (responder, _events) =
+///                         envelope.transaction.into_parts();
+///                     let status = match *envelope.request.method() {
+///                         Method::INVITE => 486,
+///                         _ => 200,
+///                     };
+///                     let response = Response::reply_to(&envelope.request)
+///                         .status(status)
+///                         .to_tag(Tag::random())
+///                         .body(Bytes::new());
+///                     if let Ok(response) = response {
+///                         let _ = responder.respond(response).await;
+///                     }
+///                 });
+///             }
+///             // The TU answers the CANCEL with a 200 and, if the request
+///             // named by `cancel.target` is an INVITE without a final
+///             // response yet, that INVITE with a 487.
+///             IncomingEvent::Cancel(cancel) => cancel_call(cancel).await,
+///             // An ACK for a 2xx, which the TU matches to its dialog by
+///             // Call-ID, tags and CSeq.
+///             IncomingEvent::Ack(ack) => dispatch_ack(ack).await,
+///             // Nothing to cancel. A UAS answers 481 through the route.
+///             IncomingEvent::UnmatchedCancel(cancel) => {
+///                 let response = Response::reply_to(&cancel.request)
+///                     .status(481)
+///                     .to_tag(Tag::random())
+///                     .body(Bytes::new());
+///                 if let Ok(response) = response {
+///                     let _ = cancel.reply.send(response).await;
+///                 }
+///             }
+///             // No transaction can be kept for it. Dropping it sends
+///             // nothing.
+///             IncomingEvent::Untracked(_) => {}
+///             _ => {}
+///         }
+///     }
+/// }
+/// ```
+///
 /// [`Reception::Stateful`]: super::Reception::Stateful
 /// [`Reception::Stateless`]: super::Reception::Stateless
 #[derive(Debug)]
@@ -257,7 +322,17 @@ impl ServerTransaction {
 /// enqueued, even if their futures were dropped. If the 500 cannot be
 /// admitted, the transaction ends. Dropping it after a final response has no
 /// protocol effect. That includes an INVITE in Accepted. Its 2xx
-/// retransmissions are the TU's, through [`Responder::reply_route`].
+/// retransmissions are the TU's, through [`Responder::reply_route`], over TCP
+/// as well as UDP, since the 2xx is retransmitted end to end and a later hop
+/// may be UDP ([RFC 3261 section 13.3.1.4]).
+///
+/// A stateful proxy forwards every response through its responder, which
+/// refuses what its transaction no longer allows, such as anything after
+/// Timer L ([RFC 6026 section 8.3]). Sending a late response through the reply
+/// route instead would skip that check.
+///
+/// [RFC 3261 section 13.3.1.4]: https://www.rfc-editor.org/rfc/rfc3261.html#section-13.3.1.4
+/// [RFC 6026 section 8.3]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.3
 pub struct Responder {
     pub(super) shared: Arc<Shared>,
     pub(super) route: ReplyRoute,
@@ -316,6 +391,41 @@ impl Responder {
     /// `TooEarly` can succeed later. `Closed` can follow an enqueued
     /// submission, so the response may or may not have been accepted.
     ///
+    /// # Example
+    ///
+    /// A UAS rings and then answers an INVITE, with one To tag for the
+    /// dialog on both responses.
+    ///
+    /// ```
+    /// use bytes::Bytes;
+    /// use signa::{
+    ///     endpoint::Responder, message::header::Tag, Request, Response,
+    /// };
+    ///
+    /// async fn answer(
+    ///     responder: &Responder,
+    ///     invite: &Request<Bytes>,
+    /// ) -> Result<(), Box<dyn std::error::Error>> {
+    ///     let tag = Tag::random();
+    ///     let ringing = Response::reply_to(invite)
+    ///         .status(180)
+    ///         .to_tag(tag.clone())
+    ///         .body(Bytes::new())?;
+    ///     responder.respond(ringing).await?;
+    ///
+    ///     let ok = Response::reply_to(invite)
+    ///         .status(200)
+    ///         .to_tag(tag)
+    ///         .header("Contact", "<sip:bob@192.0.2.4>")
+    ///         .body(Bytes::new())?;
+    ///     // Before this, the TU registers its wait for the ACK and takes a
+    ///     // `WorkGuard`. After it, the TU retransmits the 2xx through
+    ///     // `responder.reply_route()` until the ACK arrives.
+    ///     responder.respond(ok).await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    ///
     /// [RFC 6026 section 8.7]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.7
     /// [RFC 4320 section 4]: https://www.rfc-editor.org/rfc/rfc4320.html#section-4
     pub fn respond(
@@ -347,6 +457,10 @@ impl Drop for Responder {
 }
 
 /// The acceptance future of a response submission.
+///
+/// [`Responder::respond`] returns it. It is `Send` and `Unpin`, and both are
+/// part of its API, so a response-sender wrapper outside signa can name it as
+/// an associated type and poll it without boxing or pin projection.
 #[must_use = "response submission has no effect until polled"]
 pub struct ResponseSubmission<'a> {
     id: ResponseId,
@@ -598,6 +712,30 @@ impl ServerEvents {
     /// already accepted can still arrive. The stream then ends, or yields
     /// `EndpointClosed` if the endpoint stops first. It returns `None` from
     /// then on.
+    ///
+    /// # Example
+    ///
+    /// An observer that logs what became of a transaction's responses. It
+    /// can run in a task of its own while the handler goes on, or not at all.
+    ///
+    /// ```
+    /// use signa::endpoint::{ServerEvent, ServerEvents};
+    ///
+    /// async fn observe(mut events: ServerEvents) {
+    ///     while let Some(event) = events.next().await {
+    ///         match event {
+    ///             ServerEvent::TransportFailure { operation, error } => {
+    ///                 eprintln!("write of {operation:?} failed: {error}");
+    ///             }
+    ///             // A non-2xx final response to an INVITE got no ACK.
+    ///             ServerEvent::AckTimeout => eprintln!("no ACK"),
+    ///             // Later failures of accepted writes can still follow.
+    ///             ServerEvent::Terminated => {}
+    ///             other => eprintln!("{other:?}"),
+    ///         }
+    ///     }
+    /// }
+    /// ```
     pub async fn next(&mut self) -> Option<ServerEvent> {
         loop {
             if self.ended {
@@ -1475,9 +1613,12 @@ mod tests {
     fn public_operations_are_send_and_envelopes_are_owned() {
         fn send<T: Send>() {}
         fn sync<T: Sync>() {}
+        fn unpin<T: Unpin>() {}
         send::<Incoming>();
         send::<IncomingEvent>();
         send::<ResponseSubmission<'static>>();
+        // Promised in its docs, for wrappers that poll it in place.
+        unpin::<ResponseSubmission<'static>>();
         send::<ServerTransaction>();
         sync::<Responder>();
     }

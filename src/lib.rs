@@ -2,11 +2,22 @@
 signa is a fast and correct low-level SIP library.
 
 It does for SIP roughly what `hyper` does for HTTP. It carries messages over
-UDP and TCP, runs the RFC 3261 transactions, and hands requests to application
-code through owned transaction-user envelopes.
+UDP and TCP, runs the RFC 3261 transactions, and hands requests and responses
+to application code at the transaction-user boundary. It is a base for user
+agents, proxies, registrars and B2BUAs, not one of them.
 
 Its design draws heavily on the [`http`] and [`hyper`] crates.
 
+*/
+// The transaction-user API lives in `endpoint`, which needs the `tokio`
+// feature, and so do the links of this section.
+#![cfg_attr(feature = "tokio", doc = include_str!("doc/transaction_user.md"))]
+#![cfg_attr(
+    not(feature = "tokio"),
+    doc = "The transaction-user API, `endpoint`, needs the `tokio` \
+           feature.\n\n"
+)]
+/*!
 # What this release covers
 
 * SIP message types modeled on the [`http`] crate. [`Request`] and [`Response`]
@@ -20,45 +31,160 @@ Its design draws heavily on the [`http`] and [`hyper`] crates.
   stored. Header names come out in their long form, and `Content-Length` is
   always computed from the body. A response without a reason phrase gets the
   standard one for its code.
-* An `Endpoint` that carries messages over UDP and TCP, splits TCP streams into
-  messages by `Content-Length` and answers RFC 5626 keepalives, runs the
-  INVITE and non-INVITE client and server transactions of RFC 3261 section 17
-  as updated by RFC 6026 and RFC 4320, and exposes incoming events, server
-  responders and independent transaction observation. `Endpoint::start`
-  returns client control and a bounded response stream after transport
-  preparation and driver acceptance. The transaction acknowledges a non-2xx
-  INVITE response. An INVITE is cancelled through its client control, and a
-  received CANCEL or ACK for a 2xx arrives as an event. `Endpoint::send_request`
-  sends a request once without a transaction, such as the application's ACK
-  for a 2xx. Application code owns server dispatch and handler tasks. These
-  operations live in `endpoint`. A graceful shutdown answers new requests with
-  a 503 and waits for the ones in hand up to a deadline.
+* An endpoint, with the `tokio` feature, that carries messages over UDP and
+  TCP, frames TCP streams by `Content-Length`, answers RFC 5626 keepalives,
+  and runs the INVITE and non-INVITE client and server transactions of
+  RFC 3261 section 17 as updated by RFC 6026 and RFC 4320. It exposes the
+  transaction-user API, bounds the work it holds, and drains that work in a
+  graceful shutdown.
 * Stateless reception over UDP for a stateless proxy (RFC 3261 section 16.11).
   Every request and response arrives as an event without a transaction. The
-  application forwards requests with `send_request` and a branch it computed,
-  and responses with `Endpoint::forward_response`, which routes by the
-  remaining Via. Proxy validation, routing and branch computation stay with
-  the application. `examples/stateless_proxy.rs` shows the pieces.
+  application forwards requests with a branch it computed, and responses by
+  their remaining Via. `examples/stateless_proxy.rs` shows the pieces.
 
-# What it does not cover yet
+# Supported RFC scope
 
-* Dialogs and the rest of a UA core: building the ACK for a 2xx,
-  retransmitting a 2xx until its ACK, and deciding what a received CANCEL
-  means. signa gives the application the events, routes and operations for
-  them. Reliable provisional responses (RFC 3262) are not implemented.
-* Draining INVITEs in Accepted when the endpoint shuts down.
+signa implements the parts of each RFC listed here, and each item listed as
+supported or partial has tests, which the [RFC and test map] names. A section
+listed is the basis for one behavior, not a claim that the RFC, or even the
+whole section, is implemented. "The TU's" means that signa provides the events
+and operations, and the application does the rest.
+
+### RFC 3261
+
+Supported:
+
+* Message parsing and encoding, and `Content-Length` framing on TCP
+  ([section 7], [18.3]).
+* The INVITE and non-INVITE client and server transactions, with Timers A to K
+  on UDP and TCP ([17.1], [17.2]), and their matching ([17.1.3], [17.2.3]).
+* The ACK of a non-2xx ([17.1.1.3]). CANCEL built from its INVITE as a
+  transaction of its own, sent after a provisional response, with a 64 T1
+  deadline, and CANCEL matching on the server ([9.1], [9.2]).
+* Response routing by the connection or local address a request came in on,
+  `received`, and a fallback to `sent-by` ([18.2.1], [18.2.2]). A UDP request
+  above 1300 bytes is refused ([18.1.1]).
+* Stateless forwarding primitives over UDP: a caller-chosen branch, and
+  response forwarding by the next Via ([16.11]).
+
+Partial:
+
+* Transports. UDP and TCP only, see below.
+* A new request beyond admission gets a stateless 503, without a reproducible
+  To tag yet ([8.2.7], [21.5.4]).
+* `sips:` ([8.1.2]). The endpoint refuses to send a `sips:` Request-URI.
+  Nothing else about SIPS is checked, see RFC 5630 below.
+
+The TU's:
+
+* Dialogs, the ACK for a 2xx, and retransmitting a 2xx until its ACK ([12],
+  [13.2.2.4], [13.3.1.4]).
+* Answering a CANCEL, and a pending INVITE with a 487 ([9.2]).
+* Proxy behavior beyond the primitives above: validation, Route, Record-Route,
+  targets, forking, the best response and Timer C ([16]).
+* Registration, authentication, and picking the next hop from the URIs ([10],
+  [22], [8.1.2]).
+
+Not supported:
+
+* RFC 2543 fallback matching. A request without the magic cookie in its
+  branch gets no transaction and arrives as an untracked event ([17.2.3]).
+* TLS and so SIPS transport, multicast and `maddr`, and other transports
+  ([18]).
 * Stateless reception over TCP, and stateful and stateless reception on one
   endpoint.
-* Choosing a next hop. RFC 3263 resolution belongs to a layer above, which
-  selects an explicit `Target` for each request. [`Uri::sip`] exposes SIP/SIPS
-  components without selecting a destination or transport.
-* TLS. signa can build and parse `sips:` URIs, but it sends over UDP and TCP
-  only, so it cannot carry a request that requires TLS. `Endpoint::start`
-  refuses a `sips:` Request-URI and does not check Route or the target. Its
-  routing section says what that leaves to the caller.
-* Dialogs, registration, proxy request processing and routing, and the rest
-  of what an application does with messages. Those belong in crates built on
-  signa.
+
+### RFC 6026
+
+Supported:
+
+* Accepted on the client until Timer M, delivering every 2xx, and on the
+  server until Timer L, taking further 2xx and passing their ACKs to the TU
+  ([8.4], [8.7]).
+* An INVITE server keeps its state after a transport error ([8.8]).
+* A stateful endpoint discards a response that matches no transaction
+  ([8.9]).
+
+Partial:
+
+* A stateful proxy forwards only through a live transaction ([7.3], [8.3]).
+  The responder refuses a response its transaction no longer allows. No
+  loopback test sends one after Timer L.
+
+The TU's:
+
+* Retransmitting a UAS 2xx and acknowledging each 2xx ([8.1]).
+
+### RFC 4320
+
+Supported ([section 4]):
+
+* Over UDP a non-INVITE gets the driver's 100 Trying when it is due, and an
+  earlier 100 from the TU is refused. Other provisional responses and 408 are
+  refused.
+* A response that arrives after its client transaction ended is discarded, so
+  a stateful proxy cannot forward it.
+
+### RFC 3581
+
+Supported ([section 4][3581-4]):
+
+* A received request's top Via gets `received`, and `rport` gets the source
+  port. Responses go to that address and port, and a stateless proxy forwards
+  responses by them too.
+
+### RFC 5626
+
+Partial: a double CRLF on TCP gets a CRLF back ([section 4.4.1]). There is no
+flow or keepalive policy.
+
+### RFC 3263 and RFC 5630
+
+Not supported. The application resolves each next hop into an explicit
+target, without RFC 3263's lookups or failover ([3263 section 4]). signa has no
+TLS, so it must not carry a request that needs it, and it checks only part of
+that:
+
+* A `sips:` Request-URI is refused in any letter case. This guards against
+  part of what plaintext cannot do. It is not SIPS support.
+* Route and the target are sent as given and not compared. A `sips:` route
+  needs TLS too ([5630 section 5.1.1]), and catching that, like any other TLS
+  requirement that comes from routing, is the caller's.
+* A `sip:` Request-URI does not make plaintext safe for the request.
+
+# Deliberate omissions
+
+These can be built above signa with its current API:
+
+* A complete UA, PBX, registrar, proxy or B2BUA, and dialog and call state.
+  The examples show the TU parts each needs.
+* RFC 3263 resolution and failover, which pick a target and start the next
+  transaction.
+* Authentication policy, SDP and media.
+* Proxy Timer C, best-response selection, and Route and Record-Route
+  processing. The header API cannot yet remove only the first value of a
+  header, so the proxy examples rebuild those rows.
+* A helper for UAS 2xx retransmission. `examples/invite_uas.rs` has the loop.
+  I keep it out of signa because it has to fit the TU's dialog ACK dispatch,
+  duplicate ACKs, an answer carried in the ACK, and the application's
+  lifetimes.
+
+Reliable provisional responses and PRACK (RFC 3262) and session timers
+(RFC 4028) are neither designed nor tested on signa. They need designs of
+their own.
+
+These are limited by signa itself:
+
+* TLS, and so SIPS. The transport interface is private, so a transport cannot
+  be added from outside.
+* Stateless reception over TCP. Binding refuses it, since a response's Via
+  does not identify the upstream connection.
+* Stateful and stateless reception on one endpoint. Two endpoints on two
+  addresses work. A stateful proxy that forwards an unmatched CANCEL
+  statelessly (RFC 3261 section 16.10) needs the second one.
+* Multicast. A request whose top Via has `maddr` is dropped, and a multicast
+  target is refused.
+* RFC 2543 transactions, which arrive untracked.
 
 # Features
 
@@ -66,6 +192,8 @@ The `tokio` feature, on by default, enables the endpoint and socket I/O.
 Without it, message types, transaction timer configuration, and transport
 metadata and receive limits remain available without a runtime. Endpoint
 examples are omitted when this feature is disabled.
+
+The minimum supported Rust version is 1.71.
 
 # Modules
 
@@ -80,6 +208,43 @@ examples are omitted when this feature is disabled.
   [`transport::MessageLimits`]. Socket and framing implementations are private.
 - The `endpoint` module, enabled by `tokio`, provides running protocol
   operations and their handles.
+
+[RFC and test map]: https://github.com/ryumatag/signa/blob/main/docs/rfc-test-map.md
+[section 7]: https://www.rfc-editor.org/rfc/rfc3261.html#section-7
+[8.1.2]: https://www.rfc-editor.org/rfc/rfc3261.html#section-8.1.2
+[8.2.7]: https://www.rfc-editor.org/rfc/rfc3261.html#section-8.2.7
+[9.1]: https://www.rfc-editor.org/rfc/rfc3261.html#section-9.1
+[9.2]: https://www.rfc-editor.org/rfc/rfc3261.html#section-9.2
+[10]: https://www.rfc-editor.org/rfc/rfc3261.html#section-10
+[12]: https://www.rfc-editor.org/rfc/rfc3261.html#section-12
+[13.2.2.4]: https://www.rfc-editor.org/rfc/rfc3261.html#section-13.2.2.4
+[13.3.1.4]: https://www.rfc-editor.org/rfc/rfc3261.html#section-13.3.1.4
+[16]: https://www.rfc-editor.org/rfc/rfc3261.html#section-16
+[16.11]: https://www.rfc-editor.org/rfc/rfc3261.html#section-16.11
+[17.1]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17.1
+[17.1.1.3]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17.1.1.3
+[17.1.3]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17.1.3
+[17.2]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17.2
+[17.2.3]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17.2.3
+[18]: https://www.rfc-editor.org/rfc/rfc3261.html#section-18
+[18.1.1]: https://www.rfc-editor.org/rfc/rfc3261.html#section-18.1.1
+[18.2.1]: https://www.rfc-editor.org/rfc/rfc3261.html#section-18.2.1
+[18.2.2]: https://www.rfc-editor.org/rfc/rfc3261.html#section-18.2.2
+[18.3]: https://www.rfc-editor.org/rfc/rfc3261.html#section-18.3
+[21.5.4]: https://www.rfc-editor.org/rfc/rfc3261.html#section-21.5.4
+[22]: https://www.rfc-editor.org/rfc/rfc3261.html#section-22
+[7.3]: https://www.rfc-editor.org/rfc/rfc6026.html#section-7.3
+[8.1]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.1
+[8.3]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.3
+[8.4]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.4
+[8.7]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.7
+[8.8]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.8
+[8.9]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.9
+[section 4]: https://www.rfc-editor.org/rfc/rfc4320.html#section-4
+[3581-4]: https://www.rfc-editor.org/rfc/rfc3581.html#section-4
+[section 4.4.1]: https://www.rfc-editor.org/rfc/rfc5626.html#section-4.4.1
+[3263 section 4]: https://www.rfc-editor.org/rfc/rfc3263.html#section-4
+[5630 section 5.1.1]: https://www.rfc-editor.org/rfc/rfc5630.html#section-5.1.1
 
 # Examples
 */
@@ -172,6 +337,12 @@ pub mod endpoint;
 pub mod message;
 pub mod transaction;
 pub mod transport;
+
+// Runs the README's quick start with the doctests, so it cannot drift from the
+// API.
+#[cfg(all(doctest, feature = "tokio"))]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
 
 /// Entry points for signa-bench. Unstable and not part of the public API.
 #[cfg(feature = "__bench")]

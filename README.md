@@ -13,121 +13,199 @@ A fast and correct low-level SIP library in Rust.
 <br>
 
 signa does for SIP roughly what **hyper** does for HTTP. It carries messages
-over UDP and TCP, runs the RFC 3261 transactions, and hands requests to
-application code through owned transaction-user events.
+over UDP and TCP, runs the RFC 3261 transactions, and hands requests and
+responses to application code at the transaction-user boundary of
+[RFC 3261 section 17]. It is a base for user agents, proxies, registrars and
+B2BUAs. It is not one of them, and it is not a PBX.
 
 Its design draws heavily on the [hyper] and [http] crates.
 
-The current development API has request and response types modeled on the http
-crate, parsing with [**siparse**] and encoding, and an endpoint that carries
-messages over UDP and TCP, runs INVITE and non-INVITE transactions with the
-Accepted states of RFC 6026, and exposes incoming requests, responders and
-independent transaction observation. Client requests start asynchronously and
-return split control and bounded response streams. An INVITE is cancelled
-through its control, the transaction acknowledges a non-2xx, and the
-application sends the ACK for a 2xx once, without a transaction. ACKs for a 2xx
-and CANCELs reach the application as events of their own. A graceful shutdown
-waits for every transaction to reach Terminated, including INVITEs in Accepted,
-and for work the application registers with a guard, then reports whether it
-drained or hit its deadline. A stateless endpoint receives requests and
-responses over UDP without transactions, and forwards requests with a branch
-the application computes and responses by their remaining Via. Stateless TCP,
-TLS and next-hop selection are later work. signa is not a complete UA or
-proxy. Dialogs, 2xx retransmission, the meaning of a CANCEL, and a proxy's
-validation and routing stay with the application.
-
-The [API documentation on docs.rs] says what is covered in detail.
-
+[RFC 3261 section 17]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17
 [hyper]: https://docs.rs/hyper
 [http]: https://docs.rs/http
-[**siparse**]: https://docs.rs/siparse
-[API documentation on docs.rs]: https://docs.rs/signa
 
-### Modules
+### What signa does
 
-`message` contains the SIP message model, construction, parsing and encoding.
-The main types remain available at the crate root, such as `signa::Request`.
-Use `signa::message::request::Parts`, `signa::message::header::VIA` and
-`signa::message::BuildError` for detailed message APIs.
-`Uri::sip()` and `message::uri::SipUri::parse()` provide borrowed SIP/SIPS
-components on demand, preserving the original text and escapes.
+* SIP request and response types modeled on the http crate, parsed with
+  [siparse] and encoded with a computed `Content-Length`.
+* UDP and TCP transport. TCP streams are framed by `Content-Length`, and
+  responses go back over the connection or local address their request came in
+  on, with `received` and `rport` (RFC 3581).
+* INVITE and non-INVITE client and server transactions: matching,
+  retransmissions and timers, the Accepted states and Timers L and M of
+  RFC 6026, and the non-INVITE changes of RFC 4320.
+* The ACK of a non-2xx final response, and CANCEL as a transaction of its own.
+* UDP stateless reception and forwarding primitives for a stateless proxy.
+* Bounded protocol work, explicit errors, and a graceful shutdown that waits
+  for transactions and for work the application registers with a guard.
 
-`transaction::Timers` configures transaction deadlines.
-`transport::{Flow, Transport, MessageLimits}` describes transport metadata and
-stream receive limits. These APIs are runtime independent. The `tokio` feature
-enables the endpoint and sockets. State machines, sockets and framing remain
-internal implementation details.
+### What the application does
 
-### Example
+The application is the transaction user (TU). It owns dialogs and calls, the
+ACK for a 2xx, retransmitting its own 2xx until the ACK, what a received CANCEL
+means, proxy routing and forking decisions, Timer C, next-hop selection
+(RFC 3263), authentication, registration, SDP and media, and handler dispatch.
+The examples below show several of these on top of signa.
 
-A UAS for non-INVITE requests receives owned requests and responds through
-their transaction. `to_tag` adds a fresh To tag to an initial request's
-response and keeps the tag of a request within a dialog. A failed submission is
-logged rather than returned, since leaving the loop would drop `incoming` and
-shut the endpoint down.
+The TU is not a Rust trait. signa has no service trait. An ordinary receive
+loop uses the API directly, and a Tower adapter can be built outside signa.
+
+### Transaction-user API
+
+The `endpoint` module, behind the default `tokio` feature, is the whole TU
+API:
+
+* `Endpoint::builder()` binds UDP and TCP and returns a cloneable `Endpoint`
+  and one `Incoming` event receiver. The endpoint spawns no handler tasks.
+* `Incoming::recv` yields an `IncomingEvent`: a new request with its server
+  transaction, a matched CANCEL, an ACK for a 2xx, an unmatched CANCEL, an
+  untracked request, or, on a stateless endpoint, any request or response.
+* A `ServerTransaction` splits into a `Responder`, which submits responses,
+  and `ServerEvents`, which reports write failures and termination.
+* `Endpoint::start` sends a request to an explicit `Target` and returns a
+  `ClientControl`, which can cancel an INVITE, and a `Responses` stream.
+* `Endpoint::send_request`, `Endpoint::forward_response` and
+  `ReplyRoute::send` send one message without a transaction.
+* `Endpoint::shutdown` drains and reports `Drained` or `DeadlineExpired`.
+  `Endpoint::work_guard` holds it for the TU's own work.
+
+Reception is fixed per endpoint. `Reception::Stateful`, the default, runs
+transactions over UDP and TCP. `Reception::Stateless` delivers every message
+over UDP without transactions, for a stateless proxy.
+
+### Quick start
+
+A UAS and a UAC on the loopback. The UAS answers an OPTIONS through its server
+transaction, the UAC reads the response from its client transaction, and both
+shut down gracefully.
 
 ```rust
+use std::time::Duration;
+
 use bytes::Bytes;
 use signa::{
-    endpoint::{Endpoint, IncomingEvent},
+    endpoint::{Endpoint, IncomingEvent, Target},
     message::header::Tag,
-    Method, Response,
+    transport::Transport,
+    Request, Response, StatusCode,
 };
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (_endpoint, mut incoming) = Endpoint::builder()
-        .udp("0.0.0.0:5060".parse()?)
-        .tcp("0.0.0.0:5060".parse()?)
-        .bind()?;
+    // Port 0 lets the system pick one. Keep each `Incoming`, since dropping
+    // it shuts its endpoint down.
+    let (uas, mut uas_incoming) =
+        Endpoint::builder().tcp("127.0.0.1:0".parse()?).bind()?;
+    let (uac, _uac_incoming) =
+        Endpoint::builder().tcp("127.0.0.1:0".parse()?).bind()?;
 
-    while let Some(event) = incoming.recv().await {
-        if let IncomingEvent::Request(envelope) = event {
-            // A 2xx to an INVITE starts a dialog, whose 2xx retransmissions and
-            // ACK this loop does not handle.
-            let status = if envelope.request.method() == Method::INVITE {
-                501
-            } else {
-                200
-            };
-            let (responder, _) = envelope.transaction.into_parts();
-            let response = Response::reply_to(&envelope.request)
-                .status(status)
-                .to_tag(Tag::random())
-                .body(Bytes::new())?;
+    // The UAC picks the next hop itself. signa does no RFC 3263 lookup.
+    let target = Target::new(Transport::Tcp, uas.tcp_addr().unwrap());
+    let request = Request::builder()
+        .method("OPTIONS")
+        .uri("sip:bob@127.0.0.1")
+        .header("From", "<sip:alice@127.0.0.1>;tag=1928301774")
+        .header("To", "<sip:bob@127.0.0.1>")
+        .header("Call-ID", "a84b4c76e66710")
+        .header("CSeq", "1 OPTIONS")
+        .header("Max-Forwards", "70")
+        .body(Bytes::new())?;
+    let (_control, mut responses) =
+        uac.start(request, target).await?.into_parts();
 
-            if let Err(error) = responder.respond(response).await {
-                eprintln!("response not accepted: {error}");
-            }
-        }
+    // The UAS takes the request with its server transaction and answers it.
+    // `IncomingEvent` is non-exhaustive, so a real loop also has a `_` arm.
+    if let Some(IncomingEvent::Request(envelope)) = uas_incoming.recv().await {
+        let (responder, _events) = envelope.transaction.into_parts();
+        let response = Response::reply_to(&envelope.request)
+            .status(StatusCode::OK)
+            .to_tag(Tag::random())
+            .body(Bytes::new())?;
+        // Accepted by the driver, which is not the same as received.
+        responder.respond(response).await?;
     }
+
+    let response = responses.next().await.expect("a final response")?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Over TCP both transactions end with the final response. Over UDP the
+    // drain would wait for Timers J and K, 32 and 5 seconds by default.
+    assert!(uac.shutdown(Duration::from_secs(5)).await.is_drained());
+    assert!(uas.shutdown(Duration::from_secs(5)).await.is_drained());
 
     Ok(())
 }
 ```
 
-Each example below runs on the loopback, checks its own outcome, and says
-which transaction-user duties it takes on and which it leaves out. CI runs
-them with RFC 3261's timers.
+### Examples
 
-* `examples/options.rs` answers non-INVITE requests over UDP and TCP, observes
-  the transactions, and shuts down gracefully.
-* `examples/invite_uas.rs` answers INVITEs, retransmits its 2xx until the ACK
-  under a work guard, and compares a drained shutdown with a forced one.
-* `examples/invite_uac.rs` handles forked and retransmitted 2xx, acknowledges
-  each, and cancels calls, including a CANCEL that loses to a 2xx.
-* `examples/fork_proxy.rs` is a stateful proxy that forks an INVITE to two
-  UASes, relays every 2xx, and cancels the other branches.
-* `examples/stateless_proxy.rs` runs a UDP stateless proxy between a raw UAC
-  and a stateful UAS, with a stable branch for the INVITE, its CANCEL and its
-  ACK.
+Each example runs on the loopback, checks its own outcome, and says which TU
+duties it takes on and which it leaves out. CI runs them with RFC 3261's
+timers. `--t1-ms 50` makes most of them quicker.
 
-`tests/tower_fixture.rs` builds a Tower adapter outside signa, against its
-public API: response-sender wrappers applied by layers, and a bounded
-dispatcher that keeps ACK and CANCEL moving while handlers wait. signa itself
-has no Tower dependency.
+* [`examples/options.rs`](examples/options.rs): a non-INVITE responder over
+  UDP and TCP, with transaction observation and a drained shutdown.
+* [`examples/invite_uas.rs`](examples/invite_uas.rs): an INVITE UAS that
+  retransmits its 2xx until the ACK under a work guard, answers CANCEL, and
+  compares a drained shutdown with a forced one.
+* [`examples/invite_uac.rs`](examples/invite_uac.rs): an INVITE UAC that
+  acknowledges forked and retransmitted 2xx and cancels calls, including a
+  CANCEL that loses to a 2xx.
+* [`examples/fork_proxy.rs`](examples/fork_proxy.rs): a stateful proxy that
+  forks an INVITE to two UASes, relays every 2xx, and cancels the other
+  branches.
+* [`examples/stateless_proxy.rs`](examples/stateless_proxy.rs): a UDP
+  stateless proxy with a stable branch for an INVITE, its CANCEL and its ACK.
 
-`docs/rfc-test-map.md` maps each requirement signa takes on to its tests.
+[`tests/tower_fixture.rs`](tests/tower_fixture.rs) builds a Tower adapter and
+a bounded dispatcher outside signa, against its public API only. signa has no
+Tower dependency.
+
+### Supported RFC scope
+
+signa implements parts of these RFCs and tests each of them. It does not claim
+conformance to any of them as a whole.
+
+* RFC 3261: message parsing and encoding, TCP framing, client and server
+  transactions and their matching, the non-2xx ACK, CANCEL, UDP and TCP
+  response routing, and stateless forwarding primitives over UDP.
+* RFC 6026: the Accepted states, Timers L and M, every 2xx to the TU, and
+  discarding stray responses.
+* RFC 4320: the automatic 100 Trying and the responses a non-INVITE may not
+  send.
+* RFC 3581: `received` and `rport`.
+
+The [crate documentation] lists what is supported, partial, left to the TU and
+unsupported, section by section. [`docs/rfc-test-map.md`](docs/rfc-test-map.md)
+maps each requirement to its tests.
+
+### Deliberate omissions
+
+signa 0.3 has no dialog or call layer, no TLS and so no SIPS, no RFC 3263
+resolution, no PRACK or session timers, no authentication, SDP or media, and no
+proxy routing logic. Stateless reception is UDP-only and cannot share an
+endpoint with stateful reception. RFC 2543 transactions are not matched.
+`sips:` Request-URIs are refused, but nothing else about SIPS, Route or the
+target is checked. A `sip:` URI does not make plaintext safe.
+
+### Features and MSRV
+
+* `tokio`, on by default, enables the endpoint and its sockets. Without it the
+  message types, transaction timer configuration and transport metadata stay
+  available without a runtime.
+
+The minimum supported Rust version is 1.71.
+
+### Documentation
+
+* [API documentation on docs.rs](https://docs.rs/signa), with the TU boundary,
+  the lifetimes it separates, and the RFC scope in the crate documentation.
+* [`docs/rfc-test-map.md`](docs/rfc-test-map.md), requirements and their
+  tests.
+* [siparse], the SIP message head parser signa builds on.
+
+[siparse]: https://docs.rs/siparse
+[crate documentation]: https://docs.rs/signa
 
 ### License
 

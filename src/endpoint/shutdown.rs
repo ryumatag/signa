@@ -91,17 +91,21 @@ impl ShutdownOutcome {
 /// A task the TU owns takes its guard before it starts, so a shutdown that
 /// begins meanwhile waits for it.
 ///
-/// ```no_run
+/// ```
 /// use std::time::Duration;
 ///
-/// use signa::endpoint::{Endpoint, Error, ShutdownOutcome};
+/// use signa::endpoint::{Endpoint, ShutdownOutcome};
 ///
-/// # async fn run(endpoint: Endpoint) -> Result<(), Error> {
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let (endpoint, _incoming) =
+///     Endpoint::builder().udp("127.0.0.1:0".parse()?).bind()?;
+///
 /// let guard = endpoint.work_guard()?;
 /// let task = tokio::spawn(async move {
 ///     let _guard = guard;
 ///     // Retransmit a 2xx until its ACK arrives, say.
-///     tokio::time::sleep(Duration::from_secs(4)).await;
+///     tokio::time::sleep(Duration::from_millis(100)).await;
 /// });
 ///
 /// // Resolves after the task has dropped its guard, or after 40 seconds.

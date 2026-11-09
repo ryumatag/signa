@@ -159,13 +159,14 @@ impl Default for Config {
 ///
 /// # Example
 ///
-/// ```no_run
-/// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-/// let (_endpoint, mut incoming) = signa::endpoint::Endpoint::builder()
-///     .udp("127.0.0.1:5060".parse()?)
+/// ```
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let (endpoint, _incoming) = signa::endpoint::Endpoint::builder()
+///     .udp("127.0.0.1:0".parse()?)
 ///     .max_pending_requests(256)
 ///     .bind()?;
-/// let _event = incoming.recv().await;
+/// println!("listening on {}", endpoint.udp_addr().unwrap());
 /// # Ok(())
 /// # }
 /// ```
@@ -226,7 +227,7 @@ impl Builder {
     /// use signa::endpoint::{Endpoint, Reception};
     ///
     /// let builder = Endpoint::builder()
-    ///     .udp("127.0.0.1:5060".parse().unwrap())
+    ///     .udp("127.0.0.1:0".parse().unwrap())
     ///     .reception(Reception::Stateless);
     /// # drop(builder);
     /// ```

@@ -10,6 +10,11 @@ Keep it current. A change to a contract updates its row and its tests in the
 same branch. Test names are the function names, and the file says where to
 find them.
 
+The crate documentation's "Supported RFC scope" section sums these rows up by
+RFC as supported, partial, the TU's, or not supported. Each item it lists as
+supported or partial has a row here, and its omissions are in "Deliberate
+omissions in 0.3.0".
+
 ## Reading the table
 
 Type is where the evidence runs:
@@ -21,6 +26,7 @@ Type is where the evidence runs:
 * loopback: endpoints and raw peers over real loopback sockets, in
   `src/endpoint/mod.rs` and `src/transport/`.
 * external: a separate test crate that sees only the public API, in `tests/`.
+* unit: a test of one module's functions, inline in that module.
 * example: a program in `examples/` that checks its own outcome. CI runs each
   one with RFC 3261's default timers.
 
@@ -37,6 +43,17 @@ stateful.
 [6026]: https://www.rfc-editor.org/rfc/rfc6026.html
 [4320]: https://www.rfc-editor.org/rfc/rfc4320.html
 [3581]: https://www.rfc-editor.org/rfc/rfc3581.html
+
+## Messages (RFC 3261 sections 7 and 18.3)
+
+Unless a row says otherwise, these are unit tests in `src/message/mod.rs`.
+
+| Requirement | Basis | Expected behavior | Evidence | Type | Scope | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| Parsing | [3261 §7](https://www.rfc-editor.org/rfc/rfc3261.html#section-7) | A complete request or response parses with siparse and shares the input. An incomplete head, what siparse rejects, and a status outside 100 to 699 are errors. | `parses_a_request`, `parses_a_response`, `parses_either_kind_as_a_message`, `shares_the_input_instead_of_copying`, `rejects_an_incomplete_head`, `reports_what_siparse_rejected`, `rejects_status_codes_outside_the_sip_classes` | unit | - | covered |
+| Body length of one message | [3261 §18.3](https://www.rfc-editor.org/rfc/rfc3261.html#section-18.3) | Without Content-Length the body is the rest of the datagram. Content-Length cuts off trailing bytes. A shorter body, a non-numeric value, and repeated values that disagree are errors. | `body_without_content_length_is_the_rest`, `content_length_cuts_off_trailing_bytes`, `rejects_a_body_shorter_than_content_length`, `content_length_must_be_digits`, `repeated_content_length_must_agree` | unit | - | covered |
+| Encoding | [3261 §7](https://www.rfc-editor.org/rfc/rfc3261.html#section-7), [§20.14](https://www.rfc-editor.org/rfc/rfc3261.html#section-20.14) | Content-Length comes from the body, a missing reason phrase gets the standard one, and a received message encodes back to itself. | `encodes_a_request`, `encodes_a_response_with_its_canonical_reason`, `content_length_always_matches_the_body`, `round_trips_a_received_message` | unit | - | covered |
+| Extension methods | [3261 §17](https://www.rfc-editor.org/rfc/rfc3261.html#section-17) | An unknown method is an extension method. It runs as a non-INVITE transaction on both sides, arrives at a stateless endpoint, and goes out through `send_request`. | `non_canonical_case_becomes_extension`, `inline_and_allocated_extension` (`message/start_line/method.rs`), `an_extension_method_runs_as_a_non_invite_transaction`, `stateless_requests_of_every_method_arrive_without_transactions` (`endpoint/mod.rs`), `send_request_takes_any_method_without_a_transaction` | unit, loopback | UDP | covered |
 
 ## Transactions and timers (RFC 3261 sections 17 and 18, RFC 6026, RFC 4320)
 
@@ -120,7 +137,7 @@ stateful.
 
 | Requirement | Basis | Expected behavior | Evidence | Type | Scope | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| `sips:` Request-URI | [3261 §8.1.2](https://www.rfc-editor.org/rfc/rfc3261.html#section-8.1.2) | `start` and `send_request` refuse it in any letter case. | `plaintext_transports_cannot_submit_sips_request_uris`, `client_tu_refuses_a_sips_request_uri_before_admission`, `a_sips_request_uri_is_refused_in_any_case` | unit, loopback | both | covered |
+| `sips:` Request-URI | [3261 §8.1.2](https://www.rfc-editor.org/rfc/rfc3261.html#section-8.1.2) | `start` and `send_request` refuse it in any letter case. | `plaintext_transports_cannot_submit_sips_request_uris`, `client_tu_refuses_a_sips_request_uri_before_admission`, `a_sips_request_uri_is_refused_in_any_case` | unit, loopback | both | partial: the Request-URI is the only SIPS check, see the next row |
 | Route-derived TLS needs | [5630 §5.1.1](https://www.rfc-editor.org/rfc/rfc5630.html#section-5.1.1) | The caller's. signa sends Route and target as given. | `sips_routes_are_left_to_the_caller`, `client_tu_sends_to_the_target_with_request_uri_and_route_as_given` | unit, loopback | both | covered (as a boundary) |
 | TLS, RFC 3263 discovery | design | Not in 0.3.0. | none | - | - | omitted |
 
@@ -129,7 +146,7 @@ stateful.
 | Requirement | Basis | Expected behavior | Evidence | Type | Scope | Status |
 | --- | --- | --- | --- | --- | --- | --- |
 | Reception is fixed and explicit | design | Each reception refuses the other's operations. Stateless is UDP-only. | `stateless_reception_binds_udp_only`, `each_reception_refuses_the_other_s_operations` | loopback | both receptions | covered |
-| Owned envelopes, Send handles | design | Envelopes destructure, handles split, operations are `Send`. | `public_operations_are_send_and_envelopes_are_owned`, `submissions_are_send_and_unpin` (`tests/tower_fixture.rs`) | driver, external | - | covered |
+| Owned envelopes, Send handles | design | Envelopes destructure, handles split, operations are `Send`, and `ResponseSubmission` is `Unpin` as its docs promise. | `public_operations_are_send_and_envelopes_are_owned`, `submissions_are_send_and_unpin` (`tests/tower_fixture.rs`) | driver, external | - | covered |
 | Commit points | design | Dropping before enqueue has no effect. After enqueue the operation runs. | `cancellation_before_enqueue_has_no_effect_and_after_enqueue_keeps_the_write`, `client_tu_start_and_receive_cancellation_preserve_committed_work`, `queued_submissions_keep_their_count_after_waiters_drop`, `stateless_sends_commit_at_enqueue`, `shared_reply_bytes_remain_charged_after_the_future_is_dropped` | driver, loopback | both | covered |
 | Responder drop | design | An unanswered responder drop sends a 500 with a stable tag, ordered after queued submissions. | `unanswered_drop_reuses_the_provisional_to_tag`, `a_dropped_invite_responder_sends_a_500_with_the_provisional_tag`, `cancelled_waiter_and_responder_drop_cannot_race_a_queued_final`, `a_panicking_application_releases_work_through_responder_drop`, `a_tower_timeout_drops_the_handler_but_cancels_nothing` (`tests/tower_fixture.rs`) | driver, loopback, external | both | covered |
 | Stale IDs | design | A reused slot cannot be reached through an old handle. | `a_reused_numeric_slot_cannot_redirect_a_tu_capability`, `a_stale_cancel_handle_cannot_reach_a_reused_slot`, `timer_j_returns_server_capacity_and_old_ids_do_not_touch_reused_slots`, `a_removed_id_finds_nothing_even_when_its_slot_is_reused` | driver, unit | - | covered |
