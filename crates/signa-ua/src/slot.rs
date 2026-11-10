@@ -213,6 +213,26 @@ impl<T> Slots<T> {
             },
         )
     }
+
+    /// Returns the keys and records in the table, in slot order, for change.
+    pub(crate) fn iter_mut(
+        &mut self,
+    ) -> impl Iterator<Item = (Key<T>, &mut T)> {
+        self.entries.iter_mut().enumerate().filter_map(|(index, entry)| {
+            match entry {
+                Entry::Occupied { generation, value } => Some((
+                    Key {
+                        // The table never grows past `u32::MAX` slots.
+                        index: index as u32,
+                        generation: *generation,
+                        record: PhantomData,
+                    },
+                    value,
+                )),
+                _ => None,
+            }
+        })
+    }
 }
 
 impl<T: fmt::Debug> fmt::Debug for Slots<T> {

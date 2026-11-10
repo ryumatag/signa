@@ -135,20 +135,15 @@ impl ReplayContext {
 mod tests {
     use super::*;
     use crate::{
-        dialog::Dialog,
         invite::{InviteExchange, InviteUsage},
         negotiation::Negotiation,
         slot::Slots,
     };
 
     fn context(direction: Direction) -> ReplayContext {
-        let dialog = DialogId::new(
-            "call".into(),
-            "local".parse().unwrap(),
-            "remote".parse().unwrap(),
-        );
-        let dialog_key =
-            Slots::new(1).insert(Dialog::confirmed(dialog.clone())).unwrap();
+        let record = crate::tests::dialog();
+        let dialog = record.id().clone();
+        let dialog_key = Slots::new(1).insert(record).unwrap();
         let usage = Slots::new(1)
             .insert(InviteUsage::established(
                 dialog_key,

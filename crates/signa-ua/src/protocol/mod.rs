@@ -1,0 +1,273 @@
+/*!
+The headers a UA core reads, and only as far as it needs them.
+
+signa-core keeps header values opaque, and its own address and CSeq readers
+are private to it. This module reads From, To, Call-ID, CSeq, Contact, Route
+and Record-Route on top of the element scans of [`siparse::scan`], so that
+the grammar of RFC 3261 section 25.1 is followed rather than approximated by
+splitting at `,` or `;`. It is not a general typed-header API.
+
+What it returns borrows the message. Values are returned as written, with
+case, parameters and their order intact. A dialog keeps its own copy of what
+it needs.
+*/
+
+use signa_core::{
+    message::header::{HeaderName, CALL_ID, CONTACT, CSEQ, FROM, TO},
+    HeaderMap,
+};
+
+pub(crate) use self::address::addresses;
+
+mod address;
+
+/// A header the UA needs that is missing, repeated or malformed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Malformed(pub(crate) Field);
+
+/// The header a [`Malformed`] is about.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Field {
+    CallId,
+    From,
+    To,
+    CSeq,
+    Contact,
+    RecordRoute,
+}
+
+/// The URI and tag of a From or To value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Party<'a> {
+    pub(crate) uri: &'a str,
+    /// `None` for a value without a tag, which RFC 3261 section 12.1 treats
+    /// as a null tag.
+    pub(crate) tag: Option<&'a str>,
+}
+
+/// Returns the one value of `name`. Call-ID, From, To and CSeq are not
+/// lists, so a second row is as malformed as a missing one.
+fn single(
+    headers: &HeaderMap,
+    name: HeaderName,
+    field: Field,
+) -> Result<&str, Malformed> {
+    let mut rows = headers.get_all(name);
+    match (rows.next(), rows.next()) {
+        (Some(value), None) => Ok(value.as_str()),
+        _ => Err(Malformed(field)),
+    }
+}
+
+/// Returns the Call-ID, without the whitespace around it.
+///
+/// RFC 3261 section 20.8 compares Call-IDs byte by byte, so the value is
+/// returned exactly as written and only checked against `callid = word
+/// ["@" word]` of section 25.1.
+pub(crate) fn call_id(headers: &HeaderMap) -> Result<&str, Malformed> {
+    let value = single(headers, CALL_ID, Field::CallId)?;
+    let value = siparse::scan::sws(value).trim_end_matches([' ', '\t']);
+
+    let mut words = value.splitn(2, '@');
+    let valid =
+        words.all(|word| !word.is_empty() && word.bytes().all(is_word));
+    if valid {
+        Ok(value)
+    } else {
+        Err(Malformed(Field::CallId))
+    }
+}
+
+/// `word` of RFC 3261 section 25.1, without the `@` that splits a Call-ID.
+fn is_word(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || b"-.!%*_+`'~()<>:\\\"/[]?{}".contains(&byte)
+}
+
+/// Returns the URI and tag of the From value.
+pub(crate) fn from(headers: &HeaderMap) -> Result<Party<'_>, Malformed> {
+    party(single(headers, FROM, Field::From)?, Field::From)
+}
+
+/// Returns the URI and tag of the To value.
+pub(crate) fn to(headers: &HeaderMap) -> Result<Party<'_>, Malformed> {
+    party(single(headers, TO, Field::To)?, Field::To)
+}
+
+fn party(value: &str, field: Field) -> Result<Party<'_>, Malformed> {
+    let mut list = addresses(value);
+    let (Some(Ok(address)), None) = (list.next(), list.next()) else {
+        return Err(Malformed(field));
+    };
+
+    // A tag is a token (RFC 3261 section 25.1). A valueless or repeated tag
+    // leaves the dialog identity ambiguous, so it is malformed.
+    let tag = match address.parameter("tag") {
+        Ok(None) => None,
+        Ok(Some(Some(tag)))
+            if siparse::scan::token(tag) == Some((tag, "")) =>
+        {
+            Some(tag)
+        }
+        _ => return Err(Malformed(field)),
+    };
+    Ok(Party { uri: address.uri, tag })
+}
+
+/// Returns the URI of the one Contact address, or `None` without Contact.
+///
+/// RFC 3261 section 8.1.1.8 allows exactly one URI in the Contact of a
+/// request that forms a dialog, and a target refresh carries one too. Rows
+/// and comma-separated values count alike, since RFC 3261 section 7.3.1 makes
+/// them the same list.
+pub(crate) fn contact(headers: &HeaderMap) -> Result<Option<&str>, Malformed> {
+    let mut found = None;
+
+    for value in headers.get_all(CONTACT) {
+        for address in addresses(value.as_str()) {
+            let address = address.map_err(|_| Malformed(Field::Contact))?;
+            if found.replace(address.uri).is_some() {
+                return Err(Malformed(Field::Contact));
+            }
+        }
+    }
+
+    Ok(found)
+}
+
+/// Returns the sequence number and method of the CSeq value.
+///
+/// The number is read as a `u32`, the range RFC 3261 section 8.1.1.5 gives
+/// it. The method is returned as written. RFC 3261 section 20.16 makes the
+/// method of a CSeq case-sensitive, so it is compared exactly.
+pub(crate) fn cseq(headers: &HeaderMap) -> Result<(u32, &str), Malformed> {
+    use siparse::scan;
+
+    let malformed = Malformed(Field::CSeq);
+    let rest = scan::sws(single(headers, CSEQ, Field::CSeq)?);
+    let (digits, rest) = scan::digits(rest).ok_or(malformed)?;
+    // The digits have no sign, so this only fails above `u32::MAX`.
+    let number = digits.parse().map_err(|_| malformed)?;
+    let rest = scan::lws(rest).ok_or(malformed)?;
+    let (method, rest) = scan::token(rest).ok_or(malformed)?;
+
+    if scan::sws(rest).is_empty() {
+        Ok((number, method))
+    } else {
+        Err(malformed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use signa_core::HeaderValue;
+
+    use super::*;
+
+    fn headers(rows: &[(HeaderName, &'static str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in rows {
+            headers.append(name.clone(), HeaderValue::from_static(value));
+        }
+        headers
+    }
+
+    #[test]
+    fn call_ids_are_kept_as_written() {
+        for (value, expected) in [
+            (
+                "a84b4c76e66710@pc33.atlanta.com",
+                "a84b4c76e66710@pc33.atlanta.com",
+            ),
+            ("  f81d4fae-7dec-11d0 ", "f81d4fae-7dec-11d0"),
+            ("CaseMatters", "CaseMatters"),
+        ] {
+            let headers = headers(&[(CALL_ID, value)]);
+            assert_eq!(call_id(&headers), Ok(expected), "{value}");
+        }
+
+        for value in ["", "two words", "a@b@c", "@host", "a,b"] {
+            let headers = headers(&[(CALL_ID, value)]);
+            assert!(call_id(&headers).is_err(), "{value}");
+        }
+
+        let twice = headers(&[(CALL_ID, "a"), (CALL_ID, "a")]);
+        assert_eq!(call_id(&twice), Err(Malformed(Field::CallId)));
+    }
+
+    #[test]
+    fn parties_carry_their_uri_and_tag() {
+        let headers = headers(&[
+            (FROM, "\"Alice, A.\" <sip:alice@atlanta.com>;tag=1928301774"),
+            (TO, "sip:bob@biloxi.com"),
+        ]);
+
+        assert_eq!(
+            from(&headers),
+            Ok(Party {
+                uri: "sip:alice@atlanta.com",
+                tag: Some("1928301774")
+            }),
+        );
+        assert_eq!(
+            to(&headers),
+            Ok(Party { uri: "sip:bob@biloxi.com", tag: None })
+        );
+    }
+
+    #[test]
+    fn a_tag_inside_the_uri_is_not_the_header_tag() {
+        let headers = headers(&[(TO, "<sip:bob@biloxi.com;tag=uri>")]);
+
+        assert_eq!(to(&headers).unwrap().tag, None);
+    }
+
+    #[test]
+    fn an_ambiguous_tag_is_malformed() {
+        for value in [
+            "<sip:bob@biloxi.com>;tag=a;tag=b",
+            "<sip:bob@biloxi.com>;tag",
+            "<sip:bob@biloxi.com>;tag=\"quoted\"",
+            "<sip:bob@biloxi.com>, <sip:carol@chicago.com>",
+        ] {
+            let headers = headers(&[(TO, value)]);
+            assert_eq!(to(&headers), Err(Malformed(Field::To)), "{value}");
+        }
+    }
+
+    #[test]
+    fn contact_holds_one_uri() {
+        let none = headers(&[]);
+        assert_eq!(contact(&none), Ok(None));
+
+        let one = headers(&[(
+            CONTACT,
+            "\"Bob\" <sip:bob@192.0.2.4;transport=tcp>;expires=60",
+        )]);
+        assert_eq!(contact(&one), Ok(Some("sip:bob@192.0.2.4;transport=tcp")));
+
+        for rows in [
+            &[(CONTACT, "<sip:a@192.0.2.4>, <sip:b@192.0.2.4>")][..],
+            &[(CONTACT, "<sip:a@192.0.2.4>"), (CONTACT, "<sip:b@192.0.2.4>")],
+            &[(CONTACT, "<sip:a@192.0.2.4")],
+        ] {
+            assert_eq!(
+                contact(&headers(rows)),
+                Err(Malformed(Field::Contact))
+            );
+        }
+    }
+
+    #[test]
+    fn cseq_has_a_number_and_a_method() {
+        let invite = headers(&[(CSEQ, "4711 INVITE")]);
+        assert_eq!(cseq(&invite), Ok((4711, "INVITE")));
+
+        for value in
+            ["INVITE", "4711", "-1 INVITE", "4294967296 INVITE", "1 INVITE x"]
+        {
+            let headers = headers(&[(CSEQ, value)]);
+            assert!(cseq(&headers).is_err(), "{value}");
+        }
+    }
+}

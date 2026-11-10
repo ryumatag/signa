@@ -25,10 +25,8 @@ response collection.
 [RFC 5057]: https://www.rfc-editor.org/rfc/rfc5057.html
 */
 
-use signa_core::message::header::Tag;
-
 use crate::{
-    dialog::{DialogId, DialogKey},
+    dialog::{Dialog, DialogKey, Origin},
     negotiation::Negotiation,
     operation::OperationId,
     slot::Key,
@@ -53,9 +51,8 @@ pub(crate) enum Direction {
 /// key then goes stale, so no later branch can attach to it.
 #[derive(Debug)]
 pub(crate) struct InviteAttempt {
-    pub(crate) call_id: Box<str>,
-    pub(crate) local_tag: Tag,
-    pub(crate) cseq: u32,
+    /// What the INVITE says about the dialogs its responses form.
+    pub(crate) origin: Origin,
     /// Whether the INVITE carried an offer. Each forked dialog starts its
     /// negotiation from it.
     pub(crate) offer_in_request: bool,
@@ -140,16 +137,18 @@ impl InviteUsage {
 }
 
 /// What an exchange belongs to.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) enum Scope {
     /// The initial INVITE of the attempt that holds this exchange's key.
     Outgoing,
     /// An initial INVITE this user agent received.
     Incoming {
-        /// The dialog a response would form. The local tag in it is chosen
-        /// once, when the request arrives, so every response of the exchange
-        /// carries the same To tag.
-        dialog: DialogId,
+        /// The dialog a 2xx would form, read from the request when it
+        /// arrived, so that a request that cannot form one is refused before
+        /// the application sees it. The local tag in it is chosen then too,
+        /// so every response of the exchange carries the same To tag. It
+        /// moves to the dialog table when the 2xx is committed.
+        dialog: Option<Box<Dialog>>,
         offer_in_request: bool,
     },
 }
@@ -193,12 +192,15 @@ impl InviteExchange {
     }
 
     pub(crate) fn incoming(
-        dialog: DialogId,
+        dialog: Dialog,
         cseq: u32,
         offer_in_request: bool,
     ) -> InviteExchange {
         InviteExchange {
-            scope: Scope::Incoming { dialog, offer_in_request },
+            scope: Scope::Incoming {
+                dialog: Some(Box::new(dialog)),
+                offer_in_request,
+            },
             cseq,
             state: ExchangeState::Pending,
         }
@@ -289,13 +291,7 @@ mod tests {
     }
 
     fn dialog() -> DialogKey {
-        Slots::new(1)
-            .insert(crate::dialog::Dialog::early(DialogId::new(
-                "call".into(),
-                "local".parse().unwrap(),
-                "remote".parse().unwrap(),
-            )))
-            .unwrap()
+        Slots::new(1).insert(crate::tests::dialog()).unwrap()
     }
 
     #[test]

@@ -22,3 +22,9 @@ include = [
 
 [dependencies]
 signa-core = { version = "0.1.0", path = "../signa-core", default-features = false }
+# The element scans of RFC 3261 section 25.1, for the few headers a UA reads.
+siparse = "0.4.4"
+
+[dev-dependencies]
+# Names the body of the messages the tests parse.
+bytes = "1.12.1"

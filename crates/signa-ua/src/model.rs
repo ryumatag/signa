@@ -28,10 +28,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use signa_core::{StatusCode, message::header::Tag};
+use signa_core::{Request, Response, StatusCode, message::header::Tag};
 
 use crate::{
-    dialog::{Dialog, DialogId, DialogKey},
+    dialog::{Dialog, DialogError, DialogId, DialogKey, Origin, response_tag},
     error::Error,
     invite::{
         AttemptKey, Direction, ExchangeKey, ExchangeState, InviteAttempt,
@@ -39,6 +39,7 @@ use crate::{
     },
     negotiation::Negotiation,
     operation::{Completion, OperationId, Operations, Stage, SubmitError},
+    protocol::{self, Field, Malformed},
     retention::{
         AckObligation, ReplayContext, ReplayId, ReplayKey, Retention, Source,
     },
@@ -66,6 +67,8 @@ pub(crate) struct Limits {
     pub(crate) dialogs: usize,
     pub(crate) usages: usize,
     pub(crate) replays: usize,
+    /// URIs in the route set of one dialog.
+    pub(crate) routes: usize,
     pub(crate) operations: usize,
     /// Commands admitted and not yet run.
     pub(crate) commands: usize,
@@ -110,10 +113,72 @@ pub(crate) enum Effect {
     Notify(Event),
 }
 
+/// How an incoming request relates to this user agent's dialogs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Incoming {
+    /// It has no To tag, so it is outside any dialog.
+    Initial,
+    /// It belongs to this dialog.
+    InDialog(DialogKey),
+    /// It has a To tag that matches no dialog.
+    NoDialog,
+}
+
+/// Why an incoming request is refused before the application sees it.
+///
+/// Each reason maps to the status of the response that refuses it. The
+/// mapping is the rule of the RFC named, or my policy where it says so.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Refusal {
+    /// A header the UA needs is missing or malformed. A 400 (RFC 3261
+    /// section 21.4.1).
+    Malformed(Field),
+    /// It is tagged for a dialog this user agent does not have. A 481 (RFC
+    /// 3261 section 12.2.2).
+    NoDialog,
+    /// Its route set is longer than the limit. A 500, by my policy, since no
+    /// status says that the request is too long to keep state for.
+    RouteSetTooLong,
+    /// There is no room for it. A 503 (RFC 3261 section 21.5.4).
+    Busy,
+    /// It is something this user agent does not take yet. A 500.
+    Unsupported,
+}
+
+impl Refusal {
+    pub(crate) fn status(self) -> StatusCode {
+        let code = match self {
+            Refusal::Malformed(_) => 400,
+            Refusal::NoDialog => 481,
+            Refusal::RouteSetTooLong | Refusal::Unsupported => 500,
+            Refusal::Busy => 503,
+        };
+        StatusCode::from_u16(code).expect("a final status")
+    }
+}
+
+impl From<Malformed> for Refusal {
+    fn from(Malformed(field): Malformed) -> Refusal {
+        Refusal::Malformed(field)
+    }
+}
+
+impl From<DialogError> for Refusal {
+    fn from(error: DialogError) -> Refusal {
+        match error {
+            DialogError::Malformed(field) => Refusal::Malformed(field),
+            DialogError::RouteSetTooLong => Refusal::RouteSetTooLong,
+            DialogError::Terminated => Refusal::NoDialog,
+        }
+    }
+}
+
 /// What the application is told. Losing one of these loses no protocol
 /// state or terminal outcome.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Event {
+    /// A provisional response formed an early dialog.
+    EarlyDialog { dialog: DialogKey, usage: UsageKey },
     /// A 2xx confirmed the dialog. The ACK may still be owed, and the
     /// session descriptions may not be settled.
     DialogConfirmed { dialog: DialogKey, usage: UsageKey },
@@ -132,6 +197,8 @@ pub(crate) struct Model<R> {
     dialogs: Slots<Dialog>,
     usages: Slots<InviteUsage>,
     replays: Slots<ReplayContext>,
+    /// Finds a dialog from the identity a message carries.
+    dialog_index: HashMap<DialogId, DialogKey>,
     /// Finds the replay context of a 2xx or ACK from the wire.
     replay_index: HashMap<ReplayId, ReplayKey>,
     operations: Operations,
@@ -149,6 +216,7 @@ impl<R: Random> Model<R> {
             dialogs: Slots::new(limits.dialogs),
             usages: Slots::new(limits.usages),
             replays: Slots::new(limits.replays),
+            dialog_index: HashMap::new(),
             replay_index: HashMap::new(),
             operations: Operations::new(
                 limits.operations,
@@ -215,21 +283,63 @@ impl<R: Random> Model<R> {
 
 /// Initial INVITEs this user agent receives.
 impl<R: Random> Model<R> {
-    /// Takes in an initial INVITE and returns the authority to decide it.
-    pub(crate) fn receive_invite(
+    /// Says whether a request is outside any dialog or in which one.
+    ///
+    /// A request with a To tag belongs to a dialog (RFC 3261 section 12.2.2).
+    /// If none of this user agent's dialogs matches it, it is not taken for a
+    /// new initial request. It is tagged for a dialog this user agent does not
+    /// have, perhaps one it lost in a restart, and such a request gets a 481.
+    pub(crate) fn classify<B>(
+        &self,
+        request: &Request<B>,
+    ) -> Result<Incoming, Refusal> {
+        let headers = request.headers();
+        let to = protocol::to(headers)?;
+        let Some(local_tag) = to.tag else {
+            return Ok(Incoming::Initial);
+        };
+        let remote_tag = protocol::from(headers)?.tag;
+
+        let tag = |tag: &str, field| {
+            Tag::try_from(tag).map_err(|_| Refusal::Malformed(field))
+        };
+        let id = DialogId::new(
+            protocol::call_id(headers)?.into(),
+            tag(local_tag, Field::To)?,
+            remote_tag.map(|remote| tag(remote, Field::From)).transpose()?,
+        );
+        Ok(match self.dialog_index.get(&id) {
+            Some(&dialog) => Incoming::InDialog(dialog),
+            None => Incoming::NoDialog,
+        })
+    }
+
+    /// Takes in an INVITE and returns the authority to decide it, or the
+    /// reason to refuse it before the application sees it.
+    ///
+    /// `offer_in_request` says whether the body is an offer. Telling that is
+    /// the job of the body adapter, not of this model.
+    pub(crate) fn receive_invite<B>(
         &mut self,
-        call_id: Box<str>,
-        remote_tag: Tag,
-        cseq: u32,
+        request: &Request<B>,
         offer_in_request: bool,
-    ) -> Result<Authority, Error> {
-        let dialog = DialogId::new(call_id, self.tag(), remote_tag);
+    ) -> Result<Authority, Refusal> {
+        match self.classify(request)? {
+            Incoming::Initial => {}
+            Incoming::NoDialog => return Err(Refusal::NoDialog),
+            // TODO: Take re-INVITEs into their usage's exchange.
+            Incoming::InDialog(_) => return Err(Refusal::Unsupported),
+        }
+
+        let local_tag = self.tag();
+        let dialog = Dialog::uas(request, local_tag, self.limits.routes)?;
+        let cseq = protocol::cseq(request.headers())?.0;
         let exchange =
             InviteExchange::incoming(dialog, cseq, offer_in_request);
 
         match self.exchanges.insert(exchange) {
             Ok(exchange) => Ok(Authority { exchange }),
-            Err(_) => Err(Error::CapacityExceeded),
+            Err(_) => Err(Refusal::Busy),
         }
     }
 
@@ -291,14 +401,16 @@ impl<R: Random> Model<R> {
         let Some(operation) = exchange.final_committed() else {
             return;
         };
-        let Scope::Incoming { dialog: id, offer_in_request } =
-            exchange.scope.clone()
+        let cseq = exchange.cseq;
+        let Scope::Incoming { dialog, offer_in_request } = &mut exchange.scope
         else {
             unreachable!("only incoming exchanges submit finals");
         };
+        let offer_in_request = *offer_in_request;
+        let mut dialog = *dialog.take().expect("a 2xx forms the dialog once");
 
         // The 2xx carries the answer to the INVITE's offer, or an offer of
-        // its own whose answer comes in the ACK.
+        // its own whose answer comes in the ACK (RFC 3261 section 13.2.1).
         let mut negotiation = Negotiation::Stable;
         if offer_in_request {
             negotiation.offer_received().expect("stable");
@@ -307,13 +419,14 @@ impl<R: Random> Model<R> {
             negotiation.offer_sent().expect("stable");
         }
 
+        dialog.confirm().expect("a pending dialog has not ended");
         let replay = ReplayId {
-            dialog: id.clone(),
-            cseq: exchange.cseq,
+            dialog: dialog.id().clone(),
+            cseq,
             direction: Direction::Incoming,
         };
         let (_, usage) = self.establish(
-            id,
+            dialog,
             Direction::Incoming,
             negotiation,
             replay,
@@ -375,24 +488,18 @@ impl<R: Random> Model<R> {
 /// Initial INVITEs this user agent sends.
 impl<R: Random> Model<R> {
     /// Opens an attempt for an initial INVITE about to go to the core.
-    pub(crate) fn start_attempt(
+    pub(crate) fn start_attempt<B>(
         &mut self,
-        call_id: Box<str>,
-        cseq: u32,
+        request: &Request<B>,
         offer_in_request: bool,
     ) -> Result<AttemptKey, Error> {
-        let local_tag = self.tag();
+        let origin =
+            Origin::from_request(request).map_err(|_| Error::InvalidInput)?;
         let exchange = self
             .exchanges
-            .insert(InviteExchange::outgoing(cseq))
+            .insert(InviteExchange::outgoing(origin.cseq()))
             .map_err(|_| Error::CapacityExceeded)?;
-        let attempt = InviteAttempt {
-            call_id,
-            local_tag,
-            cseq,
-            offer_in_request,
-            exchange,
-        };
+        let attempt = InviteAttempt { origin, offer_in_request, exchange };
 
         self.attempts.insert(attempt).map_err(|_| {
             self.exchanges.remove(exchange);
@@ -400,26 +507,87 @@ impl<R: Random> Model<R> {
         })
     }
 
-    /// Takes in a 2xx to an attempt. A copy of a 2xx seen before is answered
-    /// with the same ACK and makes no new usage, whether or not its usage is
-    /// still up. RFC 3261 section 13.2.2.4 passes each retransmission of a
-    /// 2xx to the UAC core, which answers it with the ACK again.
-    pub(crate) fn receive_2xx(
+    /// Takes in a provisional response to an attempt.
+    ///
+    /// A 101 to 199 with a To tag forms an early dialog (RFC 3261 section
+    /// 12.1). A later one for the same dialog changes nothing. It is not
+    /// reliable, so it refreshes neither the remote target ([RFC 6141 section
+    /// 4.9]) nor the route set, which RFC 3261 section 13.2.2.4 recomputes
+    /// from the 2xx.
+    ///
+    /// [RFC 6141 section 4.9]: https://www.rfc-editor.org/rfc/rfc6141.html#section-4.9
+    pub(crate) fn receive_provisional<B>(
         &mut self,
         key: AttemptKey,
-        remote_tag: Tag,
+        response: &Response<B>,
     ) -> Result<(), Error> {
         let Some(attempt) = self.attempts.get(key) else {
             return Err(Error::StaleDecision);
         };
-        let id = DialogId::new(
-            attempt.call_id.clone(),
-            attempt.local_tag.clone(),
-            remote_tag,
-        );
+        if response.status().as_u16() == 100 {
+            return Ok(());
+        }
+        let Some(remote_tag) =
+            response_tag(response).map_err(|_| Error::InvalidInput)?
+        else {
+            return Ok(());
+        };
+        let id = attempt.origin.dialog_id(Some(remote_tag));
+        if self.dialog_index.contains_key(&id) {
+            return Ok(());
+        }
+
+        let dialog =
+            Dialog::uac(&attempt.origin, response, self.limits.routes)
+                .map_err(|_| Error::InvalidInput)?;
+        let negotiation = if attempt.offer_in_request {
+            Negotiation::LocalOfferOutstanding
+        } else {
+            Negotiation::Stable
+        };
+        // TODO: Report an early dialog that does not fit, as a fork that
+        // does not fit is to be reported.
+        if !self.usages.reserve() {
+            return Err(Error::CapacityExceeded);
+        }
+        let Ok(dialog) = self.dialogs.insert(dialog) else {
+            self.usages.release();
+            return Err(Error::CapacityExceeded);
+        };
+        let usage = self.usages.insert_reserved(InviteUsage::early(
+            dialog,
+            Direction::Outgoing,
+            negotiation,
+        ));
+        self.dialog_index.insert(id, dialog);
+
+        self.effects
+            .push(Effect::Notify(Event::EarlyDialog { dialog, usage }));
+        Ok(())
+    }
+
+    /// Takes in a 2xx to an attempt. A copy of a 2xx seen before is answered
+    /// with the same ACK and makes no new usage, whether or not its usage is
+    /// still up. RFC 3261 section 13.2.2.4 passes each retransmission of a
+    /// 2xx to the UAC core, which answers it with the ACK again.
+    ///
+    /// A 2xx for an early dialog confirms it, and one for a new remote tag
+    /// forms a confirmed dialog of its own, as RFC 3261 section 13.2.2.4
+    /// requires of a fork.
+    pub(crate) fn receive_2xx<B>(
+        &mut self,
+        key: AttemptKey,
+        response: &Response<B>,
+    ) -> Result<(), Error> {
+        let Some(attempt) = self.attempts.get(key) else {
+            return Err(Error::StaleDecision);
+        };
+        let remote_tag =
+            response_tag(response).map_err(|_| Error::InvalidInput)?;
+        let id = attempt.origin.dialog_id(remote_tag);
         let replay = ReplayId {
             dialog: id.clone(),
-            cseq: attempt.cseq,
+            cseq: attempt.origin.cseq(),
             direction: Direction::Outgoing,
         };
         let (exchange, offer_in_request) =
@@ -430,39 +598,92 @@ impl<R: Random> Model<R> {
             return Ok(());
         }
 
-        // TODO: Still send the ACK and a BYE for a branch that does not fit,
-        // from a cleanup budget, and report the response set as incomplete.
-        // RFC 3261 section 13.2.2.4 asks for the ACK of every 2xx, and a BYE
-        // for each dialog the UAC does not keep.
-        if !self.reserve_session() {
-            return Err(Error::CapacityExceeded);
-        }
+        // TODO: Still send the ACK and a BYE for a branch that does not fit
+        // or cannot form a dialog, from a cleanup budget, and report the
+        // response set as incomplete. RFC 3261 section 13.2.2.4 asks for the
+        // ACK of every 2xx, and a BYE for each dialog the UAC does not keep.
+        let replay = match self.dialog_index.get(&id).copied() {
+            Some(dialog) => {
+                self.confirm_early(dialog, response, replay, key)?
+            }
+            None => {
+                let dialog =
+                    Dialog::uac(&attempt.origin, response, self.limits.routes)
+                        .map_err(|_| Error::InvalidInput)?;
+                if !self.reserve_session() {
+                    return Err(Error::CapacityExceeded);
+                }
+
+                // With an offer in the INVITE, the 2xx carries the answer.
+                // Without one, it carries the offer and the ACK owes the
+                // answer (RFC 3261 section 13.2.1).
+                let mut negotiation = if offer_in_request {
+                    Negotiation::LocalOfferOutstanding
+                } else {
+                    Negotiation::Stable
+                };
+                settle_at_2xx(&mut negotiation);
+                self.establish(
+                    dialog,
+                    Direction::Outgoing,
+                    negotiation,
+                    replay,
+                    Source::Attempt(key),
+                )
+                .0
+            }
+        };
 
         self.exchanges
             .get_mut(exchange)
             .expect("an attempt keeps its exchange")
             .final_received();
-
-        // With an offer in the INVITE, the 2xx carries the answer. Without
-        // one, it carries the offer and the ACK owes the answer.
-        let mut negotiation = Negotiation::Stable;
-        if offer_in_request {
-            negotiation.offer_sent().expect("stable");
-            negotiation.answer_received().expect("the offer is outstanding");
-        } else {
-            negotiation.offer_received().expect("stable");
-        }
-
-        let (replay, _) = self.establish(
-            id,
-            Direction::Outgoing,
-            negotiation,
-            replay,
-            Source::Attempt(key),
-        );
-
         self.effects.push(Effect::SendAck { replay });
         Ok(())
+    }
+
+    /// Confirms an early dialog with its 2xx and makes the replay context for
+    /// the 2xx's ACK.
+    fn confirm_early<B>(
+        &mut self,
+        dialog: DialogKey,
+        response: &Response<B>,
+        replay: ReplayId,
+        attempt: AttemptKey,
+    ) -> Result<ReplayKey, Error> {
+        if !self.replays.reserve() {
+            return Err(Error::CapacityExceeded);
+        }
+        let record = self.dialogs.get_mut(dialog).expect("indexed");
+        if record.confirm_with(response, self.limits.routes).is_err() {
+            self.replays.release();
+            return Err(Error::InvalidInput);
+        }
+
+        let (usage, record) = self
+            .usages
+            .iter_mut()
+            .find(|(_, usage)| usage.dialog == dialog)
+            .expect("an early dialog has its usage");
+        record.establish();
+        settle_at_2xx(&mut record.negotiation);
+        let settled = record.negotiation == Negotiation::Stable;
+
+        let context = ReplayContext::new(
+            replay.clone(),
+            Source::Attempt(attempt),
+            usage,
+        );
+        let key = self.replays.insert_reserved(context);
+        self.replay_index.insert(replay, key);
+
+        self.effects
+            .push(Effect::Notify(Event::DialogConfirmed { dialog, usage }));
+        if settled {
+            self.effects
+                .push(Effect::Notify(Event::NegotiationCompleted { usage }));
+        }
+        Ok(key)
     }
 
     /// Records whether the ACK of a received 2xx was written.
@@ -503,6 +724,21 @@ impl<R: Random> Model<R> {
     }
 }
 
+/// Moves a sent INVITE's negotiation past its 2xx, which carries the answer
+/// to the INVITE's offer, or an offer when the INVITE had none (RFC 3261
+/// section 13.2.1).
+fn settle_at_2xx(negotiation: &mut Negotiation) {
+    match negotiation {
+        Negotiation::LocalOfferOutstanding => {
+            negotiation.answer_received().expect("the offer is outstanding")
+        }
+        Negotiation::Stable => negotiation.offer_received().expect("stable"),
+        // An offer from the peer is already outstanding, so the 2xx holds
+        // no new one.
+        Negotiation::RemoteOfferOutstanding => {}
+    }
+}
+
 /// Usages.
 impl<R: Random> Model<R> {
     /// Ends a usage, as when its BYE goes to the core or the peer's BYE is
@@ -516,6 +752,7 @@ impl<R: Random> Model<R> {
 
         if let Some(mut dialog) = self.dialogs.remove(usage.dialog) {
             dialog.terminate();
+            self.dialog_index.remove(dialog.id());
         }
         let replays: Vec<ReplayKey> = self
             .replays
@@ -548,17 +785,20 @@ impl<R: Random> Model<R> {
         true
     }
 
-    /// Stores the confirmed dialog, usage and replay context of a 2xx in the
-    /// slots [`Model::reserve_session`] set aside, and tells the application.
+    /// Stores a confirmed dialog, its usage and the replay context of its 2xx
+    /// in the slots [`Model::reserve_session`] set aside, and tells the
+    /// application.
     fn establish(
         &mut self,
-        id: DialogId,
+        dialog: Dialog,
         direction: Direction,
         negotiation: Negotiation,
         replay: ReplayId,
         source: Source,
     ) -> (ReplayKey, UsageKey) {
-        let dialog = self.dialogs.insert_reserved(Dialog::confirmed(id));
+        let id = dialog.id().clone();
+        let dialog = self.dialogs.insert_reserved(dialog);
+        self.dialog_index.insert(id, dialog);
         let usage = self.usages.insert_reserved(InviteUsage::established(
             dialog,
             direction,
@@ -591,10 +831,15 @@ impl<R: Random> Model<R> {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+
     use super::*;
     use crate::{
-        dialog::DialogPhase, error::WireEffect, invite::UsagePhase,
+        dialog::DialogPhase,
+        error::WireEffect,
+        invite::UsagePhase,
         operation::Snapshot,
+        tests::{INVITE, invite, reply, request},
     };
 
     const RETENTION: Duration = Duration::from_secs(32);
@@ -629,6 +874,7 @@ mod tests {
             dialogs: 4,
             usages: 4,
             replays: 4,
+            routes: 8,
             operations: 4,
             commands: 4,
             outcome_retention: RETENTION,
@@ -639,8 +885,9 @@ mod tests {
         Model::new(limits, Counter(0))
     }
 
-    fn tag(src: &str) -> Tag {
-        src.parse().unwrap()
+    /// The 2xx of the callee, with the tag `callee`.
+    fn callee() -> Response<Bytes> {
+        reply("200 OK", "callee", "sip:bob@192.0.2.4", "")
     }
 
     impl<R> Model<R> {
@@ -710,9 +957,7 @@ mod tests {
     fn dialog_confirmed_is_not_ack_received_or_media_ready() {
         let clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority = model
-            .receive_invite("call".into(), tag("caller"), 1, false)
-            .unwrap();
+        let authority = model.receive_invite(&request(INVITE), false).unwrap();
         let exchange = authority.exchange;
 
         model.try_submit(Command::Accept { authority }).unwrap();
@@ -729,7 +974,7 @@ mod tests {
         let id = model.dialogs.get(dialog).unwrap().id().clone();
         let replay_key = model.replay_index[&ReplayId {
             dialog: id.clone(),
-            cseq: 1,
+            cseq: 314159,
             direction: Direction::Incoming,
         }];
         assert_eq!(
@@ -746,7 +991,7 @@ mod tests {
         );
         assert!(!negotiated(&effects));
 
-        model.receive_ack(&id, 1, true);
+        model.receive_ack(&id, 314159, true);
         model.check();
 
         assert_eq!(
@@ -768,9 +1013,9 @@ mod tests {
     #[test]
     fn usage_termination_does_not_destroy_needed_replay() {
         let mut model = model(limits());
-        let attempt = model.start_attempt("call".into(), 1, true).unwrap();
+        let attempt = model.start_attempt(&request(INVITE), true).unwrap();
 
-        model.receive_2xx(attempt, tag("callee")).unwrap();
+        model.receive_2xx(attempt, &callee()).unwrap();
         let effects = model.take_effects();
         let (_, usage) = confirmed(&effects);
         let replay_key = match effects.last() {
@@ -792,7 +1037,7 @@ mod tests {
         assert_eq!(model.usages.len(), 0);
         assert_eq!(model.dialogs.len(), 0);
 
-        model.receive_2xx(attempt, tag("callee")).unwrap();
+        model.receive_2xx(attempt, &callee()).unwrap();
         model.check();
         assert_eq!(
             model.take_effects(),
@@ -804,7 +1049,7 @@ mod tests {
         model.check();
         assert!(model.replays.get(replay_key).is_none());
         assert_eq!(
-            model.receive_2xx(attempt, tag("callee")),
+            model.receive_2xx(attempt, &callee()),
             Err(Error::StaleDecision),
         );
         assert!(model.take_effects().is_empty());
@@ -817,9 +1062,7 @@ mod tests {
     fn accepted_command_survives_waiter_drop() {
         let mut clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority = model
-            .receive_invite("call".into(), tag("caller"), 1, true)
-            .unwrap();
+        let authority = model.receive_invite(&request(INVITE), true).unwrap();
         let exchange = authority.exchange;
 
         let operation =
@@ -860,12 +1103,10 @@ mod tests {
     fn unsent_busy_command_preserves_decision_authority() {
         let clock = Clock(Instant::now());
         let mut model = model(Limits { commands: 1, ..limits() });
-        let first = model
-            .receive_invite("one".into(), tag("caller"), 1, true)
-            .unwrap();
-        let second = model
-            .receive_invite("two".into(), tag("caller"), 1, true)
-            .unwrap();
+        let first =
+            model.receive_invite(&invite("one@example.com"), true).unwrap();
+        let second =
+            model.receive_invite(&invite("two@example.com"), true).unwrap();
         let exchange = second.exchange;
         model.try_submit(Command::Accept { authority: first }).unwrap();
 
@@ -900,9 +1141,7 @@ mod tests {
     fn a_losing_or_stale_decision_has_no_wire_effect() {
         let clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority = model
-            .receive_invite("call".into(), tag("caller"), 1, true)
-            .unwrap();
+        let authority = model.receive_invite(&request(INVITE), true).unwrap();
         let exchange = authority.exchange;
         let forged = Authority { exchange };
         model.try_submit(Command::Accept { authority }).unwrap();
@@ -935,9 +1174,7 @@ mod tests {
     fn no_2xx_without_room_for_its_session() {
         let clock = Clock(Instant::now());
         let mut model = model(Limits { replays: 0, ..limits() });
-        let authority = model
-            .receive_invite("call".into(), tag("caller"), 1, true)
-            .unwrap();
+        let authority = model.receive_invite(&request(INVITE), true).unwrap();
         let exchange = authority.exchange;
 
         let operation =
@@ -963,9 +1200,7 @@ mod tests {
     fn an_unknown_ack_changes_nothing() {
         let clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority = model
-            .receive_invite("call".into(), tag("caller"), 1, true)
-            .unwrap();
+        let authority = model.receive_invite(&request(INVITE), true).unwrap();
         let exchange = authority.exchange;
         model.try_submit(Command::Accept { authority }).unwrap();
         model.run_commands(clock.now());
@@ -974,12 +1209,12 @@ mod tests {
         let id = model.dialogs.get(dialog).unwrap().id().clone();
         let swapped = DialogId::new(
             id.call_id().into(),
-            id.remote_tag().clone(),
-            id.local_tag().clone(),
+            id.remote_tag().unwrap().clone(),
+            Some(id.local_tag().clone()),
         );
 
-        model.receive_ack(&id, 2, false);
-        model.receive_ack(&swapped, 1, false);
+        model.receive_ack(&id, 314160, false);
+        model.receive_ack(&swapped, 314159, false);
         model.check();
 
         assert!(model.take_effects().is_empty());
@@ -994,11 +1229,174 @@ mod tests {
     /// on every run.
     #[test]
     fn tags_come_from_the_injected_randomness() {
+        let clock = Clock(Instant::now());
         let mut model = model(limits());
+        let authority = model.receive_invite(&request(INVITE), true).unwrap();
+        let exchange = authority.exchange;
 
-        let attempt = model.start_attempt("call".into(), 1, true).unwrap();
+        model.try_submit(Command::Accept { authority }).unwrap();
+        model.run_commands(clock.now());
+        model.final_committed(exchange, clock.now());
 
-        let attempt = model.attempts.get(attempt).unwrap();
-        assert_eq!(attempt.local_tag.as_str(), "0000000000000001");
+        let (dialog, _) = confirmed(&model.take_effects());
+        let id = model.dialogs.get(dialog).unwrap().id();
+        assert_eq!(id.local_tag().as_str(), "0000000000000001");
+    }
+
+    /// An INVITE with a To tag for a dialog this user agent does not have is
+    /// refused with a 481. It is not taken for a new call, which would make
+    /// a second dialog with the same Call-ID.
+    #[test]
+    fn unknown_tagged_request_is_not_new_initial_invite() {
+        let mut model = model(limits());
+        let tagged = INVITE.replace(
+            "To: Bob <sip:bob@biloxi.example.com>",
+            "To: Bob <sip:bob@biloxi.example.com>;tag=lost",
+        );
+
+        let refusal =
+            model.receive_invite(&request(&tagged), true).unwrap_err();
+
+        assert_eq!(refusal, Refusal::NoDialog);
+        assert_eq!(refusal.status().as_u16(), 481);
+        assert_eq!(model.exchanges.len(), 0);
+        assert!(model.take_effects().is_empty());
+    }
+
+    /// Once a dialog exists, a request carrying its identity is found in it,
+    /// with the tags read from this user agent's side.
+    #[test]
+    fn a_tagged_request_finds_its_dialog() {
+        let clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let authority = model.receive_invite(&request(INVITE), true).unwrap();
+        let exchange = authority.exchange;
+        model.try_submit(Command::Accept { authority }).unwrap();
+        model.run_commands(clock.now());
+        model.final_committed(exchange, clock.now());
+        let (dialog, _) = confirmed(&model.take_effects());
+
+        let bye = INVITE
+            .replace(
+                "INVITE sip:bob@biloxi.example.com",
+                "BYE sip:bob@192.0.2.4",
+            )
+            .replace(
+                "To: Bob <sip:bob@biloxi.example.com>",
+                "To: Bob <sip:bob@biloxi.example.com>;tag=0000000000000001",
+            )
+            .replace("314159 INVITE", "314160 BYE");
+
+        assert_eq!(
+            model.classify(&request(&bye)),
+            Ok(Incoming::InDialog(dialog)),
+        );
+        let other = bye.replace("tag=1928301774", "tag=other");
+        assert_eq!(model.classify(&request(&other)), Ok(Incoming::NoDialog));
+    }
+
+    /// An INVITE that cannot form a dialog is refused with a 400 before the
+    /// application sees it.
+    #[test]
+    fn an_invite_without_contact_is_refused() {
+        let mut model = model(limits());
+        let text = INVITE.replace("Contact: <sip:alice@192.0.2.1>\n", "");
+
+        let refusal = model.receive_invite(&request(&text), true).unwrap_err();
+
+        assert_eq!(refusal, Refusal::Malformed(Field::Contact));
+        assert_eq!(refusal.status().as_u16(), 400);
+        assert_eq!(model.exchanges.len(), 0);
+    }
+
+    /// A 180 forms an early dialog. A second 180 with a new Contact refreshes
+    /// nothing, and the 2xx confirms the same dialog with its own route set
+    /// and target.
+    #[test]
+    fn an_unreliable_provisional_does_not_refresh_the_target() {
+        let mut model = model(limits());
+        let attempt = model.start_attempt(&request(INVITE), true).unwrap();
+        let ringing = |contact| {
+            reply(
+                "180 Ringing",
+                "callee",
+                contact,
+                "Record-Route: <sip:p1.example.com;lr>\n",
+            )
+        };
+
+        model
+            .receive_provisional(attempt, &ringing("sip:bob@192.0.2.4"))
+            .unwrap();
+        let (dialog, usage) = match model.take_effects()[..] {
+            [Effect::Notify(Event::EarlyDialog { dialog, usage })] => {
+                (dialog, usage)
+            }
+            ref other => panic!("no early dialog: {other:?}"),
+        };
+        model
+            .receive_provisional(attempt, &ringing("sip:bob@192.0.2.5"))
+            .unwrap();
+        model.check();
+
+        assert!(model.take_effects().is_empty());
+        let record = model.dialogs.get(dialog).unwrap();
+        assert_eq!(record.phase(), DialogPhase::Early);
+        assert_eq!(record.target().uri(), "sip:bob@192.0.2.4");
+        assert_eq!(
+            model.usages.get(usage).unwrap().phase(),
+            UsagePhase::Establishing
+        );
+
+        let ok = reply(
+            "200 OK",
+            "callee",
+            "sip:bob@192.0.2.6",
+            "Record-Route: <sip:p2.example.com;lr>, <sip:p1.example.com;lr>\n",
+        );
+        model.receive_2xx(attempt, &ok).unwrap();
+        model.check();
+
+        let effects = model.take_effects();
+        assert_eq!(confirmed(&effects), (dialog, usage));
+        assert!(negotiated(&effects));
+        let record = model.dialogs.get(dialog).unwrap();
+        assert_eq!(record.phase(), DialogPhase::Confirmed);
+        assert_eq!(record.target().uri(), "sip:bob@192.0.2.6");
+        let routes: Vec<&str> =
+            record.routes().iter().map(|route| route.uri()).collect();
+        assert_eq!(routes, ["sip:p1.example.com;lr", "sip:p2.example.com;lr"]);
+        assert_eq!(
+            model.usages.get(usage).unwrap().phase(),
+            UsagePhase::Established
+        );
+        assert_eq!(model.dialogs.len(), 1);
+    }
+
+    /// A 2xx with another tag is a fork. It forms a dialog of its own, beside
+    /// the early dialog of the first tag.
+    #[test]
+    fn a_fork_forms_a_dialog_of_its_own() {
+        let mut model = model(limits());
+        let attempt = model.start_attempt(&request(INVITE), true).unwrap();
+        model
+            .receive_provisional(
+                attempt,
+                &reply("180 Ringing", "first", "sip:bob@192.0.2.4", ""),
+            )
+            .unwrap();
+
+        model
+            .receive_2xx(
+                attempt,
+                &reply("200 OK", "second", "sip:bob@192.0.2.5", ""),
+            )
+            .unwrap();
+        model.check();
+
+        assert_eq!(model.dialogs.len(), 2);
+        let phases: Vec<DialogPhase> =
+            model.dialogs.iter().map(|(_, dialog)| dialog.phase()).collect();
+        assert_eq!(phases, [DialogPhase::Early, DialogPhase::Confirmed]);
     }
 }
