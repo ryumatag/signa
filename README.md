@@ -26,8 +26,7 @@ The repository is a Cargo workspace of three crates:
 * `signa`, the crate to depend on. It re-exports signa-core and is to become
   the front of a SIP application framework.
 * `signa-core`, the messages, transports and transactions described below.
-* `signa-ua`, dialogs and INVITE usage for user agents. It has no API yet and
-  is not published.
+* `signa-ua`, dialogs and INVITE usage for user agents. It has no API yet.
 
 [RFC 3261 section 17]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17
 [hyper]: https://docs.rs/hyper

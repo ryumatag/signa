@@ -4,7 +4,7 @@ signa-ua
 ========
 Dialogs and INVITE usage for SIP user agents, on [signa-core].
 
-It has no API yet and is not published.
+It has no API yet.
 
 </div>
 

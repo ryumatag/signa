@@ -14,8 +14,9 @@ the RFC scope section by section.
 * `tokio`, on by default, enables [`endpoint`] and its sockets. Without it the
   message types, transaction timer configuration and transport metadata stay
   available without a runtime.
-* `ua` adds signa-ua, which is to hold dialogs and INVITE usage. It has no API
-  yet, so this crate re-exports nothing from it.
+
+signa-ua, which is to hold dialogs and INVITE usage, has no API yet. This
+crate re-exports it behind a feature once it has one.
 
 The minimum supported Rust version is 1.85.
 

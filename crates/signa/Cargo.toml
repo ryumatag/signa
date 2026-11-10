@@ -1,6 +1,6 @@
 [package]
 name = "signa"
-version = "0.3.1"  #:version
+version = "0.4.0"  #:version
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ryumatag/signa"
 documentation = "https://docs.rs/signa"
@@ -28,12 +28,11 @@ include = [
 default = ["tokio"]
 # The endpoint and its sockets, from signa-core.
 tokio = ["signa-core/tokio"]
-# Dialogs and INVITE usage, from signa-ua. It has no API yet.
-ua = ["dep:signa-ua"]
 
+# TODO: Add signa-ua behind a `ua` feature once it has an API. A feature that
+# brings nothing would only be one more name to keep compatible.
 [dependencies]
-signa-core = { version = "0.3.1", path = "../signa-core", default-features = false }
-signa-ua = { version = "0.0.0", path = "../signa-ua", optional = true }
+signa-core = { version = "0.1.0", path = "../signa-core", default-features = false }
 
 [dev-dependencies]
 bytes = "1.12.1"
