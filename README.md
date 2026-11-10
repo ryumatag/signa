@@ -195,7 +195,7 @@ target is checked. A `sip:` URI does not make plaintext safe.
   message types, transaction timer configuration and transport metadata stay
   available without a runtime.
 
-The minimum supported Rust version is 1.71.
+The minimum supported Rust version is 1.85.
 
 ### Documentation
 

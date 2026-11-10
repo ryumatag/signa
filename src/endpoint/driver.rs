@@ -1213,7 +1213,7 @@ impl Driver {
             && self.control_work.is_idle()
             && self.fallback_writes.is_empty()
             && self.unanswered == 0
-            && self.udp.as_ref().map_or(true, |udp| udp.is_idle())
+            && self.udp.as_ref().is_none_or(|udp| udp.is_idle())
             && !self
                 .routes
                 .values()
@@ -3757,11 +3757,6 @@ mod tests {
     #[tokio::test]
     async fn acceptance_returns_submission_capacity_before_waking_a_submitter()
     {
-        struct Noop;
-        impl Wake for Noop {
-            fn wake(self: Arc<Self>) {}
-        }
-
         struct Next {
             responder: Arc<server::Responder>,
             response: Response<Bytes>,
@@ -3770,8 +3765,7 @@ mod tests {
 
         impl Wake for Next {
             fn wake(self: Arc<Self>) {
-                let waker = Waker::from(Arc::new(Noop));
-                let mut context = Context::from_waker(&waker);
+                let mut context = Context::from_waker(Waker::noop());
                 let mut send = self.responder.respond(self.response.clone());
                 self.queued.store(
                     Pin::new(&mut send).poll(&mut context).is_pending(),
@@ -4413,15 +4407,8 @@ mod tests {
 
     const T1: Duration = Duration::from_millis(500);
 
-    struct Noop;
-
-    impl Wake for Noop {
-        fn wake(self: Arc<Self>) {}
-    }
-
     fn now_or_never<F: Future>(future: F) -> Option<F::Output> {
-        let waker = Waker::from(Arc::new(Noop));
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(Waker::noop());
         let mut future = pin!(future);
         match future.as_mut().poll(&mut cx) {
             Poll::Ready(output) => Some(output),
@@ -4840,8 +4827,7 @@ mod tests {
         fixture.on_control();
         assert!(!fixture.is_drained());
 
-        let waker = Waker::from(Arc::new(Noop));
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(Waker::noop());
         assert!(fixture.poll_event(&mut cx).is_pending());
         assert!(!fixture.stopping);
         drop(guard);

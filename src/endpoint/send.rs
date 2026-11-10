@@ -289,7 +289,7 @@ impl Endpoint {
     /// [`Responses`]: super::Responses
     /// [`ClientControl::cancel`]: super::ClientControl::cancel
     /// [`IncomingEvent::StatelessResponse`]: super::IncomingEvent::StatelessResponse
-    #[allow(clippy::manual_async_fn)] // Expose the Send guarantee on Rust 1.71.
+    #[allow(clippy::manual_async_fn)] // State the Send guarantee.
     pub fn send_request(
         &self,
         request: Request<Bytes>,
@@ -424,7 +424,7 @@ impl Endpoint {
     /// [RFC 3581 section 4]: https://www.rfc-editor.org/rfc/rfc3581.html#section-4
     /// [`Builder::max_reply_bytes`]: super::Builder::max_reply_bytes
     /// [`Builder::udp_write_limits`]: super::Builder::udp_write_limits
-    #[allow(clippy::manual_async_fn)] // Expose the Send guarantee on Rust 1.71.
+    #[allow(clippy::manual_async_fn)] // State the Send guarantee.
     pub fn forward_response(
         &self,
         response: Response<Bytes>,

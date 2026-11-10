@@ -80,7 +80,7 @@ impl Datagram {
             || self
                 .queued_bytes
                 .checked_add(bytes)
-                .map_or(true, |total| total > limits.bytes)
+                .is_none_or(|total| total > limits.bytes)
         {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,

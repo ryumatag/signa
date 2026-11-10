@@ -18,7 +18,7 @@ path = "src/bench.rs"
 bytes = "1.12.1"
 criterion = { version = "0.8.2", default-features = false }
 signa = { path = "..", features = ["__bench"] }
-tokio = { version = "1.47", features = ["macros", "rt", "sync"] }
+tokio = { version = "1.54", features = ["macros", "rt", "sync"] }
 tower-service = "0.3.3"
 
 [profile.release]

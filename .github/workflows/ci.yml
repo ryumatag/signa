@@ -115,26 +115,21 @@ jobs:
           cargo fmt -- --check
           cargo fmt --manifest-path bench/Cargo.toml -- --check
 
-  # The newest tokio needs a newer Rust than the MSRV, so a stable cargo
-  # resolves the dependencies to versions the MSRV can build first. Cargo picks
-  # the lockfile format from `rust-version`, so the old cargo reads it.
+  # A dependency's newest release can need a newer Rust than the MSRV. The
+  # fallback resolver picks the newest release that the MSRV can build.
   msrv:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
-      - name: Resolve dependencies for the MSRV
-        run: cargo +stable generate-lockfile
-        env:
-          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.71"
-      - name: Build
-        run: cargo +1.71 build --locked --verbose
+          toolchain: "1.85"
+      - name: Test
+        run: cargo +1.85 test --verbose
+        env:
+          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
 
   rustdoc:
     runs-on: ubuntu-latest

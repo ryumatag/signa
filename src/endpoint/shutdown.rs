@@ -252,7 +252,7 @@ impl Control {
         let mut state =
             self.state.lock().expect("shutdown state is not poisoned");
         let earlier =
-            at.is_some_and(|at| state.deadline.map_or(true, |old| at < old));
+            at.is_some_and(|at| state.deadline.is_none_or(|old| at < old));
         if state.requested && !earlier {
             return false;
         }

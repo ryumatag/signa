@@ -12,7 +12,7 @@ A low-level SIP library for Rust that handles transactions, down to the last ret
 keywords = ["sip", "rfc3261", "voip", "telephony"]
 categories = ["network-programming"]
 edition = "2021"
-rust-version = "1.71"
+rust-version = "1.85"
 include = [
   "/src/**/*.rs",
   "/docs/rustdoc/**/*.md",
@@ -39,36 +39,34 @@ __bench = []
 
 [dependencies]
 bytes = { version = "1.12.1", default-features = false, features = ["std"] }
-siparse = "0.4.3"
-# RFC 3261 section 19.3 requires tags with cryptographic randomness. 0.4
-# needs Rust 1.85, above the MSRV.
-getrandom = { version = "0.3", default-features = false }
-tokio = { version = "1.47", default-features = false, features = ["io-util", "net", "rt", "sync", "time"], optional = true }
+siparse = "0.4.4"
+# RFC 3261 section 19.3 requires tags with cryptographic randomness.
+getrandom = { version = "0.4", default-features = false }
+tokio = { version = "1.54", default-features = false, features = ["io-util", "net", "rt", "sync", "time"], optional = true }
 # Keys the transaction tables. Branches come from the network, so the hasher
 # must be seeded, and it must be fast, since every message is looked up.
 foldhash = { version = "0.2", optional = true }
 # The tables index a slab of transactions through a `HashTable`, so that each
 # key is stored once. The `HashMap` of the standard library is hashbrown too,
 # but it keeps the value in the bucket.
-hashbrown = { version = "0.16", default-features = false, features = ["inline-more"], optional = true }
+hashbrown = { version = "0.17", default-features = false, features = ["inline-more"], optional = true }
 
 # `recvmsg` and `sendmsg` with the `PKTINFO` control messages, which tokio does
 # not expose.
 [target.'cfg(unix)'.dependencies]
-libc = { version = "0.2", optional = true }
+libc = { version = "0.2.191", optional = true }
 
 [dev-dependencies]
 tower-service = "0.3.3"
-# Keep property tests compatible with the crate's MSRV.
-quickcheck = { version = "~1.0.3", default-features = false }
+quickcheck = { version = "1.1", default-features = false }
 # `test-util` pauses the clock for timer tests that drive the endpoint's
 # driver by hand, so Timer D and the other long timers keep their real values.
-tokio = { version = "1.47", features = [
+tokio = { version = "1.54", features = [
   "macros",
   "rt-multi-thread",
   "test-util",
 ] }
-tower = { version = "0.5", features = ["limit", "timeout", "util"] }
+tower = { version = "0.5.3", features = ["limit", "timeout", "util"] }
 
 # The example runs an endpoint, which needs the `tokio` feature.
 [[example]]

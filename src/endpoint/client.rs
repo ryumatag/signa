@@ -235,7 +235,7 @@ impl ClientControl {
     /// ```
     ///
     /// [RFC 3261 section 9.1]: https://www.rfc-editor.org/rfc/rfc3261.html#section-9.1
-    #[allow(clippy::manual_async_fn)] // Expose the Send guarantee on Rust 1.71.
+    #[allow(clippy::manual_async_fn)] // State the Send guarantee.
     pub fn cancel(
         &self,
     ) -> impl Future<Output = Result<CancelOutcome, CancelError>> + Send + '_
@@ -824,7 +824,7 @@ impl Endpoint {
     /// [`Builder::tcp`]: super::Builder::tcp
     /// [`Builder::max_client_transactions`]: super::Builder::max_client_transactions
     /// [`Builder::max_client_handles`]: super::Builder::max_client_handles
-    #[allow(clippy::manual_async_fn)] // Expose the Send guarantee on Rust 1.71.
+    #[allow(clippy::manual_async_fn)] // State the Send guarantee.
     pub fn start(
         &self,
         request: Request<Bytes>,

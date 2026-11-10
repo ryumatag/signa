@@ -232,7 +232,7 @@ impl ClientTransaction {
                     && response
                         .headers()
                         .get(TO)
-                        .map_or(true, |v| v.as_str().trim().is_empty())
+                        .is_none_or(|v| v.as_str().trim().is_empty())
                 {
                     return ClientEvent::InvalidResponse;
                 }

@@ -194,7 +194,7 @@ Without it, message types, transaction timer configuration, and transport
 metadata and receive limits remain available without a runtime. Endpoint
 examples are omitted when this feature is disabled.
 
-The minimum supported Rust version is 1.71.
+The minimum supported Rust version is 1.85.
 
 # Modules
 

@@ -408,7 +408,7 @@ mod tests {
         // borrowing and decoding paths without an expensive randomized run.
         quickcheck::QuickCheck::new()
             .tests(if cfg!(miri) { 32 } else { 1000 })
-            .gen(quickcheck::Gen::new(if cfg!(miri) { 16 } else { 256 }))
+            .rng(quickcheck::Gen::new(if cfg!(miri) { 16 } else { 256 }))
             .quickcheck(property as fn(Vec<u8>) -> bool);
     }
 
