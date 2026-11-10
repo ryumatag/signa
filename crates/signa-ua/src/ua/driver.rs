@@ -7,11 +7,12 @@ None of them goes to the application, so nothing the application drops can
 answer, cancel or abandon a transaction behind the UA's back.
 
 Its loop waits on the endpoint's events, the handles' commands, abandoned
-INVITEs, finished jobs, responses and the next deadline, and handles each one
-without awaiting. Whatever has to wait, such as resolving a next hop or handing
-a message to the endpoint, runs as a job on a [`JoinSet`], and its result comes
-back to the loop as another input. A slow resolution therefore holds up only
-its own request, and the loop keeps taking ACKs and CANCELs.
+INVITEs, finished jobs, responses and the next deadline, which is the model's
+next timer or outcome to reclaim, and handles each one without awaiting.
+Whatever has to wait, such as resolving a next hop or handing a message to the
+endpoint, runs as a job on a [`JoinSet`], and its result comes back to the loop
+as another input. A slow resolution therefore holds up only its own request,
+and the loop keeps taking ACKs and CANCELs.
 
 Every task belongs to one of two [`JoinSet`]s, so that dropping the driver
 aborts all of them. Jobs are bounded by the configuration. More wait in a
@@ -30,10 +31,15 @@ use signa_core::{
     Method, Request, Response, StatusCode,
     endpoint::{
         Branch, ClientControl, ClientTransaction, Endpoint,
-        Error as CoreError, Incoming, IncomingEvent, Responder, ServerRequest,
-        SubmitError, Target, ViaMode,
+        Error as CoreError, Incoming, IncomingEvent, ReplyRoute, Responder,
+        ServerRequest, SubmitError, Target, ViaMode,
     },
-    message::header::{CONTACT, RECORD_ROUTE, Tag},
+    message::{
+        header::{
+            CONTACT, CONTENT_TYPE, RECORD_ROUTE, REQUIRE, Tag, UNSUPPORTED,
+        },
+        response,
+    },
 };
 use tokio::{
     sync::{OwnedSemaphorePermit, mpsc, oneshot},
@@ -48,7 +54,8 @@ use super::{
 use crate::{
     error::Error,
     invite::{AttemptKey, ExchangeKey},
-    model::{self, Effect, Model, Random, Released},
+    model::{self, Effect, Model, Random, Refusal, Released},
+    negotiation::Description,
     operation::{Completion, OperationId},
     retention::ReplayKey,
     routing::initial_next_hop,
@@ -89,6 +96,9 @@ pub(super) struct Driver<R> {
     jobs: JoinSet<Done>,
     max_jobs: usize,
     resolve_timeout: Duration,
+    /// How long a copy of a 2xx may wait for the endpoint, which is T2, the
+    /// longest interval before the next copy is due anyway.
+    resend_timeout: Duration,
     backlog: VecDeque<Job>,
     readers: JoinSet<()>,
     response_sender: mpsc::Sender<(AttemptKey, ResponseItem)>,
@@ -110,6 +120,12 @@ pub(super) struct Driver<R> {
 struct Server {
     request: Request<Bytes>,
     responder: Arc<Responder>,
+    /// The 2xx the core took, as it went out, to send again through the
+    /// INVITE's reply route until the ACK.
+    sent: Option<Response<Bytes>>,
+    /// Whether a copy of the 2xx is on its way, so that copies do not pile up
+    /// behind a busy endpoint.
+    resending: bool,
 }
 
 struct SentAck {
@@ -134,6 +150,21 @@ enum Job {
         responder: Arc<Responder>,
         response: Response<Bytes>,
     },
+    /// Submit a provisional response of an incoming exchange.
+    Provisional {
+        exchange: ExchangeKey,
+        operation: Option<OperationId>,
+        responder: Arc<Responder>,
+        response: Response<Bytes>,
+    },
+    /// Send a 2xx again, outside its transaction, waiting no longer than
+    /// `timeout`.
+    Resend {
+        exchange: ExchangeKey,
+        route: ReplyRoute,
+        response: Response<Bytes>,
+        timeout: Duration,
+    },
     /// Refuse a request before any exchange exists for it. Its result
     /// changes nothing.
     Refuse { responder: Arc<Responder>, response: Response<Bytes> },
@@ -155,10 +186,30 @@ enum AckRoute {
 
 /// What a finished job reports.
 enum Done {
-    Final { exchange: ExchangeKey, result: Result<(), SubmitError> },
+    /// `sent` is the response when it is a 2xx the core took.
+    Final {
+        exchange: ExchangeKey,
+        result: Result<(), SubmitError>,
+        sent: Option<Response<Bytes>>,
+    },
+    Provisional {
+        exchange: ExchangeKey,
+        operation: Option<OperationId>,
+        status: StatusCode,
+        result: Result<(), SubmitError>,
+    },
+    Resent {
+        exchange: ExchangeKey,
+    },
     Nothing,
-    Started { attempt: AttemptKey, result: Result<ClientTransaction, Error> },
-    Acked { replay: ReplayKey, sent: Option<SentAck> },
+    Started {
+        attempt: AttemptKey,
+        result: Result<ClientTransaction, Error>,
+    },
+    Acked {
+        replay: ReplayKey,
+        sent: Option<SentAck>,
+    },
 }
 
 impl<R: Resolve> Driver<R> {
@@ -180,6 +231,7 @@ impl<R: Resolve> Driver<R> {
             incoming,
             max_jobs: config.jobs,
             resolve_timeout: config.resolve_timeout,
+            resend_timeout: config.timers.t2(),
             contact: config.contact,
             resolver: Arc::new(config.resolver),
             shared,
@@ -236,9 +288,12 @@ impl<R: Resolve> Driver<R> {
                 () = sleep_until(deadline.unwrap_or_else(Instant::now)),
                     if deadline.is_some() =>
                 {
-                    for operation in self.model.expire(now()) {
+                    let now = now();
+                    for operation in self.model.expire(now) {
                         self.kept.remove(&operation);
                     }
+                    self.model.fire_timers(now);
+                    self.settle(None);
                 }
             }
 
@@ -271,8 +326,12 @@ impl<R: Resolve> Driver<R> {
 
     fn on_invite(&mut self, request: ServerRequest) {
         let ServerRequest { request, transaction, .. } = request;
-        // TODO: Watch the server events for transport failures and the end
-        // of the transaction.
+        // TODO: Watch the server events, for a failed write of the first 2xx
+        // and for the end of the transaction. The end would also bound how
+        // long a merged INVITE is detected, which is now only while the UA
+        // holds the exchange. Until then I drop them. Dropping them has no
+        // protocol effect in signa-core, and the 2xx's retransmissions cover
+        // a failed first write.
         let (responder, _events) = transaction.into_parts();
         let responder = Arc::new(responder);
 
@@ -283,28 +342,47 @@ impl<R: Resolve> Driver<R> {
             self.events.try_reserve(),
             self.abandon_sender.clone().try_reserve_owned(),
         ) else {
-            self.refuse(&request, responder, model::Refusal::Busy.status());
+            self.refuse(&request, responder, Refusal::Busy);
             return;
         };
 
+        // TODO: Tell an offer by the Content-Type and Content-Disposition of
+        // the body, rather than by its presence.
         let offer = !request.body().is_empty();
-        match self.model.receive_invite(&request, offer) {
+        match self.model.receive_invite(&request, offer, now()) {
             Ok(authority) => {
                 let exchange = authority.exchange();
                 self.servers.insert(
                     exchange,
-                    Server { request: request.clone(), responder },
+                    Server {
+                        request: request.clone(),
+                        responder,
+                        sent: None,
+                        resending: false,
+                    },
                 );
-                slot.send(Event::Invite(IncomingInvite {
-                    request,
-                    authority: Some(authority),
-                    abandon: Some(abandon),
-                    shared: self.shared.clone(),
-                }));
+                // An INVITE without an offer would need an offer in the 2xx
+                // and the answer checked in the ACK, which this UA cannot do
+                // yet. It is answered with a 488 rather than let through to
+                // be accepted with nothing to check the answer against. The
+                // status is my policy (RFC 3261 section 21.4.26).
+                if offer {
+                    slot.send(Event::Invite(IncomingInvite {
+                        request,
+                        authority: Some(authority),
+                        abandon: Some(abandon),
+                        shared: self.shared.clone(),
+                    }));
+                } else {
+                    drop((slot, abandon));
+                    let not_acceptable =
+                        StatusCode::from_u16(488).expect("a status");
+                    self.model.reject(exchange, not_acceptable, now());
+                }
             }
             Err(refusal) => {
                 drop((slot, abandon));
-                self.refuse(&request, responder, refusal.status());
+                self.refuse(&request, responder, refusal);
             }
         }
         self.settle(None);
@@ -316,11 +394,20 @@ impl<R: Resolve> Driver<R> {
         &mut self,
         request: &Request<Bytes>,
         responder: Arc<Responder>,
-        status: StatusCode,
+        refusal: Refusal,
     ) {
-        let mut response = Response::reply_to(request).status(status);
+        let mut response =
+            Response::reply_to(request).status(refusal.status());
         if let Some(tag) = self.tag() {
             response = response.to_tag(tag);
+        }
+        // A 420 lists the extensions the request requires that this UA does
+        // not support, which are all of them (RFC 3261 section 8.2.2.3). The
+        // model checked each row to be a list of option tags.
+        if refusal == Refusal::BadExtension {
+            for value in request.headers().get_all(REQUIRE) {
+                response = response.header(UNSUPPORTED, value.clone());
+            }
         }
         // A refusal belongs to no record of the model, so the model's tables
         // do not bound it. With the backlog full, or without a valid
@@ -365,14 +452,42 @@ impl<R: Resolve> Driver<R> {
     fn on_done(&mut self, done: Done) {
         let mut attempt = None;
         match done {
-            Done::Final { exchange, result } => match result {
-                Ok(()) => self.model.final_committed(exchange, now()),
+            Done::Final { exchange, result, sent } => match result {
+                Ok(()) => {
+                    if let Some(server) = self.servers.get_mut(&exchange) {
+                        server.sent = sent;
+                    }
+                    self.model.final_committed(exchange, now());
+                }
                 Err(error) => self.model.final_refused(
                     exchange,
                     error == SubmitError::Closed,
                     now(),
                 ),
             },
+            Done::Provisional { exchange, operation, status, result } => {
+                // Each response is a job of its own, so a provisional can
+                // reach the core after the final it was submitted before.
+                // It lost to that final, as it would have in the model.
+                let result = result.map_err(|error| match error {
+                    SubmitError::Closed => Error::DriverStopped,
+                    SubmitError::FinalAlreadySent
+                    | SubmitError::Terminated => Error::AlreadyFinalized,
+                    _ => Error::CoreSubmissionRejected,
+                });
+                self.model.provisional_done(
+                    exchange,
+                    status,
+                    operation,
+                    result,
+                    now(),
+                );
+            }
+            Done::Resent { exchange } => {
+                if let Some(server) = self.servers.get_mut(&exchange) {
+                    server.resending = false;
+                }
+            }
             Done::Nothing => {}
             Done::Started { attempt: key, result } => {
                 attempt = Some(key);
@@ -470,9 +585,18 @@ impl<R: Resolve> Driver<R> {
 
     fn apply(&mut self, effect: Effect, attempt: Option<AttemptKey>) {
         match effect {
-            Effect::SubmitFinal { exchange, status, to_tag } => {
-                self.submit_final(exchange, status, to_tag);
+            Effect::SubmitFinal { exchange, status, to_tag, body } => {
+                self.submit_final(exchange, status, to_tag, body);
             }
+            Effect::SubmitProvisional {
+                exchange,
+                status,
+                to_tag,
+                operation,
+            } => {
+                self.submit_provisional(exchange, status, to_tag, operation);
+            }
+            Effect::Resend2xx { exchange } => self.resend_2xx(exchange),
             Effect::StartInvite { attempt } => self.start_invite(attempt),
             Effect::SendAck { replay } => self.send_ack(replay),
             Effect::ResendAck { replay } => {
@@ -504,27 +628,29 @@ impl<R: Resolve> Driver<R> {
         exchange: ExchangeKey,
         status: StatusCode,
         to_tag: Tag,
+        body: Option<Description>,
     ) {
         let Some(server) = self.servers.get(&exchange) else {
             return;
         };
 
+        // TODO: Let a rejection carry the headers its status needs, such as
+        // the Allow of a 405 (RFC 3261 section 21.4.6) or the challenge of a
+        // 401 (section 21.4.2).
         let mut response =
             Response::reply_to(&server.request).status(status).to_tag(to_tag);
         if status.is_success() {
-            // RFC 3261 section 12.1.1 has the UAS copy every Record-Route
-            // value of the request into a response that forms a dialog, in
-            // order, and add its Contact.
-            for value in server.request.headers().get_all(RECORD_ROUTE) {
-                response = response.header(RECORD_ROUTE, value.clone());
-            }
-            response = response
-                .header(CONTACT, format!("<{}>", self.contact).as_str());
+            response =
+                dialog_headers(response, &server.request, &self.contact);
         }
+        let response = match body {
+            Some(body) => response
+                .header(CONTENT_TYPE, body.content_type().clone())
+                .body(body.body().clone()),
+            None => response.body(Bytes::new()),
+        };
 
-        // TODO: Carry the answer to an offer in the 2xx, which the
-        // application cannot supply yet.
-        match response.body(Bytes::new()) {
+        match response {
             Ok(response) => self.backlog.push_back(Job::Final {
                 exchange,
                 responder: server.responder.clone(),
@@ -532,6 +658,65 @@ impl<R: Resolve> Driver<R> {
             }),
             Err(_) => self.model.final_refused(exchange, false, now()),
         }
+    }
+
+    fn submit_provisional(
+        &mut self,
+        exchange: ExchangeKey,
+        status: StatusCode,
+        to_tag: Tag,
+        operation: Option<OperationId>,
+    ) {
+        let Some(server) = self.servers.get(&exchange) else {
+            return;
+        };
+
+        // A provisional response with a To tag forms an early dialog at the
+        // UAC, so it carries what a 2xx does (RFC 3261 section 12.1.1).
+        let response =
+            Response::reply_to(&server.request).status(status).to_tag(to_tag);
+        let response =
+            dialog_headers(response, &server.request, &self.contact)
+                .body(Bytes::new());
+
+        match response {
+            Ok(response) => self.backlog.push_back(Job::Provisional {
+                exchange,
+                operation,
+                responder: server.responder.clone(),
+                response,
+            }),
+            Err(_) => self.model.provisional_done(
+                exchange,
+                status,
+                operation,
+                Err(Error::InvalidInput),
+                now(),
+            ),
+        }
+    }
+
+    /// Sends the 2xx of an exchange again, through the reply route rather
+    /// than the responder. The transaction does not send a 2xx again itself
+    /// (RFC 6026 section 7.1).
+    fn resend_2xx(&mut self, exchange: ExchangeKey) {
+        let Some(server) = self.servers.get_mut(&exchange) else {
+            return;
+        };
+        let Some(response) = &server.sent else {
+            return;
+        };
+        if server.resending {
+            return;
+        }
+
+        server.resending = true;
+        self.backlog.push_back(Job::Resend {
+            exchange,
+            route: server.responder.reply_route(),
+            response: response.clone(),
+            timeout: self.resend_timeout,
+        });
     }
 
     fn start_invite(&mut self, attempt: AttemptKey) {
@@ -607,6 +792,9 @@ impl<R: Resolve> Driver<R> {
             model::Event::NegotiationCompleted { usage } => {
                 Event::Negotiated { session: Session::new(usage) }
             }
+            model::Event::AckTimeout { usage } => {
+                Event::AckTimeout { session: Session::new(usage) }
+            }
             model::Event::UsageEnded { usage } => {
                 Event::Ended { session: Session::new(usage) }
             }
@@ -677,8 +865,29 @@ impl Job {
     ) -> Done {
         match self {
             Job::Final { exchange, responder, response } => {
+                // The 2xx is kept as it went out, so that each copy is the
+                // same message (RFC 3261 section 13.3.1.4).
+                let sent =
+                    response.status().is_success().then(|| response.clone());
                 let result = responder.respond(response).await;
-                Done::Final { exchange, result }
+                let sent = sent.filter(|_| result.is_ok());
+                Done::Final { exchange, result, sent }
+            }
+            Job::Provisional { exchange, operation, responder, response } => {
+                let status = response.status();
+                let result = responder.respond(response).await;
+                Done::Provisional { exchange, operation, status, result }
+            }
+            // A copy that does not get out changes nothing. The next one, or
+            // the peer's ACK, settles it. A copy stuck behind a full endpoint
+            // or a blocked connection is given up after `timeout`, so that it
+            // holds no job slot for long and the next copy can take its
+            // place. Giving up after the endpoint queued the copy withdraws
+            // nothing, and giving up before costs nothing.
+            Job::Resend { exchange, route, response, timeout } => {
+                let _ =
+                    tokio::time::timeout(timeout, route.send(response)).await;
+                Done::Resent { exchange }
             }
             Job::Refuse { responder, response } => {
                 let _ = responder.respond(response).await;
@@ -715,6 +924,19 @@ impl Job {
             }
         }
     }
+}
+
+/// Adds what a response that forms a dialog carries: every Record-Route value
+/// of the request, in order, and the UA's Contact (RFC 3261 section 12.1.1).
+fn dialog_headers(
+    mut response: response::Builder,
+    request: &Request<Bytes>,
+    contact: &str,
+) -> response::Builder {
+    for value in request.headers().get_all(RECORD_ROUTE) {
+        response = response.header(RECORD_ROUTE, value.clone());
+    }
+    response.header(CONTACT, format!("<{contact}>").as_str())
 }
 
 /// Resolves a next hop, or gives up after `timeout`. A resolver that never

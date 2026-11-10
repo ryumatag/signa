@@ -1,5 +1,5 @@
 /*!
-The UA's runtime through its public API, against raw UDP peers.
+The UA's runtime through its public API, against raw UDP and TCP peers.
 
 Each test drives a UA attached to a loopback endpoint and plays the other
 side by hand, so that what goes on the wire is what the test checks.
@@ -9,15 +9,21 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use signa_core::{
-    Request, Response, StatusCode,
+    HeaderValue, Request, Response, StatusCode,
     endpoint::{Endpoint, Incoming, Reception, Target},
     message::header::CALL_ID,
+    transaction::Timers,
 };
 use signa_ua::{
-    AttachError, Config, Error, Event, Query, Resolve, ResolveError,
-    StaticResolver, Ua, UaEvents, attach,
+    AttachError, Config, Description, Error, Event, Query, Resolve,
+    ResolveError, StaticResolver, Ua, UaEvents, attach,
 };
-use tokio::{net::UdpSocket, sync::Notify, time::timeout};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpStream, UdpSocket},
+    sync::Notify,
+    time::timeout,
+};
 
 const WAIT: Duration = Duration::from_secs(2);
 
@@ -27,6 +33,45 @@ fn bind() -> (Endpoint, Incoming) {
 
 fn config() -> Config {
     Config::new("sip:ua@127.0.0.1").unwrap()
+}
+
+/// Timers short enough that a test sees a 2xx retransmitted several times,
+/// and its ACK deadline of 64 T1 pass, within a second or two.
+fn fast() -> Timers {
+    Timers::builder()
+        .t1(Duration::from_millis(20))
+        .t2(Duration::from_millis(80))
+        .build()
+        .unwrap()
+}
+
+/// A UA whose endpoint and configuration both run on [`fast`] timers, on
+/// UDP and TCP.
+fn start_fast() -> (Ua, SocketAddr, SocketAddr) {
+    start_fast_with(config())
+}
+
+/// [`start_fast`] with `config`, whose timers it sets.
+fn start_fast_with(config: Config) -> (Ua, SocketAddr, SocketAddr) {
+    let local = "127.0.0.1:0".parse().unwrap();
+    let (endpoint, incoming) = Endpoint::builder()
+        .udp(local)
+        .tcp(local)
+        .timers(fast())
+        .bind()
+        .unwrap();
+    let (udp, tcp) =
+        (endpoint.udp_addr().unwrap(), endpoint.tcp_addr().unwrap());
+    let ua = attach(endpoint, incoming, config.timers(fast())).unwrap();
+    (ua, udp, tcp)
+}
+
+/// The answer the application gives to the peer's offer.
+fn sdp() -> Description {
+    Description::new(
+        HeaderValue::from_static("application/sdp"),
+        Bytes::from_static(b"v=0\r\n"),
+    )
 }
 
 fn start<R: Resolve>(config: Config<R>) -> (Ua, SocketAddr) {
@@ -87,12 +132,111 @@ impl Peer {
         })
         .await;
     }
+
+    /// Checks that each failure response arriving for a while answers the
+    /// request on `branch`.
+    async fn only_failures_for(&self, branch: &str, wait: Duration) {
+        let _ = timeout(wait, async {
+            loop {
+                let (message, _) = self.recv().await;
+                if message.starts_with("SIP/2.0 4") {
+                    let via = header(&message, "Via");
+                    assert!(via[0].contains(branch), "unexpected {message}");
+                }
+            }
+        })
+        .await;
+    }
+
+    /// Reads and discards what arrives for a while, such as a copy already
+    /// on its way.
+    async fn drain(&self, wait: Duration) {
+        let _ = timeout(wait, async {
+            loop {
+                self.recv().await;
+            }
+        })
+        .await;
+    }
+}
+
+/// A TCP connection that plays the other side.
+struct TcpPeer {
+    stream: TcpStream,
+    buffer: Vec<u8>,
+}
+
+impl TcpPeer {
+    async fn connect(to: SocketAddr) -> TcpPeer {
+        TcpPeer {
+            stream: TcpStream::connect(to).await.unwrap(),
+            buffer: Vec::new(),
+        }
+    }
+
+    fn address(&self) -> SocketAddr {
+        self.stream.local_addr().unwrap()
+    }
+
+    async fn send(&mut self, message: &str) {
+        let message = message.replace("\r\n", "\n").replace('\n', "\r\n");
+        self.stream.write_all(message.as_bytes()).await.unwrap();
+    }
+
+    /// Receives the next message off the stream, framed by its
+    /// Content-Length.
+    async fn recv(&mut self) -> String {
+        let read = async {
+            loop {
+                if let Some(message) = self.framed() {
+                    return message;
+                }
+                let mut chunk = [0; 4096];
+                let n = self.stream.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "the UA closed the connection");
+                self.buffer.extend_from_slice(&chunk[..n]);
+            }
+        };
+        timeout(WAIT, read).await.expect("a message in time")
+    }
+
+    /// Takes the first whole message out of the buffer.
+    fn framed(&mut self) -> Option<String> {
+        let end = self.buffer.windows(4).position(|w| w == b"\r\n\r\n")?;
+        let head = std::str::from_utf8(&self.buffer[..end]).unwrap();
+        let length = head
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| {
+                name.trim().eq_ignore_ascii_case("content-length")
+            })
+            .map_or(0, |(_, value)| value.trim().parse().unwrap());
+        let total = end + 4 + length;
+        if self.buffer.len() < total {
+            return None;
+        }
+        let message = self.buffer.drain(..total).collect();
+        Some(String::from_utf8(message).unwrap())
+    }
+
+    async fn recv_starting(&mut self, start: &str) -> String {
+        loop {
+            let message = self.recv().await;
+            if message.starts_with(start) {
+                return message;
+            }
+        }
+    }
 }
 
 fn invite_to_ua(peer: SocketAddr, call: &str) -> String {
+    invite_over("UDP", peer, call)
+}
+
+fn invite_over(transport: &str, peer: SocketAddr, call: &str) -> String {
     format!(
         "INVITE sip:ua@127.0.0.1 SIP/2.0
-Via: SIP/2.0/UDP {peer};branch=z9hG4bK-{call}
+Via: SIP/2.0/{transport} {peer};branch=z9hG4bK-{call}
 Max-Forwards: 70
 To: <sip:ua@127.0.0.1>
 From: <sip:peer@{peer}>;tag=peer-{call}
@@ -145,6 +289,24 @@ fn header<'a>(message: &'a str, name: &str) -> Vec<&'a str> {
         .collect()
 }
 
+/// The ACK of the peer for the 2xx `ok` it received for its INVITE `call`,
+/// with `cseq` as its CSeq number.
+fn ack_for(ok: &str, peer: SocketAddr, call: &str, cseq: u32) -> String {
+    format!(
+        "ACK sip:ua@127.0.0.1 SIP/2.0
+Via: SIP/2.0/UDP {peer};branch=z9hG4bK-ack-{call}
+Max-Forwards: 70
+To: {to}
+From: <sip:peer@{peer}>;tag=peer-{call}
+Call-ID: {call}
+CSeq: {cseq} ACK
+Content-Length: 0
+
+",
+        to = header(ok, "To")[0],
+    )
+}
+
 async fn invite(events: &mut UaEvents) -> signa_ua::IncomingInvite {
     loop {
         match timeout(WAIT, events.recv()).await.unwrap().unwrap() {
@@ -152,6 +314,18 @@ async fn invite(events: &mut UaEvents) -> signa_ua::IncomingInvite {
             _ => continue,
         }
     }
+}
+
+/// Says whether an INVITE reaches the application within `wait`.
+async fn invite_within(events: &mut UaEvents, wait: Duration) -> bool {
+    let next = async {
+        loop {
+            if let Event::Invite(_) = events.recv().await.unwrap() {
+                return;
+            }
+        }
+    };
+    timeout(wait, next).await.is_ok()
 }
 
 /// The UA takes the only receiver of its endpoint, and refuses an endpoint
@@ -183,7 +357,7 @@ async fn waiting_operation_drop_does_not_withdraw_accepted_command() {
 
     peer.send(&invite_to_ua(peer.address(), "drop-wait"), address).await;
     let invite = invite(&mut ua.events).await;
-    drop(invite.try_accept().unwrap());
+    drop(invite.try_accept(sdp()).unwrap());
 
     let (ok, _) = peer.recv_starting("SIP/2.0 200").await;
     assert!(header(&ok, "To")[0].contains(";tag="));
@@ -203,7 +377,7 @@ async fn observer_drop_does_not_drop_responder_or_client_control() {
     peer.send(&invite_to_ua(peer.address(), "drop-uas"), address).await;
     let invite = invite(&mut ua.events).await;
     // The session handle goes at once.
-    let _ = invite.try_accept().unwrap().await.unwrap();
+    let _ = invite.try_accept(sdp()).unwrap().await.unwrap();
     peer.recv_starting("SIP/2.0 200").await;
     peer.quiet("SIP/2.0 500", Duration::from_millis(300)).await;
 
@@ -413,7 +587,7 @@ async fn an_invalid_rejection_hands_the_invite_back() {
     let refused = invite.try_reject(StatusCode::OK).unwrap_err();
     assert_eq!(refused.error(), Error::InvalidInput);
 
-    refused.into_inner().try_accept().unwrap().await.unwrap();
+    refused.into_inner().try_accept(sdp()).unwrap().await.unwrap();
     let (ok, _) = peer.recv_starting("SIP/2.0 200").await;
     assert_eq!(header(&ok, "Call-ID"), ["retry"]);
 }
@@ -434,7 +608,7 @@ async fn a_hung_resolver_gives_up_and_frees_its_job() {
     let hung = ua.handle.try_invite(invite_from_ua("slow.invalid", "hung"));
     peer.send(&invite_to_ua(peer.address(), "behind"), address).await;
     let invite = invite(&mut ua.events).await;
-    let accepted = invite.try_accept().unwrap();
+    let accepted = invite.try_accept(sdp()).unwrap();
 
     assert_eq!(
         timeout(WAIT, hung.unwrap()).await.unwrap().unwrap_err(),
@@ -443,4 +617,215 @@ async fn a_hung_resolver_gives_up_and_frees_its_job() {
     let (ok, _) = peer.recv_starting("SIP/2.0 200").await;
     assert_eq!(header(&ok, "Call-ID"), ["behind"]);
     timeout(WAIT, accepted).await.unwrap().unwrap();
+}
+
+/// Every response to an INVITE carries the To tag of its first one: the
+/// 180, the 200 and each copy of the 200. The 180 forms an early dialog at
+/// the caller, so it carries the Contact and Record-Route as the 200 does.
+#[tokio::test]
+async fn uas_to_tag_is_stable() {
+    let (mut ua, udp, _) = start_fast();
+    tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+
+    peer.send(&invite_to_ua(peer.address(), "tag"), udp).await;
+    let invite = invite(&mut ua.events).await;
+    let ringing = StatusCode::from_u16(180).unwrap();
+    invite.try_provisional(ringing).unwrap().await.unwrap();
+    let (ringing, _) = peer.recv_starting("SIP/2.0 180").await;
+    invite.try_accept(sdp()).unwrap().await.unwrap();
+    let (ok, _) = peer.recv_starting("SIP/2.0 200").await;
+    let (copy, _) = peer.recv_starting("SIP/2.0 200").await;
+
+    let to = header(&ringing, "To");
+    assert!(to[0].contains(";tag="));
+    assert_eq!(header(&ok, "To"), to);
+    assert_eq!(header(&copy, "To"), to);
+    assert_eq!(header(&ringing, "Contact"), ["<sip:ua@127.0.0.1>"]);
+    assert_eq!(
+        header(&ringing, "Record-Route"),
+        ["<sip:proxy.example.com;lr>"]
+    );
+}
+
+/// The 2xx goes out again until its ACK, over TCP as over UDP. A reliable
+/// transport does not excuse it, since a proxy on the way may forward over
+/// UDP (RFC 3261 section 13.3.1.4).
+#[tokio::test]
+async fn uas_2xx_retransmits_on_udp_and_tcp() {
+    let (mut ua, udp, tcp) = start_fast();
+    tokio::spawn(ua.driver);
+
+    let peer = Peer::new().await;
+    peer.send(&invite_to_ua(peer.address(), "over-udp"), udp).await;
+    invite(&mut ua.events).await.try_accept(sdp()).unwrap().await.unwrap();
+    for _ in 0..3 {
+        let (ok, _) = peer.recv_starting("SIP/2.0 200").await;
+        assert_eq!(header(&ok, "Call-ID"), ["over-udp"]);
+    }
+
+    let mut stream = TcpPeer::connect(tcp).await;
+    let request = invite_over("TCP", stream.address(), "over-tcp");
+    stream.send(&request).await;
+    invite(&mut ua.events).await.try_accept(sdp()).unwrap().await.unwrap();
+    for _ in 0..3 {
+        let ok = stream.recv_starting("SIP/2.0 200").await;
+        assert_eq!(header(&ok, "Call-ID"), ["over-tcp"]);
+    }
+}
+
+/// Each copy of the 2xx is the message that first went out, answer and
+/// all, from the address the INVITE reached. It goes through the INVITE's
+/// reply route, which takes nothing but the request's Via, From, Call-ID and
+/// CSeq as they were received.
+#[tokio::test]
+async fn response_replay_preserves_reply_route_identity() {
+    let (mut ua, udp, _) = start_fast();
+    tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+
+    peer.send(&invite_to_ua(peer.address(), "replay"), udp).await;
+    invite(&mut ua.events).await.try_accept(sdp()).unwrap().await.unwrap();
+    let (ok, first) = peer.recv_starting("SIP/2.0 200").await;
+    let (copy, second) = peer.recv_starting("SIP/2.0 200").await;
+
+    assert_eq!(copy, ok);
+    assert_eq!((first, second), (udp, udp));
+    assert_eq!(header(&ok, "Content-Type"), ["application/sdp"]);
+    assert!(ok.ends_with("\r\n\r\nv=0\r\n"));
+}
+
+/// An ACK with another CSeq is not the 2xx's, and the copies go on. The
+/// ACK that matches stops them.
+#[tokio::test]
+async fn matching_ack_stops_retransmission_unrelated_ack_does_not() {
+    let (mut ua, udp, _) = start_fast();
+    tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+
+    peer.send(&invite_to_ua(peer.address(), "ack"), udp).await;
+    invite(&mut ua.events).await.try_accept(sdp()).unwrap().await.unwrap();
+    let (ok, _) = peer.recv_starting("SIP/2.0 200").await;
+
+    peer.send(&ack_for(&ok, peer.address(), "ack", 2), udp).await;
+    peer.recv_starting("SIP/2.0 200").await;
+    peer.recv_starting("SIP/2.0 200").await;
+
+    peer.send(&ack_for(&ok, peer.address(), "ack", 1), udp).await;
+    peer.drain(Duration::from_millis(50)).await;
+    // Neither a copy of the 200 nor any response to the ACKs.
+    peer.quiet("SIP/2.0", Duration::from_millis(400)).await;
+}
+
+/// Without an ACK, the copies stop 64 T1 after the first 2xx, and the
+/// session ends, with the reason before the end.
+#[tokio::test]
+async fn an_unacknowledged_2xx_ends_its_session() {
+    let (mut ua, udp, _) = start_fast();
+    tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+
+    peer.send(&invite_to_ua(peer.address(), "no-ack"), udp).await;
+    let accepted = invite(&mut ua.events).await.try_accept(sdp()).unwrap();
+    let session = accepted.await.unwrap();
+
+    let mut ends = Vec::new();
+    while ends.len() < 2 {
+        match timeout(WAIT, ua.events.recv()).await.unwrap().unwrap() {
+            Event::AckTimeout { session: ended } => {
+                ends.push(("timeout", ended))
+            }
+            Event::Ended { session: ended } => ends.push(("ended", ended)),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        ends,
+        [("timeout", session.clone()), ("ended", session.clone())]
+    );
+    peer.drain(Duration::from_millis(50)).await;
+    peer.quiet("SIP/2.0 200", Duration::from_millis(300)).await;
+    assert_eq!(ua.handle.snapshot(&session).await.unwrap(), None);
+}
+
+/// A retransmission of the INVITE is the core's to absorb, before and after
+/// the 2xx, so the application sees one INVITE and one session. A copy that
+/// came by another path, with another branch, gets a 482 (RFC 3261 section
+/// 8.2.2.2).
+#[tokio::test]
+async fn retransmitted_invite_does_not_create_second_usage() {
+    let (mut ua, udp, _) = start_fast();
+    tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+    let request = invite_to_ua(peer.address(), "again");
+    let merged =
+        request.replace("branch=z9hG4bK-again", "branch=z9hG4bK-other");
+
+    peer.send(&request, udp).await;
+    let invite = invite(&mut ua.events).await;
+    peer.send(&request, udp).await;
+    peer.send(&merged, udp).await;
+
+    // The 482 answers the merged copy, and the copy on the same branch gets
+    // none. The core sends the 482 again until its ACK, which this peer
+    // does not send, so each failure that arrives is that 482.
+    let (loop_detected, _) = peer.recv_starting("SIP/2.0 482").await;
+    assert_eq!(header(&loop_detected, "Call-ID"), ["again"]);
+    peer.only_failures_for("z9hG4bK-other", Duration::from_millis(200)).await;
+    assert!(!invite_within(&mut ua.events, Duration::from_millis(200)).await);
+
+    invite.try_accept(sdp()).unwrap().await.unwrap();
+    peer.recv_starting("SIP/2.0 200").await;
+    peer.send(&request, udp).await;
+    peer.only_failures_for("z9hG4bK-other", Duration::from_millis(200)).await;
+    assert!(!invite_within(&mut ua.events, Duration::from_millis(200)).await);
+}
+
+/// An INVITE the application holds past the decision timeout gets a 500,
+/// and the accept that comes after it sends nothing.
+#[tokio::test]
+async fn the_decision_timeout_answers_an_undecided_invite() {
+    let config = config().decision_timeout(Duration::from_millis(100));
+    let (mut ua, udp, _) = start_fast_with(config);
+    tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+
+    peer.send(&invite_to_ua(peer.address(), "slow"), udp).await;
+    let invite = invite(&mut ua.events).await;
+    let (error, _) = peer.recv_starting("SIP/2.0 500").await;
+    let late = invite.try_accept(sdp()).unwrap().await.unwrap_err();
+
+    assert_eq!(header(&error, "Call-ID"), ["slow"]);
+    assert!(matches!(late, Error::AlreadyFinalized | Error::StaleDecision));
+    peer.quiet("SIP/2.0 200", Duration::from_millis(200)).await;
+}
+
+/// An INVITE without an offer gets a 488 before the application sees it,
+/// since this UA cannot check the answer its ACK would carry yet. One that
+/// requires an extension gets a 420 that lists it as unsupported.
+#[tokio::test]
+async fn an_offerless_or_extended_invite_is_refused() {
+    let (mut ua, udp, _) = start_fast();
+    tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+    let offerless = invite_to_ua(peer.address(), "offerless").replace(
+        "Content-Type: application/sdp\nContent-Length: 4\n\nv=0\n",
+        "Content-Length: 0\n\n",
+    );
+    let extended = invite_to_ua(peer.address(), "extended").replace(
+        "Max-Forwards: 70\n",
+        "Max-Forwards: 70\nRequire: 100rel, timer\n",
+    );
+
+    peer.send(&offerless, udp).await;
+    let (refused, _) = peer.recv_starting("SIP/2.0 488").await;
+    assert_eq!(header(&refused, "Call-ID"), ["offerless"]);
+    assert!(header(&refused, "To")[0].contains(";tag="));
+
+    peer.send(&extended, udp).await;
+    let (refused, _) = peer.recv_starting("SIP/2.0 420").await;
+    assert_eq!(header(&refused, "Call-ID"), ["extended"]);
+    assert_eq!(header(&refused, "Unsupported"), ["100rel, timer"]);
+
+    assert!(!invite_within(&mut ua.events, Duration::from_millis(200)).await);
 }

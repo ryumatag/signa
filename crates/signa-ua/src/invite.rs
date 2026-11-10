@@ -25,6 +25,8 @@ response collection.
 [RFC 5057]: https://www.rfc-editor.org/rfc/rfc5057.html
 */
 
+use std::time::Instant;
+
 use bytes::Bytes;
 use signa_core::{Request, StatusCode};
 
@@ -157,7 +159,25 @@ pub(crate) enum Scope {
         /// moves to the dialog table when the 2xx is committed.
         dialog: Option<Box<Dialog>>,
         offer_in_request: bool,
+        /// What finds a merged copy of the INVITE while the exchange lives.
+        merge: MergeKey,
+        /// When the application's decision is due, while it is.
+        decision_due: Option<Instant>,
+        /// The last provisional response the application chose, and when it
+        /// is due again, while no final is under way.
+        provisional: Option<(StatusCode, Instant)>,
     },
+}
+
+/// What RFC 3261 section 8.2.2.2 compares to tell a merged request: the From
+/// tag, the Call-ID and the CSeq. A request without a To tag that matches an
+/// ongoing transaction on these, but is not that transaction's, reached this
+/// user agent twice by different paths, as through a forking proxy.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct MergeKey {
+    pub(crate) call_id: Box<str>,
+    pub(crate) from_tag: Option<Box<str>>,
+    pub(crate) cseq: u32,
 }
 
 /// Where an INVITE transaction's final response stands.
@@ -210,13 +230,18 @@ impl InviteExchange {
 
     pub(crate) fn incoming(
         dialog: Dialog,
-        cseq: u32,
+        merge: MergeKey,
         offer_in_request: bool,
+        decision_due: Option<Instant>,
     ) -> InviteExchange {
+        let cseq = merge.cseq;
         InviteExchange {
             scope: Scope::Incoming {
                 dialog: Some(Box::new(dialog)),
                 offer_in_request,
+                merge,
+                decision_due,
+                provisional: None,
             },
             cseq,
             state: ExchangeState::Pending,

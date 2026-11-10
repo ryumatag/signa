@@ -12,15 +12,23 @@ protocol test depends on real time.
 The model keeps no transaction timer. Timers A to M, the ACK of a non-2xx and
 CANCEL retransmission belong to the transaction layer in signa-core
 ([RFC 3261 section 17], [RFC 6026 section 7]). The times the model takes are
-for timers of the UA core, which so far is only how long an outcome nobody
-waits for is kept.
+for timers of the UA core, in [`crate::timer`], and for how long an outcome
+nobody waits for is kept.
 
-TODO: Only the tables, the axes of state, admission and outcomes, and the
-transitions their tests need are here. The rest of the UAS and UAC paths,
-early dialogs and forks, CANCEL and BYE, and offer/answer are still to come.
+Two timers end at 64 T1 after a UAS sends a 2xx, and they are not the same.
+The core's Timer L keeps the INVITE transaction in Accepted, so that it
+absorbs copies of the INVITE and takes the 2xx of other forks
+([RFC 6026 section 8.7]). The model's ACK deadline stops retransmitting the
+2xx and ends the session that never got its ACK
+([RFC 3261 section 13.3.1.4]). Neither waits for the other.
+
+TODO: CANCEL and BYE, re-INVITEs, and the answer an ACK owes are still to
+come.
 
 [RFC 3261 section 17]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17
 [RFC 6026 section 7]: https://www.rfc-editor.org/rfc/rfc6026.html#section-7
+[RFC 6026 section 8.7]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.7
+[RFC 3261 section 13.3.1.4]: https://www.rfc-editor.org/rfc/rfc3261.html#section-13.3.1.4
 */
 
 use std::{
@@ -30,27 +38,36 @@ use std::{
 
 use bytes::Bytes;
 use signa_core::{
-    message::header::Tag, Method, Request, Response, StatusCode,
+    Method, Request, Response, StatusCode, message::header::Tag,
 };
 
 use crate::{
     dialog::{
-        request_dialog, response_tag, Dialog, DialogError, DialogId,
-        DialogKey, Origin, Outgoing, Sequence,
+        Dialog, DialogError, DialogId, DialogKey, Origin, Outgoing, Sequence,
+        request_dialog, response_tag,
     },
     error::Error,
     invite::{
         AttemptKey, Direction, ExchangeKey, ExchangeState, InviteAttempt,
-        InviteExchange, InviteUsage, Scope, UsageKey, UsagePhase,
+        InviteExchange, InviteUsage, MergeKey, Scope, UsageKey, UsagePhase,
     },
-    negotiation::Negotiation,
+    negotiation::{Description, Negotiation},
     operation::{Completion, OperationId, Operations, Stage, SubmitError},
     protocol::{self, Field, Malformed},
     retention::{
-        AckObligation, ReplayContext, ReplayId, ReplayKey, Retention, Source,
+        AckObligation, ReplayContext, ReplayId, ReplayKey, Retention,
+        Retransmission, Source,
     },
     slot::Slots,
+    timer::{Timer, TimerQueue},
 };
+
+/// How often a UAS that rings sends its provisional response again.
+///
+/// RFC 3261 section 13.3.1.1 lets a proxy cancel an INVITE after three
+/// minutes without a response, and has the UAS send a non-100 provisional
+/// every minute so that a lost one does not cost the call.
+const PROVISIONAL_INTERVAL: Duration = Duration::from_secs(60);
 
 /// A source of randomness for tags and Call-IDs, and later the retry timer
 /// of a 491.
@@ -80,6 +97,12 @@ pub(crate) struct Limits {
     pub(crate) commands: usize,
     /// How long an outcome nobody waits for is kept.
     pub(crate) outcome_retention: Duration,
+    /// T1 and T2 of RFC 3261 section 17, which pace the retransmission of a
+    /// 2xx this user agent sends and set its ACK deadline.
+    pub(crate) t1: Duration,
+    pub(crate) t2: Duration,
+    /// How long the application may take to decide an incoming INVITE.
+    pub(crate) decision_timeout: Duration,
 }
 
 /// The authority to decide the final response of an incoming INVITE.
@@ -105,8 +128,11 @@ impl Authority {
 /// What the application asks of the UA.
 #[derive(Debug)]
 pub(crate) enum Command {
-    /// Accept an incoming INVITE with a 2xx.
-    Accept { authority: Authority },
+    /// Accept an incoming INVITE with a 2xx that carries `answer`.
+    Accept { authority: Authority, answer: Description },
+    /// Send a provisional response from 101 to 199 for an incoming INVITE.
+    /// It takes no authority, since it decides nothing.
+    Provisional { exchange: ExchangeKey, status: StatusCode },
     /// Reject an incoming INVITE with a final response from 300 to 699.
     Reject { authority: Authority, status: StatusCode },
     /// Send an initial INVITE that carries an offer.
@@ -117,9 +143,30 @@ pub(crate) enum Command {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Effect {
     /// Submit the final response of an incoming INVITE through its
+    /// responder, with `to_tag` on its To and `body` as its body, then report
+    /// the verdict with [`Model::final_committed`] or
+    /// [`Model::final_refused`]. The runtime keeps a 2xx it submitted, for
+    /// [`Effect::Resend2xx`].
+    SubmitFinal {
+        exchange: ExchangeKey,
+        status: StatusCode,
+        to_tag: Tag,
+        body: Option<Description>,
+    },
+    /// Submit a provisional response of an incoming INVITE through its
     /// responder, with `to_tag` on its To, then report the verdict with
-    /// [`Model::final_committed`] or [`Model::final_refused`].
-    SubmitFinal { exchange: ExchangeKey, status: StatusCode, to_tag: Tag },
+    /// [`Model::provisional_done`]. `operation` is `None` when the UA sends
+    /// it again on its own.
+    SubmitProvisional {
+        exchange: ExchangeKey,
+        status: StatusCode,
+        to_tag: Tag,
+        operation: Option<OperationId>,
+    },
+    /// Send the 2xx of an incoming INVITE again, as it was first submitted,
+    /// through the INVITE's reply route. Nothing reports back. A copy that
+    /// does not get out is covered by the next one.
+    Resend2xx { exchange: ExchangeKey },
     /// Send the INVITE of an attempt, which [`Model::take_invite`] hands
     /// over, then report the outcome with [`Model::invite_started`] or
     /// [`Model::invite_failed`].
@@ -167,6 +214,13 @@ pub(crate) enum Refusal {
     /// It is tagged for a dialog this user agent does not have. A 481 (RFC
     /// 3261 section 12.2.2).
     NoDialog,
+    /// It is a merged copy of an INVITE this user agent is handling. A 482
+    /// (RFC 3261 section 8.2.2.2).
+    Merged,
+    /// It requires an extension, and this user agent supports none. A 420
+    /// whose Unsupported lists the request's Require tags (RFC 3261 section
+    /// 8.2.2.3).
+    BadExtension,
     /// Its route set is longer than the limit. A 500, by my policy, since no
     /// status says that the request is too long to keep state for.
     RouteSetTooLong,
@@ -182,7 +236,9 @@ impl Refusal {
     pub(crate) fn status(self) -> StatusCode {
         let code = match self {
             Refusal::Malformed(_) => 400,
+            Refusal::BadExtension => 420,
             Refusal::NoDialog => 481,
+            Refusal::Merged => 482,
             Refusal::RouteSetTooLong
             | Refusal::Unsupported
             | Refusal::Internal => 500,
@@ -209,7 +265,10 @@ impl From<DialogError> for Refusal {
 }
 
 /// What the application is told. Losing one of these loses no protocol
-/// state or terminal outcome.
+/// state, and the outcome of an operation reaches its waiter apart from them.
+///
+/// TODO: Keep why a usage ended for a while after it is reclaimed, so that a
+/// snapshot can tell an ACK timeout whose notification was lost.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Event {
     /// A provisional response formed an early dialog.
@@ -219,6 +278,9 @@ pub(crate) enum Event {
     DialogConfirmed { dialog: DialogKey, usage: UsageKey },
     /// The offer/answer exchange of a usage completed.
     NegotiationCompleted { usage: UsageKey },
+    /// No ACK came for the 2xx of an incoming INVITE by its deadline. The
+    /// usage ends next.
+    AckTimeout { usage: UsageKey },
     /// The usage ended.
     UsageEnded { usage: UsageKey },
     /// An attempt got a final response other than a 2xx, which ended its
@@ -239,6 +301,9 @@ pub(crate) struct Model<R> {
     dialog_index: HashMap<DialogId, DialogKey>,
     /// Finds the replay context of a 2xx or ACK from the wire.
     replay_index: HashMap<ReplayId, ReplayKey>,
+    /// Finds the incoming exchange a merged INVITE is a copy of.
+    merge_index: HashMap<MergeKey, ExchangeKey>,
+    timers: TimerQueue,
     operations: Operations,
     commands: VecDeque<(OperationId, Command)>,
     effects: Vec<Effect>,
@@ -256,6 +321,8 @@ impl<R: Random> Model<R> {
             replays: Slots::new(limits.replays),
             dialog_index: HashMap::new(),
             replay_index: HashMap::new(),
+            merge_index: HashMap::new(),
+            timers: TimerQueue::default(),
             operations: Operations::new(
                 limits.operations,
                 limits.outcome_retention,
@@ -311,10 +378,11 @@ impl<R: Random> Model<R> {
     pub(crate) fn run_commands(&mut self, now: Instant) {
         while let Some((operation, command)) = self.commands.pop_front() {
             match command {
-                Command::Accept { authority } => self.submit_final(
+                Command::Accept { authority, answer } => self.submit_final(
                     Some(operation),
                     authority.exchange,
                     StatusCode::OK,
+                    Some(answer),
                     now,
                 ),
                 Command::Reject { authority, status } => {
@@ -323,6 +391,7 @@ impl<R: Random> Model<R> {
                             Some(operation),
                             authority.exchange,
                             status,
+                            None,
                             now,
                         );
                     } else {
@@ -332,6 +401,9 @@ impl<R: Random> Model<R> {
                             now,
                         );
                     }
+                }
+                Command::Provisional { exchange, status } => {
+                    self.provisional(operation, exchange, status, now)
                 }
                 Command::Invite { request } => {
                     self.invite(operation, *request, now)
@@ -363,9 +435,29 @@ impl<R: Random> Model<R> {
         self.operations.expire(now)
     }
 
-    /// Returns when [`Model::expire`] has something to do next.
+    /// Returns when [`Model::expire`] or [`Model::fire_timers`] has
+    /// something to do next.
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
-        self.operations.next_expiry()
+        match (self.operations.next_expiry(), self.timers.next()) {
+            (Some(expiry), Some(timer)) => Some(expiry.min(timer)),
+            (expiry, timer) => expiry.or(timer),
+        }
+    }
+
+    /// Runs the timers due by `now`.
+    pub(crate) fn fire_timers(&mut self, now: Instant) {
+        while let Some((at, timer)) = self.timers.pop_due(now) {
+            match timer {
+                Timer::Decision(exchange) => self.decision_due(exchange, now),
+                Timer::Provisional(exchange) => {
+                    self.provisional_due(exchange, at, now)
+                }
+                Timer::Retransmit(replay) => {
+                    self.retransmission_due(replay, at, now)
+                }
+                Timer::AckDeadline(replay) => self.ack_overdue(replay),
+            }
+        }
     }
 
     /// Returns where a usage stands, or `None` once it has been reclaimed.
@@ -402,12 +494,16 @@ impl<R: Random> Model<R> {
     /// Takes in an INVITE and returns the authority to decide it, or the
     /// reason to refuse it before the application sees it.
     ///
-    /// `offer_in_request` says whether the body is an offer. Telling that is
-    /// the job of the body adapter, not of this model.
+    /// The checks follow the order of RFC 3261 section 8.2.2: the To tag, a
+    /// merged request, then Require. `offer_in_request` says whether the body
+    /// is an offer. Telling that is the job of the body adapter, not of this
+    /// model. The application's decision is due one decision timeout after
+    /// `now`.
     pub(crate) fn receive_invite<B>(
         &mut self,
         request: &Request<B>,
         offer_in_request: bool,
+        now: Instant,
     ) -> Result<Authority, Refusal> {
         match self.classify(request)? {
             Incoming::Initial => {}
@@ -416,18 +512,44 @@ impl<R: Random> Model<R> {
             Incoming::InDialog(_) => return Err(Refusal::Unsupported),
         }
 
+        let headers = request.headers();
+        let merge = MergeKey {
+            call_id: protocol::call_id(headers)?.into(),
+            from_tag: protocol::from(headers)?.tag.map(Into::into),
+            cseq: protocol::cseq(headers)?.0,
+        };
+        // The core absorbs a retransmission in the INVITE's transaction, so a
+        // request that reaches the UA with the identity of an exchange it
+        // holds came by another path.
+        if self.merge_index.contains_key(&merge) {
+            return Err(Refusal::Merged);
+        }
+        if protocol::requires_extension(headers)? {
+            return Err(Refusal::BadExtension);
+        }
+
         let Some(local_tag) = self.tag() else {
             return Err(Refusal::Internal);
         };
         let dialog = Dialog::uas(request, local_tag, self.limits.routes)?;
-        let cseq = protocol::cseq(request.headers())?.0;
-        let exchange =
-            InviteExchange::incoming(dialog, cseq, offer_in_request);
+        // A timeout too long to add to the clock sets no deadline, rather
+        // than overflow.
+        let decision_due = now.checked_add(self.limits.decision_timeout);
+        let exchange = InviteExchange::incoming(
+            dialog,
+            merge.clone(),
+            offer_in_request,
+            decision_due,
+        );
 
-        match self.exchanges.insert(exchange) {
-            Ok(exchange) => Ok(Authority { exchange }),
-            Err(_) => Err(Refusal::Busy),
+        let Ok(exchange) = self.exchanges.insert(exchange) else {
+            return Err(Refusal::Busy);
+        };
+        self.merge_index.insert(merge, exchange);
+        if let Some(due) = decision_due {
+            self.timers.set(due, Timer::Decision(exchange));
         }
+        Ok(Authority { exchange })
     }
 
     /// Sends the final response of an exchange that has none yet.
@@ -439,6 +561,7 @@ impl<R: Random> Model<R> {
         operation: Option<OperationId>,
         key: ExchangeKey,
         status: StatusCode,
+        body: Option<Description>,
         now: Instant,
     ) {
         let Some(exchange) = self.exchanges.get(key) else {
@@ -463,14 +586,18 @@ impl<R: Random> Model<R> {
         // aside before it goes out, so it never goes out without them.
         // `final_committed` uses them, and `final_refused` gives them back.
         if status.is_success() && !self.reserve_session() {
-            // TODO: Send the exchange's final through the abandonment path.
-            // Its authority went with the command, so nobody else can.
             if let Some(operation) = operation {
                 self.complete(operation, Err(Error::CapacityExceeded), now);
             }
+            // The authority went with the command, so nobody else can answer
+            // the INVITE. The UA does, with the 503 of a server without room
+            // (RFC 3261 section 21.5.4). Answering at all is my policy.
+            let unavailable = StatusCode::from_u16(503).expect("a status");
+            self.submit_final(None, key, unavailable, None, now);
             return;
         }
 
+        self.stop_exchange_timers(key);
         self.exchanges
             .get_mut(key)
             .expect("checked above")
@@ -480,7 +607,25 @@ impl<R: Random> Model<R> {
             exchange: key,
             status,
             to_tag,
+            body,
         });
+    }
+
+    /// Answers an INVITE with a final response of the UA's own, unless a
+    /// final is already decided or under way.
+    pub(crate) fn reject(
+        &mut self,
+        exchange: ExchangeKey,
+        status: StatusCode,
+        now: Instant,
+    ) {
+        let pending = self.exchanges.get(exchange).is_some_and(|exchange| {
+            exchange.state() == ExchangeState::Pending
+        });
+
+        if pending {
+            self.submit_final(None, exchange, status, None, now);
+        }
     }
 
     /// Answers an INVITE whose authority was dropped without a decision.
@@ -489,17 +634,179 @@ impl<R: Random> Model<R> {
     /// that no INVITE stays unanswered once nobody can decide it. The 500 is
     /// my policy. No RFC rule picks the status.
     pub(crate) fn abandon(&mut self, exchange: ExchangeKey, now: Instant) {
-        let pending = self.exchanges.get(exchange).is_some_and(|exchange| {
-            exchange.state() == ExchangeState::Pending
-        });
+        let error = StatusCode::from_u16(500).expect("a final status");
+        self.reject(exchange, error, now);
+    }
 
-        if pending {
-            let status = StatusCode::from_u16(500).expect("a final status");
-            self.submit_final(None, exchange, status, now);
+    /// Answers an INVITE the application has not decided in time, as an
+    /// abandoned one. The deadline is my policy, so that an application that
+    /// loses track of a decision does not leave the caller waiting for
+    /// Timer C of every proxy on the way. The application keeps the
+    /// authority. A decision it submits later gets `AlreadyFinalized` while
+    /// the 500 is under way, and `StaleDecision` once the exchange is gone.
+    fn decision_due(&mut self, exchange: ExchangeKey, now: Instant) {
+        if let Some(InviteExchange {
+            scope: Scope::Incoming { decision_due, .. },
+            ..
+        }) = self.exchanges.get_mut(exchange)
+        {
+            *decision_due = None;
+        }
+        self.abandon(exchange, now);
+    }
+
+    /// Sends a provisional response the application chose.
+    fn provisional(
+        &mut self,
+        operation: OperationId,
+        key: ExchangeKey,
+        status: StatusCode,
+        now: Instant,
+    ) {
+        let Some(exchange) = self.exchanges.get(key) else {
+            self.complete(operation, Err(Error::StaleDecision), now);
+            return;
+        };
+        if exchange.state() != ExchangeState::Pending {
+            self.complete(operation, Err(Error::AlreadyFinalized), now);
+            return;
+        }
+        let Scope::Incoming { dialog: Some(dialog), .. } = &exchange.scope
+        else {
+            unreachable!("a pending incoming exchange keeps its dialog");
+        };
+        // A 100 is the core's to send (RFC 3261 section 17.2.1).
+        if !(101..=199).contains(&status.as_u16()) {
+            self.complete(operation, Err(Error::InvalidInput), now);
+            return;
+        }
+
+        let to_tag = dialog.id().local_tag().clone();
+        self.effects.push(Effect::SubmitProvisional {
+            exchange: key,
+            status,
+            to_tag,
+            operation: Some(operation),
+        });
+    }
+
+    /// Records the core's verdict on a provisional response.
+    ///
+    /// The last provisional the application got into the core is the one the
+    /// UA sends again a minute later, and every minute after, until a final
+    /// is under way. RFC 3261 section 13.3.1.1 asks for that of a UAS that
+    /// takes long to answer. The UA does not pick a provisional of its own,
+    /// since only the application knows whether the phone rings.
+    pub(crate) fn provisional_done(
+        &mut self,
+        key: ExchangeKey,
+        status: StatusCode,
+        operation: Option<OperationId>,
+        result: Result<(), Error>,
+        now: Instant,
+    ) {
+        let Some(operation) = operation else {
+            return;
+        };
+        if let Err(error) = result {
+            self.complete(operation, Err(error), now);
+            return;
+        }
+        self.operations.advance(operation, Stage::Committed);
+        self.complete(operation, Ok(Completion::Done), now);
+
+        let Some(exchange) = self.exchanges.get_mut(key) else {
+            return;
+        };
+        if exchange.state() != ExchangeState::Pending {
+            return;
+        }
+        let Scope::Incoming { provisional, .. } = &mut exchange.scope else {
+            return;
+        };
+        if let Some((_, at)) = provisional.take() {
+            self.timers.cancel(at, Timer::Provisional(key));
+        }
+        let at = now + PROVISIONAL_INTERVAL;
+        *provisional = Some((status, at));
+        self.timers.set(at, Timer::Provisional(key));
+    }
+
+    /// Sends the last provisional response again, and sets the next time.
+    fn provisional_due(
+        &mut self,
+        key: ExchangeKey,
+        at: Instant,
+        now: Instant,
+    ) {
+        let Some(exchange) = self.exchanges.get_mut(key) else {
+            return;
+        };
+        if exchange.state() != ExchangeState::Pending {
+            return;
+        }
+        let Scope::Incoming {
+            dialog: Some(dialog),
+            provisional: Some((status, due)),
+            ..
+        } = &mut exchange.scope
+        else {
+            return;
+        };
+
+        let next = after(at, PROVISIONAL_INTERVAL, now);
+        *due = next;
+        self.timers.set(next, Timer::Provisional(key));
+        self.effects.push(Effect::SubmitProvisional {
+            exchange: key,
+            status: *status,
+            to_tag: dialog.id().local_tag().clone(),
+            operation: None,
+        });
+    }
+
+    /// Cancels the decision deadline and the provisional replay of an
+    /// incoming exchange, as when a final is under way.
+    fn stop_exchange_timers(&mut self, key: ExchangeKey) {
+        let Some(InviteExchange {
+            scope: Scope::Incoming { decision_due, provisional, .. },
+            ..
+        }) = self.exchanges.get_mut(key)
+        else {
+            return;
+        };
+
+        if let Some(at) = decision_due.take() {
+            self.timers.cancel(at, Timer::Decision(key));
+        }
+        if let Some((_, at)) = provisional.take() {
+            self.timers.cancel(at, Timer::Provisional(key));
         }
     }
 
+    /// Removes an incoming exchange with its timers and its place in the
+    /// merge index, and has the runtime let go of its responder.
+    fn drop_exchange(&mut self, key: ExchangeKey) {
+        self.stop_exchange_timers(key);
+        let Some(exchange) = self.exchanges.remove(key) else {
+            return;
+        };
+
+        if let Scope::Incoming { merge, .. } = &exchange.scope {
+            if self.merge_index.get(merge) == Some(&key) {
+                self.merge_index.remove(merge);
+            }
+        }
+        self.effects.push(Effect::Released(Released::Exchange(key)));
+    }
+
     /// Records the core's acceptance of a final response in flight.
+    ///
+    /// For a 2xx, RFC 3261 section 13.3.1.4 counts the retransmissions and
+    /// the ACK deadline from its first transmission. The model counts from
+    /// `now`, when the runtime learns that the core took it, which is the
+    /// nearest time it knows and never earlier. The deadline can therefore
+    /// fall a little after the core's Timer L, never before.
     pub(crate) fn final_committed(&mut self, key: ExchangeKey, now: Instant) {
         let Some(exchange) = self.exchanges.get_mut(key) else {
             return;
@@ -511,8 +818,7 @@ impl<R: Random> Model<R> {
         // The core acknowledges a non-2xx itself (RFC 3261 section
         // 17.2.1), so nothing is left for the UA once it takes one.
         if !status.is_success() {
-            self.exchanges.remove(key);
-            self.effects.push(Effect::Released(Released::Exchange(key)));
+            self.drop_exchange(key);
             if let Some(operation) = operation {
                 self.complete(operation, Ok(Completion::Done), now);
             }
@@ -520,7 +826,8 @@ impl<R: Random> Model<R> {
         }
 
         let cseq = exchange.cseq;
-        let Scope::Incoming { dialog, offer_in_request } = &mut exchange.scope
+        let Scope::Incoming { dialog, offer_in_request, .. } =
+            &mut exchange.scope
         else {
             unreachable!("only incoming exchanges submit finals");
         };
@@ -544,13 +851,24 @@ impl<R: Random> Model<R> {
             cseq,
             direction: Direction::Incoming,
         };
-        let (_, usage) = self.establish(
+        let (replay, usage) = self.establish(
             dialog,
             Direction::Incoming,
             negotiation,
             replay,
             Source::Exchange(key),
         );
+
+        // RFC 3261 section 13.3.1.4 has the 2xx go out again T1 later, and
+        // gives up on its ACK 64 T1 after the first.
+        let (t1, deadline) = (self.limits.t1, now + self.limits.t1 * 64);
+        let next = (now + t1 < deadline).then_some(now + t1);
+        self.replays.get_mut(replay).expect("just made").retransmission =
+            Some(Retransmission { next, interval: t1, deadline });
+        if let Some(next) = next {
+            self.timers.set(next, Timer::Retransmit(replay));
+        }
+        self.timers.set(deadline, Timer::AckDeadline(replay));
 
         if let Some(operation) = operation {
             self.operations.advance(operation, Stage::Committed);
@@ -585,7 +903,10 @@ impl<R: Random> Model<R> {
         });
 
         if let Some((_, exchange)) = in_flight {
-            exchange.early_ack = Some(answer);
+            // A copy of the ACK carries what the first one did, so a copy
+            // without a body does not undo an answer that came before it.
+            exchange.early_ack =
+                Some(exchange.early_ack == Some(true) || answer);
         }
     }
 
@@ -593,7 +914,8 @@ impl<R: Random> Model<R> {
     ///
     /// Unless `closed`, the core left the transaction as it was, so the
     /// exchange is pending again. Nobody holds its authority any more, so
-    /// the UA answers it as an abandoned one. When `closed`, nobody knows
+    /// the UA answers it as an abandoned one, and does not submit the
+    /// refused final again. When `closed`, nobody knows
     /// whether the core took the response, and the endpoint is going away,
     /// so nothing more is sent.
     pub(crate) fn final_refused(
@@ -624,22 +946,22 @@ impl<R: Random> Model<R> {
         }
 
         if closed {
-            self.exchanges.remove(key);
-            self.effects.push(Effect::Released(Released::Exchange(key)));
+            self.drop_exchange(key);
         } else if operation.is_some() {
             self.abandon(key, now);
         } else {
-            // TODO: Retry the UA's own final once the core has room, rather
-            // than leave the transaction to end on its timers.
-            self.exchanges.remove(key);
-            self.effects.push(Effect::Released(Released::Exchange(key)));
+            // The UA's own final was refused. I do not retry it, since no
+            // RFC rule asks for more than a final response, and signa-core
+            // gives one. Dropping the exchange drops its responder, and
+            // signa-core sends its 500 for an unanswered one.
+            self.drop_exchange(key);
         }
     }
 
     /// Takes in an ACK as received. `answer` says whether it carries the
     /// answer to an offer in the 2xx. An ACK without the dialog headers is
-    /// dropped, since no response to an ACK exists (RFC 3261 section 17.1.1.3
-    /// has the client send it without a transaction).
+    /// dropped. Nothing answers an ACK, since the ACK of a 2xx goes outside
+    /// any transaction (RFC 3261 section 13.2.2.4).
     pub(crate) fn receive_ack_request<B>(
         &mut self,
         request: &Request<B>,
@@ -655,7 +977,9 @@ impl<R: Random> Model<R> {
     }
 
     /// Takes in an ACK. An ACK that matches no 2xx this user agent sent is
-    /// dropped without a response or a change of state.
+    /// dropped without a response or a change of state. One that matches
+    /// stops the 2xx's retransmissions (RFC 3261 section 13.3.1.4), whatever
+    /// its body says.
     pub(crate) fn receive_ack(
         &mut self,
         dialog: &DialogId,
@@ -680,12 +1004,9 @@ impl<R: Random> Model<R> {
         replay.duplicates_ended();
         let (usage, source) = (replay.usage, replay.source);
 
+        self.stop_retransmission(key);
         if let Source::Exchange(exchange) = source {
-            if let Some(mut record) = self.exchanges.remove(exchange) {
-                record.complete();
-                self.effects
-                    .push(Effect::Released(Released::Exchange(exchange)));
-            }
+            self.drop_exchange(exchange);
         }
         if let Some(record) = self.usages.get_mut(usage) {
             // TODO: Treat an ACK without the answer it owes as a negotiation
@@ -699,6 +1020,89 @@ impl<R: Random> Model<R> {
         }
         self.reclaim_replay(key);
     }
+
+    /// Sends a 2xx again and sets the next time, its interval doubled up to
+    /// T2 (RFC 3261 section 13.3.1.4). No copy is scheduled at or after the
+    /// deadline.
+    fn retransmission_due(
+        &mut self,
+        key: ReplayKey,
+        at: Instant,
+        now: Instant,
+    ) {
+        let Some(replay) = self.replays.get_mut(key) else {
+            return;
+        };
+        let (Some(retransmission), Source::Exchange(exchange)) =
+            (&mut replay.retransmission, replay.source)
+        else {
+            return;
+        };
+
+        retransmission.interval =
+            (retransmission.interval * 2).min(self.limits.t2);
+        let next = after(at, retransmission.interval, now);
+        retransmission.next = (next < retransmission.deadline).then_some(next);
+        if let Some(next) = retransmission.next {
+            self.timers.set(next, Timer::Retransmit(key));
+        }
+        self.effects.push(Effect::Resend2xx { exchange });
+    }
+
+    /// Cancels what is left of a 2xx's retransmission.
+    fn stop_retransmission(&mut self, key: ReplayKey) {
+        let Some(retransmission) = self
+            .replays
+            .get_mut(key)
+            .and_then(|replay| replay.retransmission.take())
+        else {
+            return;
+        };
+
+        if let Some(next) = retransmission.next {
+            self.timers.cancel(next, Timer::Retransmit(key));
+        }
+        self.timers.cancel(retransmission.deadline, Timer::AckDeadline(key));
+    }
+
+    /// Gives up on the ACK of a 2xx this user agent sent.
+    ///
+    /// RFC 3261 section 13.3.1.4 leaves the dialog confirmed and has the
+    /// session end with a BYE. A late ACK finds nothing afterwards, so it
+    /// brings back neither the usage nor the retransmissions.
+    ///
+    /// TODO: Send that BYE. Until then the usage ends here without one, and
+    /// the application is told why.
+    fn ack_overdue(&mut self, key: ReplayKey) {
+        let Some(replay) = self.replays.get_mut(key) else {
+            return;
+        };
+        if replay.ack != AckObligation::AwaitingPeer {
+            return;
+        }
+
+        replay.ack = AckObligation::Failed;
+        replay.duplicates_ended();
+        let (usage, source) = (replay.usage, replay.source);
+
+        self.stop_retransmission(key);
+        if let Source::Exchange(exchange) = source {
+            self.drop_exchange(exchange);
+        }
+        if self.usages.get(usage).is_some() {
+            self.effects.push(Effect::Notify(Event::AckTimeout { usage }));
+            self.end_usage(usage);
+        }
+        self.reclaim_replay(key);
+    }
+}
+
+/// Returns `interval` after `at`, the time a timer was due, or after `now`
+/// when that has passed too, so that a late driver sends one copy rather
+/// than a burst to catch up.
+fn after(at: Instant, interval: Duration, now: Instant) -> Instant {
+    let next = at + interval;
+    if next > now { next } else { now + interval }
 }
 
 /// Initial INVITEs this user agent sends.
@@ -1190,10 +1594,13 @@ mod tests {
         error::WireEffect,
         invite::UsagePhase,
         operation::Snapshot,
-        tests::{invite, reply, request, INVITE},
+        tests::{INVITE, invite, reply, request},
     };
 
     const RETENTION: Duration = Duration::from_secs(32);
+    const T1: Duration = Duration::from_millis(500);
+    const T2: Duration = Duration::from_secs(4);
+    const DECISION: Duration = Duration::from_secs(180);
 
     /// Counts up from one, so each tag is predictable.
     struct Counter(u64);
@@ -1229,7 +1636,18 @@ mod tests {
             operations: 4,
             commands: 4,
             outcome_retention: RETENTION,
+            t1: T1,
+            t2: T2,
+            decision_timeout: DECISION,
         }
+    }
+
+    /// An answer, which the model passes on without reading.
+    fn answer() -> Description {
+        Description::new(
+            signa_core::HeaderValue::from_static("application/sdp"),
+            Bytes::from_static(b"v=0\r\n"),
+        )
     }
 
     fn model(limits: Limits) -> Model<Counter> {
@@ -1260,7 +1678,11 @@ mod tests {
             }
             assert_eq!(self.dialogs.len(), self.usages.len());
 
-            for (_, exchange) in self.exchanges.iter() {
+            // Each timer that is set belongs to a record that holds its
+            // instant, so none outlives its record.
+            let mut timers = 0;
+            let mut incoming = 0;
+            for (key, exchange) in self.exchanges.iter() {
                 if let ExchangeState::FinalSubmissionPending {
                     operation: Some(operation),
                     ..
@@ -1269,7 +1691,32 @@ mod tests {
                     let snapshot = self.operations.snapshot(operation);
                     assert_eq!(snapshot.unwrap().outcome, None);
                 }
+                if let Scope::Incoming {
+                    merge,
+                    decision_due,
+                    provisional,
+                    ..
+                } = &exchange.scope
+                {
+                    incoming += 1;
+                    assert_eq!(self.merge_index.get(merge), Some(&key));
+                    timers += usize::from(decision_due.is_some());
+                    timers += usize::from(provisional.is_some());
+                    if exchange.state() != ExchangeState::Pending {
+                        assert!(
+                            decision_due.is_none() && provisional.is_none()
+                        );
+                    }
+                }
             }
+            for (_, replay) in self.replays.iter() {
+                if let Some(retransmission) = replay.retransmission {
+                    assert_eq!(replay.ack, AckObligation::AwaitingPeer);
+                    timers += 1 + usize::from(retransmission.next.is_some());
+                }
+            }
+            assert_eq!(self.merge_index.len(), incoming);
+            assert_eq!(self.timers.len(), timers);
         }
 
         fn replay(&self, effects: &[Effect]) -> &ReplayContext {
@@ -1327,6 +1774,53 @@ mod tests {
         })
     }
 
+    /// Has the UAS take the INVITE, accept it and the core take the 2xx at
+    /// the clock's time, and returns the exchange, the replay context and the
+    /// usage.
+    fn accepted(
+        model: &mut Model<Counter>,
+        clock: &Clock,
+    ) -> (ExchangeKey, ReplayKey, UsageKey) {
+        let authority =
+            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
+        let exchange = authority.exchange;
+        model
+            .try_submit(Command::Accept { authority, answer: answer() })
+            .unwrap();
+        model.run_commands(clock.now());
+        model.final_committed(exchange, clock.now());
+
+        let (dialog, usage) = confirmed(&model.take_effects());
+        let id = model.dialogs.get(dialog).unwrap().id().clone();
+        let replay = model.replay_index[&ReplayId {
+            dialog: id,
+            cseq: 314159,
+            direction: Direction::Incoming,
+        }];
+        (exchange, replay, usage)
+    }
+
+    /// The dialog of the INVITE, as the UAS of [`accepted`] sees it.
+    fn uas_dialog() -> DialogId {
+        DialogId::new(
+            "a84b4c76e66710@pc33.atlanta.example.com".into(),
+            "0000000000000001".parse().unwrap(),
+            Some("1928301774".parse().unwrap()),
+        )
+    }
+
+    /// Moves the clock to `to` and runs the timers due by then.
+    fn advance_to(
+        model: &mut Model<Counter>,
+        clock: &mut Clock,
+        to: Instant,
+    ) -> Vec<Effect> {
+        clock.0 = to;
+        model.fire_timers(clock.now());
+        model.check();
+        model.take_effects()
+    }
+
     /// A UAS takes an INVITE without an offer and accepts it. The 2xx
     /// carries the offer, so its answer comes in the ACK. Once the core has
     /// the 2xx, the dialog is confirmed, but the ACK is still awaited and the
@@ -1335,10 +1829,14 @@ mod tests {
     fn dialog_confirmed_is_not_ack_received_or_media_ready() {
         let clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority = model.receive_invite(&request(INVITE), false).unwrap();
+        let authority = model
+            .receive_invite(&request(INVITE), false, clock.now())
+            .unwrap();
         let exchange = authority.exchange;
 
-        model.try_submit(Command::Accept { authority }).unwrap();
+        model
+            .try_submit(Command::Accept { authority, answer: answer() })
+            .unwrap();
         model.run_commands(clock.now());
         assert_eq!(finals(model.take_effects()), [(exchange, 200)]);
         model.final_committed(exchange, clock.now());
@@ -1442,11 +1940,13 @@ mod tests {
     fn accepted_command_survives_waiter_drop() {
         let mut clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority = model.receive_invite(&request(INVITE), true).unwrap();
+        let authority =
+            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
         let exchange = authority.exchange;
 
-        let operation =
-            model.try_submit(Command::Accept { authority }).unwrap();
+        let operation = model
+            .try_submit(Command::Accept { authority, answer: answer() })
+            .unwrap();
         model.waiter_dropped(operation, clock.now());
         clock.advance(RETENTION);
         model.expire(clock.now());
@@ -1480,15 +1980,22 @@ mod tests {
     fn unsent_busy_command_preserves_decision_authority() {
         let clock = Clock(Instant::now());
         let mut model = model(Limits { commands: 1, ..limits() });
-        let first =
-            model.receive_invite(&invite("one@example.com"), true).unwrap();
-        let second =
-            model.receive_invite(&invite("two@example.com"), true).unwrap();
+        let first = model
+            .receive_invite(&invite("one@example.com"), true, clock.now())
+            .unwrap();
+        let second = model
+            .receive_invite(&invite("two@example.com"), true, clock.now())
+            .unwrap();
         let exchange = second.exchange;
-        model.try_submit(Command::Accept { authority: first }).unwrap();
+        model
+            .try_submit(Command::Accept { authority: first, answer: answer() })
+            .unwrap();
 
         let refused = model
-            .try_submit(Command::Accept { authority: second })
+            .try_submit(Command::Accept {
+                authority: second,
+                answer: answer(),
+            })
             .unwrap_err();
 
         assert_eq!(refused.error, Error::Busy);
@@ -1515,11 +2022,17 @@ mod tests {
     fn a_losing_or_stale_decision_has_no_wire_effect() {
         let clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority = model.receive_invite(&request(INVITE), true).unwrap();
+        let authority =
+            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
         let exchange = authority.exchange;
         let forged = Authority { exchange };
-        model.try_submit(Command::Accept { authority }).unwrap();
-        let losing = model.try_submit(Command::Accept { authority: forged });
+        model
+            .try_submit(Command::Accept { authority, answer: answer() })
+            .unwrap();
+        let losing = model.try_submit(Command::Accept {
+            authority: forged,
+            answer: answer(),
+        });
 
         model.run_commands(clock.now());
 
@@ -1531,6 +2044,7 @@ mod tests {
                     exchange,
                     status: StatusCode::OK,
                     to_tag: "0000000000000001".parse().unwrap(),
+                    body: Some(answer()),
                 },
                 Effect::OperationEnded { operation: losing },
             ],
@@ -1542,7 +2056,10 @@ mod tests {
 
         model.exchanges.remove(exchange);
         let stale = model
-            .try_submit(Command::Accept { authority: Authority { exchange } })
+            .try_submit(Command::Accept {
+                authority: Authority { exchange },
+                answer: answer(),
+            })
             .unwrap();
         model.run_commands(clock.now());
 
@@ -1557,30 +2074,29 @@ mod tests {
     }
 
     /// The dialog, usage and replay context of a 2xx are set aside before
-    /// it is submitted. Without room, the 2xx does not go out.
+    /// it is submitted. Without room, the 2xx does not go out, and the UA
+    /// answers the INVITE with a 503 in its place, since the authority went
+    /// with the accept.
     #[test]
     fn no_2xx_without_room_for_its_session() {
         let clock = Clock(Instant::now());
         let mut model = model(Limits { replays: 0, ..limits() });
-        let authority = model.receive_invite(&request(INVITE), true).unwrap();
+        let authority =
+            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
         let exchange = authority.exchange;
 
-        let operation =
-            model.try_submit(Command::Accept { authority }).unwrap();
+        let operation = model
+            .try_submit(Command::Accept { authority, answer: answer() })
+            .unwrap();
         model.run_commands(clock.now());
         model.check();
 
-        assert_eq!(
-            model.take_effects(),
-            [Effect::OperationEnded { operation }],
-        );
+        let effects = model.take_effects();
+        assert_eq!(effects[0], Effect::OperationEnded { operation });
+        assert_eq!(finals(effects[1..].to_vec()), [(exchange, 503)]);
         assert_eq!(
             model.operations.snapshot(operation).unwrap().outcome,
             Some(Err(Error::CapacityExceeded)),
-        );
-        assert_eq!(
-            model.exchanges.get(exchange).unwrap().state(),
-            ExchangeState::Pending,
         );
         assert!(model.dialogs.reserve(), "the reservation was given back");
     }
@@ -1591,9 +2107,12 @@ mod tests {
     fn an_unknown_ack_changes_nothing() {
         let clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority = model.receive_invite(&request(INVITE), true).unwrap();
+        let authority =
+            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
         let exchange = authority.exchange;
-        model.try_submit(Command::Accept { authority }).unwrap();
+        model
+            .try_submit(Command::Accept { authority, answer: answer() })
+            .unwrap();
         model.run_commands(clock.now());
         model.final_committed(exchange, clock.now());
         let (dialog, _) = confirmed(&model.take_effects());
@@ -1622,10 +2141,13 @@ mod tests {
     fn tags_come_from_the_injected_randomness() {
         let clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority = model.receive_invite(&request(INVITE), true).unwrap();
+        let authority =
+            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
         let exchange = authority.exchange;
 
-        model.try_submit(Command::Accept { authority }).unwrap();
+        model
+            .try_submit(Command::Accept { authority, answer: answer() })
+            .unwrap();
         model.run_commands(clock.now());
         model.final_committed(exchange, clock.now());
 
@@ -1640,13 +2162,15 @@ mod tests {
     #[test]
     fn unknown_tagged_request_is_not_new_initial_invite() {
         let mut model = model(limits());
+        let clock = Clock(Instant::now());
         let tagged = INVITE.replace(
             "To: Bob <sip:bob@biloxi.example.com>",
             "To: Bob <sip:bob@biloxi.example.com>;tag=lost",
         );
 
-        let refusal =
-            model.receive_invite(&request(&tagged), true).unwrap_err();
+        let refusal = model
+            .receive_invite(&request(&tagged), true, clock.now())
+            .unwrap_err();
 
         assert_eq!(refusal, Refusal::NoDialog);
         assert_eq!(refusal.status().as_u16(), 481);
@@ -1660,9 +2184,12 @@ mod tests {
     fn a_tagged_request_finds_its_dialog() {
         let clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority = model.receive_invite(&request(INVITE), true).unwrap();
+        let authority =
+            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
         let exchange = authority.exchange;
-        model.try_submit(Command::Accept { authority }).unwrap();
+        model
+            .try_submit(Command::Accept { authority, answer: answer() })
+            .unwrap();
         model.run_commands(clock.now());
         model.final_committed(exchange, clock.now());
         let (dialog, _) = confirmed(&model.take_effects());
@@ -1691,9 +2218,12 @@ mod tests {
     #[test]
     fn an_invite_without_contact_is_refused() {
         let mut model = model(limits());
+        let clock = Clock(Instant::now());
         let text = INVITE.replace("Contact: <sip:alice@192.0.2.1>\n", "");
 
-        let refusal = model.receive_invite(&request(&text), true).unwrap_err();
+        let refusal = model
+            .receive_invite(&request(&text), true, clock.now())
+            .unwrap_err();
 
         assert_eq!(refusal, Refusal::Malformed(Field::Contact));
         assert_eq!(refusal.status().as_u16(), 400);
@@ -1798,7 +2328,8 @@ mod tests {
     fn a_rejection_leaves_nothing_behind() {
         let clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority = model.receive_invite(&request(INVITE), true).unwrap();
+        let authority =
+            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
         let exchange = authority.exchange;
         let busy = StatusCode::from_u16(486).unwrap();
 
@@ -1827,7 +2358,8 @@ mod tests {
     fn a_rejection_with_a_2xx_is_invalid() {
         let clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority = model.receive_invite(&request(INVITE), true).unwrap();
+        let authority =
+            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
 
         let operation = model
             .try_submit(Command::Reject { authority, status: StatusCode::OK })
@@ -1850,13 +2382,19 @@ mod tests {
     fn an_abandoned_invite_gets_a_500() {
         let clock = Clock(Instant::now());
         let mut model = model(limits());
-        let abandoned = model.receive_invite(&request(INVITE), true).unwrap();
+        let abandoned =
+            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
         let decided = model
-            .receive_invite(&invite("decided@example.com"), true)
+            .receive_invite(&invite("decided@example.com"), true, clock.now())
             .unwrap();
         let (abandoned, decided_exchange) =
             (abandoned.exchange(), decided.exchange());
-        model.try_submit(Command::Accept { authority: decided }).unwrap();
+        model
+            .try_submit(Command::Accept {
+                authority: decided,
+                answer: answer(),
+            })
+            .unwrap();
         model.run_commands(clock.now());
         model.take_effects();
 
@@ -1878,10 +2416,13 @@ mod tests {
         for (call, closed) in
             [("refused@example.com", false), ("closed@example.com", true)]
         {
-            let authority = model.receive_invite(&invite(call), true).unwrap();
+            let authority = model
+                .receive_invite(&invite(call), true, clock.now())
+                .unwrap();
             let exchange = authority.exchange;
-            let operation =
-                model.try_submit(Command::Accept { authority }).unwrap();
+            let operation = model
+                .try_submit(Command::Accept { authority, answer: answer() })
+                .unwrap();
             model.run_commands(clock.now());
             model.take_effects();
 
@@ -2007,9 +2548,13 @@ mod tests {
     fn a_received_ack_finds_its_2xx() {
         let clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority = model.receive_invite(&request(INVITE), false).unwrap();
+        let authority = model
+            .receive_invite(&request(INVITE), false, clock.now())
+            .unwrap();
         let exchange = authority.exchange;
-        model.try_submit(Command::Accept { authority }).unwrap();
+        model
+            .try_submit(Command::Accept { authority, answer: answer() })
+            .unwrap();
         model.run_commands(clock.now());
         model.final_committed(exchange, clock.now());
         model.take_effects();
@@ -2043,9 +2588,11 @@ mod tests {
         }
 
         let mut model = Model::new(limits(), Broken);
+        let clock = Clock(Instant::now());
 
-        let refusal =
-            model.receive_invite(&request(INVITE), true).unwrap_err();
+        let refusal = model
+            .receive_invite(&request(INVITE), true, clock.now())
+            .unwrap_err();
 
         assert_eq!(refusal, Refusal::Internal);
         assert_eq!(refusal.status().as_u16(), 500);
@@ -2057,7 +2604,8 @@ mod tests {
     fn kept_outcomes_have_a_deadline() {
         let mut clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority = model.receive_invite(&request(INVITE), true).unwrap();
+        let authority =
+            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
         let busy = StatusCode::from_u16(486).unwrap();
         let operation = model
             .try_submit(Command::Reject { authority, status: busy })
@@ -2096,14 +2644,18 @@ mod tests {
     /// The ACK can reach the driver before the core's verdict on the 2xx
     /// does. It is kept and applied once the 2xx is committed, rather than
     /// dropped as matching nothing (RFC 3261 section 13.3.1.4 stops the 2xx
-    /// at its ACK).
+    /// at its ACK). No retransmission is left set.
     #[test]
-    fn an_ack_before_the_commit_is_not_lost() {
+    fn ack_arriving_before_submission_completion_is_not_lost() {
         let clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority = model.receive_invite(&request(INVITE), false).unwrap();
+        let authority = model
+            .receive_invite(&request(INVITE), false, clock.now())
+            .unwrap();
         let exchange = authority.exchange;
-        model.try_submit(Command::Accept { authority }).unwrap();
+        model
+            .try_submit(Command::Accept { authority, answer: answer() })
+            .unwrap();
         model.run_commands(clock.now());
         model.take_effects();
         let id = DialogId::new(
@@ -2114,11 +2666,403 @@ mod tests {
 
         model.receive_ack(&id, 314160, true);
         model.receive_ack(&id, 314159, true);
+        // A copy without a body does not undo the answer of the first.
+        model.receive_ack(&id, 314159, false);
         model.final_committed(exchange, clock.now());
         model.check();
 
         assert!(model.exchanges.get(exchange).is_none(), "the ACK applied");
         assert_eq!(model.replays.len(), 0);
+        assert_eq!(model.timers.len(), 0);
         assert!(negotiated(&model.take_effects()));
+    }
+
+    /// Once an accept is under way, nothing else picks the final: neither the
+    /// decision deadline, nor the drop of a forged authority, nor a reject.
+    /// After the core has the 2xx, the same holds.
+    #[test]
+    fn uas_final_response_is_selected_once() {
+        let mut clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let authority =
+            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
+        let exchange = authority.exchange;
+        model
+            .try_submit(Command::Accept { authority, answer: answer() })
+            .unwrap();
+        model.run_commands(clock.now());
+        assert_eq!(finals(model.take_effects()), [(exchange, 200)]);
+
+        let start = clock.now();
+        let effects = advance_to(&mut model, &mut clock, start + DECISION);
+        model.abandon(exchange, clock.now());
+        let rejected = model
+            .try_submit(Command::Reject {
+                authority: Authority { exchange },
+                status: StatusCode::from_u16(486).unwrap(),
+            })
+            .unwrap();
+        model.run_commands(clock.now());
+
+        assert!(effects.is_empty());
+        assert_eq!(
+            model.take_effects(),
+            [Effect::OperationEnded { operation: rejected }],
+        );
+        model.final_committed(exchange, clock.now());
+        model.take_effects();
+        model.abandon(exchange, clock.now());
+        assert!(model.take_effects().is_empty());
+        model.check();
+    }
+
+    /// The 2xx goes out again at T1, 2 T1 later, then 4 T1, capped at T2,
+    /// and the ACK deadline stays at 64 T1 after the first transmission
+    /// however many copies went out (RFC 3261 section 13.3.1.4).
+    #[test]
+    fn uas_ack_deadline_does_not_slide_on_each_retransmission() {
+        let mut clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let first = clock.now();
+        let (exchange, replay, usage) = accepted(&mut model, &clock);
+        let deadline = first + T1 * 64;
+        assert_eq!(
+            model
+                .replays
+                .get(replay)
+                .unwrap()
+                .retransmission
+                .unwrap()
+                .deadline,
+            deadline,
+        );
+
+        let mut copies = Vec::new();
+        while let Some(next) =
+            model.next_deadline().filter(|&at| at < deadline)
+        {
+            let effects = advance_to(&mut model, &mut clock, next);
+            assert_eq!(effects, [Effect::Resend2xx { exchange }]);
+            copies.push(next - first);
+        }
+
+        let millis: Vec<u128> =
+            copies.iter().map(|elapsed| elapsed.as_millis()).collect();
+        assert_eq!(
+            millis,
+            [500, 1500, 3500, 7500, 11500, 15500, 19500, 23500, 27500, 31500],
+        );
+        assert_eq!(model.next_deadline(), Some(deadline));
+        let effects = advance_to(
+            &mut model,
+            &mut clock,
+            deadline - Duration::from_millis(1),
+        );
+        assert!(effects.is_empty(), "nothing before the deadline");
+        let effects = advance_to(&mut model, &mut clock, deadline);
+        assert!(notices(&effects).contains(&Event::AckTimeout { usage }));
+    }
+
+    /// Without an ACK by the deadline, the retransmissions stop, the
+    /// application is told why, and the usage ends with its dialog. Nothing
+    /// of the exchange is left.
+    #[test]
+    fn no_ack_triggers_explicit_termination_policy() {
+        let mut clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let (exchange, replay, usage) = accepted(&mut model, &clock);
+        let deadline = clock.now() + T1 * 64;
+
+        let effects = advance_to(&mut model, &mut clock, deadline);
+
+        let notified = notices(&effects);
+        assert_eq!(
+            notified,
+            [Event::AckTimeout { usage }, Event::UsageEnded { usage }],
+        );
+        assert!(
+            effects.contains(&Effect::Released(Released::Exchange(exchange)))
+        );
+        assert!(effects.contains(&Effect::Released(Released::Replay(replay))));
+        assert!(model.exchanges.get(exchange).is_none());
+        assert_eq!(model.usages.len(), 0);
+        assert_eq!(model.dialogs.len(), 0);
+        assert_eq!(model.next_deadline(), None);
+    }
+
+    /// An ACK after the deadline finds nothing. It brings back neither the
+    /// usage nor the retransmissions.
+    #[test]
+    fn late_ack_does_not_revive_terminated_usage() {
+        let mut clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let (_, _, usage) = accepted(&mut model, &clock);
+        let deadline = clock.now() + T1 * 64;
+        advance_to(&mut model, &mut clock, deadline);
+
+        model.receive_ack(&uas_dialog(), 314159, false);
+        model.check();
+
+        assert!(model.take_effects().is_empty());
+        assert_eq!(model.usage_state(usage), None);
+        assert_eq!(model.replays.len(), 0);
+        assert_eq!(model.next_deadline(), None);
+    }
+
+    /// An ACK with the 2xx's dialog and CSeq stops the retransmissions. One
+    /// with another CSeq does not.
+    #[test]
+    fn a_matching_ack_stops_the_retransmissions() {
+        let mut clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let (exchange, _, _) = accepted(&mut model, &clock);
+
+        model.receive_ack(&uas_dialog(), 314158, false);
+        let next = model.next_deadline().unwrap();
+        let effects = advance_to(&mut model, &mut clock, next);
+        assert_eq!(effects, [Effect::Resend2xx { exchange }]);
+
+        model.receive_ack(&uas_dialog(), 314159, false);
+        model.check();
+        assert_eq!(model.next_deadline(), None);
+        assert!(model.exchanges.get(exchange).is_none());
+    }
+
+    /// An INVITE the application has not decided by the deadline gets a 500.
+    /// The application's later accept loses to it.
+    #[test]
+    fn an_undecided_invite_gets_a_500_at_its_deadline() {
+        let mut clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let authority =
+            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
+        let exchange = authority.exchange;
+        let due = clock.now() + DECISION;
+
+        assert!(
+            advance_to(&mut model, &mut clock, due - Duration::from_millis(1))
+                .is_empty()
+        );
+        let effects = advance_to(&mut model, &mut clock, due);
+        assert_eq!(finals(effects), [(exchange, 500)]);
+
+        let late = model
+            .try_submit(Command::Accept { authority, answer: answer() })
+            .unwrap();
+        model.run_commands(clock.now());
+        assert_eq!(
+            model.take_effects(),
+            [Effect::OperationEnded { operation: late }],
+        );
+        assert_eq!(
+            model.take_outcome(late),
+            Some(Err(Error::AlreadyFinalized)),
+        );
+        model.final_committed(exchange, clock.now());
+        model.check();
+        assert!(model.exchanges.get(exchange).is_none());
+    }
+
+    /// A provisional the application chose goes out again every minute,
+    /// with the same To tag, until a final is under way. The UA picks none
+    /// of its own. The application rings for longer than the default
+    /// decision timeout here, as one that lets a phone ring would.
+    #[test]
+    fn a_chosen_provisional_is_sent_again_every_minute() {
+        let mut clock = Clock(Instant::now());
+        let decision_timeout = Duration::from_secs(600);
+        let mut model = model(Limits { decision_timeout, ..limits() });
+        let authority =
+            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
+        let exchange = authority.exchange;
+        let tag: Tag = "0000000000000001".parse().unwrap();
+        let minute = Duration::from_secs(60);
+        let start = clock.now();
+        assert!(advance_to(&mut model, &mut clock, start + minute).is_empty());
+
+        let ringing = StatusCode::from_u16(180).unwrap();
+        let operation = model
+            .try_submit(Command::Provisional { exchange, status: ringing })
+            .unwrap();
+        model.run_commands(clock.now());
+        assert_eq!(
+            model.take_effects(),
+            [Effect::SubmitProvisional {
+                exchange,
+                status: ringing,
+                to_tag: tag.clone(),
+                operation: Some(operation),
+            }],
+        );
+        model.provisional_done(
+            exchange,
+            ringing,
+            Some(operation),
+            Ok(()),
+            clock.now(),
+        );
+        assert_eq!(
+            model.take_effects(),
+            [Effect::OperationEnded { operation }],
+        );
+        assert_eq!(model.take_outcome(operation), Some(Ok(Completion::Done)));
+        model.check();
+
+        let sent = clock.now();
+        for minutes in 1..=3 {
+            let effects =
+                advance_to(&mut model, &mut clock, sent + minute * minutes);
+            assert_eq!(
+                effects,
+                [Effect::SubmitProvisional {
+                    exchange,
+                    status: ringing,
+                    to_tag: tag.clone(),
+                    operation: None,
+                }],
+            );
+        }
+
+        model
+            .try_submit(Command::Accept { authority, answer: answer() })
+            .unwrap();
+        model.run_commands(clock.now());
+        model.take_effects();
+        model.check();
+        let later = clock.now() + minute * 2;
+        let effects = advance_to(&mut model, &mut clock, later);
+        assert!(effects.iter().all(|effect| {
+            !matches!(effect, Effect::SubmitProvisional { .. })
+        }));
+    }
+
+    /// A provisional needs a status from 101 to 199, and an exchange whose
+    /// final is not under way.
+    #[test]
+    fn a_provisional_after_the_final_is_refused() {
+        let clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let authority =
+            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
+        let exchange = authority.exchange;
+        let trying = model
+            .try_submit(Command::Provisional {
+                exchange,
+                status: StatusCode::from_u16(100).unwrap(),
+            })
+            .unwrap();
+        model.run_commands(clock.now());
+        model
+            .try_submit(Command::Accept { authority, answer: answer() })
+            .unwrap();
+        let late = model
+            .try_submit(Command::Provisional {
+                exchange,
+                status: StatusCode::from_u16(180).unwrap(),
+            })
+            .unwrap();
+        model.run_commands(clock.now());
+
+        assert_eq!(model.take_outcome(trying), Some(Err(Error::InvalidInput)));
+        assert_eq!(
+            model.take_outcome(late),
+            Some(Err(Error::AlreadyFinalized)),
+        );
+    }
+
+    /// An INVITE with the From tag, Call-ID and CSeq of one the UAS is
+    /// handling came by another path, and gets a 482 (RFC 3261 section
+    /// 8.2.2.2). Once the first exchange is done with, the identity is free.
+    #[test]
+    fn a_merged_invite_gets_a_482() {
+        let clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let merged = INVITE.replace("z9hG4bK776asdhds", "z9hG4bKother");
+        let authority =
+            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
+        let exchange = authority.exchange;
+
+        let refusal = model
+            .receive_invite(&request(&merged), true, clock.now())
+            .unwrap_err();
+        assert_eq!(refusal, Refusal::Merged);
+        assert_eq!(refusal.status().as_u16(), 482);
+        let next_cseq = merged.replace("314159 INVITE", "314160 INVITE");
+        assert!(
+            model
+                .receive_invite(&request(&next_cseq), true, clock.now())
+                .is_ok()
+        );
+
+        model
+            .try_submit(Command::Reject {
+                authority,
+                status: StatusCode::from_u16(486).unwrap(),
+            })
+            .unwrap();
+        model.run_commands(clock.now());
+        model.final_committed(exchange, clock.now());
+        model.check();
+        assert!(
+            model.receive_invite(&request(&merged), true, clock.now()).is_ok()
+        );
+    }
+
+    /// An INVITE that requires an extension gets a 420, since this UA
+    /// supports none (RFC 3261 section 8.2.2.3). A malformed Require is a
+    /// 400.
+    #[test]
+    fn a_required_extension_gets_a_420() {
+        let clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let required = INVITE.replace(
+            "Max-Forwards: 70\n",
+            "Max-Forwards: 70\nRequire: 100rel\n",
+        );
+        let malformed = INVITE.replace(
+            "Max-Forwards: 70\n",
+            "Max-Forwards: 70\nRequire: 100rel;x\n",
+        );
+
+        let refusal = model
+            .receive_invite(&request(&required), true, clock.now())
+            .unwrap_err();
+        assert_eq!(refusal, Refusal::BadExtension);
+        assert_eq!(refusal.status().as_u16(), 420);
+        assert_eq!(
+            model.receive_invite(&request(&malformed), true, clock.now()),
+            Err(Refusal::Malformed(Field::Require)),
+        );
+        assert_eq!(model.exchanges.len(), 0);
+    }
+
+    /// A driver that runs a retransmission late sends one copy, and the next
+    /// is an interval after that, not a burst to catch up.
+    #[test]
+    fn a_late_retransmission_sends_one_copy() {
+        let mut clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let first = clock.now();
+        let (exchange, _, _) = accepted(&mut model, &clock);
+
+        let late = first + Duration::from_secs(10);
+        let effects = advance_to(&mut model, &mut clock, late);
+
+        assert_eq!(effects, [Effect::Resend2xx { exchange }]);
+        assert_eq!(model.next_deadline(), Some(late + T1 * 2));
+    }
+
+    /// A decision timeout too long to add to the clock sets no deadline,
+    /// rather than overflow.
+    #[test]
+    fn a_decision_timeout_past_the_clock_sets_no_deadline() {
+        let clock = Clock(Instant::now());
+        let decision_timeout = Duration::MAX;
+        let mut model = model(Limits { decision_timeout, ..limits() });
+
+        model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
+        model.check();
+
+        assert_eq!(model.next_deadline(), None);
     }
 }

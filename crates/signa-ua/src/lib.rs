@@ -19,8 +19,10 @@ endpoint.
 
 This is an early stage of the crate, and much of a UA core is missing:
 
-* A 2xx carries no session description, and an ACK no answer.
-* A 2xx this UA sends is not retransmitted, and nothing times out its ACK.
+* The UA neither supplies nor checks the answer an ACK carries. So an
+  incoming INVITE without an offer gets a 488, and the UA refuses to send
+  one.
+* A session whose 2xx gets no ACK ends without the BYE RFC 3261 asks for.
 * CANCEL, BYE and every other request in a dialog get signa-core's 500.
 * There is no re-INVITE, and no graceful shutdown of the UA.
 * Next hops resolve from IP literals and a fixed table, with no DNS.
@@ -38,10 +40,11 @@ This is an early stage of the crate, and much of a UA core is missing:
 
 #[cfg(feature = "tokio")]
 pub use self::ua::{
-    attach, AttachError, AttemptId, Config, Error, Event, IncomingInvite,
+    AttachError, AttemptId, Config, Description, Error, Event, IncomingInvite,
     InvalidContact, InviteAttempt, NegotiationState, Operation, Query,
     Resolve, ResolveError, Session, SessionId, SessionPhase, SessionSnapshot,
     StaticResolver, SubmitError, Ua, UaDriver, UaEvents, UaHandle, WireEffect,
+    attach,
 };
 
 // The private state model. `dialog` knows nothing of `invite`, so other
@@ -57,6 +60,7 @@ mod protocol;
 mod retention;
 mod routing;
 mod slot;
+mod timer;
 #[cfg(feature = "tokio")]
 mod ua;
 

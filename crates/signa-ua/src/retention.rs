@@ -19,6 +19,8 @@ itself rather than the dialog's key, so it can outlive the dialog record.
 [RFC 3261 section 13.3.1.4]: https://www.rfc-editor.org/rfc/rfc3261.html#section-13.3.1.4
 */
 
+use std::time::{Duration, Instant};
+
 use crate::{
     dialog::DialogId,
     invite::{AttemptKey, Direction, ExchangeKey, UsageKey},
@@ -73,18 +75,35 @@ pub(crate) enum Source {
     Exchange(ExchangeKey),
 }
 
+/// The retransmission of a 2xx this user agent sent, until its ACK.
+///
+/// RFC 3261 section 13.3.1.4 starts the interval at T1 and doubles it up to
+/// T2. The deadline is 64 T1 after the UA learned that the core took the
+/// 2xx, and stays there whatever the retransmissions do.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Retransmission {
+    /// When the 2xx goes out again, or `None` once the next copy would not
+    /// fall before `deadline`.
+    pub(crate) next: Option<Instant>,
+    /// The interval that ends at `next`. The one after it is twice as long,
+    /// up to T2.
+    pub(crate) interval: Duration,
+    pub(crate) deadline: Instant,
+}
+
 /// The state needed to answer the duplicates of one 2xx.
 ///
-/// TODO: Keep the 2xx this user agent sent with its reply route, and the ACK
-/// it sent for a received 2xx. That ACK is fixed when first sent and reused
-/// for each duplicate, as RFC 3261 section 13.2.2.4 has the UAC core pass
-/// each retransmitted 2xx to the ACK it already built.
+/// The messages themselves stay with the runtime: the 2xx this user agent
+/// sent, with its responder, and the ACK it sent for a received 2xx, fixed
+/// when first sent and reused for each duplicate.
 #[derive(Debug)]
 pub(crate) struct ReplayContext {
     pub(crate) id: ReplayId,
     pub(crate) source: Source,
     pub(crate) usage: UsageKey,
     pub(crate) ack: AckObligation,
+    /// Set for a 2xx this user agent sent, while it awaits the ACK.
+    pub(crate) retransmission: Option<Retransmission>,
     usage_ended: bool,
     duplicates_end: bool,
 }
@@ -105,6 +124,7 @@ impl ReplayContext {
             source,
             usage,
             ack,
+            retransmission: None,
             usage_ended: false,
             duplicates_end: false,
         }

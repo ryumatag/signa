@@ -2,8 +2,8 @@
 The headers a UA core reads, and only as far as it needs them.
 
 signa-core keeps header values opaque, and its own address and CSeq readers
-are private to it. This module reads From, To, Call-ID, CSeq, Contact, Route
-and Record-Route on top of the element scans of [`siparse::scan`], so that
+are private to it. This module reads From, To, Call-ID, CSeq, Contact, Route,
+Record-Route and Require on top of the element scans of [`siparse::scan`], so that
 the grammar of RFC 3261 section 25.1 is followed rather than approximated by
 splitting at `,` or `;`. It is not a general typed-header API.
 
@@ -13,8 +13,8 @@ it needs.
 */
 
 use signa_core::{
-    message::header::{HeaderName, CALL_ID, CONTACT, CSEQ, FROM, TO},
     HeaderMap,
+    message::header::{CALL_ID, CONTACT, CSEQ, FROM, HeaderName, REQUIRE, TO},
 };
 use siparse::scan;
 
@@ -36,6 +36,7 @@ pub(crate) enum Field {
     Contact,
     Route,
     RecordRoute,
+    Require,
 }
 
 /// The URI and tag of a From or To value.
@@ -73,11 +74,7 @@ pub(crate) fn call_id(headers: &HeaderMap) -> Result<&str, Malformed> {
     let mut words = value.splitn(2, '@');
     let valid =
         words.all(|word| !word.is_empty() && word.bytes().all(is_word));
-    if valid {
-        Ok(value)
-    } else {
-        Err(Malformed(Field::CallId))
-    }
+    if valid { Ok(value) } else { Err(Malformed(Field::CallId)) }
 }
 
 /// `word` of RFC 3261 section 25.1, without the `@` that splits a Call-ID.
@@ -154,6 +151,34 @@ pub(crate) fn cseq(headers: &HeaderMap) -> Result<(u32, &str), Malformed> {
     } else {
         Err(malformed)
     }
+}
+
+/// Says whether the request requires any extension.
+///
+/// Each Require row is a comma-separated list of option tags, which are
+/// tokens (RFC 3261 sections 20.32 and 25.1). The tags themselves do not
+/// matter yet, since this user agent supports none of them.
+pub(crate) fn requires_extension(
+    headers: &HeaderMap,
+) -> Result<bool, Malformed> {
+    let malformed = Malformed(Field::Require);
+    let mut any = false;
+
+    for value in headers.get_all(REQUIRE) {
+        let mut rest = scan::sws(value.as_str());
+        loop {
+            let (_, after) = scan::token(rest).ok_or(malformed)?;
+            any = true;
+            rest = scan::sws(after);
+            match rest.strip_prefix(',') {
+                Some(after) => rest = scan::sws(after),
+                None if rest.is_empty() => break,
+                None => return Err(malformed),
+            }
+        }
+    }
+
+    Ok(any)
 }
 
 #[cfg(test)]
@@ -266,6 +291,30 @@ mod tests {
         {
             let headers = headers(&[(CSEQ, value)]);
             assert!(cseq(&headers).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn require_lists_option_tags() {
+        assert_eq!(requires_extension(&headers(&[])), Ok(false));
+        for rows in [
+            &[(REQUIRE, "100rel")][..],
+            &[(REQUIRE, " 100rel , timer ")],
+            &[(REQUIRE, "100rel"), (REQUIRE, "timer")],
+        ] {
+            assert_eq!(
+                requires_extension(&headers(rows)),
+                Ok(true),
+                "{rows:?}"
+            );
+        }
+
+        for value in ["", "100rel,", ",100rel", "100rel timer", "a;b"] {
+            assert_eq!(
+                requires_extension(&headers(&[(REQUIRE, value)])),
+                Err(Malformed(Field::Require)),
+                "{value}",
+            );
         }
     }
 }

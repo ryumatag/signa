@@ -38,6 +38,20 @@ impl<T> PartialEq for Key<T> {
 
 impl<T> Eq for Key<T> {}
 
+// The order means nothing beyond being total, which a sorted timer queue
+// needs to tell two timers due at the same instant apart.
+impl<T> Ord for Key<T> {
+    fn cmp(&self, other: &Key<T>) -> std::cmp::Ordering {
+        (self.index, self.generation).cmp(&(other.index, other.generation))
+    }
+}
+
+impl<T> PartialOrd for Key<T> {
+    fn partial_cmp(&self, other: &Key<T>) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl<T> Hash for Key<T> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         (self.index, self.generation).hash(state);

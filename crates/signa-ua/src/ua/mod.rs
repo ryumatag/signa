@@ -18,11 +18,13 @@ use signa_core::{
     Request, StatusCode,
     endpoint::{Endpoint, Incoming, Reception, Target},
     message::uri::SipUri,
+    transaction::Timers,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 pub use crate::{
     error::{Error, WireEffect},
+    negotiation::Description,
     routing::{ResolveError, StaticResolver},
 };
 use crate::{
@@ -97,6 +99,8 @@ pub struct Config<R = StaticResolver> {
     jobs: usize,
     resolve_timeout: Duration,
     outcome_retention: Duration,
+    timers: Timers,
+    decision_timeout: Duration,
 }
 
 /// The Contact URI given to [`Config::new`] is not a SIP or SIPS URI.
@@ -138,6 +142,11 @@ impl Config {
             // 64 T1 with RFC 3261's T1, the time a peer may still
             // retransmit, which is about as long as anyone looks back.
             outcome_retention: Duration::from_secs(32),
+            timers: Timers::new(),
+            // A proxy may cancel an INVITE after three minutes without a
+            // final response (RFC 3261 section 16.6, Timer C), so a decision
+            // later than that is likely to come too late anyway.
+            decision_timeout: Duration::from_secs(180),
         })
     }
 }
@@ -158,6 +167,8 @@ impl<R> Config<R> {
             jobs: self.jobs,
             resolve_timeout: self.resolve_timeout,
             outcome_retention: self.outcome_retention,
+            timers: self.timers,
+            decision_timeout: self.decision_timeout,
         }
     }
 
@@ -181,8 +192,11 @@ impl<R> Config<R> {
         self
     }
 
-    /// Sets how many incoming INVITEs may wait for a decision. Beyond it, the
-    /// UA answers a new INVITE with a 503. The default is 256.
+    /// Sets how many incoming INVITEs may wait for a decision. Each counts
+    /// until the application submits a decision or drops its
+    /// [`IncomingInvite`], also after the UA answered it at the decision
+    /// timeout. Beyond it, the UA answers a new INVITE with a 503. The default
+    /// is 256.
     pub fn max_pending_invites(mut self, limit: usize) -> Config<R> {
         self.pending_invites = limit.max(1);
         self
@@ -224,6 +238,26 @@ impl<R> Config<R> {
         self
     }
 
+    /// Sets T1 and T2, which pace the retransmission of each 2xx the UA sends
+    /// and set the deadline for its ACK, 64 T1 later
+    /// ([RFC 3261 section 13.3.1.4]). Give the endpoint's timers, so that the
+    /// UA and the endpoint agree on them. The default is [`Timers::new`].
+    ///
+    /// [RFC 3261 section 13.3.1.4]: https://www.rfc-editor.org/rfc/rfc3261.html#section-13.3.1.4
+    pub fn timers(mut self, timers: Timers) -> Config<R> {
+        self.timers = timers;
+        self
+    }
+
+    /// Sets how long the application may take to decide an incoming INVITE.
+    /// The UA answers an INVITE still undecided then with a 500, as one whose
+    /// [`IncomingInvite`] was dropped. A timeout too long to add to the clock,
+    /// such as [`Duration::MAX`], sets no deadline. The default is 3 minutes.
+    pub fn decision_timeout(mut self, timeout: Duration) -> Config<R> {
+        self.decision_timeout = timeout;
+        self
+    }
+
     fn limits(&self) -> Limits {
         Limits {
             attempts: self.attempts,
@@ -238,6 +272,9 @@ impl<R> Config<R> {
             // The driver runs each command as it arrives.
             commands: 1,
             outcome_retention: self.outcome_retention,
+            t1: self.timers.t1(),
+            t2: self.timers.t2(),
+            decision_timeout: self.decision_timeout,
         }
     }
 }
@@ -631,6 +668,12 @@ pub enum Event {
         /// The session.
         session: Session,
     },
+    /// No ACK came for the 2xx of an incoming INVITE within 64 T1 of its
+    /// first transmission. The session ends next, with [`Event::Ended`].
+    AckTimeout {
+        /// The session.
+        session: Session,
+    },
     /// A session ended.
     Ended {
         /// The session.
@@ -656,7 +699,12 @@ pub enum Event {
 /// The authority is this value, which cannot be cloned. Submitting a
 /// decision consumes it, and a refused submission hands it back. Dropping it
 /// without a decision has the UA answer the INVITE with a 500, a policy of
-/// this crate rather than an RFC rule.
+/// this crate rather than an RFC rule. So does a decision that takes longer
+/// than [`Config::decision_timeout`].
+///
+/// The INVITE carries an offer. The UA answers one without an offer itself,
+/// with a 488, since its 2xx would have to carry an offer and its ACK the
+/// answer, which this UA cannot check yet.
 pub struct IncomingInvite {
     request: Request<Bytes>,
     authority: Option<Authority>,
@@ -678,32 +726,107 @@ impl IncomingInvite {
         &self.request
     }
 
-    /// Accepts the INVITE with a 200.
+    /// Sends a provisional response, from 101 to 199, with the To tag every
+    /// response to this INVITE carries. The endpoint sends the 100 itself.
     ///
-    /// The operation completes once the endpoint has the 200, with the
-    /// [`Session`] it established. It fails with [`Error::AlreadyFinalized`]
-    /// if another final response came first.
+    /// It decides nothing, so it keeps the authority. Until a final response
+    /// is under way, the UA sends the last provisional that reached the
+    /// endpoint again every minute, as RFC 3261 section 13.3.1.1 asks of a UAS
+    /// that takes long to answer. The UA never picks a provisional of its
+    /// own.
+    ///
+    /// The operation completes once the endpoint has the response. It fails
+    /// with [`Error::AlreadyFinalized`] if a final response is under way or
+    /// went first, and with [`Error::StaleDecision`] once the UA is done with
+    /// the INVITE.
     ///
     /// # Errors
     ///
-    /// Returns this INVITE with [`Error::Busy`] when the command queue or the
-    /// operations are full, or with [`Error::Closed`] once the driver has
-    /// stopped.
+    /// Returns `status` with [`Error::InvalidInput`] for a status outside 101
+    /// to 199, with [`Error::Busy`] when the command queue or the operations
+    /// are full, or with [`Error::Closed`] once the driver has stopped.
+    pub fn try_provisional(
+        &self,
+        status: StatusCode,
+    ) -> Result<Operation<()>, SubmitError<StatusCode>> {
+        if !(101..=199).contains(&status.as_u16()) {
+            return Err(SubmitError {
+                error: Error::InvalidInput,
+                value: Box::new(status),
+            });
+        }
+
+        let exchange = self
+            .authority
+            .as_ref()
+            .expect("a live invite holds its authority")
+            .exchange();
+        self.shared.submit(status, |status| model::Command::Provisional {
+            exchange,
+            status,
+        })
+    }
+
+    /// Accepts the INVITE with a 200 that carries `answer`, the answer to its
+    /// offer.
+    ///
+    /// The 200 copies the INVITE's Record-Route and carries the UA's Contact.
+    /// The UA sends it again until the ACK arrives, on every transport
+    /// (RFC 3261 section 13.3.1.4). If none arrives within 64 T1, the session
+    /// ends with [`Event::AckTimeout`].
+    ///
+    /// The operation completes once the endpoint has the 200, with the
+    /// [`Session`] it established. That is neither the ACK nor delivery to
+    /// the peer. It fails without sending the 200:
+    ///
+    /// * with [`Error::AlreadyFinalized`] if another final response is under
+    ///   way, and [`Error::StaleDecision`] if the UA is already done with the
+    ///   INVITE, as after a final at the decision timeout,
+    /// * with [`Error::CapacityExceeded`] when the UA has no room for the
+    ///   session, and the UA answers the INVITE with a 503,
+    /// * with [`Error::CoreSubmissionRejected`] when the endpoint refuses the
+    ///   200, and the UA answers the INVITE with a 500, since nobody holds
+    ///   the decision any more.
+    ///
+    /// # Errors
+    ///
+    /// Returns this INVITE and `answer` with [`Error::InvalidInput`] when the
+    /// body of `answer` is empty, with [`Error::Busy`] when the command queue
+    /// or the operations are full, or with [`Error::Closed`] once the driver
+    /// has stopped.
     pub fn try_accept(
         self,
-    ) -> Result<Operation<Session>, SubmitError<IncomingInvite>> {
+        answer: Description,
+    ) -> Result<Operation<Session>, SubmitError<(IncomingInvite, Description)>>
+    {
+        if answer.body().is_empty() {
+            return Err(SubmitError {
+                error: Error::InvalidInput,
+                value: Box::new((self, answer)),
+            });
+        }
+
         let shared = self.shared.clone();
-        shared.submit(self, |mut invite| model::Command::Accept {
-            authority: invite.take_authority(),
+        shared.submit((self, answer), |(mut invite, answer)| {
+            model::Command::Accept {
+                authority: invite.take_authority(),
+                answer,
+            }
         })
     }
 
     /// Rejects the INVITE with `status`, which must be from 300 to 699.
     ///
+    /// The response carries the To tag and what it copies from the INVITE,
+    /// and nothing else. A status whose response needs a header of its own,
+    /// such as the Allow of a 405, the challenge of a 401 or the Contact of a
+    /// 3xx, cannot be sent as it should yet.
+    ///
     /// # Errors
     ///
     /// Returns this INVITE with [`Error::InvalidInput`] for another status,
-    /// and otherwise as [`IncomingInvite::try_accept`] does.
+    /// with [`Error::Busy`] when the command queue or the operations are
+    /// full, or with [`Error::Closed`] once the driver has stopped.
     pub fn try_reject(
         self,
         status: StatusCode,

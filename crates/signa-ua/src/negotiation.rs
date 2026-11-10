@@ -16,6 +16,45 @@ answer an ACK must carry.
 [RFC 3264 section 4]: https://www.rfc-editor.org/rfc/rfc3264.html#section-4
 */
 
+use bytes::Bytes;
+use signa_core::HeaderValue;
+
+/// A session description to carry in a message, such as the answer in a 2xx.
+///
+/// The UA does not look inside it. It goes out as the body, with
+/// `content_type` as the Content-Type. Whether the bytes are a valid offer or
+/// answer is for the code that made them to decide, such as an SDP
+/// implementation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(not(feature = "tokio"), allow(unreachable_pub))]
+pub struct Description {
+    content_type: HeaderValue,
+    body: Bytes,
+}
+
+// Only the runtime reads a description, to put it on the wire.
+#[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+impl Description {
+    /// Creates a description of `body`, whose media type is
+    /// `content_type`, such as `application/sdp`.
+    #[cfg_attr(not(feature = "tokio"), allow(unreachable_pub))]
+    pub fn new(content_type: HeaderValue, body: Bytes) -> Description {
+        Description { content_type, body }
+    }
+
+    /// Returns the media type of the body.
+    #[cfg_attr(not(feature = "tokio"), allow(unreachable_pub))]
+    pub fn content_type(&self) -> &HeaderValue {
+        &self.content_type
+    }
+
+    /// Returns the body.
+    #[cfg_attr(not(feature = "tokio"), allow(unreachable_pub))]
+    pub fn body(&self) -> &Bytes {
+        &self.body
+    }
+}
+
 /// The offer/answer state of one dialog.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum Negotiation {
