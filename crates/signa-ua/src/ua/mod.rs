@@ -24,7 +24,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 pub use crate::{
     error::{Error, WireEffect},
+    invite::AttemptResult,
     negotiation::Description,
+    plan::InvitePlan,
     routing::{ResolveError, StaticResolver},
 };
 use crate::{
@@ -180,6 +182,11 @@ impl<R> Config<R> {
     }
 
     /// Sets how many events may wait in [`UaEvents`]. The default is 256.
+    ///
+    /// Each [`IncomingInvite`] and each INVITE this UA sends holds a place in
+    /// it until its event is received, so that the event cannot be lost. A
+    /// new INVITE that finds no place gets a 503, and one to send fails with
+    /// [`Error::CapacityExceeded`].
     pub fn event_capacity(mut self, capacity: usize) -> Config<R> {
         self.events = capacity.max(1);
         self
@@ -405,6 +412,10 @@ enum Command {
         usage: UsageKey,
         reply: oneshot::Sender<Option<SessionSnapshot>>,
     },
+    AttemptSnapshot {
+        attempt: AttemptKey,
+        reply: oneshot::Sender<Option<AttemptSnapshot>>,
+    },
 }
 
 impl Shared {
@@ -457,40 +468,73 @@ pub struct UaHandle {
 }
 
 impl UaHandle {
-    /// Submits an initial INVITE, built by the caller and carrying an offer
-    /// in its body.
+    /// Submits an initial INVITE, built from `plan` with the offer it
+    /// carries.
     ///
-    /// The UA resolves its next hop from the top Route or the Request-URI
-    /// (RFC 3261 section 8.1.2) and hands it to the endpoint. The operation
-    /// completes once the endpoint has it, with the [`InviteAttempt`] that
-    /// collects its responses. Each dialog a response forms comes as an
-    /// event, and the UA acknowledges each 2xx itself.
+    /// The UA picks the Call-ID, the From tag and the first CSeq number, adds
+    /// its Contact, resolves the next hop from the first route or the
+    /// Request-URI (RFC 3261 section 8.1.2), and hands the INVITE to the
+    /// endpoint. The operation completes once the endpoint has it, with the
+    /// [`InviteAttempt`] that collects its responses.
     ///
-    /// An INVITE without an offer is refused. The ACK would then owe the
-    /// answer to an offer in the 2xx, which this UA cannot supply yet.
+    /// Each dialog a response forms comes as an event, and the UA
+    /// acknowledges each 2xx itself, whatever the application does with the
+    /// session. No 2xx wins over another. The UA keeps each one as a session
+    /// of its own. [`Event::AttemptEnded`] says what the INVITE came to once
+    /// no more responses can arrive, and [`UaHandle::attempt_snapshot`] says
+    /// it before.
+    ///
+    /// The operation fails with [`Error::Unroutable`] when the next hop does
+    /// not resolve or needs TLS, with [`Error::CapacityExceeded`] when the
+    /// UA has no room for the attempt or its event, and with
+    /// [`Error::TransportFailure`] or [`Error::CoreSubmissionRejected`] when
+    /// the endpoint cannot take the INVITE.
     ///
     /// # Errors
     ///
-    /// Returns the request with [`Error::Busy`] when the command queue or
-    /// the operations are full, [`Error::Closed`] once the driver has
-    /// stopped, and [`Error::InvalidInput`] for a request that is not an
-    /// INVITE with a body.
+    /// Returns `plan` with [`Error::InvalidInput`] when the UA cannot send
+    /// it, as [`InvitePlan`] says, with [`Error::Busy`] when the command
+    /// queue or the operations are full, and with [`Error::Closed`] once the
+    /// driver has stopped.
     pub fn try_invite(
         &self,
-        request: Request<Bytes>,
-    ) -> Result<Operation<InviteAttempt>, SubmitError<Request<Bytes>>> {
-        if *request.method() != signa_core::Method::INVITE
-            || request.body().is_empty()
-        {
+        plan: InvitePlan,
+    ) -> Result<Operation<InviteAttempt>, SubmitError<InvitePlan>> {
+        if !plan.is_valid() {
             return Err(SubmitError {
                 error: Error::InvalidInput,
-                value: Box::new(request),
+                value: Box::new(plan),
             });
         }
 
-        self.shared.submit(request, |request| model::Command::Invite {
-            request: Box::new(request),
+        self.shared.submit(plan, |plan| model::Command::Invite {
+            plan: Box::new(plan),
         })
+    }
+
+    /// Returns what an INVITE this UA sent has come to so far, or `None` once
+    /// it has ended and [`Event::AttemptEnded`] has said what it came to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Busy`] when the command queue is full,
+    /// [`Error::Closed`] when the driver no longer takes commands, and
+    /// [`Error::DriverStopped`] when it stopped before answering.
+    pub async fn attempt_snapshot(
+        &self,
+        attempt: &InviteAttempt,
+    ) -> Result<Option<AttemptSnapshot>, Error> {
+        let slot =
+            self.shared.commands.try_reserve().map_err(
+                |error| match error {
+                    mpsc::error::TrySendError::Full(()) => Error::Busy,
+                    mpsc::error::TrySendError::Closed(()) => Error::Closed,
+                },
+            )?;
+        let (reply, receiver) = oneshot::channel();
+        slot.send(Command::AttemptSnapshot { attempt: attempt.id.0, reply });
+
+        receiver.await.map_err(|_| Error::DriverStopped)
     }
 
     /// Returns where a session stands, or `None` once it has ended and the
@@ -679,13 +723,28 @@ pub enum Event {
         /// The session.
         session: Session,
     },
-    /// An INVITE this UA sent got a final response other than a 2xx, which
-    /// ended its early dialogs. Another fork may still answer with a 2xx.
+    /// An INVITE this UA sent got no 2xx, which ended its early dialogs:
+    /// its first final response was not a 2xx, or its transaction failed.
     Failed {
         /// The INVITE.
         attempt: AttemptId,
-        /// The status of the final response.
-        status: StatusCode,
+        /// Why, such as [`Error::RemoteFailure`] with the status of the
+        /// final response, or [`Error::Timeout`].
+        error: Error,
+    },
+    /// An INVITE this UA sent can get no more responses, and this is what it
+    /// came to. It is the last event of the attempt, and it is never dropped
+    /// for a full queue, since the UA set its place aside when it sent the
+    /// INVITE.
+    AttemptEnded {
+        /// The INVITE.
+        attempt: AttemptId,
+        /// Whether a 2xx came.
+        result: AttemptResult,
+        /// Whether every response the endpoint took for the INVITE reached
+        /// the UA. When the endpoint drops responses for want of room, it is
+        /// `false`, and a fork's 2xx may be among them.
+        complete: bool,
     },
     /// Notifications were dropped because the queue was full.
     Lagged {
@@ -907,13 +966,29 @@ impl InviteAttempt {
 }
 
 /// Where a session stands.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct SessionSnapshot {
     /// The session's phase.
     pub phase: SessionPhase,
     /// The offer/answer exchange of its dialog.
     pub negotiation: NegotiationState,
+    /// The last session description the peer sent: the offer of an INVITE
+    /// this UA took, or the answer in the 2xx of one it sent. The UA does not
+    /// check it.
+    pub remote_description: Option<Description>,
+}
+
+/// What an INVITE this UA sent has come to so far.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct AttemptSnapshot {
+    /// Whether a 2xx came, or why none did, once the first final response
+    /// or a failure of the transaction is in.
+    pub result: Option<AttemptResult>,
+    /// Whether every response the endpoint took for the INVITE so far
+    /// reached the UA.
+    pub complete: bool,
 }
 
 /// The phase of a session.
@@ -943,8 +1018,13 @@ pub enum NegotiationState {
 }
 
 impl SessionSnapshot {
-    fn new(phase: UsagePhase, negotiation: Negotiation) -> SessionSnapshot {
+    fn new(
+        phase: UsagePhase,
+        negotiation: Negotiation,
+        remote_description: Option<Description>,
+    ) -> SessionSnapshot {
         SessionSnapshot {
+            remote_description,
             phase: match phase {
                 UsagePhase::Establishing => SessionPhase::Early,
                 UsagePhase::Established => SessionPhase::Established,

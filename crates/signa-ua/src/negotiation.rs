@@ -17,7 +17,7 @@ answer an ACK must carry.
 */
 
 use bytes::Bytes;
-use signa_core::HeaderValue;
+use signa_core::{HeaderMap, HeaderValue, message::header::CONTENT_TYPE};
 
 /// A session description to carry in a message, such as the answer in a 2xx.
 ///
@@ -40,6 +40,32 @@ impl Description {
     #[cfg_attr(not(feature = "tokio"), allow(unreachable_pub))]
     pub fn new(content_type: HeaderValue, body: Bytes) -> Description {
         Description { content_type, body }
+    }
+
+    /// Reads the session description a message carries, its body with its
+    /// Content-Type, or `None` without a body. A body without a Content-Type
+    /// is not taken for one, since RFC 3261 section 20.15 requires the header
+    /// with any body.
+    ///
+    /// Both are copied, so that a description the UA keeps does not hold on
+    /// to the buffer the message arrived in.
+    ///
+    /// TODO: Tell a session description by its Content-Disposition too, and
+    /// leave a multipart body to an adapter that can take it apart.
+    pub(crate) fn from_message(
+        headers: &HeaderMap,
+        body: &[u8],
+    ) -> Option<Description> {
+        if body.is_empty() {
+            return None;
+        }
+        let content_type = headers.get(CONTENT_TYPE)?;
+
+        Some(Description {
+            content_type: HeaderValue::from_bytes(content_type.as_bytes())
+                .expect("a received value is valid"),
+            body: Bytes::copy_from_slice(body),
+        })
     }
 
     /// Returns the media type of the body.
@@ -142,5 +168,19 @@ mod tests {
         assert!(state.answer_sent().is_err());
         assert!(Negotiation::Stable.answer_received().is_err());
         assert_eq!(state, Negotiation::LocalOfferOutstanding);
+    }
+
+    #[test]
+    fn a_description_needs_a_body_and_its_type() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(Description::from_message(&headers, b"v=0\r\n"), None);
+
+        headers
+            .append(CONTENT_TYPE, HeaderValue::from_static("application/sdp"));
+        assert_eq!(Description::from_message(&headers, b""), None);
+        let description =
+            Description::from_message(&headers, b"v=0\r\n").unwrap();
+        assert_eq!(description.content_type(), "application/sdp");
+        assert_eq!(description.body().as_ref(), b"v=0\r\n");
     }
 }

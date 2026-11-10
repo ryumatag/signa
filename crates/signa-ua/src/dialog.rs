@@ -176,6 +176,27 @@ impl Origin {
         self.cseq
     }
 
+    /// Says whether a response carries the identity of the INVITE this was
+    /// read from: its Call-ID, From tag and CSeq. The core matched the
+    /// response to the transaction by its Via alone (RFC 3261 section
+    /// 17.1.3), so one that changed any of these is not a response this
+    /// request's dialogs can be formed from.
+    pub(crate) fn answered_by<B>(&self, response: &Response<B>) -> bool {
+        let headers = response.headers();
+        let (Ok(call_id), Ok(from), Ok((cseq, method))) = (
+            protocol::call_id(headers),
+            protocol::from(headers),
+            protocol::cseq(headers),
+        ) else {
+            return false;
+        };
+
+        call_id == &*self.call_id
+            && from.tag == Some(self.local_tag.as_str())
+            && cseq == self.cseq
+            && method == "INVITE"
+    }
+
     /// Says whether a response to this request formed the dialog `id`.
     pub(crate) fn formed(&self, id: &DialogId) -> bool {
         id.call_id == self.call_id && id.local_tag == self.local_tag

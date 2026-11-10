@@ -48,11 +48,13 @@ use crate::{
     },
     error::Error,
     invite::{
-        AttemptKey, Direction, ExchangeKey, ExchangeState, InviteAttempt,
-        InviteExchange, InviteUsage, MergeKey, Scope, UsageKey, UsagePhase,
+        AttemptKey, AttemptResult, Direction, ExchangeKey, ExchangeState,
+        InviteAttempt, InviteExchange, InviteUsage, MergeKey, Scope, UsageKey,
+        UsagePhase,
     },
     negotiation::{Description, Negotiation},
     operation::{Completion, OperationId, Operations, Stage, SubmitError},
+    plan::{Identity, InvitePlan},
     protocol::{self, Field, Malformed},
     retention::{
         AckObligation, ReplayContext, ReplayId, ReplayKey, Retention,
@@ -135,8 +137,8 @@ pub(crate) enum Command {
     Provisional { exchange: ExchangeKey, status: StatusCode },
     /// Reject an incoming INVITE with a final response from 300 to 699.
     Reject { authority: Authority, status: StatusCode },
-    /// Send an initial INVITE that carries an offer.
-    Invite { request: Box<Request<Bytes>> },
+    /// Send an initial INVITE built from a plan, which carries an offer.
+    Invite { plan: Box<InvitePlan> },
 }
 
 /// What the runtime does on the model's behalf.
@@ -176,6 +178,10 @@ pub(crate) enum Effect {
     SendAck { replay: ReplayKey },
     /// Send the ACK already sent for a 2xx again, for a copy of that 2xx.
     ResendAck { replay: ReplayKey },
+    /// Tell the application what an attempt came to, now that the core has
+    /// finished collecting its responses. This cannot be lost, so the
+    /// runtime sets room aside for it when it sends the INVITE.
+    AttemptEnded { attempt: AttemptKey, result: AttemptResult, complete: bool },
     /// Tell the application.
     Notify(Event),
     /// Hand the outcome of an operation to its waiter, if it still has one.
@@ -187,6 +193,8 @@ pub(crate) enum Effect {
 /// A record the model has reclaimed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Released {
+    /// An attempt whose INVITE never reached the core.
+    Attempt(AttemptKey),
     Exchange(ExchangeKey),
     Replay(ReplayKey),
 }
@@ -283,14 +291,16 @@ pub(crate) enum Event {
     AckTimeout { usage: UsageKey },
     /// The usage ended.
     UsageEnded { usage: UsageKey },
-    /// An attempt got a final response other than a 2xx, which ended its
-    /// early dialogs.
-    AttemptFailed { attempt: AttemptKey, status: StatusCode },
+    /// An attempt got a final response other than a 2xx, or its transaction
+    /// failed, which ended its early dialogs.
+    AttemptFailed { attempt: AttemptKey, error: Error },
 }
 
 /// The UA's state.
 pub(crate) struct Model<R> {
     limits: Limits,
+    /// The Contact URI of every INVITE this user agent sends.
+    contact: Box<str>,
     random: R,
     attempts: Slots<InviteAttempt>,
     exchanges: Slots<InviteExchange>,
@@ -310,9 +320,14 @@ pub(crate) struct Model<R> {
 }
 
 impl<R: Random> Model<R> {
-    pub(crate) fn new(limits: Limits, random: R) -> Model<R> {
+    pub(crate) fn new(
+        limits: Limits,
+        contact: Box<str>,
+        random: R,
+    ) -> Model<R> {
         Model {
             limits,
+            contact,
             random,
             attempts: Slots::new(limits.attempts),
             exchanges: Slots::new(limits.exchanges),
@@ -405,9 +420,7 @@ impl<R: Random> Model<R> {
                 Command::Provisional { exchange, status } => {
                     self.provisional(operation, exchange, status, now)
                 }
-                Command::Invite { request } => {
-                    self.invite(operation, *request, now)
-                }
+                Command::Invite { plan } => self.invite(operation, *plan, now),
             }
         }
     }
@@ -464,9 +477,9 @@ impl<R: Random> Model<R> {
     pub(crate) fn usage_state(
         &self,
         usage: UsageKey,
-    ) -> Option<(UsagePhase, Negotiation)> {
+    ) -> Option<(UsagePhase, Negotiation, Option<Description>)> {
         let usage = self.usages.get(usage)?;
-        Some((usage.phase(), usage.negotiation))
+        Some((usage.phase(), usage.negotiation, usage.remote.clone()))
     }
 }
 
@@ -495,14 +508,14 @@ impl<R: Random> Model<R> {
     /// reason to refuse it before the application sees it.
     ///
     /// The checks follow the order of RFC 3261 section 8.2.2: the To tag, a
-    /// merged request, then Require. `offer_in_request` says whether the body
-    /// is an offer. Telling that is the job of the body adapter, not of this
-    /// model. The application's decision is due one decision timeout after
+    /// merged request, then Require. `offer` is the session description of
+    /// the body, if it is an offer. Telling that is the job of the body
+    /// adapter, not of this model. The application's decision is due one decision timeout after
     /// `now`.
     pub(crate) fn receive_invite<B>(
         &mut self,
         request: &Request<B>,
-        offer_in_request: bool,
+        offer: Option<Description>,
         now: Instant,
     ) -> Result<Authority, Refusal> {
         match self.classify(request)? {
@@ -538,7 +551,7 @@ impl<R: Random> Model<R> {
         let exchange = InviteExchange::incoming(
             dialog,
             merge.clone(),
-            offer_in_request,
+            offer,
             decision_due,
         );
 
@@ -826,12 +839,11 @@ impl<R: Random> Model<R> {
         }
 
         let cseq = exchange.cseq;
-        let Scope::Incoming { dialog, offer_in_request, .. } =
-            &mut exchange.scope
-        else {
+        let Scope::Incoming { dialog, offer, .. } = &mut exchange.scope else {
             unreachable!("only incoming exchanges submit finals");
         };
-        let offer_in_request = *offer_in_request;
+        let offer = offer.take();
+        let offer_in_request = offer.is_some();
         let mut dialog = *dialog.take().expect("a 2xx forms the dialog once");
 
         // The 2xx carries the answer to the INVITE's offer, or an offer of
@@ -858,6 +870,7 @@ impl<R: Random> Model<R> {
             replay,
             Source::Exchange(key),
         );
+        self.usages.get_mut(usage).expect("just made").remote = offer;
 
         // RFC 3261 section 13.3.1.4 has the 2xx go out again T1 later, and
         // gives up on its ACK 64 T1 after the first.
@@ -1125,6 +1138,8 @@ impl<R: Random> Model<R> {
             exchange,
             request: None,
             operation: None,
+            result: None,
+            complete: true,
         };
 
         self.attempts.insert(attempt).map_err(|_| {
@@ -1133,18 +1148,22 @@ impl<R: Random> Model<R> {
         })
     }
 
-    /// Opens an attempt for an INVITE with an offer, and has the runtime
-    /// send it.
+    /// Builds the INVITE of a plan, opens an attempt for it, and has the
+    /// runtime send it.
     fn invite(
         &mut self,
         operation: OperationId,
-        request: Request<Bytes>,
+        plan: InvitePlan,
         now: Instant,
     ) {
-        if *request.method() != Method::INVITE {
+        let Some(identity) = self.identity() else {
+            self.complete(operation, Err(Error::Internal), now);
+            return;
+        };
+        let Some(request) = plan.build(&identity, &self.contact) else {
             self.complete(operation, Err(Error::InvalidInput), now);
             return;
-        }
+        };
         let attempt = match self.start_attempt(&request, true) {
             Ok(attempt) => attempt,
             Err(error) => {
@@ -1157,6 +1176,25 @@ impl<R: Random> Model<R> {
         record.request = Some(Box::new(request));
         record.operation = Some(operation);
         self.effects.push(Effect::StartInvite { attempt });
+    }
+
+    /// Picks the Call-ID, the From tag and the first CSeq number of an
+    /// INVITE.
+    ///
+    /// The Call-ID is 128 random bits, which RFC 3261 section 8.1.1.4
+    /// recommends to make it unique without a host name. The first number
+    /// is below 2^16, as a UAS picks its own (`Dialog::uas`), which leaves the
+    /// dialog nearly all of the room below the 2^31 that section 8.1.1.5
+    /// allows an initial request.
+    fn identity(&mut self) -> Option<Identity> {
+        let call_id = format!(
+            "{:016x}{:016x}",
+            self.random.next_u64()?,
+            self.random.next_u64()?
+        );
+        let tag = self.tag()?;
+        let cseq = (self.random.next_u64()? & 0xffff) as u32 + 1;
+        Some(Identity { call_id: call_id.into(), tag, cseq })
     }
 
     /// Hands the runtime the INVITE of an attempt to send.
@@ -1199,25 +1237,64 @@ impl<R: Random> Model<R> {
         };
 
         self.exchanges.remove(record.exchange);
+        self.effects.push(Effect::Released(Released::Attempt(attempt)));
         if let Some(operation) = record.operation {
             self.complete(operation, Err(error), now);
         }
     }
 
-    /// Takes in a final response other than a 2xx to an attempt.
+    /// Returns what an attempt came to so far, and whether every response
+    /// reached the UA, or `None` once the attempt has ended.
+    pub(crate) fn attempt_state(
+        &self,
+        attempt: AttemptKey,
+    ) -> Option<(Option<AttemptResult>, bool)> {
+        let attempt = self.attempts.get(attempt)?;
+        Some((attempt.result, attempt.complete))
+    }
+
+    /// Takes in the end of an attempt without a 2xx: a final response other
+    /// than a 2xx, or the failure of its transaction, such as a timeout.
     ///
-    /// RFC 3261 section 12.3 ends every early dialog of the request then. A
-    /// 2xx may still arrive from another fork until the core finishes the
-    /// response collection, so the attempt stays.
-    pub(crate) fn receive_failure(
+    /// RFC 3261 section 12.3 ends every early dialog of the request then.
+    /// The first failure decides the attempt's result, unless a 2xx came
+    /// before it.
+    pub(crate) fn attempt_failed(
         &mut self,
         attempt: AttemptKey,
-        status: StatusCode,
+        error: Error,
     ) {
+        let Some(record) = self.attempts.get_mut(attempt) else {
+            return;
+        };
+        let first = record.result.is_none();
+        if first {
+            record.result = Some(AttemptResult::Failed(error));
+        }
+
+        if let Some(exchange) = self.exchanges.get_mut(record.exchange) {
+            exchange.final_received();
+        }
+        self.end_early_usages(attempt);
+        if first {
+            self.effects
+                .push(Effect::Notify(Event::AttemptFailed { attempt, error }));
+        }
+    }
+
+    /// Records that the core dropped responses to an attempt for want of
+    /// room. The attempt's set of responses can no longer be complete.
+    pub(crate) fn responses_lost(&mut self, attempt: AttemptKey) {
+        if let Some(record) = self.attempts.get_mut(attempt) {
+            record.complete = false;
+        }
+    }
+
+    /// Ends the early usages an attempt formed.
+    fn end_early_usages(&mut self, attempt: AttemptKey) {
         let Some(record) = self.attempts.get(attempt) else {
             return;
         };
-        let exchange = record.exchange;
         let early: Vec<UsageKey> = self
             .usages
             .iter()
@@ -1230,14 +1307,9 @@ impl<R: Random> Model<R> {
             .map(|(usage, _)| usage)
             .collect();
 
-        if let Some(exchange) = self.exchanges.get_mut(exchange) {
-            exchange.final_received();
-        }
         for usage in early {
             self.end_usage(usage);
         }
-        self.effects
-            .push(Effect::Notify(Event::AttemptFailed { attempt, status }));
     }
 
     /// Says whether the model still keeps a replay context.
@@ -1263,11 +1335,11 @@ impl<R: Random> Model<R> {
 
     /// Takes in a provisional response to an attempt.
     ///
-    /// A 101 to 199 with a To tag forms an early dialog (RFC 3261 section
-    /// 12.1). A later one for the same dialog changes nothing. It is not
-    /// reliable, so it refreshes neither the remote target ([RFC 6141 section
-    /// 4.9]) nor the route set, which RFC 3261 section 13.2.2.4 recomputes
-    /// from the 2xx.
+    /// A 100 changes nothing. A 101 to 199 with a To tag forms an early
+    /// dialog (RFC 3261 section 12.1). A later one for the same dialog
+    /// changes nothing. It is not reliable, so it refreshes neither the
+    /// remote target ([RFC 6141 section 4.9]) nor the route set, which RFC
+    /// 3261 section 13.2.2.4 recomputes from the 2xx.
     ///
     /// [RFC 6141 section 4.9]: https://www.rfc-editor.org/rfc/rfc6141.html#section-4.9
     pub(crate) fn receive_provisional<B>(
@@ -1280,6 +1352,9 @@ impl<R: Random> Model<R> {
         };
         if response.status().as_u16() == 100 {
             return Ok(());
+        }
+        if !attempt.origin.answered_by(response) {
+            return Err(Error::InvalidInput);
         }
         let Some(remote_tag) =
             response_tag(response).map_err(|_| Error::InvalidInput)?
@@ -1320,22 +1395,30 @@ impl<R: Random> Model<R> {
         Ok(())
     }
 
-    /// Takes in a 2xx to an attempt. A copy of a 2xx seen before is answered
-    /// with the same ACK and makes no new usage, whether or not its usage is
-    /// still up. RFC 3261 section 13.2.2.4 passes each retransmission of a
-    /// 2xx to the UAC core, which answers it with the ACK again.
+    /// Takes in a 2xx to an attempt, and the session description it
+    /// carries. A copy of a 2xx seen before is answered with the same ACK
+    /// and makes no new usage, whether or not its usage is still up. RFC 3261
+    /// section 13.2.2.4 passes each retransmission of a 2xx to the UAC core,
+    /// which answers it with the ACK again.
     ///
     /// A 2xx for an early dialog confirms it, and one for a new remote tag
     /// forms a confirmed dialog of its own, as RFC 3261 section 13.2.2.4
-    /// requires of a fork.
+    /// requires of a fork. No 2xx is preferred over another. Each one is a
+    /// session of its own for the application to keep or end.
     pub(crate) fn receive_2xx<B>(
         &mut self,
         key: AttemptKey,
         response: &Response<B>,
+        description: Option<Description>,
     ) -> Result<(), Error> {
         let Some(attempt) = self.attempts.get(key) else {
             return Err(Error::StaleDecision);
         };
+        // TODO: Still send the ACK and a BYE for a 2xx that cannot form a
+        // dialog, and report the response set as incomplete.
+        if !attempt.origin.answered_by(response) {
+            return Err(Error::InvalidInput);
+        }
         let remote_tag =
             response_tag(response).map_err(|_| Error::InvalidInput)?;
         let id = attempt.origin.dialog_id(remote_tag);
@@ -1352,13 +1435,13 @@ impl<R: Random> Model<R> {
             return Ok(());
         }
 
-        // TODO: Still send the ACK and a BYE for a branch that does not fit
-        // or cannot form a dialog, from a cleanup budget, and report the
-        // response set as incomplete. RFC 3261 section 13.2.2.4 asks for the
-        // ACK of every 2xx, and a BYE for each dialog the UAC does not keep.
+        // TODO: Still send the ACK and a BYE for a branch that does not fit,
+        // from a cleanup budget, and report the response set as incomplete.
+        // RFC 3261 section 13.2.2.4 asks for the ACK of every 2xx, and a BYE
+        // for each dialog the UAC does not keep.
         let replay = match self.dialog_index.get(&id).copied() {
             Some(dialog) => {
-                self.confirm_early(dialog, response, replay, key)?
+                self.confirm_early(dialog, response, replay, key, description)?
             }
             None => {
                 let dialog =
@@ -1376,18 +1459,22 @@ impl<R: Random> Model<R> {
                 } else {
                     Negotiation::Stable
                 };
-                settle_at_2xx(&mut negotiation);
-                self.establish(
+                settle_at_2xx(&mut negotiation, description.is_some());
+                let (replay, usage) = self.establish(
                     dialog,
                     Direction::Outgoing,
                     negotiation,
                     replay,
                     Source::Attempt(key),
-                )
-                .0
+                );
+                self.usages.get_mut(usage).expect("just made").remote =
+                    description;
+                replay
             }
         };
 
+        let attempt = self.attempts.get_mut(key).expect("checked above");
+        attempt.result.get_or_insert(AttemptResult::Answered);
         self.exchanges
             .get_mut(exchange)
             .expect("an attempt keeps its exchange")
@@ -1404,6 +1491,7 @@ impl<R: Random> Model<R> {
         response: &Response<B>,
         replay: ReplayId,
         attempt: AttemptKey,
+        description: Option<Description>,
     ) -> Result<ReplayKey, Error> {
         if !self.replays.reserve() {
             return Err(Error::CapacityExceeded);
@@ -1420,7 +1508,8 @@ impl<R: Random> Model<R> {
             .find(|(_, usage)| usage.dialog == dialog)
             .expect("an early dialog has its usage");
         record.establish();
-        settle_at_2xx(&mut record.negotiation);
+        settle_at_2xx(&mut record.negotiation, description.is_some());
+        record.remote = description;
         let settled = record.negotiation == Negotiation::Stable;
 
         let context = ReplayContext::new(
@@ -1455,9 +1544,17 @@ impl<R: Random> Model<R> {
         }
     }
 
-    /// Records that the core finished collecting the attempt's responses.
-    /// Copies of its 2xx can no longer arrive.
+    /// Records that the core finished collecting the attempt's responses,
+    /// and reports what the attempt came to. Copies of its 2xx can no longer
+    /// arrive, and an early dialog no response confirmed can no longer be
+    /// confirmed.
+    ///
+    /// An attempt that ends without a final response or a failure, as when
+    /// the endpoint stops, failed with `DriverStopped`, or with
+    /// `ObservationIncomplete` if the core dropped responses that may have
+    /// been the final one.
     pub(crate) fn response_collection_finished(&mut self, key: AttemptKey) {
+        self.end_early_usages(key);
         let Some(attempt) = self.attempts.remove(key) else {
             return;
         };
@@ -1475,13 +1572,33 @@ impl<R: Random> Model<R> {
             self.replays.get_mut(replay).expect("listed").duplicates_ended();
             self.reclaim_replay(replay);
         }
+
+        let result = attempt.result.unwrap_or(AttemptResult::Failed(
+            if attempt.complete {
+                Error::DriverStopped
+            } else {
+                Error::ObservationIncomplete
+            },
+        ));
+        self.effects.push(Effect::AttemptEnded {
+            attempt: key,
+            result,
+            complete: attempt.complete,
+        });
     }
 }
 
 /// Moves a sent INVITE's negotiation past its 2xx, which carries the answer
 /// to the INVITE's offer, or an offer when the INVITE had none (RFC 3261
-/// section 13.2.1).
-fn settle_at_2xx(negotiation: &mut Negotiation) {
+/// section 13.2.1). `description` says whether the 2xx carries one.
+///
+/// TODO: Treat a 2xx without the answer it owes as a negotiation failure.
+/// Until then the offer stays outstanding, and the session never reports a
+/// completed negotiation.
+fn settle_at_2xx(negotiation: &mut Negotiation, description: bool) {
+    if !description {
+        return;
+    }
     match negotiation {
         Negotiation::LocalOfferOutstanding => {
             negotiation.answer_received().expect("the offer is outstanding")
@@ -1594,7 +1711,7 @@ mod tests {
         error::WireEffect,
         invite::UsagePhase,
         operation::Snapshot,
-        tests::{INVITE, invite, reply, request},
+        tests::{INVITE, invite, reply, request, response},
     };
 
     const RETENTION: Duration = Duration::from_secs(32);
@@ -1642,6 +1759,11 @@ mod tests {
         }
     }
 
+    /// An offer in an INVITE, which the model passes on without reading.
+    fn offer() -> Option<Description> {
+        Some(answer())
+    }
+
     /// An answer, which the model passes on without reading.
     fn answer() -> Description {
         Description::new(
@@ -1651,12 +1773,18 @@ mod tests {
     }
 
     fn model(limits: Limits) -> Model<Counter> {
-        Model::new(limits, Counter(0))
+        Model::new(limits, "sip:ua@192.0.2.1".into(), Counter(0))
     }
 
     /// The 2xx of the callee, with the tag `callee`.
     fn callee() -> Response<Bytes> {
         reply("200 OK", "callee", "sip:bob@192.0.2.4", "")
+    }
+
+    /// The 2xx of the callee, with `from` replaced by `to` in its text.
+    fn callee_with(from: &str, to: &str) -> Response<Bytes> {
+        let text = String::from_utf8(callee().to_bytes().to_vec()).unwrap();
+        response(&text.replace("\r\n", "\n").replace(from, to))
     }
 
     impl<R> Model<R> {
@@ -1781,8 +1909,9 @@ mod tests {
         model: &mut Model<Counter>,
         clock: &Clock,
     ) -> (ExchangeKey, ReplayKey, UsageKey) {
-        let authority =
-            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
+        let authority = model
+            .receive_invite(&request(INVITE), offer(), clock.now())
+            .unwrap();
         let exchange = authority.exchange;
         model
             .try_submit(Command::Accept { authority, answer: answer() })
@@ -1829,9 +1958,8 @@ mod tests {
     fn dialog_confirmed_is_not_ack_received_or_media_ready() {
         let clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority = model
-            .receive_invite(&request(INVITE), false, clock.now())
-            .unwrap();
+        let authority =
+            model.receive_invite(&request(INVITE), None, clock.now()).unwrap();
         let exchange = authority.exchange;
 
         model
@@ -1888,7 +2016,7 @@ mod tests {
         let mut model = model(limits());
         let attempt = model.start_attempt(&request(INVITE), true).unwrap();
 
-        model.receive_2xx(attempt, &callee()).unwrap();
+        model.receive_2xx(attempt, &callee(), Some(answer())).unwrap();
         let effects = model.take_effects();
         let (_, usage) = confirmed(&effects);
         let replay_key = match effects.last() {
@@ -1911,7 +2039,7 @@ mod tests {
         assert_eq!(model.usages.len(), 0);
         assert_eq!(model.dialogs.len(), 0);
 
-        model.receive_2xx(attempt, &callee()).unwrap();
+        model.receive_2xx(attempt, &callee(), Some(answer())).unwrap();
         model.check();
         assert_eq!(
             model.take_effects(),
@@ -1923,11 +2051,18 @@ mod tests {
         model.check();
         assert_eq!(
             model.take_effects(),
-            [Effect::Released(Released::Replay(replay_key))],
+            [
+                Effect::Released(Released::Replay(replay_key)),
+                Effect::AttemptEnded {
+                    attempt,
+                    result: AttemptResult::Answered,
+                    complete: true,
+                },
+            ],
         );
         assert!(!model.has_replay(replay_key));
         assert_eq!(
-            model.receive_2xx(attempt, &callee()),
+            model.receive_2xx(attempt, &callee(), Some(answer())),
             Err(Error::StaleDecision),
         );
         assert!(model.take_effects().is_empty());
@@ -1940,8 +2075,9 @@ mod tests {
     fn accepted_command_survives_waiter_drop() {
         let mut clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority =
-            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
+        let authority = model
+            .receive_invite(&request(INVITE), offer(), clock.now())
+            .unwrap();
         let exchange = authority.exchange;
 
         let operation = model
@@ -1981,10 +2117,10 @@ mod tests {
         let clock = Clock(Instant::now());
         let mut model = model(Limits { commands: 1, ..limits() });
         let first = model
-            .receive_invite(&invite("one@example.com"), true, clock.now())
+            .receive_invite(&invite("one@example.com"), offer(), clock.now())
             .unwrap();
         let second = model
-            .receive_invite(&invite("two@example.com"), true, clock.now())
+            .receive_invite(&invite("two@example.com"), offer(), clock.now())
             .unwrap();
         let exchange = second.exchange;
         model
@@ -2022,8 +2158,9 @@ mod tests {
     fn a_losing_or_stale_decision_has_no_wire_effect() {
         let clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority =
-            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
+        let authority = model
+            .receive_invite(&request(INVITE), offer(), clock.now())
+            .unwrap();
         let exchange = authority.exchange;
         let forged = Authority { exchange };
         model
@@ -2081,8 +2218,9 @@ mod tests {
     fn no_2xx_without_room_for_its_session() {
         let clock = Clock(Instant::now());
         let mut model = model(Limits { replays: 0, ..limits() });
-        let authority =
-            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
+        let authority = model
+            .receive_invite(&request(INVITE), offer(), clock.now())
+            .unwrap();
         let exchange = authority.exchange;
 
         let operation = model
@@ -2107,8 +2245,9 @@ mod tests {
     fn an_unknown_ack_changes_nothing() {
         let clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority =
-            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
+        let authority = model
+            .receive_invite(&request(INVITE), offer(), clock.now())
+            .unwrap();
         let exchange = authority.exchange;
         model
             .try_submit(Command::Accept { authority, answer: answer() })
@@ -2141,8 +2280,9 @@ mod tests {
     fn tags_come_from_the_injected_randomness() {
         let clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority =
-            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
+        let authority = model
+            .receive_invite(&request(INVITE), offer(), clock.now())
+            .unwrap();
         let exchange = authority.exchange;
 
         model
@@ -2169,7 +2309,7 @@ mod tests {
         );
 
         let refusal = model
-            .receive_invite(&request(&tagged), true, clock.now())
+            .receive_invite(&request(&tagged), offer(), clock.now())
             .unwrap_err();
 
         assert_eq!(refusal, Refusal::NoDialog);
@@ -2184,8 +2324,9 @@ mod tests {
     fn a_tagged_request_finds_its_dialog() {
         let clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority =
-            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
+        let authority = model
+            .receive_invite(&request(INVITE), offer(), clock.now())
+            .unwrap();
         let exchange = authority.exchange;
         model
             .try_submit(Command::Accept { authority, answer: answer() })
@@ -2222,7 +2363,7 @@ mod tests {
         let text = INVITE.replace("Contact: <sip:alice@192.0.2.1>\n", "");
 
         let refusal = model
-            .receive_invite(&request(&text), true, clock.now())
+            .receive_invite(&request(&text), offer(), clock.now())
             .unwrap_err();
 
         assert_eq!(refusal, Refusal::Malformed(Field::Contact));
@@ -2275,7 +2416,7 @@ mod tests {
             "sip:bob@192.0.2.6",
             "Record-Route: <sip:p2.example.com;lr>, <sip:p1.example.com;lr>\n",
         );
-        model.receive_2xx(attempt, &ok).unwrap();
+        model.receive_2xx(attempt, &ok, Some(answer())).unwrap();
         model.check();
 
         let effects = model.take_effects();
@@ -2311,6 +2452,7 @@ mod tests {
             .receive_2xx(
                 attempt,
                 &reply("200 OK", "second", "sip:bob@192.0.2.5", ""),
+                Some(answer()),
             )
             .unwrap();
         model.check();
@@ -2328,8 +2470,9 @@ mod tests {
     fn a_rejection_leaves_nothing_behind() {
         let clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority =
-            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
+        let authority = model
+            .receive_invite(&request(INVITE), offer(), clock.now())
+            .unwrap();
         let exchange = authority.exchange;
         let busy = StatusCode::from_u16(486).unwrap();
 
@@ -2358,8 +2501,9 @@ mod tests {
     fn a_rejection_with_a_2xx_is_invalid() {
         let clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority =
-            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
+        let authority = model
+            .receive_invite(&request(INVITE), offer(), clock.now())
+            .unwrap();
 
         let operation = model
             .try_submit(Command::Reject { authority, status: StatusCode::OK })
@@ -2382,10 +2526,15 @@ mod tests {
     fn an_abandoned_invite_gets_a_500() {
         let clock = Clock(Instant::now());
         let mut model = model(limits());
-        let abandoned =
-            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
+        let abandoned = model
+            .receive_invite(&request(INVITE), offer(), clock.now())
+            .unwrap();
         let decided = model
-            .receive_invite(&invite("decided@example.com"), true, clock.now())
+            .receive_invite(
+                &invite("decided@example.com"),
+                offer(),
+                clock.now(),
+            )
             .unwrap();
         let (abandoned, decided_exchange) =
             (abandoned.exchange(), decided.exchange());
@@ -2417,7 +2566,7 @@ mod tests {
             [("refused@example.com", false), ("closed@example.com", true)]
         {
             let authority = model
-                .receive_invite(&invite(call), true, clock.now())
+                .receive_invite(&invite(call), offer(), clock.now())
                 .unwrap();
             let exchange = authority.exchange;
             let operation = model
@@ -2451,7 +2600,18 @@ mod tests {
         }
     }
 
-    /// An INVITE command opens an attempt and hands the request over. Its
+    /// A plan for the callee of the INVITE, from its caller.
+    fn plan() -> Box<InvitePlan> {
+        let uri = |text: &str| text.parse().unwrap();
+        Box::new(InvitePlan::new(
+            uri("sip:bob@biloxi.example.com"),
+            uri("sip:alice@atlanta.example.com"),
+            answer(),
+        ))
+    }
+
+    /// An INVITE command builds the INVITE with an identity from the
+    /// injected randomness, opens an attempt and hands the request over. Its
     /// operation completes with the attempt once the core has it, or fails
     /// and closes the attempt.
     #[test]
@@ -2459,16 +2619,23 @@ mod tests {
         let clock = Clock(Instant::now());
         let mut model = model(limits());
 
-        let started = model
-            .try_submit(Command::Invite { request: Box::new(request(INVITE)) })
-            .unwrap();
+        let started =
+            model.try_submit(Command::Invite { plan: plan() }).unwrap();
         model.run_commands(clock.now());
         let [Effect::StartInvite { attempt }] = model.take_effects()[..]
         else {
             panic!("no INVITE to send");
         };
         let request = model.take_invite(attempt).unwrap();
+        let header = |name| request.headers().get(name).unwrap().as_str();
         assert_eq!(request.method(), &Method::INVITE);
+        assert_eq!(header("Call-ID"), "00000000000000010000000000000002");
+        assert_eq!(
+            header("From"),
+            "<sip:alice@atlanta.example.com>;tag=0000000000000003",
+        );
+        assert_eq!(header("CSeq"), "5 INVITE");
+        assert_eq!(header("Contact"), "<sip:ua@192.0.2.1>");
         assert!(model.take_invite(attempt).is_none());
         model.invite_started(attempt, clock.now());
         assert_eq!(
@@ -2480,11 +2647,8 @@ mod tests {
             Some(Ok(Completion::Attempt(attempt))),
         );
 
-        let failed = model
-            .try_submit(Command::Invite {
-                request: Box::new(invite("failed@example.com")),
-            })
-            .unwrap();
+        let failed =
+            model.try_submit(Command::Invite { plan: plan() }).unwrap();
         model.run_commands(clock.now());
         let [Effect::StartInvite { attempt }] = model.take_effects()[..]
         else {
@@ -2510,18 +2674,21 @@ mod tests {
         };
         let busy = StatusCode::from_u16(486).unwrap();
 
-        model.receive_failure(attempt, busy);
+        model.attempt_failed(attempt, Error::RemoteFailure(busy));
         model.check();
 
         assert_eq!(
             notices(&model.take_effects()),
             [
                 Event::UsageEnded { usage },
-                Event::AttemptFailed { attempt, status: busy },
+                Event::AttemptFailed {
+                    attempt,
+                    error: Error::RemoteFailure(busy)
+                },
             ],
         );
         assert_eq!(model.dialogs.len(), 0);
-        model.receive_2xx(attempt, &callee()).unwrap();
+        model.receive_2xx(attempt, &callee(), Some(answer())).unwrap();
         assert_eq!(model.dialogs.len(), 1);
     }
 
@@ -2530,7 +2697,7 @@ mod tests {
     fn an_ack_is_built_from_its_dialog() {
         let mut model = model(limits());
         let attempt = model.start_attempt(&request(INVITE), true).unwrap();
-        model.receive_2xx(attempt, &callee()).unwrap();
+        model.receive_2xx(attempt, &callee(), Some(answer())).unwrap();
         let replay = match model.take_effects().last() {
             Some(Effect::SendAck { replay }) => *replay,
             other => panic!("no ACK: {other:?}"),
@@ -2548,9 +2715,8 @@ mod tests {
     fn a_received_ack_finds_its_2xx() {
         let clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority = model
-            .receive_invite(&request(INVITE), false, clock.now())
-            .unwrap();
+        let authority =
+            model.receive_invite(&request(INVITE), None, clock.now()).unwrap();
         let exchange = authority.exchange;
         model
             .try_submit(Command::Accept { authority, answer: answer() })
@@ -2587,11 +2753,12 @@ mod tests {
             }
         }
 
-        let mut model = Model::new(limits(), Broken);
+        let mut model =
+            Model::new(limits(), "sip:ua@192.0.2.1".into(), Broken);
         let clock = Clock(Instant::now());
 
         let refusal = model
-            .receive_invite(&request(INVITE), true, clock.now())
+            .receive_invite(&request(INVITE), offer(), clock.now())
             .unwrap_err();
 
         assert_eq!(refusal, Refusal::Internal);
@@ -2604,8 +2771,9 @@ mod tests {
     fn kept_outcomes_have_a_deadline() {
         let mut clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority =
-            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
+        let authority = model
+            .receive_invite(&request(INVITE), offer(), clock.now())
+            .unwrap();
         let busy = StatusCode::from_u16(486).unwrap();
         let operation = model
             .try_submit(Command::Reject { authority, status: busy })
@@ -2630,12 +2798,16 @@ mod tests {
     fn usage_state_follows_the_usage() {
         let mut model = model(limits());
         let attempt = model.start_attempt(&request(INVITE), true).unwrap();
-        model.receive_2xx(attempt, &callee()).unwrap();
+        model.receive_2xx(attempt, &callee(), Some(answer())).unwrap();
         let (_, usage) = confirmed(&model.take_effects());
 
         assert_eq!(
             model.usage_state(usage),
-            Some((UsagePhase::Established, Negotiation::Stable)),
+            Some((
+                UsagePhase::Established,
+                Negotiation::Stable,
+                Some(answer())
+            )),
         );
         model.end_usage(usage);
         assert_eq!(model.usage_state(usage), None);
@@ -2649,9 +2821,8 @@ mod tests {
     fn ack_arriving_before_submission_completion_is_not_lost() {
         let clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority = model
-            .receive_invite(&request(INVITE), false, clock.now())
-            .unwrap();
+        let authority =
+            model.receive_invite(&request(INVITE), None, clock.now()).unwrap();
         let exchange = authority.exchange;
         model
             .try_submit(Command::Accept { authority, answer: answer() })
@@ -2684,8 +2855,9 @@ mod tests {
     fn uas_final_response_is_selected_once() {
         let mut clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority =
-            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
+        let authority = model
+            .receive_invite(&request(INVITE), offer(), clock.now())
+            .unwrap();
         let exchange = authority.exchange;
         model
             .try_submit(Command::Accept { authority, answer: answer() })
@@ -2834,8 +3006,9 @@ mod tests {
     fn an_undecided_invite_gets_a_500_at_its_deadline() {
         let mut clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority =
-            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
+        let authority = model
+            .receive_invite(&request(INVITE), offer(), clock.now())
+            .unwrap();
         let exchange = authority.exchange;
         let due = clock.now() + DECISION;
 
@@ -2872,8 +3045,9 @@ mod tests {
         let mut clock = Clock(Instant::now());
         let decision_timeout = Duration::from_secs(600);
         let mut model = model(Limits { decision_timeout, ..limits() });
-        let authority =
-            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
+        let authority = model
+            .receive_invite(&request(INVITE), offer(), clock.now())
+            .unwrap();
         let exchange = authority.exchange;
         let tag: Tag = "0000000000000001".parse().unwrap();
         let minute = Duration::from_secs(60);
@@ -2942,8 +3116,9 @@ mod tests {
     fn a_provisional_after_the_final_is_refused() {
         let clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority =
-            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
+        let authority = model
+            .receive_invite(&request(INVITE), offer(), clock.now())
+            .unwrap();
         let exchange = authority.exchange;
         let trying = model
             .try_submit(Command::Provisional {
@@ -2978,19 +3153,20 @@ mod tests {
         let clock = Clock(Instant::now());
         let mut model = model(limits());
         let merged = INVITE.replace("z9hG4bK776asdhds", "z9hG4bKother");
-        let authority =
-            model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
+        let authority = model
+            .receive_invite(&request(INVITE), offer(), clock.now())
+            .unwrap();
         let exchange = authority.exchange;
 
         let refusal = model
-            .receive_invite(&request(&merged), true, clock.now())
+            .receive_invite(&request(&merged), offer(), clock.now())
             .unwrap_err();
         assert_eq!(refusal, Refusal::Merged);
         assert_eq!(refusal.status().as_u16(), 482);
         let next_cseq = merged.replace("314159 INVITE", "314160 INVITE");
         assert!(
             model
-                .receive_invite(&request(&next_cseq), true, clock.now())
+                .receive_invite(&request(&next_cseq), offer(), clock.now())
                 .is_ok()
         );
 
@@ -3004,7 +3180,9 @@ mod tests {
         model.final_committed(exchange, clock.now());
         model.check();
         assert!(
-            model.receive_invite(&request(&merged), true, clock.now()).is_ok()
+            model
+                .receive_invite(&request(&merged), offer(), clock.now())
+                .is_ok()
         );
     }
 
@@ -3025,12 +3203,12 @@ mod tests {
         );
 
         let refusal = model
-            .receive_invite(&request(&required), true, clock.now())
+            .receive_invite(&request(&required), offer(), clock.now())
             .unwrap_err();
         assert_eq!(refusal, Refusal::BadExtension);
         assert_eq!(refusal.status().as_u16(), 420);
         assert_eq!(
-            model.receive_invite(&request(&malformed), true, clock.now()),
+            model.receive_invite(&request(&malformed), offer(), clock.now()),
             Err(Refusal::Malformed(Field::Require)),
         );
         assert_eq!(model.exchanges.len(), 0);
@@ -3060,9 +3238,221 @@ mod tests {
         let decision_timeout = Duration::MAX;
         let mut model = model(Limits { decision_timeout, ..limits() });
 
-        model.receive_invite(&request(INVITE), true, clock.now()).unwrap();
+        model.receive_invite(&request(INVITE), offer(), clock.now()).unwrap();
         model.check();
 
         assert_eq!(model.next_deadline(), None);
+    }
+
+    /// Returns what `effects` say an attempt came to at its end.
+    fn ended(effects: &[Effect]) -> (AttemptResult, bool) {
+        effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::AttemptEnded { result, complete, .. } => {
+                    Some((*result, *complete))
+                }
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    /// A response the core matched to the INVITE by its Via, but with
+    /// another Call-ID, From tag or CSeq, is not taken for a dialog of the
+    /// INVITE, and gets no ACK.
+    #[test]
+    fn a_response_with_another_identity_forms_no_dialog() {
+        let mut model = model(limits());
+        let attempt = model.start_attempt(&request(INVITE), true).unwrap();
+
+        for (from, to) in [
+            ("a84b4c76e66710@pc33", "other@pc33"),
+            ("tag=1928301774", "tag=other"),
+            ("314159 INVITE", "314158 INVITE"),
+        ] {
+            assert_eq!(
+                model.receive_2xx(
+                    attempt,
+                    &callee_with(from, to),
+                    Some(answer())
+                ),
+                Err(Error::InvalidInput),
+                "{from}",
+            );
+        }
+        model.check();
+
+        assert!(model.take_effects().is_empty());
+        assert_eq!(model.dialogs.len(), 0);
+    }
+
+    /// The ACK of a 2xx takes the INVITE's CSeq number, and takes no new
+    /// number from the dialog, whose next request still gets the one after
+    /// the INVITE's (RFC 3261 section 13.2.2.4).
+    #[test]
+    fn uac_ack_uses_invite_cseq_without_increment() {
+        let mut model = model(limits());
+        let attempt = model.start_attempt(&request(INVITE), true).unwrap();
+        model.receive_2xx(attempt, &callee(), Some(answer())).unwrap();
+        let (dialog, _) = confirmed(&model.take_effects());
+        let replay = model.replays.iter().next().unwrap().0;
+
+        let ack = model.ack_request(replay).unwrap();
+        let again = model.ack_request(replay).unwrap();
+        let next = model
+            .dialogs
+            .get_mut(dialog)
+            .unwrap()
+            .request(Method::BYE, Sequence::Next { seed: 0 })
+            .unwrap();
+
+        assert_eq!(ack.request.headers().get("CSeq").unwrap(), "314159 ACK");
+        assert_eq!(again.request.headers().get("CSeq").unwrap(), "314159 ACK");
+        assert_eq!(next.request.headers().get("CSeq").unwrap(), "314160 BYE");
+    }
+
+    /// The first final response or failure decides what an attempt came to.
+    /// A non-2xx final and a failure of the transport are told apart, and a
+    /// failure after a 2xx does not undo it.
+    #[test]
+    fn the_first_failure_decides_the_attempt() {
+        let mut model = model(limits());
+        let busy = StatusCode::from_u16(486).unwrap();
+        let rejected = model.start_attempt(&request(INVITE), true).unwrap();
+        let lost =
+            model.start_attempt(&invite("lost@example.com"), true).unwrap();
+        let answered = model
+            .start_attempt(&invite("answered@example.com"), true)
+            .unwrap();
+        let answer_ok = callee_with(
+            "a84b4c76e66710@pc33.atlanta.example.com",
+            "answered@example.com",
+        );
+
+        model.attempt_failed(rejected, Error::RemoteFailure(busy));
+        model.attempt_failed(rejected, Error::TransportFailure);
+        model.attempt_failed(lost, Error::TransportFailure);
+        model.receive_2xx(answered, &answer_ok, Some(answer())).unwrap();
+        model.attempt_failed(answered, Error::TransportFailure);
+        model.check();
+
+        let failed = Some(AttemptResult::Failed(Error::RemoteFailure(busy)));
+        assert_eq!(model.attempt_state(rejected), Some((failed, true)));
+        let lost_state = Some(AttemptResult::Failed(Error::TransportFailure));
+        assert_eq!(model.attempt_state(lost), Some((lost_state, true)));
+        assert_eq!(
+            model.attempt_state(answered),
+            Some((Some(AttemptResult::Answered), true)),
+        );
+        let notified: Vec<Event> = notices(&model.take_effects())
+            .into_iter()
+            .filter(|event| matches!(event, Event::AttemptFailed { .. }))
+            .collect();
+        assert_eq!(
+            notified,
+            [
+                Event::AttemptFailed {
+                    attempt: rejected,
+                    error: Error::RemoteFailure(busy),
+                },
+                Event::AttemptFailed {
+                    attempt: lost,
+                    error: Error::TransportFailure,
+                },
+            ],
+        );
+    }
+
+    /// Once the core dropped responses, the attempt's set of responses is
+    /// not complete, and its end says so. Without a final response before
+    /// the loss, it ends as `ObservationIncomplete`, not as a success or a
+    /// plain stop.
+    #[test]
+    fn responses_overflow_marks_response_set_incomplete() {
+        let mut model = model(limits());
+        let answered = model.start_attempt(&request(INVITE), true).unwrap();
+        let unknown =
+            model.start_attempt(&invite("unknown@example.com"), true).unwrap();
+        let stopped =
+            model.start_attempt(&invite("stopped@example.com"), true).unwrap();
+        model.receive_2xx(answered, &callee(), Some(answer())).unwrap();
+        model.take_effects();
+
+        model.responses_lost(answered);
+        model.responses_lost(unknown);
+        assert_eq!(
+            model.attempt_state(answered),
+            Some((Some(AttemptResult::Answered), false)),
+        );
+
+        model.response_collection_finished(answered);
+        assert_eq!(
+            ended(&model.take_effects()),
+            (AttemptResult::Answered, false),
+        );
+        model.response_collection_finished(unknown);
+        assert_eq!(
+            ended(&model.take_effects()),
+            (AttemptResult::Failed(Error::ObservationIncomplete), false),
+        );
+        model.response_collection_finished(stopped);
+        assert_eq!(
+            ended(&model.take_effects()),
+            (AttemptResult::Failed(Error::DriverStopped), true),
+        );
+        assert_eq!(model.attempt_state(answered), None);
+        model.check();
+    }
+
+    /// A 2xx without the answer the INVITE's offer is owed confirms the
+    /// dialog, and gets its ACK, but leaves the offer outstanding rather than
+    /// report a completed negotiation. The answer of a 2xx that has one is
+    /// kept for the session.
+    #[test]
+    fn a_2xx_without_its_answer_leaves_the_offer_outstanding() {
+        let mut model = model(limits());
+        let attempt = model.start_attempt(&request(INVITE), true).unwrap();
+
+        model.receive_2xx(attempt, &callee(), None).unwrap();
+
+        let effects = model.take_effects();
+        let (_, usage) = confirmed(&effects);
+        assert!(!negotiated(&effects));
+        assert!(effects.iter().any(|e| matches!(e, Effect::SendAck { .. })));
+        assert_eq!(
+            model.usage_state(usage),
+            Some((
+                UsagePhase::Established,
+                Negotiation::LocalOfferOutstanding,
+                None,
+            )),
+        );
+    }
+
+    /// When the core stops collecting responses, an early dialog no 2xx
+    /// confirmed cannot be confirmed any more, and ends.
+    #[test]
+    fn the_end_of_the_responses_ends_unconfirmed_early_dialogs() {
+        let mut model = model(limits());
+        let attempt = model.start_attempt(&request(INVITE), true).unwrap();
+        model
+            .receive_provisional(
+                attempt,
+                &reply("180 Ringing", "early", "sip:bob@192.0.2.4", ""),
+            )
+            .unwrap();
+        model.receive_2xx(attempt, &callee(), Some(answer())).unwrap();
+        let effects = model.take_effects();
+        let (_, kept) = confirmed(&effects);
+
+        model.response_collection_finished(attempt);
+        model.check();
+
+        let ended: Vec<Event> = notices(&model.take_effects());
+        assert_eq!(ended.len(), 1);
+        assert!(
+            matches!(ended[0], Event::UsageEnded { usage } if usage != kept)
+        );
+        assert!(model.usage_state(kept).is_some());
     }
 }

@@ -36,7 +36,8 @@ use signa_core::{
     },
     message::{
         header::{
-            CONTACT, CONTENT_TYPE, RECORD_ROUTE, REQUIRE, Tag, UNSUPPORTED,
+            ALLOW, CONTACT, CONTENT_TYPE, RECORD_ROUTE, REQUIRE, Tag,
+            UNSUPPORTED,
         },
         response,
     },
@@ -48,8 +49,8 @@ use tokio::{
 };
 
 use super::{
-    AttemptId, Command, Config, Event, IncomingInvite, Query, Resolve,
-    ResolveError, Session, SessionSnapshot, Shared,
+    AttemptId, AttemptSnapshot, Command, Config, Event, IncomingInvite, Query,
+    Resolve, ResolveError, Session, SessionSnapshot, Shared,
 };
 use crate::{
     error::Error,
@@ -57,6 +58,7 @@ use crate::{
     model::{self, Effect, Model, Random, Refusal, Released},
     negotiation::Description,
     operation::{Completion, OperationId},
+    plan::ALLOWED,
     retention::ReplayKey,
     routing::initial_next_hop,
 };
@@ -115,6 +117,9 @@ pub(super) struct Driver<R> {
     waiters: HashMap<OperationId, Waiter>,
     /// The permits of outcomes kept after their waiter went away.
     kept: HashMap<OperationId, OwnedSemaphorePermit>,
+    /// The place in the event queue set aside for the last event of each
+    /// attempt, [`Event::AttemptEnded`].
+    endings: HashMap<AttemptKey, mpsc::OwnedPermit<Event>>,
 }
 
 struct Server {
@@ -225,7 +230,11 @@ impl<R: Resolve> Driver<R> {
         let (response_sender, responses) = mpsc::channel(RESPONSE_QUEUE);
 
         Driver {
-            model: Model::new(config.limits(), OsRandom),
+            model: Model::new(
+                config.limits(),
+                config.contact.clone(),
+                OsRandom,
+            ),
             random: OsRandom,
             endpoint,
             incoming,
@@ -250,6 +259,7 @@ impl<R: Resolve> Driver<R> {
             acks: HashMap::new(),
             waiters: HashMap::new(),
             kept: HashMap::new(),
+            endings: HashMap::new(),
         }
     }
 
@@ -346,9 +356,9 @@ impl<R: Resolve> Driver<R> {
             return;
         };
 
-        // TODO: Tell an offer by the Content-Type and Content-Disposition of
-        // the body, rather than by its presence.
-        let offer = !request.body().is_empty();
+        let offer =
+            Description::from_message(request.headers(), request.body());
+        let offered = offer.is_some();
         match self.model.receive_invite(&request, offer, now()) {
             Ok(authority) => {
                 let exchange = authority.exchange();
@@ -366,7 +376,7 @@ impl<R: Resolve> Driver<R> {
                 // yet. It is answered with a 488 rather than let through to
                 // be accepted with nothing to check the answer against. The
                 // status is my policy (RFC 3261 section 21.4.26).
-                if offer {
+                if offered {
                     slot.send(Event::Invite(IncomingInvite {
                         request,
                         authority: Some(authority),
@@ -439,9 +449,15 @@ impl<R: Resolve> Driver<R> {
             }
             Command::Snapshot { usage, reply } => {
                 let snapshot = self.model.usage_state(usage).map(
-                    |(phase, negotiation)| {
-                        SessionSnapshot::new(phase, negotiation)
+                    |(phase, negotiation, remote)| {
+                        SessionSnapshot::new(phase, negotiation, remote)
                     },
+                );
+                let _ = reply.send(snapshot);
+            }
+            Command::AttemptSnapshot { attempt, reply } => {
+                let snapshot = self.model.attempt_state(attempt).map(
+                    |(result, complete)| AttemptSnapshot { result, complete },
                 );
                 let _ = reply.send(snapshot);
             }
@@ -537,30 +553,49 @@ impl<R: Resolve> Driver<R> {
         match item {
             Some(Ok(response)) => {
                 let status = response.status();
-                // An error here is a response that cannot form a dialog.
-                // RFC 3261 leaves no way to answer it, so the UA keeps none.
+                // An error here is a response that cannot form a dialog, such
+                // as one that does not carry the INVITE's identity. The UA
+                // keeps nothing for it.
                 //
                 // TODO: Report such a response, and send the ACK and a BYE
-                // for a 2xx that cannot form a dialog.
+                // for a 2xx that cannot form a dialog (RFC 3261 section
+                // 13.2.2.4).
                 let _ = match status.as_u16() {
                     100..=199 => {
                         self.model.receive_provisional(attempt, &response)
                     }
-                    200..=299 => self.model.receive_2xx(attempt, &response),
+                    200..=299 => {
+                        let description = Description::from_message(
+                            response.headers(),
+                            response.body(),
+                        );
+                        self.model.receive_2xx(attempt, &response, description)
+                    }
                     _ => {
-                        self.model.receive_failure(attempt, status);
+                        let error = Error::RemoteFailure(status);
+                        self.model.attempt_failed(attempt, error);
                         Ok(())
                     }
                 };
             }
-            // RFC 3261 section 8.1.3.1 treats a transaction timeout as a 408.
-            Some(Err(error)) if error.is_timeout() => {
-                let timeout = StatusCode::from_u16(408).expect("a status");
-                self.model.receive_failure(attempt, timeout);
+            // The endpoint dropped responses for want of room. The
+            // transaction goes on, but the UA sees no more of it.
+            Some(Err(error)) if error.is_delivery_overflow() => {
+                self.model.responses_lost(attempt);
             }
-            // TODO: Report a response overflow as an incomplete response
-            // set, rather than leave the attempt to end quietly.
-            Some(Err(_)) => {}
+            // The transaction failed. A timeout counts as a 408 in RFC 3261
+            // section 8.1.3.1, but no 408 came from the peer, so the UA
+            // reports it as the timeout it is.
+            Some(Err(error)) => {
+                let error = if error.is_timeout() {
+                    Error::Timeout
+                } else if error.is_transport() {
+                    Error::TransportFailure
+                } else {
+                    Error::DriverStopped
+                };
+                self.model.attempt_failed(attempt, error);
+            }
             None => {
                 self.clients.remove(&attempt);
                 self.model.response_collection_finished(attempt);
@@ -614,6 +649,18 @@ impl<R: Resolve> Driver<R> {
             }
             Effect::Notify(event) => self.notify(event, attempt),
             Effect::OperationEnded { operation } => self.deliver(operation),
+            Effect::AttemptEnded { attempt, result, complete } => {
+                if let Some(permit) = self.endings.remove(&attempt) {
+                    permit.send(Event::AttemptEnded {
+                        attempt: AttemptId(attempt),
+                        result,
+                        complete,
+                    });
+                }
+            }
+            Effect::Released(Released::Attempt(attempt)) => {
+                self.endings.remove(&attempt);
+            }
             Effect::Released(Released::Exchange(exchange)) => {
                 self.servers.remove(&exchange);
             }
@@ -639,9 +686,11 @@ impl<R: Resolve> Driver<R> {
         // 401 (section 21.4.2).
         let mut response =
             Response::reply_to(&server.request).status(status).to_tag(to_tag);
+        // A 2xx says which methods the UA takes (RFC 3261 section 13.3.1.4).
         if status.is_success() {
             response =
-                dialog_headers(response, &server.request, &self.contact);
+                dialog_headers(response, &server.request, &self.contact)
+                    .header(ALLOW, ALLOWED);
         }
         let response = match body {
             Some(body) => response
@@ -720,9 +769,26 @@ impl<R: Resolve> Driver<R> {
     }
 
     fn start_invite(&mut self, attempt: AttemptKey) {
+        use mpsc::error::TrySendError;
+
         let Some(request) = self.model.take_invite(attempt) else {
             return;
         };
+        // The last event of the attempt gets its place now, so that it is
+        // never dropped. Without a place the INVITE does not go out. Without
+        // a receiver, nobody would read the event, so the INVITE goes out
+        // without one.
+        match self.events.clone().try_reserve_owned() {
+            Ok(permit) => {
+                self.endings.insert(attempt, permit);
+            }
+            Err(TrySendError::Full(_)) => {
+                let error = Error::CapacityExceeded;
+                self.model.invite_failed(attempt, error, now());
+                return;
+            }
+            Err(TrySendError::Closed(_)) => {}
+        }
 
         match initial_next_hop(request.uri().as_str(), request.headers()) {
             Ok((uri, false)) => {
@@ -798,8 +864,8 @@ impl<R: Resolve> Driver<R> {
             model::Event::UsageEnded { usage } => {
                 Event::Ended { session: Session::new(usage) }
             }
-            model::Event::AttemptFailed { attempt, status } => {
-                Event::Failed { attempt: AttemptId(attempt), status }
+            model::Event::AttemptFailed { attempt, error } => {
+                Event::Failed { attempt: AttemptId(attempt), error }
             }
         };
         self.emit(event);

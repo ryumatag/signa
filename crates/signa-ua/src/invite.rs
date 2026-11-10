@@ -32,7 +32,8 @@ use signa_core::{Request, StatusCode};
 
 use crate::{
     dialog::{Dialog, DialogKey, Origin},
-    negotiation::Negotiation,
+    error::Error,
+    negotiation::{Description, Negotiation},
     operation::OperationId,
     slot::Key,
 };
@@ -66,6 +67,25 @@ pub(crate) struct InviteAttempt {
     pub(crate) request: Option<Box<Request<Bytes>>>,
     /// The operation that sent the INVITE, until it is in the core.
     pub(crate) operation: Option<OperationId>,
+    /// What the INVITE came to, once its first final response or failure
+    /// is in.
+    pub(crate) result: Option<AttemptResult>,
+    /// Whether every response the core took for the INVITE reached the UA.
+    /// A response overflow in the core clears it for good.
+    pub(crate) complete: bool,
+}
+
+/// What an INVITE this user agent sent came to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+#[cfg_attr(not(feature = "tokio"), allow(unreachable_pub))]
+pub enum AttemptResult {
+    /// A 2xx came, and formed a session. Others may have come from other
+    /// forks.
+    Answered,
+    /// No 2xx came, for the reason given, such as
+    /// [`Error::RemoteFailure`] for a final response other than a 2xx.
+    Failed(Error),
 }
 
 /// Where an INVITE usage is in its life.
@@ -90,6 +110,10 @@ pub(crate) struct InviteUsage {
     phase: UsagePhase,
     /// Kept per usage, so that each fork negotiates on its own.
     pub(crate) negotiation: Negotiation,
+    /// The last session description the peer sent in this usage: the offer
+    /// of an INVITE this user agent took, or the answer in the 2xx of one it
+    /// sent.
+    pub(crate) remote: Option<Description>,
 }
 
 impl InviteUsage {
@@ -105,6 +129,7 @@ impl InviteUsage {
             direction,
             phase: UsagePhase::Establishing,
             negotiation,
+            remote: None,
         }
     }
 
@@ -118,6 +143,7 @@ impl InviteUsage {
             direction,
             phase: UsagePhase::Established,
             negotiation,
+            remote: None,
         }
     }
 
@@ -158,7 +184,8 @@ pub(crate) enum Scope {
         /// so every response of the exchange carries the same To tag. It
         /// moves to the dialog table when the 2xx is committed.
         dialog: Option<Box<Dialog>>,
-        offer_in_request: bool,
+        /// The INVITE's offer. It moves to the usage the 2xx forms.
+        offer: Option<Description>,
         /// What finds a merged copy of the INVITE while the exchange lives.
         merge: MergeKey,
         /// When the application's decision is due, while it is.
@@ -231,14 +258,14 @@ impl InviteExchange {
     pub(crate) fn incoming(
         dialog: Dialog,
         merge: MergeKey,
-        offer_in_request: bool,
+        offer: Option<Description>,
         decision_due: Option<Instant>,
     ) -> InviteExchange {
         let cseq = merge.cseq;
         InviteExchange {
             scope: Scope::Incoming {
                 dialog: Some(Box::new(dialog)),
-                offer_in_request,
+                offer,
                 merge,
                 decision_due,
                 provisional: None,

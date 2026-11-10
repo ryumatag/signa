@@ -43,6 +43,11 @@ pub enum Error {
     TransportFailure,
     /// The peer answered with a non-2xx final.
     RemoteFailure(StatusCode),
+    /// The transaction timed out without a response, as Timer B ends an
+    /// INVITE that got none. RFC 3261 section 8.1.3.1 treats this as a 408,
+    /// but no 408 came from the peer, and the request may not have reached
+    /// it.
+    Timeout,
     /// The external description provider or validator failed.
     NegotiationFailure,
     /// Responses or events were lost, such as by a core response overflow,
@@ -56,6 +61,9 @@ pub enum Error {
     AlreadyFinalized,
     /// The UA no longer admits new work.
     Closed,
+    /// The UA failed in itself, such as its source of randomness. Nothing was
+    /// sent.
+    Internal,
     /// The driver stopped while the operation ran. This includes the core's
     /// `Closed`, after which nobody knows whether the core took the message.
     DriverStopped,
@@ -86,8 +94,10 @@ impl Error {
             | Error::Unroutable
             | Error::StaleDecision
             | Error::AlreadyFinalized
+            | Error::Internal
             | Error::Closed => WireEffect::None,
             Error::TransportFailure
+            | Error::Timeout
             | Error::NegotiationFailure
             | Error::ObservationIncomplete
             | Error::DriverStopped => WireEffect::Unknown,
@@ -113,6 +123,8 @@ impl fmt::Display for Error {
             Error::RemoteFailure(status) => {
                 write!(f, "the peer answered {}", status.as_u16())
             }
+            Error::Timeout => f.write_str("no response came in time"),
+            Error::Internal => f.write_str("the UA failed in itself"),
             Error::NegotiationFailure => {
                 f.write_str("the session description provider failed")
             }
@@ -149,11 +161,13 @@ mod tests {
             Error::Unroutable,
             Error::TransportFailure,
             Error::RemoteFailure(busy_here),
+            Error::Timeout,
             Error::NegotiationFailure,
             Error::ObservationIncomplete,
             Error::StaleDecision,
             Error::AlreadyFinalized,
             Error::Closed,
+            Error::Internal,
             Error::DriverStopped,
         ];
 
@@ -163,7 +177,9 @@ mod tests {
             .collect();
         assert_eq!(delivered, [Error::RemoteFailure(busy_here)]);
 
-        for error in [Error::TransportFailure, Error::DriverStopped] {
+        for error in
+            [Error::TransportFailure, Error::Timeout, Error::DriverStopped]
+        {
             assert_eq!(error.wire_effect(), WireEffect::Unknown, "{error:?}");
         }
     }

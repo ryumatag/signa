@@ -23,7 +23,12 @@ This is an early stage of the crate, and much of a UA core is missing:
   incoming INVITE without an offer gets a 488, and the UA refuses to send
   one.
 * A session whose 2xx gets no ACK ends without the BYE RFC 3261 asks for.
-* CANCEL, BYE and every other request in a dialog get signa-core's 500.
+* A 2xx without the answer to the INVITE's offer confirms its session, which
+  then never reports a completed negotiation, rather than fail it.
+* A 2xx that cannot form a dialog, or does not fit in the UA's limits, gets
+  no ACK and no BYE.
+* There is no CANCEL of an INVITE this UA sent. CANCEL, BYE and every other
+  request in a dialog get signa-core's 500.
 * There is no re-INVITE, and no graceful shutdown of the UA.
 * Next hops resolve from IP literals and a fixed table, with no DNS.
 */
@@ -40,11 +45,11 @@ This is an early stage of the crate, and much of a UA core is missing:
 
 #[cfg(feature = "tokio")]
 pub use self::ua::{
-    AttachError, AttemptId, Config, Description, Error, Event, IncomingInvite,
-    InvalidContact, InviteAttempt, NegotiationState, Operation, Query,
-    Resolve, ResolveError, Session, SessionId, SessionPhase, SessionSnapshot,
-    StaticResolver, SubmitError, Ua, UaDriver, UaEvents, UaHandle, WireEffect,
-    attach,
+    AttachError, AttemptId, AttemptResult, AttemptSnapshot, Config,
+    Description, Error, Event, IncomingInvite, InvalidContact, InviteAttempt,
+    InvitePlan, NegotiationState, Operation, Query, Resolve, ResolveError,
+    Session, SessionId, SessionPhase, SessionSnapshot, StaticResolver,
+    SubmitError, Ua, UaDriver, UaEvents, UaHandle, WireEffect, attach,
 };
 
 // The private state model. `dialog` knows nothing of `invite`, so other
@@ -56,6 +61,7 @@ mod invite;
 mod model;
 mod negotiation;
 mod operation;
+mod plan;
 mod protocol;
 mod retention;
 mod routing;
