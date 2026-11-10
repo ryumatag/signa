@@ -11,9 +11,9 @@ the RFC scope section by section.
 
 # Features
 
-* `tokio`, on by default, enables [`endpoint`] and its sockets. Without it the
-  message types, transaction timer configuration and transport metadata stay
-  available without a runtime.
+* `tokio`, on by default, enables the `endpoint` module and its sockets.
+  Without it the message types, transaction timer configuration and transport
+  metadata stay available without a runtime.
 
 signa-ua, which is to hold dialogs and INVITE usage, has no API yet. This
 crate re-exports it behind a feature once it has one.

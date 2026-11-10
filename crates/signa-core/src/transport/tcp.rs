@@ -1,10 +1,10 @@
 /*!
 The TCP transport.
 
-[`Listener::accept`] and [`connect`] each start a connection as two tasks. The
-reader frames the stream with the [`Decoder`] and sends every message into the
-channel the endpoint reads, with the connection's [`Flow`] and [`Writer`], so a
-response goes back on the connection the request came on
+[`Listener::accept`] and `connect_reserved` each start a connection as two
+tasks. The reader frames the stream with the [`Decoder`] and sends every
+message into the channel the endpoint reads, with the connection's [`Flow`]
+and [`Writer`], so a response goes back on the connection the request came on
 (RFC 3261 section 18.2.2). The writer writes what [`Writer::send`] queues.
 
 The channel to the endpoint is bounded. When the endpoint falls behind, the
@@ -179,7 +179,8 @@ impl Teardown {
     }
 }
 
-/// Settings for every connection a listener accepts or [`connect`] opens.
+/// Settings for every connection a listener accepts or `connect_reserved`
+/// opens.
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     /// The decoder's limits.

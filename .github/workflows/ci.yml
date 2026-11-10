@@ -142,6 +142,9 @@ jobs:
         env:
           CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
 
+  # Features decide which items exist and which modules are public, so an
+  # intra-doc link can resolve under one set and break under another. Each set
+  # is built with and without the private items.
   rustdoc:
     runs-on: ubuntu-latest
     env:
@@ -154,7 +157,14 @@ jobs:
         with:
           toolchain: stable
       - name: Build docs
-        run: cargo doc --workspace --all-features --verbose
+        run: |
+          for features in --all-features --no-default-features ''; do
+            for private in '' --document-private-items; do
+              echo "::group::cargo doc $features $private"
+              cargo doc --workspace --no-deps $features $private
+              echo "::endgroup::"
+            done
+          done
 
   # signa's own `unsafe` is `from_utf8_unchecked` on bytes a check has
   # accepted, which Miri cannot verify. The tests still drive siparse's

@@ -5,7 +5,8 @@ siparse parses the head. This module turns its output into a `Request` or
 `Response` whose parts share the input `Bytes` instead of copying it, and picks
 out the body. The public `from_shared` functions take one complete message,
 such as a datagram. The stream decoder in `frame` parses the head on its own
-through [`head`] and supplies the body once it has arrived.
+through `head` and supplies the body once it has arrived. Both exist only
+with the `tokio` feature, so this is not a link.
 */
 
 use bytes::Bytes;

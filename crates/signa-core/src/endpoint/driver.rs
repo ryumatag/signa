@@ -8,7 +8,7 @@ control wakeup. Each turn bounds write-receipt polling and UDP flush,
 and the task yields after 64 events so continuously ready work also shares the
 runtime with connection tasks.
 
-The tables are slabs, see [`table`], and the timers are one heap of deadlines,
+The tables are slabs, see [`table`](super::table), and the timers are one heap of deadlines,
 with one `Sleep` set to the earliest. An entry names its transaction by its
 table id. A transaction whose deadline moves gets a new entry, and an entry
 whose transaction has moved on is harmless, because a transaction fires nothing

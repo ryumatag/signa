@@ -22,7 +22,7 @@ enum Repr {
     Custom(Custom),
 }
 
-/// A custom (non-standard) SIP header name backed by [`Bytes`].
+/// A custom (non-standard) SIP header name backed by [`Bytes`](bytes::Bytes).
 ///
 /// Invariant: the contained bytes are valid lowercase SIP token characters
 /// (RFC 3261, Section 25.1) and therefore valid UTF-8.
