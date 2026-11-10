@@ -84,11 +84,16 @@ impl<K: Hash + Eq, E> Table<K, E> {
         Some((Id { slot, generation }, entry))
     }
 
-    /// Returns an entry whose key hashes as `probe` does and satisfies
-    /// `matches`, and its id.
+    /// Returns an entry that satisfies `matches`, and its id, from those the
+    /// hash of `probe` leads to.
+    ///
+    /// The hash only narrows the search. The index compares a few bits of it
+    /// before calling `matches`, so a key with another hash can reach it too.
+    /// `matches` must accept only keys that hash as `probe` does.
     ///
     /// A CANCEL finds its target this way. The keys hash by branch alone, so
-    /// the CANCEL's own key finds candidates of any method.
+    /// the CANCEL's own key finds candidates of any method, and
+    /// `ServerKey::is_cancel_target` accepts only those with its branch.
     pub(super) fn find_by(
         &self,
         probe: &K,
@@ -199,16 +204,22 @@ fn key_of<K, E>(slots: &[Option<(K, E)>], slot: u32) -> &K {
 mod tests {
     use super::*;
 
+    // The probe's hash narrows the search and the predicate decides. The
+    // index compares only a few bits of the hash, and the hasher has a random
+    // seed, so whether "b" reaches a predicate probed with "a" varies by run.
+    // Only what holds for every seed is checked.
     #[test]
     fn find_by_takes_a_predicate_under_the_probe_hash() {
         let mut table = Table::new();
         let a = table.insert("a", 1);
-        table.insert("b", 2);
+        let b = table.insert("b", 2);
 
         assert_eq!(table.find_by(&"a", |key| *key == "a"), Some((a, &1)));
-        assert_eq!(table.find_by(&"a", |key| *key == "b"), None);
+        assert_eq!(table.find_by(&"b", |key| *key == "b"), Some((b, &2)));
+        assert_eq!(table.find_by(&"a", |_| false), None);
+
         table.remove(a);
-        assert_eq!(table.find_by(&"a", |_| true), None);
+        assert_eq!(table.find_by(&"a", |key| *key == "a"), None);
     }
 
     #[test]
