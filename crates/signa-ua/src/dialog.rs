@@ -452,6 +452,14 @@ impl Dialog {
         Ok(())
     }
 
+    /// Numbers on from `local`, the last number another record of the same
+    /// dialog gave out, if it is past this one's. A number that may have
+    /// reached the peer is never given out again (RFC 3261 section 8.1.1.5
+    /// has it grow by one with each request).
+    pub(crate) fn number_after(&mut self, local: Option<u32>) {
+        self.local_cseq = self.local_cseq.max(local);
+    }
+
     /// Ends the dialog from any phase. Ending it twice does nothing.
     pub(crate) fn terminate(&mut self) {
         self.phase = DialogPhase::Terminated;

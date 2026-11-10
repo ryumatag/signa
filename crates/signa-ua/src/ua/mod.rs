@@ -8,7 +8,10 @@ use std::{
     future::Future,
     marker::PhantomData,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -18,12 +21,13 @@ use signa_core::{
     Request, StatusCode,
     endpoint::{Endpoint, Incoming, Reception, Target},
     transaction::Timers,
+    transport::Flow,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 pub use crate::{
     error::{Error, WireEffect},
-    invite::AttemptResult,
+    invite::{AttemptResult, CancelResult, EndReason},
     negotiation::Description,
     plan::InvitePlan,
     routing::{ResolveError, StaticResolver},
@@ -41,9 +45,11 @@ mod driver;
 /// Resolves the next hop of a request to a transport and socket address.
 ///
 /// The UA calls it for each request it sends outside a transaction's reply
-/// path: an INVITE, and the ACK of each 2xx. Each call runs as a task of its
-/// own, so a slow resolution holds up only its own request. The UA never asks
-/// to resolve a hop that must be secured, since it has no TLS.
+/// path: an INVITE, the ACK of each 2xx, and each BYE. Each call runs as a
+/// task of its own, so a slow resolution holds up only its own request. The
+/// UA never asks to resolve a hop that must be secured, since it has no TLS.
+/// A CANCEL goes where its INVITE went, without a resolution (RFC 3261
+/// section 9.1).
 pub trait Resolve: Send + Sync + 'static {
     /// Resolves `query.uri()` for a request of `query.size()` bytes.
     fn resolve(
@@ -404,8 +410,10 @@ pub struct Ua {
 ///
 /// Dropping a handle sends nothing. A [`Session`] or [`InviteAttempt`] going
 /// away is neither a BYE nor a CANCEL, and the UA keeps answering and
-/// acknowledging for it. The exception is an [`IncomingInvite`] dropped without
-/// a decision. Nobody can answer it any more, so the UA does, with a 500.
+/// acknowledging for it. Only [`UaHandle::try_terminate`],
+/// [`UaHandle::try_cancel`] and [`UaHandle::try_abandon`] send those. The
+/// exception is an [`IncomingInvite`] dropped without a decision. Nobody can
+/// answer it any more, so the UA does, with a 500.
 ///
 /// # Errors
 ///
@@ -425,6 +433,7 @@ pub fn attach<R: Resolve>(
     let capacity = bounded(config.events.saturating_add(config.attempts));
     let (events, event_receiver) = mpsc::channel(capacity);
     let shared = Arc::new(Shared {
+        id: UaId(NEXT_UA.fetch_add(1, Ordering::Relaxed)),
         commands,
         operations: Arc::new(Semaphore::new(config.operations)),
     });
@@ -444,9 +453,21 @@ pub fn attach<R: Resolve>(
     })
 }
 
+/// Tells the handles of one UA from those of another.
+///
+/// Each UA numbers its sessions and attempts from the same start, so a key
+/// alone would name another UA's session as well. A handle carries the
+/// identity of the UA that made it, and every other UA refuses it.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct UaId(u64);
+
+/// The next UA's identity. 2^64 UAs in one process will not happen.
+static NEXT_UA: AtomicU64 = AtomicU64::new(0);
+
 /// What the handles share with the driver.
 #[derive(Debug)]
 struct Shared {
+    id: UaId,
     commands: mpsc::Sender<Command>,
     /// One permit per operation that runs or keeps its outcome. A submission
     /// takes one, so that the driver always has room for what it admitted.
@@ -469,6 +490,23 @@ enum Command {
         attempt: AttemptKey,
         reply: oneshot::Sender<Option<AttemptSnapshot>>,
     },
+}
+
+/// Submits an operation on a handle the application keeps, which has
+/// nothing to hand back if it is refused. A handle of another UA, `ua`, is
+/// refused before anything is admitted.
+fn submit_on<T>(
+    shared: &Arc<Shared>,
+    ua: UaId,
+    command: model::Command,
+) -> Result<Operation<T>, SubmitError<()>> {
+    if ua != shared.id {
+        return Err(SubmitError {
+            error: Error::InvalidInput,
+            value: Box::new(()),
+        });
+    }
+    shared.submit((), |()| command)
 }
 
 impl Shared {
@@ -510,7 +548,7 @@ impl Shared {
             reply,
             permit,
         });
-        Ok(Operation { receiver, kind: PhantomData })
+        Ok(Operation { receiver, ua: self.id, kind: PhantomData })
     }
 }
 
@@ -577,18 +615,140 @@ impl UaHandle {
         })
     }
 
+    /// Cancels an INVITE this UA sent, while it has no final response.
+    ///
+    /// The endpoint sends the CANCEL once a provisional response has come,
+    /// and none if a final response comes first (RFC 3261 section 9.1). The
+    /// CANCEL is a transaction of its own, whose response the UA does not
+    /// wait for. It ends nothing by itself. The INVITE usually ends with a
+    /// 487, and [`Event::AttemptEnded`] says so. A 2xx that wins the race
+    /// forms a session as any other, which gets its ACK and stays up for the
+    /// application to keep or end (section 15). To end such sessions too,
+    /// give the attempt up with [`UaHandle::try_abandon`] instead.
+    ///
+    /// The operation completes once the endpoint has the CANCEL, with
+    /// [`CancelResult::Sent`], or once it is clear that none is needed, with
+    /// [`CancelResult::NotNeeded`]. It can wait long, for a provisional
+    /// response. It fails, with nothing sent unless the error says so:
+    ///
+    /// * with [`Error::InvalidTransition`] if a CANCEL was already asked
+    ///   for, by this or by [`UaHandle::try_abandon`],
+    /// * with [`Error::StaleDecision`] once the attempt has ended,
+    /// * with [`Error::CoreSubmissionRejected`] or
+    ///   [`Error::TransportFailure`] when the endpoint needed a new
+    ///   connection to the next hop and could not admit or open one, and
+    /// * with [`Error::DriverStopped`] when the endpoint stops first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidInput`] for an attempt of another UA,
+    /// [`Error::Busy`] when the command queue or the operations are full, and
+    /// [`Error::Closed`] once the driver has stopped.
+    pub fn try_cancel(
+        &self,
+        attempt: &InviteAttempt,
+    ) -> Result<Operation<CancelResult>, SubmitError<()>> {
+        let AttemptId { ua, attempt } = attempt.id;
+        submit_on(&self.shared, ua, model::Command::Cancel { attempt })
+    }
+
+    /// Gives up an INVITE this UA sent, as a caller that hangs up does
+    /// (RFC 3261 section 15).
+    ///
+    /// The INVITE gets its CANCEL, as with [`UaHandle::try_cancel`], unless
+    /// it has a final response or a CANCEL already. Each session it formed
+    /// whose dialog is confirmed gets a BYE, as with
+    /// [`UaHandle::try_terminate`]. Each early one ends with the INVITE,
+    /// which the CANCEL ends, and shows as [`SessionPhase::Ending`] until
+    /// then. Each 2xx that comes later, from any fork, gets its ACK and then
+    /// a BYE, and forms no session (section 13.2.2.4).
+    ///
+    /// The operation completes once the UA has done that much, which is
+    /// neither the CANCEL nor a BYE reaching the endpoint. Each session says
+    /// when it ended, with [`Event::Ended`]. A BYE that cannot reach the
+    /// endpoint leaves its session up, for the application to end again.
+    /// Giving an attempt up twice does no more than once. The operation
+    /// fails with [`Error::StaleDecision`] once the attempt has ended, which
+    /// is as late as a 2xx can come for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidInput`] for an attempt of another UA,
+    /// [`Error::Busy`] when the command queue or the operations are full, and
+    /// [`Error::Closed`] once the driver has stopped.
+    pub fn try_abandon(
+        &self,
+        attempt: &InviteAttempt,
+    ) -> Result<Operation<()>, SubmitError<()>> {
+        let AttemptId { ua, attempt } = attempt.id;
+        submit_on(&self.shared, ua, model::Command::Abandon { attempt })
+    }
+
+    /// Ends a session with a BYE.
+    ///
+    /// The BYE goes in a client transaction of its own, through the
+    /// dialog's route set. The session ends once the endpoint has it, with
+    /// [`Event::Ended`] and [`EndReason::LocalBye`], before any response,
+    /// as RFC 3261 section 15.1.1 has it. A session this UA answered waits
+    /// for the ACK of its 2xx first, since section 15 keeps the callee from
+    /// sending its BYE before that, and shows as [`SessionPhase::Ending`]
+    /// meanwhile. If the ACK never comes, the BYE goes at the ACK deadline.
+    ///
+    /// The operation completes with the BYE's response. A 2xx is success.
+    /// It fails with [`Error::RemoteFailure`] for another final response,
+    /// such as the 481 of a peer that ended the dialog already, with
+    /// [`Error::Timeout`] if no response came, and with
+    /// [`Error::TransportFailure`] if the transaction failed to write. The
+    /// session has ended either way, and the UA sends no second BYE.
+    ///
+    /// When the BYE never reaches the endpoint, the session stays as it
+    /// was, and the operation fails, with nothing sent:
+    ///
+    /// * with [`Error::Unroutable`] when the next hop does not resolve or
+    ///   needs TLS,
+    /// * with [`Error::CoreSubmissionRejected`] when the endpoint refuses
+    ///   the BYE, as when it is busy,
+    /// * with [`Error::TransportFailure`] when it could not open a
+    ///   connection, and
+    /// * with [`Error::InvalidTransition`] when the dialog has run out of
+    ///   CSeq numbers.
+    ///
+    /// It also fails with [`Error::InvalidTransition`] for a session that
+    /// is already ending or has ended, and with [`Error::StaleDecision`]
+    /// for one the UA has let go of. A peer's BYE that crosses this one
+    /// ends the session too, and an operation still waiting for the ACK then
+    /// completes with nothing sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidInput`] for a session of another UA,
+    /// [`Error::Busy`] when the command queue or the operations are full, and
+    /// [`Error::Closed`] once the driver has stopped.
+    pub fn try_terminate(
+        &self,
+        session: &Session,
+    ) -> Result<Operation<()>, SubmitError<()>> {
+        let SessionId { ua, usage } = session.id;
+        submit_on(&self.shared, ua, model::Command::Terminate { usage })
+    }
+
     /// Returns what an INVITE this UA sent has come to so far, or `None` once
     /// it has ended and [`Event::AttemptEnded`] has said what it came to.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Busy`] when the command queue is full,
-    /// [`Error::Closed`] when the driver no longer takes commands, and
-    /// [`Error::DriverStopped`] when it stopped before answering.
+    /// Returns [`Error::InvalidInput`] for a handle of another UA,
+    /// [`Error::Busy`] when the command queue is full, [`Error::Closed`] when
+    /// the driver no longer takes commands, and [`Error::DriverStopped`] when
+    /// it stopped before answering.
     pub async fn attempt_snapshot(
         &self,
         attempt: &InviteAttempt,
     ) -> Result<Option<AttemptSnapshot>, Error> {
+        let AttemptId { ua, attempt } = attempt.id;
+        if ua != self.shared.id {
+            return Err(Error::InvalidInput);
+        }
         let slot =
             self.shared.commands.try_reserve().map_err(
                 |error| match error {
@@ -597,23 +757,29 @@ impl UaHandle {
                 },
             )?;
         let (reply, receiver) = oneshot::channel();
-        slot.send(Command::AttemptSnapshot { attempt: attempt.id.0, reply });
+        slot.send(Command::AttemptSnapshot { attempt, reply });
 
         receiver.await.map_err(|_| Error::DriverStopped)
     }
 
-    /// Returns where a session stands, or `None` once it has ended and the
-    /// UA has let go of it.
+    /// Returns where a session stands, or `None` once the UA has let go of
+    /// it. A session that ended is still shown, with why, for as long as it
+    /// is among the last [`Config::max_dialogs`] sessions to end.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Busy`] when the command queue is full,
-    /// [`Error::Closed`] when the driver no longer takes commands, and
-    /// [`Error::DriverStopped`] when it stopped before answering.
+    /// Returns [`Error::InvalidInput`] for a handle of another UA,
+    /// [`Error::Busy`] when the command queue is full, [`Error::Closed`] when
+    /// the driver no longer takes commands, and [`Error::DriverStopped`] when
+    /// it stopped before answering.
     pub async fn snapshot(
         &self,
         session: &Session,
     ) -> Result<Option<SessionSnapshot>, Error> {
+        let SessionId { ua, usage } = session.id;
+        if ua != self.shared.id {
+            return Err(Error::InvalidInput);
+        }
         let slot =
             self.shared.commands.try_reserve().map_err(
                 |error| match error {
@@ -622,7 +788,7 @@ impl UaHandle {
                 },
             )?;
         let (reply, receiver) = oneshot::channel();
-        slot.send(Command::Snapshot { usage: session.id.0, reply });
+        slot.send(Command::Snapshot { usage, reply });
 
         receiver.await.map_err(|_| Error::DriverStopped)
     }
@@ -673,6 +839,8 @@ impl<T> error::Error for SubmitError<T> {}
 #[must_use = "an operation goes on without its future, but its outcome is lost"]
 pub struct Operation<T> {
     receiver: oneshot::Receiver<Result<Completion, Error>>,
+    /// The UA that runs it, for the handle it completes with.
+    ua: UaId,
     kind: PhantomData<fn() -> T>,
 }
 
@@ -700,9 +868,10 @@ impl Future for Operation<InviteAttempt> {
         mut self: Pin<&mut Operation<InviteAttempt>>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<InviteAttempt, Error>> {
+        let ua = self.ua;
         self.poll_completion(cx).map(|outcome| match outcome? {
             Completion::Attempt(attempt) => {
-                Ok(InviteAttempt { id: AttemptId(attempt) })
+                Ok(InviteAttempt { id: AttemptId { ua, attempt } })
             }
             _ => unreachable!("an INVITE completes with its attempt"),
         })
@@ -716,9 +885,24 @@ impl Future for Operation<Session> {
         mut self: Pin<&mut Operation<Session>>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Session, Error>> {
+        let ua = self.ua;
         self.poll_completion(cx).map(|outcome| match outcome? {
-            Completion::Session(usage) => Ok(Session { id: SessionId(usage) }),
+            Completion::Session(usage) => Ok(Session::new(ua, usage)),
             _ => unreachable!("an accept completes with its session"),
+        })
+    }
+}
+
+impl Future for Operation<CancelResult> {
+    type Output = Result<CancelResult, Error>;
+
+    fn poll(
+        mut self: Pin<&mut Operation<CancelResult>>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<CancelResult, Error>> {
+        self.poll_completion(cx).map(|outcome| match outcome? {
+            Completion::Cancel(result) => Ok(result),
+            _ => unreachable!("a cancel completes with what it did"),
         })
     }
 }
@@ -788,11 +972,25 @@ pub enum Event {
         /// The session.
         session: Session,
     },
-    /// A session ended.
+    /// A session ended. Its snapshot keeps why for a while, see
+    /// [`UaHandle::snapshot`].
     #[non_exhaustive]
     Ended {
         /// The session.
         session: Session,
+        /// Why.
+        reason: EndReason,
+    },
+    /// The caller gave up an INVITE the application had not decided, with a
+    /// CANCEL or with a BYE in its early dialog, and the UA answered it with
+    /// a 487 (RFC 3261 sections 9.2 and 15.1.2). A decision the application
+    /// submits now fails with [`Error::AlreadyFinalized`] or
+    /// [`Error::StaleDecision`]. A final that was under way when the caller
+    /// gave up goes on, and this does not come.
+    #[non_exhaustive]
+    Cancelled {
+        /// The INVITE, as [`IncomingInvite::id`] said.
+        invite: InviteId,
     },
     /// An INVITE this UA sent got no 2xx, which ended its early dialogs:
     /// its first final response was not a 2xx, or its transaction failed.
@@ -850,8 +1048,14 @@ pub enum Event {
 /// The INVITE carries an offer. The UA answers one without an offer itself,
 /// with a 488, since its 2xx would have to carry an offer and its ACK the
 /// answer, which this UA cannot check yet.
+///
+/// If the caller gives the INVITE up first, with a CANCEL or a BYE in its
+/// early dialog, the UA answers it with a 487 and reports
+/// [`Event::Cancelled`]. A final the application submitted before that goes
+/// on and decides.
 pub struct IncomingInvite {
     request: Request<Bytes>,
+    flow: Flow,
     authority: Option<Authority>,
     /// A slot reserved in the driver's queue of abandoned INVITEs, so that
     /// dropping this always reaches the driver.
@@ -869,6 +1073,23 @@ impl IncomingInvite {
     /// Returns the INVITE as received.
     pub fn request(&self) -> &Request<Bytes> {
         &self.request
+    }
+
+    /// Returns where the INVITE arrived: the transport, the local address
+    /// it reached and the address it came from. It describes the flow, and
+    /// sends nothing. An application that serves several networks on one
+    /// endpoint can tell them apart by it.
+    pub fn flow(&self) -> Flow {
+        self.flow
+    }
+
+    /// Returns the INVITE's identity, which [`Event::Cancelled`] names.
+    pub fn id(&self) -> InviteId {
+        let authority = self
+            .authority
+            .as_ref()
+            .expect("a live invite holds its authority");
+        InviteId { ua: self.shared.id, exchange: authority.exchange() }
     }
 
     /// Sends a provisional response, from 101 to 199, with the To tag every
@@ -1007,22 +1228,32 @@ impl Drop for IncomingInvite {
     }
 }
 
-/// Identifies a session within its UA.
+/// Identifies an incoming INVITE, also among those of other UAs.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct SessionId(UsageKey);
+pub struct InviteId {
+    ua: UaId,
+    exchange: ExchangeKey,
+}
+
+/// Identifies a session, also among those of other UAs.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct SessionId {
+    ua: UaId,
+    usage: UsageKey,
+}
 
 /// An INVITE session, the INVITE usage of one dialog.
 ///
 /// It is a handle. The UA keeps the session's state, and dropping this sends
-/// no BYE.
+/// no BYE. [`UaHandle::try_terminate`] does.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Session {
     id: SessionId,
 }
 
 impl Session {
-    pub(crate) fn new(usage: UsageKey) -> Session {
-        Session { id: SessionId(usage) }
+    fn new(ua: UaId, usage: UsageKey) -> Session {
+        Session { id: SessionId { ua, usage } }
     }
 
     /// Returns the session's identity.
@@ -1031,14 +1262,18 @@ impl Session {
     }
 }
 
-/// Identifies an INVITE this UA sent.
+/// Identifies an INVITE this UA sent, also among those of other UAs.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct AttemptId(AttemptKey);
+pub struct AttemptId {
+    ua: UaId,
+    attempt: AttemptKey,
+}
 
 /// An initial INVITE this UA sent, which collects responses until the
 /// endpoint stops delivering them.
 ///
 /// Dropping it sends no CANCEL. The UA still acknowledges every 2xx.
+/// [`UaHandle::try_cancel`] and [`UaHandle::try_abandon`] send one.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct InviteAttempt {
     id: AttemptId,
@@ -1061,8 +1296,10 @@ pub struct SessionSnapshot {
     pub negotiation: NegotiationState,
     /// The last session description the peer sent: the offer of an INVITE
     /// this UA took, or the answer in the 2xx of one it sent. The UA does not
-    /// check it.
+    /// check it. A session that ended no longer has it.
     pub remote_description: Option<Description>,
+    /// Why the session ended, once it has.
+    pub end_reason: Option<EndReason>,
 }
 
 /// What an INVITE this UA sent has come to so far.
@@ -1094,7 +1331,9 @@ pub enum SessionPhase {
     Early,
     /// A 2xx confirmed its dialog.
     Established,
-    /// It is ending, with its BYE waiting for its turn.
+    /// It is ending. Its BYE is on its way to the endpoint, or waits for
+    /// the ACK of this UA's 2xx, or an early session waits for the CANCEL of
+    /// its INVITE to take effect.
     Ending,
     /// It ended.
     Ended,
@@ -1117,9 +1356,11 @@ impl SessionSnapshot {
         phase: UsagePhase,
         negotiation: Negotiation,
         remote_description: Option<Description>,
+        end_reason: Option<EndReason>,
     ) -> SessionSnapshot {
         SessionSnapshot {
             remote_description,
+            end_reason,
             phase: match phase {
                 UsagePhase::Establishing => SessionPhase::Early,
                 UsagePhase::Established => SessionPhase::Established,

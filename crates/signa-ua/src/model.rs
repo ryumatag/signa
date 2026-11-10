@@ -22,10 +22,21 @@ absorbs copies of the INVITE and takes the 2xx of other forks
 2xx and ends the session that never got its ACK
 ([RFC 3261 section 13.3.1.4]). Neither waits for the other.
 
-TODO: CANCEL and BYE, re-INVITEs, and the answer an ACK owes are still to
-come.
+CANCEL is the core's to send and retransmit. The model only asks for it, and
+decides what a CANCEL that arrives does to an INVITE it holds. A BYE goes in a
+client transaction of the core's own, and what the model keeps is when it may
+go and what it ends.
+
+After this user agent sends a BYE, its dialog lingers until the BYE's
+transaction ends, in what [RFC 5407 section 2] calls the Mortal state. A BYE
+from the peer that crosses it gets a 200 there, and any other request a 481,
+rather than the 481 of a dialog nobody knows ([RFC 5407 section 3.2.1]).
+
+TODO: Re-INVITEs and the answer an ACK owes are still to come.
 
 [RFC 3261 section 17]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17
+[RFC 5407 section 2]: https://www.rfc-editor.org/rfc/rfc5407.html#section-2
+[RFC 5407 section 3.2.1]: https://www.rfc-editor.org/rfc/rfc5407.html#section-3.2.1
 [RFC 6026 section 7]: https://www.rfc-editor.org/rfc/rfc6026.html#section-7
 [RFC 6026 section 8.7]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.7
 [RFC 3261 section 13.3.1.4]: https://www.rfc-editor.org/rfc/rfc3261.html#section-13.3.1.4
@@ -38,18 +49,21 @@ use std::{
 
 use signa_core::{
     Method, Request, Response, StatusCode, message::header::Tag,
+    transport::Flow,
 };
 
 use crate::{
     dialog::{
-        Dialog, DialogError, DialogId, DialogKey, Origin, Outgoing, Sequence,
-        request_dialog, response_tag,
+        Dialog, DialogError, DialogId, DialogKey, DialogPhase, Origin,
+        OutOfOrder, Outgoing, RequestError, Sequence, request_dialog,
+        response_tag,
     },
     error::Error,
     invite::{
-        AttemptKey, AttemptResult, Direction, ExchangeKey, ExchangeState,
-        InviteAttempt, InviteExchange, InviteUsage, MergeKey, Scope, UsageKey,
-        UsagePhase,
+        AttemptKey, AttemptResult, ByeIntent, CancelIntent, CancelResult,
+        Direction, EndReason, ExchangeKey, ExchangeState, InviteAttempt,
+        InviteExchange, InviteUsage, MergeKey, Scope, UsageKey, UsagePhase,
+        Withdrawal,
     },
     negotiation::{Description, Negotiation},
     operation::{Completion, OperationId, Operations, Stage, SubmitError},
@@ -147,6 +161,14 @@ pub(crate) enum Command {
     Reject { authority: Authority, status: StatusCode },
     /// Send an initial INVITE built from a plan, which carries an offer.
     Invite { plan: Box<InvitePlan> },
+    /// Cancel an INVITE this user agent sent, while it has no final
+    /// response. The sessions its 2xx responses form are left alone.
+    Cancel { attempt: AttemptKey },
+    /// Give an INVITE this user agent sent up: cancel it, end the sessions
+    /// it formed, and end each one a 2xx forms later.
+    Abandon { attempt: AttemptKey },
+    /// End a session with a BYE.
+    Terminate { usage: UsageKey },
 }
 
 /// What the runtime does on the model's behalf.
@@ -190,6 +212,14 @@ pub(crate) enum Effect {
     /// report with [`Model::bye_done`] once the core has it or cannot take
     /// it. Nothing waits for the BYE's response.
     SendBye { replay: ReplayKey },
+    /// Send the BYE that ends a session, which
+    /// [`Model::session_bye_request`] builds. Report whether the core took
+    /// it with [`Model::bye_started`], and then its response with
+    /// [`Model::bye_answered`].
+    SendSessionBye { usage: UsageKey },
+    /// Ask the core to cancel the INVITE of an attempt, then report what it
+    /// did with [`Model::cancel_done`].
+    CancelInvite { attempt: AttemptKey, operation: Option<OperationId> },
     /// Tell the application what an attempt came to, now that the core has
     /// finished collecting its responses. This cannot be lost, so the
     /// runtime sets room aside for it when it sends the INVITE.
@@ -256,6 +286,10 @@ pub(crate) enum Refusal {
     Busy,
     /// It is something this user agent does not take yet. A 500.
     Unsupported,
+    /// Its CSeq is below the last one in its dialog, which RFC 3261 section
+    /// 12.2.2 answers with a 500. So is one with the last number, by my
+    /// policy (see `Dialog::remote_request`).
+    OutOfOrder,
     /// Its Request-URI is a SIPS URI, which needs TLS, and this user agent
     /// has none. A 416, which RFC 3261 section 8.2.2.1 gives a scheme the
     /// UAS does not support.
@@ -280,6 +314,7 @@ impl Refusal {
             Refusal::Merged => 482,
             Refusal::RouteSetTooLong
             | Refusal::Unsupported
+            | Refusal::OutOfOrder
             | Refusal::Internal => 500,
             Refusal::Busy => 503,
         };
@@ -305,9 +340,7 @@ impl From<DialogError> for Refusal {
 
 /// What the application is told. Losing one of these loses no protocol
 /// state, and the outcome of an operation reaches its waiter apart from them.
-///
-/// TODO: Keep why a usage ended for a while after it is reclaimed, so that a
-/// snapshot can tell an ACK timeout whose notification was lost.
+/// Why a usage ended outlives the notification too, see [`Model::ended`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Event {
     /// A provisional response formed an early dialog.
@@ -321,10 +354,42 @@ pub(crate) enum Event {
     /// usage ends next.
     AckTimeout { usage: UsageKey },
     /// The usage ended.
-    UsageEnded { usage: UsageKey },
+    UsageEnded { usage: UsageKey, reason: EndReason },
     /// An attempt got a final response other than a 2xx, or its transaction
     /// failed, which ended its early dialogs.
     AttemptFailed { attempt: AttemptKey, error: Error },
+    /// The caller gave an INVITE up before the application decided it, and
+    /// the UA answered it with a 487.
+    InviteWithdrawn { exchange: ExchangeKey },
+}
+
+/// How the UA takes a request in a dialog other than INVITE, ACK and CANCEL.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InDialog {
+    /// A BYE the UA took. It gets a 200 (RFC 3261 section 15.1.2).
+    Bye,
+    /// A request that changes nothing in the dialog, which RFC 3261 section
+    /// 12.2.2 has answered as one outside it.
+    Other,
+}
+
+/// A BYE on its way to the core, from the moment it is asked for until the
+/// core has it or cannot take it.
+#[derive(Clone, Copy, Debug)]
+struct SendingBye {
+    operation: Option<OperationId>,
+    dialog: DialogKey,
+    reason: EndReason,
+    /// Whether the usage goes back to its phase before if the BYE never
+    /// reaches the core, rather than end anyway, as at an ACK timeout.
+    restore: bool,
+}
+
+/// A BYE the core took, whose response the runtime is to report.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ByeStarted {
+    pub(crate) dialog: DialogKey,
+    pub(crate) operation: Option<OperationId>,
 }
 
 /// What an attempt has come to so far.
@@ -360,6 +425,16 @@ pub(crate) struct Model<R> {
     replay_index: HashMap<ReplayId, ReplayKey>,
     /// Finds the incoming exchange a merged INVITE is a copy of.
     merge_index: HashMap<MergeKey, ExchangeKey>,
+    /// Finds an incoming exchange from the early dialog its responses form,
+    /// for a BYE the caller sends in it, until its final is committed.
+    early_index: HashMap<DialogId, ExchangeKey>,
+    /// The BYEs on their way to the core, by the usage they end. Each usage
+    /// has one at most, so the usage table bounds them.
+    byes: HashMap<UsageKey, SendingBye>,
+    /// Why each of the last usages to end ended, the oldest first, so that a
+    /// snapshot can say it after the notification was lost. At most
+    /// `limits.usages` are kept.
+    ended: VecDeque<(UsageKey, EndReason, Negotiation)>,
     timers: TimerQueue,
     operations: Operations,
     commands: VecDeque<(OperationId, Command)>,
@@ -389,6 +464,9 @@ impl<R: Random> Model<R> {
             dialog_index: HashMap::new(),
             replay_index: HashMap::new(),
             merge_index: HashMap::new(),
+            early_index: HashMap::new(),
+            byes: HashMap::new(),
+            ended: VecDeque::new(),
             timers: TimerQueue::default(),
             operations: Operations::new(limits.operations),
             commands: VecDeque::new(),
@@ -463,6 +541,18 @@ impl<R: Random> Model<R> {
                     self.provisional(operation, exchange, status)
                 }
                 Command::Invite { plan } => self.invite(operation, *plan),
+                Command::Cancel { attempt } => {
+                    self.cancel_attempt(Some(operation), attempt)
+                }
+                Command::Abandon { attempt } => {
+                    let outcome = self
+                        .abandon_attempt(attempt)
+                        .map(|()| Completion::Done);
+                    self.complete(operation, outcome);
+                }
+                Command::Terminate { usage } => {
+                    self.terminate(Some(operation), usage);
+                }
             }
         }
     }
@@ -506,6 +596,19 @@ impl<R: Random> Model<R> {
         let usage = self.usages.get(usage)?;
         Some((usage.phase(), usage.negotiation, usage.remote.clone()))
     }
+
+    /// Returns why a usage ended, and where its negotiation stood then, as
+    /// long as it is among the last ones to end.
+    pub(crate) fn ended(
+        &self,
+        usage: UsageKey,
+    ) -> Option<(EndReason, Negotiation)> {
+        self.ended
+            .iter()
+            .rev()
+            .find(|(key, ..)| *key == usage)
+            .map(|&(_, reason, negotiation)| (reason, negotiation))
+    }
 }
 
 /// Initial INVITEs this user agent receives.
@@ -547,6 +650,11 @@ impl<R: Random> Model<R> {
         match self.classify(request)? {
             Incoming::Initial => {}
             Incoming::NoDialog => return Err(Refusal::NoDialog),
+            // A dialog this user agent sent a BYE in is Mortal, and a
+            // re-INVITE in it gets a 481 (RFC 5407 section 3.2.2).
+            Incoming::InDialog(dialog) if self.is_mortal(dialog) => {
+                return Err(Refusal::NoDialog);
+            }
             // TODO: Take re-INVITEs into their usage's exchange.
             Incoming::InDialog(_) => return Err(Refusal::Unsupported),
         }
@@ -579,6 +687,7 @@ impl<R: Random> Model<R> {
             return Err(Refusal::Internal);
         };
         let dialog = Dialog::uas(request, local_tag, self.limits.routes)?;
+        let early = dialog.id().clone();
         // A time too far off to add to the clock sets no deadline, rather
         // than overflow.
         let decision_due = now.checked_add(self.limits.decision_timeout);
@@ -601,6 +710,7 @@ impl<R: Random> Model<R> {
             return Err(Refusal::Busy);
         };
         self.merge_index.insert(merge, exchange);
+        self.early_index.insert(early, exchange);
         if let Some(due) = decision_due {
             self.timers.set(due, Timer::Decision(exchange));
         }
@@ -866,12 +976,23 @@ impl<R: Random> Model<R> {
             return;
         };
 
-        if let Scope::Incoming { merge, .. } = &exchange.scope {
+        if let Scope::Incoming { merge, dialog, .. } = &exchange.scope {
             if self.merge_index.get(merge) == Some(&key) {
                 self.merge_index.remove(merge);
             }
+            if let Some(dialog) = dialog {
+                self.forget_early(dialog.id(), key);
+            }
         }
         self.effects.push(Effect::Released(Released::Exchange(key)));
+    }
+
+    /// Takes an incoming exchange's early dialog out of the index, once a
+    /// final decides the exchange and no BYE can withdraw it.
+    fn forget_early(&mut self, id: &DialogId, key: ExchangeKey) {
+        if self.early_index.get(id) == Some(&key) {
+            self.early_index.remove(id);
+        }
     }
 
     /// Records the core's acceptance of a final response in flight.
@@ -900,12 +1021,17 @@ impl<R: Random> Model<R> {
         }
 
         let cseq = exchange.cseq;
-        let Scope::Incoming { dialog, offer, .. } = &mut exchange.scope else {
+        let Scope::Incoming { dialog, offer, withdrawn, .. } =
+            &mut exchange.scope
+        else {
             unreachable!("only incoming exchanges submit finals");
         };
-        let offer = offer.take();
+        let (offer, withdrawn) = (offer.take(), withdrawn.as_deref().copied());
         let offer_in_request = offer.is_some();
         let mut dialog = *dialog.take().expect("a 2xx forms the dialog once");
+        // From here on the dialog is in the dialog table, which finds the
+        // requests the caller sends in it.
+        self.forget_early(dialog.id(), key);
 
         // The 2xx carries the answer to the INVITE's offer, or an offer of
         // its own whose answer comes in the ACK (RFC 3261 section 13.2.1).
@@ -955,6 +1081,16 @@ impl<R: Random> Model<R> {
             .and_then(|exchange| exchange.early_ack.take());
         if let Some(answer) = early_ack {
             self.receive_ack(&replay_dialog, cseq, answer);
+        }
+
+        // The caller sent a BYE in the early dialog while the 2xx was on its
+        // way, and the UA answered it with a 200. The 2xx confirmed the
+        // dialog that BYE ends (RFC 5407 section 3.1.3), so the session ends
+        // as it starts. The 2xx still goes out again until its ACK, as RFC
+        // 3261 section 13.3.1.4 asks. A CANCEL has no effect on a final
+        // already sent (section 9.2).
+        if let Some(Withdrawal::Bye { flow }) = withdrawn {
+            self.end_usage(usage, EndReason::RemoteBye { flow });
         }
     }
 
@@ -1017,7 +1153,14 @@ impl<R: Random> Model<R> {
         if closed {
             self.drop_exchange(key);
         } else if operation.is_some() {
-            self.abandon(key);
+            // The caller gave the INVITE up while the application's final
+            // was on its way. The final lost, so the INVITE gets the 487 it
+            // would have had then (RFC 3261 sections 9.2 and 15.1.2).
+            if self.withdrawn(key).is_some() {
+                self.answer_withdrawal(key);
+            } else {
+                self.abandon(key);
+            }
         } else {
             // The UA's own final was refused. I do not retry it, since no
             // RFC rule asks for more than a final response, and signa-core
@@ -1025,6 +1168,170 @@ impl<R: Random> Model<R> {
             // signa-core sends its 500 for an unanswered one.
             self.drop_exchange(key);
         }
+    }
+
+    /// Returns how the caller gave up an incoming INVITE, if it did.
+    fn withdrawn(&self, key: ExchangeKey) -> Option<Withdrawal> {
+        match &self.exchanges.get(key)?.scope {
+            Scope::Incoming { withdrawn, .. } => withdrawn.as_deref().copied(),
+            Scope::Outgoing => None,
+        }
+    }
+
+    /// Takes in a CANCEL of the INVITE of an incoming exchange, which the
+    /// core matched to the INVITE's transaction (RFC 3261 section 9.2).
+    ///
+    /// Returns the To tag of the INVITE's responses, which the 200 to the
+    /// CANCEL SHOULD carry too (section 9.2), or `None` once the UA no
+    /// longer holds the exchange. The 200 itself is the runtime's to send,
+    /// whatever the INVITE's state, since the CANCEL matched a transaction.
+    pub(crate) fn receive_cancel(&mut self, key: ExchangeKey) -> Option<Tag> {
+        let exchange = self.exchanges.get(key)?;
+        let tag = match &exchange.scope {
+            Scope::Incoming { dialog: Some(dialog), .. } => {
+                dialog.id().local_tag().clone()
+            }
+            // The 2xx went, and the dialog with it, so the tag is the
+            // dialog's. The CANCEL changes nothing then.
+            Scope::Incoming { dialog: None, .. } => {
+                return self.committed_tag(key);
+            }
+            Scope::Outgoing => return None,
+        };
+
+        self.withdraw(key, Withdrawal::Cancel);
+        Some(tag)
+    }
+
+    /// Takes in a request with a To tag other than INVITE, ACK and CANCEL,
+    /// which arrived on `flow`, and says how to answer it.
+    ///
+    /// RFC 3261 section 12.2.2 finds its dialog by the tags and Call-ID, and
+    /// checks its CSeq against the last one the peer sent. A BYE ends the
+    /// session of its dialog and gets a 200 (section 15.1.2). So does a BYE
+    /// in the early dialog of an INVITE this user agent has not answered,
+    /// which also gets that INVITE a 487 (section 15.1.2, and RFC 5407
+    /// appendix A). A request that changes nothing in the dialog is answered
+    /// as one outside it. A dialog that matches none gets a 481.
+    ///
+    /// In a dialog that is Mortal, since this user agent sent a BYE in it, a
+    /// BYE still gets a 200 and any other request a 481 ([RFC 5407 sections
+    /// 2 and 3.2.1]). Nothing else changes, and the CSeq is not checked,
+    /// since the dialog takes no new request.
+    ///
+    /// [RFC 5407 sections 2 and 3.2.1]: https://www.rfc-editor.org/rfc/rfc5407.html#section-3.2.1
+    pub(crate) fn receive_request<B>(
+        &mut self,
+        request: &Request<B>,
+        flow: Flow,
+    ) -> Result<InDialog, Refusal> {
+        let Some(id) = request_dialog(request)? else {
+            return Ok(InDialog::Other);
+        };
+        let (cseq, _) = protocol::cseq(request.headers())?;
+        let bye = *request.method() == Method::BYE;
+
+        if let Some(&key) = self.dialog_index.get(&id) {
+            if self.is_mortal(key) {
+                return if bye {
+                    Ok(InDialog::Bye)
+                } else {
+                    Err(Refusal::NoDialog)
+                };
+            }
+            let dialog = self.dialogs.get_mut(key).expect("indexed");
+            dialog.remote_request(cseq).map_err(out_of_order)?;
+            if !bye {
+                return Ok(InDialog::Other);
+            }
+
+            let usage = self
+                .usages
+                .iter()
+                .find_map(|(usage, record)| {
+                    (record.dialog == key).then_some(usage)
+                })
+                .expect("a live dialog has its usage");
+            self.end_usage(usage, EndReason::RemoteBye { flow });
+            return Ok(InDialog::Bye);
+        }
+
+        let Some(&key) = self.early_index.get(&id) else {
+            return Err(Refusal::NoDialog);
+        };
+        let Some(InviteExchange {
+            scope: Scope::Incoming { dialog: Some(dialog), .. },
+            ..
+        }) = self.exchanges.get_mut(key)
+        else {
+            unreachable!("an indexed early dialog is its exchange's");
+        };
+        dialog.remote_request(cseq).map_err(out_of_order)?;
+        if bye {
+            self.withdraw(key, Withdrawal::Bye { flow });
+            return Ok(InDialog::Bye);
+        }
+        Ok(InDialog::Other)
+    }
+
+    /// Says whether a dialog is Mortal: this user agent ended its session
+    /// with a BYE whose transaction has not ended yet.
+    fn is_mortal(&self, dialog: DialogKey) -> bool {
+        self.dialogs
+            .get(dialog)
+            .is_some_and(|dialog| dialog.phase() == DialogPhase::Terminated)
+    }
+
+    /// Returns the To tag of the 2xx an incoming exchange committed, from the
+    /// replay context that awaits its ACK.
+    fn committed_tag(&self, key: ExchangeKey) -> Option<Tag> {
+        self.replays.iter().find_map(|(_, replay)| {
+            (replay.source == Source::Exchange(key))
+                .then(|| replay.id.dialog.local_tag().clone())
+        })
+    }
+
+    /// Records that the caller gave up an incoming INVITE.
+    ///
+    /// An INVITE still undecided gets a 487 at once (RFC 3261 section 9.2
+    /// for a CANCEL, section 15.1.2 for a BYE in its early dialog). One whose
+    /// final is under way keeps it, and the withdrawal applies only if the
+    /// core refuses that final. One that has its final already is left
+    /// alone, since neither request undoes it (section 9.2).
+    fn withdraw(&mut self, key: ExchangeKey, withdrawal: Withdrawal) {
+        let Some(exchange) = self.exchanges.get_mut(key) else {
+            return;
+        };
+        let state = exchange.state();
+        let Scope::Incoming { withdrawn, .. } = &mut exchange.scope else {
+            return;
+        };
+        if !matches!(
+            state,
+            ExchangeState::Pending
+                | ExchangeState::FinalSubmissionPending { .. }
+        ) {
+            return;
+        }
+        // The first one counts. A BYE after a CANCEL still answers a 2xx in
+        // flight with the end of its session, though.
+        if withdrawn.is_none() || matches!(withdrawal, Withdrawal::Bye { .. })
+        {
+            *withdrawn = Some(Box::new(withdrawal));
+        }
+
+        if state == ExchangeState::Pending {
+            self.answer_withdrawal(key);
+        }
+    }
+
+    /// Answers an INVITE the caller gave up with a 487, and tells the
+    /// application, whose decision now finds the final taken.
+    fn answer_withdrawal(&mut self, key: ExchangeKey) {
+        let terminated = StatusCode::from_u16(487).expect("a final status");
+        self.reject(key, terminated);
+        self.effects
+            .push(Effect::Notify(Event::InviteWithdrawn { exchange: key }));
     }
 
     /// Takes in an ACK as received. `answer` says whether it carries the
@@ -1088,6 +1395,11 @@ impl<R: Random> Model<R> {
                     Event::NegotiationCompleted { usage },
                 ));
             }
+            // The application asked to end the session before the ACK, and
+            // RFC 3261 section 15 lets its BYE go now.
+            if let ByeIntent::Deferred { operation } = record.bye {
+                self.start_bye(usage, operation, EndReason::LocalBye, true);
+            }
         }
         self.reclaim_replay(key);
     }
@@ -1139,11 +1451,11 @@ impl<R: Random> Model<R> {
     /// Gives up on the ACK of a 2xx this user agent sent.
     ///
     /// RFC 3261 section 13.3.1.4 leaves the dialog confirmed and has the
-    /// session end with a BYE. A late ACK finds nothing afterwards, so it
-    /// brings back neither the usage nor the retransmissions.
-    ///
-    /// TODO: Send that BYE. Until then the usage ends here without one, and
-    /// the application is told why.
+    /// session end with a BYE, which section 15 allows now that the wait for
+    /// the ACK is over. The usage ends once the BYE reaches the core, or
+    /// without it if it cannot. A BYE the application asked for goes now, as
+    /// its own. A late ACK finds nothing afterwards, so it brings back
+    /// neither the usage nor the retransmissions.
     fn ack_overdue(&mut self, key: ReplayKey) {
         let Some(replay) = self.replays.get_mut(key) else {
             return;
@@ -1160,14 +1472,33 @@ impl<R: Random> Model<R> {
         if let Source::Exchange(exchange) = source {
             self.drop_exchange(exchange);
         }
-        if let Some(usage) =
-            usage.filter(|&usage| self.usages.get(usage).is_some())
+        if let Some((usage, bye)) =
+            usage.and_then(|usage| Some((usage, self.usages.get(usage)?.bye)))
         {
             self.effects.push(Effect::Notify(Event::AckTimeout { usage }));
-            self.end_usage(usage);
+            match bye {
+                ByeIntent::None => {
+                    self.start_bye(usage, None, EndReason::AckTimeout, false);
+                }
+                ByeIntent::Deferred { operation } => {
+                    self.start_bye(
+                        usage,
+                        operation,
+                        EndReason::LocalBye,
+                        false,
+                    );
+                }
+                ByeIntent::Sending => {}
+            }
         }
         self.reclaim_replay(key);
     }
+}
+
+/// Refuses a request out of order in its dialog, whether its CSeq is lower
+/// than the last or the same.
+fn out_of_order(_: OutOfOrder) -> Refusal {
+    Refusal::OutOfOrder
 }
 
 /// Returns `interval` after `at`, the time a timer was due, or after `now`
@@ -1254,22 +1585,27 @@ impl<R: Random> Model<R> {
         Some(*request)
     }
 
-    /// Records that the core took the INVITE of an attempt.
+    /// Records that the core took the INVITE of an attempt, and asks it for
+    /// the CANCEL the application wanted before then.
     pub(crate) fn invite_started(&mut self, attempt: AttemptKey) {
-        let Some(operation) = self
-            .attempts
-            .get_mut(attempt)
-            .and_then(|attempt| attempt.operation.take())
-        else {
+        let Some(record) = self.attempts.get_mut(attempt) else {
+            return;
+        };
+        let Some(operation) = record.operation.take() else {
             return;
         };
 
+        if let CancelIntent::Waiting(cancel) = record.cancel {
+            record.cancel = CancelIntent::Asked;
+            self.effects
+                .push(Effect::CancelInvite { attempt, operation: cancel });
+        }
         self.operations.advance(operation, Stage::Committed);
         self.complete(operation, Ok(Completion::Attempt(attempt)));
     }
 
     /// Records that the INVITE of an attempt never reached the core, and
-    /// closes the attempt.
+    /// closes the attempt. A CANCEL asked for meanwhile is not needed.
     pub(crate) fn invite_failed(&mut self, attempt: AttemptKey, error: Error) {
         let Some(record) = self.attempts.remove(attempt) else {
             return;
@@ -1280,6 +1616,69 @@ impl<R: Random> Model<R> {
         if let Some(operation) = record.operation {
             self.complete(operation, Err(error));
         }
+        if let CancelIntent::Waiting(Some(cancel)) = record.cancel {
+            let not_needed = Completion::Cancel(CancelResult::NotNeeded);
+            self.complete(cancel, Ok(not_needed));
+        }
+    }
+
+    /// Asks for the CANCEL of an attempt's INVITE, for `operation` if the
+    /// application asked.
+    ///
+    /// The core sends the CANCEL once a provisional response came, and none
+    /// if a final came first (RFC 3261 section 9.1). Before the core has the
+    /// INVITE, the intent waits for it. An INVITE that already has its final
+    /// gets no CANCEL, since it would do nothing (section 9.1 says it SHOULD
+    /// NOT go). The CANCEL decides nothing about the attempt. A 2xx that
+    /// wins the race forms a session as any other, which the application
+    /// may keep or end (section 15).
+    fn cancel_attempt(
+        &mut self,
+        operation: Option<OperationId>,
+        attempt: AttemptKey,
+    ) {
+        let Some(record) = self.attempts.get_mut(attempt) else {
+            if let Some(operation) = operation {
+                self.complete(operation, Err(Error::StaleDecision));
+            }
+            return;
+        };
+        if record.cancel != CancelIntent::None {
+            if let Some(operation) = operation {
+                self.complete(operation, Err(Error::InvalidTransition));
+            }
+            return;
+        }
+        if record.result.is_some() {
+            if let Some(operation) = operation {
+                let not_needed = Completion::Cancel(CancelResult::NotNeeded);
+                self.complete(operation, Ok(not_needed));
+            }
+            return;
+        }
+
+        if record.started() {
+            record.cancel = CancelIntent::Asked;
+            self.effects.push(Effect::CancelInvite { attempt, operation });
+        } else {
+            record.cancel = CancelIntent::Waiting(operation);
+        }
+    }
+
+    /// Records what the core did with a CANCEL it was asked for.
+    pub(crate) fn cancel_done(
+        &mut self,
+        operation: Option<OperationId>,
+        result: Result<CancelResult, Error>,
+    ) {
+        let Some(operation) = operation else {
+            return;
+        };
+
+        if result == Ok(CancelResult::Sent) {
+            self.operations.advance(operation, Stage::Committed);
+        }
+        self.complete(operation, result.map(Completion::Cancel));
     }
 
     /// Returns what an attempt came to so far, or `None` once it has ended.
@@ -1303,18 +1702,45 @@ impl<R: Random> Model<R> {
         })
     }
 
-    /// Gives an attempt up, as the application intends. Each 2xx that comes
-    /// for it from now on, also one for an early dialog, gets its ACK and a
-    /// BYE that ends its dialog, and forms no session (RFC 3261 section
-    /// 13.2.2.4). The sessions it formed before are left alone.
+    /// Gives an attempt up, as the application intends, which is what RFC
+    /// 3261 section 15 describes for a caller that hangs up: a CANCEL while
+    /// the INVITE has no final response, and a BYE in each confirmed dialog.
     ///
-    /// TODO: Cancel the INVITE while it is pending, and end the sessions it
-    /// formed, once the UA has CANCEL and the BYE of a usage. Until then
-    /// nothing but the model gives an attempt up.
-    pub(crate) fn abandon_attempt(&mut self, attempt: AttemptKey) {
-        if let Some(record) = self.attempts.get_mut(attempt) {
-            record.abandoned = true;
+    /// * The INVITE gets its CANCEL, unless it has its final already.
+    /// * Each session it formed that is confirmed gets its BYE.
+    /// * An early session is left to the CANCEL, whose 487 ends it, and
+    ///   shows as ending meanwhile.
+    /// * Each 2xx that comes from now on, also one for an early dialog, gets
+    ///   its ACK and a BYE that ends its dialog, and forms no session
+    ///   (section 13.2.2.4).
+    ///
+    /// Giving up twice does no more than once. A session that is already
+    /// ending keeps its BYE. A BYE that cannot reach the core leaves its
+    /// session up, for the application to end again, since the peer still
+    /// has it.
+    pub(crate) fn abandon_attempt(
+        &mut self,
+        attempt: AttemptKey,
+    ) -> Result<(), Error> {
+        let record =
+            self.attempts.get_mut(attempt).ok_or(Error::StaleDecision)?;
+        record.abandoned = true;
+        let forks = record.forks.clone();
+
+        self.cancel_attempt(None, attempt);
+        for usage in forks {
+            let Some(record) = self.usages.get_mut(usage) else {
+                continue;
+            };
+            match record.phase() {
+                UsagePhase::Established => {
+                    self.start_bye(usage, None, EndReason::LocalBye, true);
+                }
+                UsagePhase::Establishing => record.begin_ending(),
+                UsagePhase::Ending | UsagePhase::Ended => {}
+            }
         }
+        Ok(())
     }
 
     /// Takes in the end of an attempt without a 2xx: a final response other
@@ -1354,7 +1780,8 @@ impl<R: Random> Model<R> {
         }
     }
 
-    /// Ends the early usages an attempt formed.
+    /// Ends the early usages an attempt formed, also those ending, whose
+    /// dialog no 2xx can confirm any more.
     fn end_early_usages(&mut self, attempt: AttemptKey) {
         let Some(record) = self.attempts.get(attempt) else {
             return;
@@ -1365,13 +1792,14 @@ impl<R: Random> Model<R> {
             .copied()
             .filter(|&usage| {
                 self.usages.get(usage).is_some_and(|usage| {
-                    usage.phase() == UsagePhase::Establishing
+                    self.dialogs.get(usage.dialog).map(Dialog::phase)
+                        == Some(DialogPhase::Early)
                 })
             })
             .collect();
 
         for usage in early {
-            self.end_usage(usage);
+            self.end_usage(usage, EndReason::Unconfirmed);
         }
     }
 
@@ -1474,9 +1902,11 @@ impl<R: Random> Model<R> {
             cseq: attempt.origin.cseq(),
             direction: Direction::Outgoing,
         };
+        // Nor does one for a dialog this user agent ended with a BYE.
         if attempt.abandoned
             || self.dialog_index.contains_key(&id)
             || self.replay_index.contains_key(&answered)
+            || attempt.ended_early(&id).is_some()
         {
             return Ok(());
         }
@@ -1593,7 +2023,25 @@ impl<R: Random> Model<R> {
             self.effects.push(Effect::ResendAck { replay });
             return Ok(());
         }
-        if let Some(dialog) = self.dialog_index.get(&id).copied() {
+        let known = self.dialog_index.get(&id).copied();
+        if let Some(numbered) = attempt.ended_early(&id) {
+            // This user agent ended the early dialog with a BYE, which
+            // crossed the 2xx, whether or not the BYE's transaction is still
+            // on. RFC 5407 appendix A has a UAC ready for a 2xx until the
+            // INVITE's final, and section 13.2.2.4 of RFC 3261 asks for its
+            // ACK and a BYE all the same. The dialog's numbers go on from the
+            // BYE's, which the peer may have seen. Ending it was the
+            // application's choice, so the attempt stays complete.
+            let mut dialog =
+                Dialog::uac(&attempt.origin, response, self.limits.routes)
+                    .map_err(|_| Error::InvalidInput)?;
+            dialog.number_after(numbered);
+            return self
+                .clean_up(key, dialog, replay)
+                .then_some(())
+                .ok_or(Error::CapacityExceeded);
+        }
+        if let Some(dialog) = known {
             return self.confirm_early(
                 key,
                 dialog,
@@ -1690,7 +2138,7 @@ impl<R: Random> Model<R> {
         if !room {
             let record = self.dialogs.remove(dialog).expect("indexed");
             self.dialog_index.remove(record.id());
-            self.end_usage(usage);
+            self.end_usage(usage, EndReason::LocalBye);
             let cleaned = self.clean_up(attempt, record, replay);
             debug_assert!(cleaned, "the room was checked above");
             return if abandoned {
@@ -1870,18 +2318,46 @@ fn settle_at_2xx(negotiation: &mut Negotiation, description: bool) {
 
 /// Usages.
 impl<R: Random> Model<R> {
-    /// Ends a usage, as when its BYE goes to the core or the peer's BYE is
-    /// accepted. The dialog ends with it. The replay contexts of its 2xx
-    /// stay until copies of the 2xx can no longer arrive.
-    pub(crate) fn end_usage(&mut self, key: UsageKey) {
+    /// Ends a usage, as when the peer's BYE is accepted or its early dialog
+    /// ends without a 2xx. The dialog ends with it. The replay contexts of
+    /// its 2xx stay until copies of the 2xx can no longer arrive.
+    pub(crate) fn end_usage(&mut self, key: UsageKey, reason: EndReason) {
+        self.finish_usage(key, reason, false);
+    }
+
+    /// Ends a usage whose BYE the core took, as [`Model::end_usage`] does,
+    /// but leaves its dialog Mortal until the BYE's transaction ends
+    /// ([RFC 5407 section 2]), for [`Model::bye_answered`] to reclaim.
+    ///
+    /// [RFC 5407 section 2]: https://www.rfc-editor.org/rfc/rfc5407.html#section-2
+    fn end_usage_mortal(&mut self, key: UsageKey, reason: EndReason) {
+        self.finish_usage(key, reason, true);
+    }
+
+    fn finish_usage(
+        &mut self,
+        key: UsageKey,
+        reason: EndReason,
+        mortal: bool,
+    ) {
         let Some(mut usage) = self.usages.remove(key) else {
             return;
         };
         usage.end();
 
-        if let Some(mut dialog) = self.dialogs.remove(usage.dialog) {
+        if mortal {
+            if let Some(dialog) = self.dialogs.get_mut(usage.dialog) {
+                dialog.terminate();
+            }
+        } else if let Some(mut dialog) = self.dialogs.remove(usage.dialog) {
             dialog.terminate();
             self.dialog_index.remove(dialog.id());
+        }
+        // A BYE the application asked for, deferred until the ACK, is not
+        // needed any more. The session ended as it asked, as when the peer's
+        // BYE crossed it, so the operation succeeds with nothing sent.
+        if let ByeIntent::Deferred { operation: Some(operation) } = usage.bye {
+            self.complete(operation, Ok(Completion::Done));
         }
         let replays: Vec<ReplayKey> = self
             .replays
@@ -1894,7 +2370,204 @@ impl<R: Random> Model<R> {
             self.reclaim_replay(replay);
         }
 
-        self.effects.push(Effect::Notify(Event::UsageEnded { usage: key }));
+        if self.ended.len() >= self.limits.usages {
+            self.ended.pop_front();
+        }
+        self.ended.push_back((key, reason, usage.negotiation));
+        self.effects
+            .push(Effect::Notify(Event::UsageEnded { usage: key, reason }));
+    }
+
+    /// Ends a usage with a BYE, for `operation` if the application asked.
+    ///
+    /// RFC 3261 section 15 lets the caller send a BYE in an early or a
+    /// confirmed dialog, and the callee in a confirmed one, once the ACK of
+    /// its 2xx came or its wait for that ACK is over. A callee's usage
+    /// therefore waits for that ACK with its BYE deferred. A usage that is
+    /// already ending, or has ended, takes no second BYE.
+    fn terminate(&mut self, operation: Option<OperationId>, key: UsageKey) {
+        let Some(usage) = self.usages.get_mut(key) else {
+            if let Some(operation) = operation {
+                let error = if self.ended(key).is_some() {
+                    Error::InvalidTransition
+                } else {
+                    Error::StaleDecision
+                };
+                self.complete(operation, Err(error));
+            }
+            return;
+        };
+        if usage.bye != ByeIntent::None {
+            if let Some(operation) = operation {
+                self.complete(operation, Err(Error::InvalidTransition));
+            }
+            return;
+        }
+
+        // A UAS keeps a usage only once its 2xx is committed, so only an ACK
+        // still awaited holds the BYE back.
+        let awaiting_ack = usage.direction == Direction::Incoming
+            && self.replays.iter().any(|(_, replay)| {
+                replay.usage == Some(key)
+                    && replay.ack == AckObligation::AwaitingPeer
+            });
+        if awaiting_ack {
+            usage.begin_ending();
+            usage.bye = ByeIntent::Deferred { operation };
+            return;
+        }
+
+        self.start_bye(key, operation, EndReason::LocalBye, true);
+    }
+
+    /// Has the runtime send the BYE of a usage, which ends it once the core
+    /// takes it (RFC 3261 section 15.1.1). If the core never does, the usage
+    /// goes back to what it was if `restore`, or ends anyway without it.
+    fn start_bye(
+        &mut self,
+        key: UsageKey,
+        operation: Option<OperationId>,
+        reason: EndReason,
+        restore: bool,
+    ) {
+        let Some(usage) = self.usages.get_mut(key) else {
+            return;
+        };
+        debug_assert_ne!(usage.bye, ByeIntent::Sending);
+
+        usage.begin_ending();
+        usage.bye = ByeIntent::Sending;
+        let dialog = usage.dialog;
+        self.byes
+            .insert(key, SendingBye { operation, dialog, reason, restore });
+        self.effects.push(Effect::SendSessionBye { usage: key });
+    }
+
+    /// Builds the BYE of a usage from its dialog, as any request in a dialog
+    /// is built (RFC 3261 section 15.1.1). It takes the dialog's next number
+    /// for good, sent or not, since it may reach the peer (section 8.1.1.5).
+    pub(crate) fn session_bye_request(
+        &mut self,
+        key: UsageKey,
+    ) -> Result<Outgoing, Error> {
+        let dialog = self.byes.get(&key).ok_or(Error::StaleDecision)?.dialog;
+        // A UAS that sent nothing in the dialog yet picks its first number
+        // from this.
+        let seed = self.random.next_u64().ok_or(Error::Internal)?;
+
+        let record =
+            self.dialogs.get_mut(dialog).ok_or(Error::StaleDecision)?;
+        record.request(Method::BYE, Sequence::Next { seed }).map_err(|error| {
+            match error {
+                RequestError::Terminated => Error::StaleDecision,
+                // Out of numbers, the dialog can take no new request.
+                RequestError::CSeqExhausted => Error::InvalidTransition,
+                RequestError::WrongSequence
+                | RequestError::Cancel
+                | RequestError::Invalid => Error::Internal,
+            }
+        })
+    }
+
+    /// Records whether the core took the BYE of a usage.
+    ///
+    /// Once it did, the session is over (RFC 3261 section 15.1.1), whatever
+    /// the response says, and the dialog stays Mortal until the BYE's
+    /// transaction ends. The returned [`ByeStarted`] is what the runtime
+    /// reports that response with. A BYE that never reached the core leaves
+    /// the usage as it was before, unless it was to end it anyway, as at an
+    /// ACK timeout, where RFC 3261 section 13.3.1.4 ends the session either
+    /// way.
+    ///
+    /// A usage the peer's BYE ended meanwhile stays ended. Its dialog went
+    /// then, so nothing stays Mortal.
+    pub(crate) fn bye_started(
+        &mut self,
+        key: UsageKey,
+        result: Result<(), Error>,
+    ) -> Option<ByeStarted> {
+        let bye = self.byes.remove(&key)?;
+
+        match result {
+            Ok(()) => {
+                if let Some(operation) = bye.operation {
+                    self.operations.advance(operation, Stage::Committed);
+                }
+                self.remember_ended_early(key, bye.dialog);
+                self.end_usage_mortal(key, bye.reason);
+                Some(ByeStarted {
+                    dialog: bye.dialog,
+                    operation: bye.operation,
+                })
+            }
+            Err(error) => {
+                // A 2xx may have confirmed an early dialog meanwhile, so the
+                // usage takes the phase its dialog says.
+                let early = self.dialogs.get(bye.dialog).map(Dialog::phase)
+                    == Some(DialogPhase::Early);
+                let phase = if early {
+                    UsagePhase::Establishing
+                } else {
+                    UsagePhase::Established
+                };
+                match (self.usages.get_mut(key), bye.restore) {
+                    (Some(usage), true) => usage.resume(phase),
+                    (Some(_), false) => self.end_usage(key, bye.reason),
+                    (None, _) => {}
+                }
+                if let Some(operation) = bye.operation {
+                    self.complete(operation, Err(error));
+                }
+                None
+            }
+        }
+    }
+
+    /// Has the attempt that formed an early dialog remember that this user
+    /// agent ended it with a BYE, for as long as its 2xx may still come.
+    fn remember_ended_early(&mut self, usage: UsageKey, dialog: DialogKey) {
+        let Some(record) = self
+            .dialogs
+            .get(dialog)
+            .filter(|record| record.phase() == DialogPhase::Early)
+        else {
+            return;
+        };
+        let ended = (record.id().clone(), record.local_cseq());
+        let attempt = self
+            .attempts
+            .iter_mut()
+            .find(|(_, attempt)| attempt.forks.contains(&usage));
+
+        if let Some((_, attempt)) = attempt {
+            attempt.ended_early.push(ended);
+        }
+    }
+
+    /// Records the response to a BYE the core took, or the failure of its
+    /// transaction, which ends the Mortal state of its dialog.
+    ///
+    /// The operation that asked for the BYE ends with it. A 481 or a timeout
+    /// fails it, but brings back nothing (RFC 3261 section 15.1.1 takes the
+    /// dialog as ended then too), and the BYE is not sent again.
+    pub(crate) fn bye_answered(
+        &mut self,
+        bye: ByeStarted,
+        result: Result<(), Error>,
+    ) {
+        if let Some(operation) = bye.operation {
+            if matches!(result, Ok(()) | Err(Error::RemoteFailure(_))) {
+                self.operations.advance(operation, Stage::Answered);
+            }
+            self.complete(operation, result.map(|()| Completion::Done));
+        }
+
+        if self.is_mortal(bye.dialog) {
+            let dialog = self.dialogs.remove(bye.dialog).expect("checked");
+            if self.dialog_index.get(dialog.id()) == Some(&bye.dialog) {
+                self.dialog_index.remove(dialog.id());
+            }
+        }
     }
 
     /// Sets aside a dialog, a usage and a replay context, or nothing.
@@ -2083,14 +2756,45 @@ mod tests {
             assert!(self.replays.len() - cleanups <= self.limits.replays);
             for (_, attempt) in self.attempts.iter() {
                 assert!(attempt.forks.len() <= self.limits.forks);
+                assert!(attempt.ended_early.len() <= attempt.forks.len());
             }
 
-            for (_, usage) in self.usages.iter() {
+            for (key, usage) in self.usages.iter() {
                 let dialog = self.dialogs.get(usage.dialog).unwrap();
                 assert_ne!(dialog.phase(), DialogPhase::Terminated);
                 assert_ne!(usage.phase(), UsagePhase::Ended);
+                assert_eq!(
+                    usage.bye == ByeIntent::Sending,
+                    self.byes.contains_key(&key),
+                );
+                if usage.bye != ByeIntent::None {
+                    assert_eq!(usage.phase(), UsagePhase::Ending);
+                }
             }
-            assert_eq!(self.dialogs.len(), self.usages.len());
+            // A dialog no usage holds is Mortal, and waits for its BYE.
+            let mortal = self
+                .dialogs
+                .iter()
+                .filter(|(_, dialog)| {
+                    dialog.phase() == DialogPhase::Terminated
+                })
+                .count();
+            assert_eq!(self.dialogs.len(), self.usages.len() + mortal);
+            for (_, dialog) in self.dialogs.iter() {
+                assert!(self.dialog_index.contains_key(dialog.id()));
+            }
+            assert_eq!(self.dialog_index.len(), self.dialogs.len());
+            assert!(self.ended.len() <= self.limits.usages);
+            for (id, &key) in &self.early_index {
+                let Some(InviteExchange {
+                    scope: Scope::Incoming { dialog: Some(dialog), .. },
+                    ..
+                }) = self.exchanges.get(key)
+                else {
+                    panic!("an early dialog without its exchange");
+                };
+                assert_eq!(dialog.id(), id);
+            }
 
             // Each timer that is set belongs to a record that holds its
             // instant, so none outlives its record.
@@ -2347,11 +3051,14 @@ mod tests {
         assert_eq!(model.replay(&effects).ack, AckObligation::NeedToSend);
         model.ack_written(replay_key, true);
 
-        model.end_usage(usage);
+        model.end_usage(usage, EndReason::LocalBye);
         model.check();
         assert_eq!(
             model.take_effects(),
-            [Effect::Notify(Event::UsageEnded { usage })],
+            [Effect::Notify(Event::UsageEnded {
+                usage,
+                reason: EndReason::LocalBye
+            })],
         );
         assert!(model.has_replay(replay_key));
         let replay = model.replays.get(replay_key).unwrap();
@@ -2994,7 +3701,7 @@ mod tests {
         assert_eq!(
             notices(&model.take_effects()),
             [
-                Event::UsageEnded { usage },
+                Event::UsageEnded { usage, reason: EndReason::Unconfirmed },
                 Event::AttemptFailed {
                     attempt,
                     error: Error::RemoteFailure(busy)
@@ -3096,7 +3803,7 @@ mod tests {
                 Some(answer())
             )),
         );
-        model.end_usage(usage);
+        model.end_usage(usage, EndReason::LocalBye);
         assert_eq!(model.usage_state(usage), None);
     }
 
@@ -3365,8 +4072,11 @@ mod tests {
     }
 
     /// Without an ACK by the deadline, the retransmissions stop, the
-    /// application is told why, and the usage ends with its dialog. Nothing
-    /// of the exchange is left.
+    /// application is told why, and the session ends with a BYE, as RFC
+    /// 3261 section 13.3.1.4 asks. The usage ends once the core has the BYE,
+    /// and its dialog stays Mortal until the BYE's response. Nothing of the
+    /// exchange is left. A BYE that cannot reach the core ends the session
+    /// all the same.
     #[test]
     fn no_ack_triggers_explicit_termination_policy() {
         let mut clock = Clock(Instant::now());
@@ -3376,19 +4086,45 @@ mod tests {
 
         let effects = advance_to(&mut model, &mut clock, deadline);
 
-        let notified = notices(&effects);
-        assert_eq!(
-            notified,
-            [Event::AckTimeout { usage }, Event::UsageEnded { usage }],
-        );
+        assert_eq!(notices(&effects), [Event::AckTimeout { usage }]);
+        assert!(effects.contains(&Effect::SendSessionBye { usage }));
         assert!(
             effects.contains(&Effect::Released(Released::Exchange(exchange)))
         );
         assert!(effects.contains(&Effect::Released(Released::Replay(replay))));
         assert!(model.exchanges.get(exchange).is_none());
-        assert_eq!(model.usages.len(), 0);
-        assert_eq!(model.dialogs.len(), 0);
         assert_eq!(model.next_deadline(), None);
+        let bye = model.session_bye_request(usage).unwrap().request;
+        assert_eq!(bye.method(), &Method::BYE);
+        assert_eq!(bye.uri().as_str(), "sip:alice@192.0.2.1");
+
+        let started = model.bye_started(usage, Ok(())).unwrap();
+        model.check();
+        assert_eq!(
+            notices(&model.take_effects()),
+            [Event::UsageEnded { usage, reason: EndReason::AckTimeout }],
+        );
+        assert_eq!(model.usages.len(), 0);
+        assert_eq!(model.dialogs.len(), 1, "the dialog is Mortal");
+        model.bye_answered(started, Ok(()));
+        model.check();
+        assert_eq!(model.dialogs.len(), 0);
+        assert_eq!(
+            model.ended(usage),
+            Some((EndReason::AckTimeout, Negotiation::Stable)),
+        );
+
+        let mut model = self::model(limits());
+        let (_, _, usage) = accepted(&mut model, &clock);
+        let deadline = clock.now() + T1 * 64;
+        advance_to(&mut model, &mut clock, deadline);
+        assert!(model.bye_started(usage, Err(Error::Unroutable)).is_none());
+        model.check();
+        assert_eq!(
+            notices(&model.take_effects()),
+            [Event::UsageEnded { usage, reason: EndReason::AckTimeout }],
+        );
+        assert_eq!(model.dialogs.len(), 0);
     }
 
     /// An ACK after the deadline finds nothing. It brings back neither the
@@ -3405,7 +4141,8 @@ mod tests {
         model.check();
 
         assert!(model.take_effects().is_empty());
-        assert_eq!(model.usage_state(usage), None);
+        let (phase, _, _) = model.usage_state(usage).unwrap();
+        assert_eq!(phase, UsagePhase::Ending, "its BYE is on its way");
         assert_eq!(model.replays.len(), 0);
         assert_eq!(model.next_deadline(), None);
     }
@@ -3922,7 +4659,7 @@ mod tests {
         let ended: Vec<Event> = notices(&model.take_effects());
         assert_eq!(ended.len(), 1);
         assert!(
-            matches!(ended[0], Event::UsageEnded { usage } if usage != kept)
+            matches!(ended[0], Event::UsageEnded { usage, .. } if usage != kept)
         );
         assert!(model.usage_state(kept).is_some());
     }
@@ -4077,8 +4814,9 @@ mod tests {
     /// for an early dialog or a new fork, forms no session. Each gets its
     /// ACK, and a BYE after it built from its dialog, which is the request
     /// after the INVITE (RFC 3261 section 13.2.2.4). A session formed before
-    /// is left alone, and so is the attempt's set of responses, since giving
-    /// up was the application's choice.
+    /// gets a BYE of its own, and stays listed while it ends. The attempt's
+    /// set of responses stays complete, since giving up was the
+    /// application's choice.
     #[test]
     fn late_2xx_after_attempt_abandon_is_cleaned_up() {
         let mut model = model(limits());
@@ -4090,7 +4828,7 @@ mod tests {
             .unwrap();
         let kept = confirmations(&model.take_effects())[0];
 
-        model.abandon_attempt(attempt);
+        model.abandon_attempt(attempt).unwrap();
         model
             .receive_2xx(attempt, &fork("early", "sip:bob@192.0.2.4"), offer())
             .unwrap();
@@ -4107,10 +4845,11 @@ mod tests {
 
         let effects = model.take_effects();
         assert!(confirmations(&effects).is_empty());
+        assert!(effects.contains(&Effect::SendSessionBye { usage: kept }));
         let early_usage = notices(&effects)
             .into_iter()
             .find_map(|event| match event {
-                Event::UsageEnded { usage } => Some(usage),
+                Event::UsageEnded { usage, .. } => Some(usage),
                 _ => None,
             })
             .unwrap();
@@ -4211,12 +4950,15 @@ mod tests {
         model.ack_written(cleanup, true);
         model.take_effects();
 
-        model.end_usage(session);
+        model.end_usage(session, EndReason::LocalBye);
         model.bye_done(cleanup);
         model.check();
         assert_eq!(
             model.take_effects(),
-            [Effect::Notify(Event::UsageEnded { usage: session })],
+            [Effect::Notify(Event::UsageEnded {
+                usage: session,
+                reason: EndReason::LocalBye
+            })],
         );
         assert_eq!(model.dialogs.len(), 0, "an ended session holds no dialog");
         assert!(model.has_replay(replay) && model.has_replay(cleanup));
@@ -4329,7 +5071,10 @@ mod tests {
 
         assert_eq!(acks(&confirmed).len(), 1);
         assert_eq!(confirmations(&early_end), []);
-        assert_eq!(notices(&early_end), [Event::UsageEnded { usage: second }]);
+        assert_eq!(
+            notices(&early_end),
+            [Event::UsageEnded { usage: second, reason: EndReason::LocalBye }]
+        );
         assert_eq!(acks(&early_end).len(), 1);
         assert_eq!(acks(&beyond).len(), 1);
         assert_eq!(model.cleanups, 2);
@@ -4422,7 +5167,7 @@ mod tests {
             .receive_2xx(attempt, &fork("ended", "sip:bob@192.0.2.4"), offer())
             .unwrap();
         let session = confirmations(&model.take_effects())[0];
-        model.end_usage(session);
+        model.end_usage(session, EndReason::LocalBye);
         model
             .receive_2xx(attempt, &fork("kept", "sip:dan@192.0.2.6"), offer())
             .unwrap();
@@ -4436,7 +5181,7 @@ mod tests {
 
         assert_eq!(late(&mut model, "ended"), Ok(()));
         assert_eq!(late(&mut model, "beyond"), Ok(()));
-        model.abandon_attempt(attempt);
+        model.abandon_attempt(attempt).unwrap();
         model
             .receive_2xx(attempt, &fork("given", "sip:eve@192.0.2.7"), offer())
             .unwrap();
@@ -4494,5 +5239,718 @@ mod tests {
         let state = model.attempt_state(attempt).unwrap();
         assert!(state.degraded && !state.complete);
         assert!(state.sessions.contains(&third));
+    }
+
+    /// Where the peer's requests arrive in these tests.
+    fn flow() -> Flow {
+        Flow {
+            transport: signa_core::transport::Transport::Udp,
+            local: "192.0.2.4:5060".parse().unwrap(),
+            remote: "192.0.2.1:5060".parse().unwrap(),
+        }
+    }
+
+    /// A request the caller of [`INVITE`] sends in the dialog the UAS of
+    /// [`accepted`] formed, numbered `cseq`.
+    fn from_caller(method: &str, cseq: u32) -> Request<Bytes> {
+        request(
+            &INVITE
+                .replace(
+                    "INVITE sip:bob@biloxi.example.com",
+                    &format!("{method} sip:bob@192.0.2.4"),
+                )
+                .replace(
+                    "To: Bob <sip:bob@biloxi.example.com>",
+                    "To: Bob <sip:bob@biloxi.example.com>;tag=0000000000000001",
+                )
+                .replace("314159 INVITE", &format!("{cseq} {method}")),
+        )
+    }
+
+    /// A request the callee whose tag is `tag` sends in the dialog the 2xx
+    /// of [`callee`] formed at the caller, numbered `cseq`.
+    fn from_callee(method: &str, tag: &str, cseq: u32) -> Request<Bytes> {
+        request(&format!(
+            "{method} sip:alice@192.0.2.1 SIP/2.0
+Via: SIP/2.0/UDP 192.0.2.4;branch=z9hG4bK-{method}-{cseq}
+Max-Forwards: 70
+To: \"Alice, A.\" <sip:alice@atlanta.example.com>;tag=1928301774
+From: Bob <sip:bob@biloxi.example.com>;tag={tag}
+Call-ID: a84b4c76e66710@pc33.atlanta.example.com
+CSeq: {cseq} {method}
+Contact: <sip:bob@192.0.2.4>
+
+"
+        ))
+    }
+
+    /// Returns the status of each final response `effects` submit.
+    fn statuses(effects: &[Effect]) -> Vec<u16> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::SubmitFinal { status, .. } => Some(status.as_u16()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Returns whether `effects` send the BYE of `usage`, and how often.
+    fn session_byes(effects: &[Effect], usage: UsageKey) -> usize {
+        effects
+            .iter()
+            .filter(|effect| **effect == Effect::SendSessionBye { usage })
+            .count()
+    }
+
+    /// Has the callee's 2xx confirm a session of an attempt, whose ACK goes
+    /// out, and returns the attempt, the session and the ACK's context.
+    fn caller_session(
+        model: &mut Model<Counter>,
+    ) -> (AttemptKey, UsageKey, ReplayKey) {
+        let attempt = model.start_attempt(&request(INVITE), true).unwrap();
+        model.receive_2xx(attempt, &callee(), offer()).unwrap();
+        let effects = model.take_effects();
+        let (session, replay) =
+            (confirmations(&effects)[0], acks(&effects)[0]);
+        model.ack_written(replay, true);
+        (attempt, session, replay)
+    }
+
+    /// Submits a command and runs it, returning its operation.
+    fn run(model: &mut Model<Counter>, command: Command) -> OperationId {
+        let operation = model.try_submit(command).unwrap();
+        model.run_commands();
+        operation
+    }
+
+    /// A CANCEL that arrives before the application decides gets the INVITE
+    /// a 487 at once (RFC 3261 section 9.2), and the CANCEL's 200 the To tag
+    /// of the INVITE's responses. The application is told, and its accept
+    /// after that finds the final taken and sends nothing.
+    #[test]
+    fn cancel_wins_before_final_commit() {
+        let clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let authority = model
+            .receive_invite(&request(INVITE), offer(), clock.now())
+            .unwrap();
+        let exchange = authority.exchange;
+
+        let tag = model.receive_cancel(exchange).unwrap();
+        model.check();
+        assert_eq!(tag.as_str(), "0000000000000001");
+        assert_eq!(
+            model.take_effects(),
+            [
+                Effect::SubmitFinal {
+                    exchange,
+                    status: StatusCode::from_u16(487).unwrap(),
+                    to_tag: tag,
+                    body: None,
+                },
+                Effect::Notify(Event::InviteWithdrawn { exchange }),
+            ],
+        );
+
+        let accept =
+            run(&mut model, Command::Accept { authority, answer: answer() });
+        assert_eq!(
+            model.take_effects(),
+            [Effect::OperationEnded { operation: accept }],
+        );
+        assert_eq!(
+            model.take_outcome(accept),
+            Some(Err(Error::AlreadyFinalized)),
+        );
+        model.final_committed(exchange, clock.now());
+        model.check();
+        assert!(model.exchanges.get(exchange).is_none());
+        assert_eq!(model.receive_cancel(exchange), None, "nothing to cancel");
+        assert_eq!(model.usages.len(), 0);
+    }
+
+    /// An accept the core has not confirmed yet wins over a CANCEL that
+    /// arrives meanwhile. The CANCEL changes nothing, no 487 goes, and the
+    /// session forms (RFC 3261 section 9.2). Had the core refused the 2xx,
+    /// the INVITE would get the 487 rather than the 500 of an abandoned one.
+    #[test]
+    fn accept_wins_before_cancel_does_not_emit_487() {
+        let clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let authority = model
+            .receive_invite(&request(INVITE), offer(), clock.now())
+            .unwrap();
+        let exchange = authority.exchange;
+        let accept =
+            run(&mut model, Command::Accept { authority, answer: answer() });
+        assert_eq!(statuses(&model.take_effects()), [200]);
+
+        assert!(model.receive_cancel(exchange).is_some());
+        assert!(model.take_effects().is_empty());
+        model.final_committed(exchange, clock.now());
+        model.check();
+
+        let effects = model.take_effects();
+        assert!(statuses(&effects).is_empty());
+        let (_, usage) = confirmed(&effects);
+        assert_eq!(
+            model.take_outcome(accept),
+            Some(Ok(Completion::Session(usage))),
+        );
+        let tag = model.receive_cancel(exchange).unwrap();
+        assert_eq!(tag.as_str(), "0000000000000001", "the dialog's tag");
+        assert!(model.take_effects().is_empty(), "too late to change it");
+
+        // The same race, with the core refusing the 2xx.
+        let mut model = self::model(limits());
+        let authority = model
+            .receive_invite(&request(INVITE), offer(), clock.now())
+            .unwrap();
+        let exchange = authority.exchange;
+        run(&mut model, Command::Accept { authority, answer: answer() });
+        model.receive_cancel(exchange);
+        model.take_effects();
+        model.final_refused(exchange, false);
+        model.check();
+        let effects = model.take_effects();
+        assert_eq!(statuses(&effects), [487]);
+        assert!(
+            effects.contains(&Effect::Notify(Event::InviteWithdrawn {
+                exchange
+            }))
+        );
+    }
+
+    /// A BYE the caller sends in the early dialog of an INVITE the
+    /// application has not decided gets the INVITE a 487 (RFC 3261 section
+    /// 15.1.2, RFC 5407 appendix A), and is taken for a 200. One that crosses
+    /// the application's 2xx ends the session the 2xx forms, whose 2xx
+    /// still goes out again until its ACK (RFC 5407 section 3.1.3).
+    #[test]
+    fn a_bye_in_the_early_dialog_ends_the_invite() {
+        let clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let authority = model
+            .receive_invite(&request(INVITE), offer(), clock.now())
+            .unwrap();
+
+        let taken = model.receive_request(&from_caller("BYE", 314160), flow());
+        model.check();
+        assert_eq!(taken, Ok(InDialog::Bye));
+        assert_eq!(statuses(&model.take_effects()), [487]);
+        assert!(model.exchanges.get(authority.exchange).is_some());
+
+        let mut model = self::model(limits());
+        let authority = model
+            .receive_invite(&request(INVITE), offer(), clock.now())
+            .unwrap();
+        let exchange = authority.exchange;
+        run(&mut model, Command::Accept { authority, answer: answer() });
+        model.take_effects();
+        let lower = model.receive_request(&from_caller("BYE", 1), flow());
+        assert_eq!(lower, Err(Refusal::OutOfOrder));
+        let taken = model.receive_request(&from_caller("BYE", 314160), flow());
+        assert_eq!(taken, Ok(InDialog::Bye));
+        model.final_committed(exchange, clock.now());
+        model.check();
+
+        let effects = model.take_effects();
+        let (_, usage) = confirmed(&effects);
+        let reason = EndReason::RemoteBye { flow: flow() };
+        assert!(
+            notices(&effects).contains(&Event::UsageEnded { usage, reason })
+        );
+        assert!(statuses(&effects).is_empty());
+        assert_eq!(model.replays.len(), 1, "the 2xx still awaits its ACK");
+        assert!(model.next_deadline().is_some());
+        assert_eq!(model.ended(usage), Some((reason, Negotiation::Stable)));
+    }
+
+    /// A BYE from the peer ends its session and its dialog, and gets a 200
+    /// (RFC 3261 section 15.1.2). A request in the dialog numbered at or
+    /// below the last one gets a 500 and changes nothing (section 12.2.2),
+    /// and one that changes nothing is answered as outside a dialog. After
+    /// the BYE, the dialog is gone, and a request in it gets a 481.
+    #[test]
+    fn a_remote_bye_ends_the_session() {
+        let clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let (_, _, usage) = accepted(&mut model, &clock);
+        model.receive_ack(&uas_dialog(), 314159, false);
+        model.take_effects();
+
+        let options =
+            model.receive_request(&from_caller("OPTIONS", 314160), flow());
+        let stale = model.receive_request(&from_caller("BYE", 314160), flow());
+        let taken = model.receive_request(&from_caller("BYE", 314170), flow());
+        model.check();
+
+        assert_eq!(options, Ok(InDialog::Other));
+        assert_eq!(stale, Err(Refusal::OutOfOrder));
+        assert_eq!(taken, Ok(InDialog::Bye));
+        let reason = EndReason::RemoteBye { flow: flow() };
+        assert_eq!(
+            notices(&model.take_effects()),
+            [Event::UsageEnded { usage, reason }],
+        );
+        assert_eq!(model.dialogs.len(), 0);
+        let again = model.receive_request(&from_caller("BYE", 314171), flow());
+        assert_eq!(again, Err(Refusal::NoDialog));
+    }
+
+    /// A CANCEL asked for after the INVITE went goes to the core at once,
+    /// and its outcome is the operation's. It decides nothing. A 2xx that
+    /// wins the race forms a session as any other, and gets its ACK (RFC
+    /// 3261 sections 9.1 and 15). Asking twice is refused, and asking once
+    /// the INVITE has its final is not needed.
+    #[test]
+    fn late_success_after_cancel_is_acked() {
+        let mut model = model(limits());
+        let attempt = model.start_attempt(&request(INVITE), true).unwrap();
+
+        let cancel = run(&mut model, Command::Cancel { attempt });
+        assert_eq!(
+            model.take_effects(),
+            [Effect::CancelInvite { attempt, operation: Some(cancel) }],
+        );
+        model.cancel_done(Some(cancel), Ok(CancelResult::Sent));
+        assert_eq!(
+            model.take_outcome(cancel),
+            Some(Ok(Completion::Cancel(CancelResult::Sent))),
+        );
+        let again = run(&mut model, Command::Cancel { attempt });
+        assert_eq!(
+            model.take_outcome(again),
+            Some(Err(Error::InvalidTransition)),
+        );
+        model.take_effects();
+
+        model.receive_2xx(attempt, &callee(), offer()).unwrap();
+        model.check();
+        let effects = model.take_effects();
+        assert_eq!(confirmations(&effects).len(), 1);
+        assert_eq!(acks(&effects).len(), 1);
+        assert_eq!(model.attempt_state(attempt).unwrap().sessions.len(), 1);
+
+        let fresh =
+            model.start_attempt(&invite("fresh@example.com"), true).unwrap();
+        let busy = StatusCode::from_u16(486).unwrap();
+        model.attempt_failed(fresh, Error::RemoteFailure(busy));
+        let late = run(&mut model, Command::Cancel { attempt: fresh });
+        assert_eq!(
+            model.take_outcome(late),
+            Some(Ok(Completion::Cancel(CancelResult::NotNeeded))),
+        );
+    }
+
+    /// A CANCEL asked for before the core has the INVITE waits for it, and
+    /// goes to the core once the INVITE does. If the INVITE never does,
+    /// there was nothing to cancel.
+    #[test]
+    fn a_cancel_before_the_invite_starts_waits_for_it() {
+        let mut model = model(limits());
+        run(&mut model, Command::Invite { plan: plan() });
+        let [Effect::StartInvite { attempt }] = model.take_effects()[..]
+        else {
+            panic!("no INVITE to send");
+        };
+
+        let cancel = run(&mut model, Command::Cancel { attempt });
+        assert!(model.take_effects().is_empty());
+        model.invite_started(attempt);
+        let effects = model.take_effects();
+        assert_eq!(
+            effects[0],
+            Effect::CancelInvite { attempt, operation: Some(cancel) },
+        );
+
+        run(&mut model, Command::Invite { plan: plan() });
+        let [Effect::StartInvite { attempt }] = model.take_effects()[..]
+        else {
+            panic!("no INVITE to send");
+        };
+        let cancel = run(&mut model, Command::Cancel { attempt });
+        model.invite_failed(attempt, Error::Unroutable);
+        model.check();
+        assert_eq!(
+            model.take_outcome(cancel),
+            Some(Ok(Completion::Cancel(CancelResult::NotNeeded))),
+        );
+    }
+
+    /// Giving an attempt up is what RFC 3261 section 15 has a caller do to
+    /// hang up. While the INVITE has no final, it gets its CANCEL, and an
+    /// early session ends with it. Each 2xx that wins the race, from the
+    /// early dialog or from a fork never seen, gets its ACK and a BYE, and no
+    /// session (section 13.2.2.4).
+    #[test]
+    fn abandon_cleans_all_late_successful_forks() {
+        let mut model = model(limits());
+        let attempt = model.start_attempt(&request(INVITE), true).unwrap();
+        let ringing = reply("180 Ringing", "early", "sip:bob@192.0.2.4", "");
+        model.receive_provisional(attempt, &ringing).unwrap();
+        let early = match model.take_effects()[..] {
+            [Effect::Notify(Event::EarlyDialog { usage, .. })] => usage,
+            ref other => panic!("no early dialog: {other:?}"),
+        };
+
+        let abandon = run(&mut model, Command::Abandon { attempt });
+        model.check();
+        assert_eq!(
+            model.take_effects(),
+            [
+                Effect::CancelInvite { attempt, operation: None },
+                Effect::OperationEnded { operation: abandon },
+            ],
+        );
+        assert_eq!(model.usage_state(early).unwrap().0, UsagePhase::Ending);
+
+        model
+            .receive_2xx(attempt, &fork("early", "sip:bob@192.0.2.4"), offer())
+            .unwrap();
+        model
+            .receive_2xx(
+                attempt,
+                &fork("late", "sip:carol@192.0.2.5"),
+                offer(),
+            )
+            .unwrap();
+        model.check();
+        let effects = model.take_effects();
+        assert!(confirmations(&effects).is_empty());
+        let cleanups = acks(&effects);
+        assert_eq!(cleanups.len(), 2);
+        for &cleanup in &cleanups {
+            model.ack_written(cleanup, true);
+        }
+        assert_eq!(byes(&model.take_effects()), cleanups);
+        let state = model.attempt_state(attempt).unwrap();
+        assert!(state.sessions.is_empty());
+        assert!(state.complete && !state.degraded);
+
+        // An attempt given up after a 2xx gets no CANCEL, which would do
+        // nothing (section 9.1), and its session gets a BYE.
+        let mut model = self::model(limits());
+        let (attempt, session, _) = caller_session(&mut model);
+        run(&mut model, Command::Abandon { attempt });
+        let effects = model.take_effects();
+        assert_eq!(session_byes(&effects, session), 1);
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::CancelInvite { .. }))
+        );
+    }
+
+    /// A callee that hangs up before the ACK of its 2xx holds its BYE back
+    /// (RFC 3261 section 15) and shows the session as ending. The ACK lets
+    /// it go. Without an ACK, it goes at the ACK deadline, as RFC 3261
+    /// section 13.3.1.4 asks anyway, and the session ends by the
+    /// application's BYE.
+    #[test]
+    fn callee_bye_waits_for_ack_or_ack_deadline() {
+        let mut clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let (_, _, usage) = accepted(&mut model, &clock);
+
+        let terminate = run(&mut model, Command::Terminate { usage });
+        model.check();
+        assert!(model.take_effects().is_empty(), "no BYE before the ACK");
+        assert_eq!(model.usage_state(usage).unwrap().0, UsagePhase::Ending);
+        assert_eq!(
+            model.operations.snapshot(terminate).unwrap().outcome,
+            None
+        );
+        model.receive_ack(&uas_dialog(), 314159, false);
+        model.check();
+        assert_eq!(session_byes(&model.take_effects(), usage), 1);
+
+        let mut model = self::model(limits());
+        let (_, _, usage) = accepted(&mut model, &clock);
+        run(&mut model, Command::Terminate { usage });
+        let deadline = clock.now() + T1 * 64;
+        let effects = advance_to(&mut model, &mut clock, deadline);
+        assert_eq!(session_byes(&effects, usage), 1);
+        model.bye_started(usage, Ok(())).unwrap();
+        assert_eq!(
+            notices(&model.take_effects()),
+            [Event::UsageEnded { usage, reason: EndReason::LocalBye }],
+        );
+    }
+
+    /// The caller may end an early session with a BYE (RFC 3261 section 15),
+    /// in its early dialog, numbered after the INVITE. Its dialog is Mortal
+    /// then, so a provisional for it forms nothing, and a 2xx that crossed
+    /// the BYE gets its ACK and a BYE of its own, numbered after the first
+    /// (RFC 5407 appendix A, RFC 3261 section 13.2.2.4).
+    #[test]
+    fn caller_can_end_early_invite_usage() {
+        let mut model = model(limits());
+        let attempt = model.start_attempt(&request(INVITE), true).unwrap();
+        let ringing = reply("180 Ringing", "early", "sip:bob@192.0.2.4", "");
+        model.receive_provisional(attempt, &ringing).unwrap();
+        let early = match model.take_effects()[..] {
+            [Effect::Notify(Event::EarlyDialog { usage, .. })] => usage,
+            ref other => panic!("no early dialog: {other:?}"),
+        };
+
+        run(&mut model, Command::Terminate { usage: early });
+        assert_eq!(session_byes(&model.take_effects(), early), 1);
+        let bye = model.session_bye_request(early).unwrap().request;
+        assert_eq!(bye.uri().as_str(), "sip:bob@192.0.2.4");
+        assert_eq!(bye.headers().get("CSeq").unwrap(), "314160 BYE");
+        assert_eq!(
+            bye.headers().get("To").unwrap(),
+            "<sip:bob@biloxi.example.com>;tag=early",
+        );
+        model.bye_started(early, Ok(())).unwrap();
+        model.check();
+        assert_eq!(
+            notices(&model.take_effects()),
+            [Event::UsageEnded { usage: early, reason: EndReason::LocalBye }],
+        );
+
+        model.receive_provisional(attempt, &ringing).unwrap();
+        assert!(model.take_effects().is_empty());
+        model
+            .receive_2xx(attempt, &fork("early", "sip:bob@192.0.2.4"), offer())
+            .unwrap();
+        model.check();
+        let cleanup = acks(&model.take_effects())[0];
+        model.ack_written(cleanup, true);
+        assert_eq!(byes(&model.take_effects()), [cleanup]);
+        let bye = model.bye_request(cleanup).unwrap().request;
+        assert_eq!(bye.headers().get("CSeq").unwrap(), "314161 BYE");
+        assert!(model.attempt_state(attempt).unwrap().complete);
+    }
+
+    /// When both sides send a BYE at once, each ends the session once. A BYE
+    /// from the peer in a dialog this user agent sent its own in, which is
+    /// Mortal, gets a 200 and changes nothing more, and any other request in
+    /// it a 481, as does a re-INVITE (RFC 5407 sections 3.2.1 and 3.2.2). A
+    /// BYE asked for after the peer's ends nothing twice. Once the BYE's
+    /// transaction ends, the dialog is gone.
+    #[test]
+    fn crossed_bye_is_idempotent() {
+        let clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let (_, session, _) = caller_session(&mut model);
+        run(&mut model, Command::Terminate { usage: session });
+        model.take_effects();
+        let started = model.bye_started(session, Ok(())).unwrap();
+        model.take_effects();
+
+        let bye =
+            model.receive_request(&from_callee("BYE", "callee", 7), flow());
+        let info =
+            model.receive_request(&from_callee("INFO", "callee", 8), flow());
+        let reinvite = model.receive_invite(
+            &from_callee("INVITE", "callee", 9),
+            offer(),
+            clock.now(),
+        );
+        let again = run(&mut model, Command::Terminate { usage: session });
+        model.check();
+        assert_eq!(bye, Ok(InDialog::Bye));
+        assert_eq!(info, Err(Refusal::NoDialog));
+        assert_eq!(reinvite.unwrap_err(), Refusal::NoDialog);
+        assert_eq!(
+            model.take_outcome(again),
+            Some(Err(Error::InvalidTransition)),
+        );
+        assert!(notices(&model.take_effects()).is_empty(), "no second end");
+        model.bye_answered(started, Ok(()));
+        model.check();
+        let late =
+            model.receive_request(&from_callee("BYE", "callee", 10), flow());
+        assert_eq!(late, Err(Refusal::NoDialog));
+
+        // The peer's BYE first, while this user agent's is on its way.
+        let mut model = self::model(limits());
+        let (_, session, _) = caller_session(&mut model);
+        let terminate = run(&mut model, Command::Terminate { usage: session });
+        model.take_effects();
+        let bye =
+            model.receive_request(&from_callee("BYE", "callee", 7), flow());
+        assert_eq!(bye, Ok(InDialog::Bye));
+        let started = model.bye_started(session, Ok(())).unwrap();
+        let gone = Error::RemoteFailure(StatusCode::from_u16(481).unwrap());
+        model.bye_answered(started, Err(gone));
+        model.check();
+        let ended = notices(&model.take_effects());
+        assert_eq!(ended.len(), 1, "{ended:?}");
+        assert_eq!(model.dialogs.len(), 0);
+        assert_eq!(model.take_outcome(terminate), Some(Err(gone)));
+    }
+
+    /// The BYE takes the dialog's next number once, however the session
+    /// ends: one asked for twice, or held back for the ACK and the ACK
+    /// arriving twice, still makes one BYE. A UAS that sent nothing in the
+    /// dialog yet picks its first number.
+    #[test]
+    fn cseq_for_bye_is_allocated_once() {
+        let clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let (_, session, _) = caller_session(&mut model);
+        run(&mut model, Command::Terminate { usage: session });
+        run(&mut model, Command::Terminate { usage: session });
+        assert_eq!(session_byes(&model.take_effects(), session), 1);
+        let bye = model.session_bye_request(session).unwrap().request;
+        assert_eq!(bye.headers().get("CSeq").unwrap(), "314160 BYE");
+        model.bye_started(session, Ok(())).unwrap();
+        assert!(model.session_bye_request(session).is_err());
+
+        let mut model = self::model(limits());
+        let (_, _, usage) = accepted(&mut model, &clock);
+        run(&mut model, Command::Terminate { usage });
+        model.receive_ack(&uas_dialog(), 314159, false);
+        model.receive_ack(&uas_dialog(), 314159, false);
+        assert_eq!(session_byes(&model.take_effects(), usage), 1);
+        let bye = model.session_bye_request(usage).unwrap().request;
+        assert_eq!(bye.headers().get("CSeq").unwrap(), "3 BYE");
+        assert_eq!(
+            bye.headers().get("From").unwrap(),
+            "<sip:bob@biloxi.example.com>;tag=0000000000000001",
+        );
+    }
+
+    /// The session ends once the core has the BYE, before any response
+    /// (RFC 3261 section 15.1.1). The operation waits for the response, and
+    /// a failure there brings nothing back. A BYE the core never took leaves
+    /// the session as it was, and fails the operation with nothing sent.
+    #[test]
+    fn bye_submission_ends_usage_before_bye_response() {
+        let mut model = model(limits());
+        let (_, session, _) = caller_session(&mut model);
+        let terminate = run(&mut model, Command::Terminate { usage: session });
+        assert_eq!(model.usage_state(session).unwrap().0, UsagePhase::Ending);
+        model.take_effects();
+
+        let started = model.bye_started(session, Ok(())).unwrap();
+        model.check();
+        assert_eq!(
+            notices(&model.take_effects()),
+            [Event::UsageEnded {
+                usage: session,
+                reason: EndReason::LocalBye
+            }],
+        );
+        assert_eq!(
+            model.operations.snapshot(terminate),
+            Some(Snapshot { stage: Stage::Committed, outcome: None }),
+        );
+        let gone = Error::RemoteFailure(StatusCode::from_u16(481).unwrap());
+        model.bye_answered(started, Err(gone));
+        model.check();
+        assert_eq!(
+            model.operations.snapshot(terminate),
+            Some(Snapshot {
+                stage: Stage::Answered,
+                outcome: Some(Err(gone))
+            }),
+        );
+        assert_eq!(model.usage_state(session), None);
+
+        let mut model = self::model(limits());
+        let (_, session, _) = caller_session(&mut model);
+        let terminate = run(&mut model, Command::Terminate { usage: session });
+        let refused = Error::CoreSubmissionRejected;
+        assert!(model.bye_started(session, Err(refused)).is_none());
+        model.check();
+        assert_eq!(model.take_outcome(terminate), Some(Err(refused)));
+        assert_eq!(
+            model.usage_state(session).unwrap().0,
+            UsagePhase::Established,
+        );
+        model.take_effects();
+        run(&mut model, Command::Terminate { usage: session });
+        assert_eq!(session_byes(&model.take_effects(), session), 1);
+    }
+
+    /// A session the caller ended with a BYE keeps what copies of its 2xx
+    /// need. A copy that comes after the BYE, before or after its response,
+    /// gets the same ACK, and no new session.
+    #[test]
+    fn bye_does_not_destroy_invite_ack_replay() {
+        let mut model = model(limits());
+        let (attempt, session, replay) = caller_session(&mut model);
+        run(&mut model, Command::Terminate { usage: session });
+        let started = model.bye_started(session, Ok(())).unwrap();
+        model.take_effects();
+
+        model.receive_2xx(attempt, &callee(), offer()).unwrap();
+        assert_eq!(model.take_effects(), [Effect::ResendAck { replay }]);
+        model.bye_answered(started, Ok(()));
+        model.take_effects();
+        model.receive_2xx(attempt, &callee(), offer()).unwrap();
+        model.check();
+        assert_eq!(model.take_effects(), [Effect::ResendAck { replay }]);
+        assert_eq!(model.usages.len(), 0);
+    }
+
+    /// Why a session ended stays for a snapshot after its notification, for
+    /// the last as many sessions as the usage table holds.
+    #[test]
+    fn why_a_session_ended_outlives_its_notification() {
+        let mut model = model(Limits { usages: 2, ..limits() });
+        let mut ended = Vec::new();
+        for n in 0..3 {
+            let call = format!("call{n}@example.com");
+            let attempt = model.start_attempt(&invite(&call), true).unwrap();
+            let ok =
+                callee_with("a84b4c76e66710@pc33.atlanta.example.com", &call);
+            model.receive_2xx(attempt, &ok, offer()).unwrap();
+            let session = confirmations(&model.take_effects())[0];
+            model.end_usage(session, EndReason::RemoteBye { flow: flow() });
+            ended.push(session);
+        }
+        model.check();
+
+        assert_eq!(model.ended(ended[0]), None, "the oldest went");
+        for &session in &ended[1..] {
+            let (reason, _) = model.ended(session).unwrap();
+            assert_eq!(reason, EndReason::RemoteBye { flow: flow() });
+        }
+    }
+
+    /// The callee's 2xx can cross the BYE that ended its early dialog and
+    /// arrive after the BYE's response, as a copy the callee sends until its
+    /// ACK (RFC 3261 section 13.3.1.4). The dialog is gone by then, but the
+    /// attempt remembers ending it. The 2xx gets its ACK and a BYE numbered
+    /// after the first, and no session, and a provisional forms nothing.
+    #[test]
+    fn a_2xx_after_the_bye_of_its_early_dialog_is_cleaned_up() {
+        let mut model = model(limits());
+        let attempt = model.start_attempt(&request(INVITE), true).unwrap();
+        let ringing = reply("180 Ringing", "early", "sip:bob@192.0.2.4", "");
+        model.receive_provisional(attempt, &ringing).unwrap();
+        let early = match model.take_effects()[..] {
+            [Effect::Notify(Event::EarlyDialog { usage, .. })] => usage,
+            ref other => panic!("no early dialog: {other:?}"),
+        };
+        run(&mut model, Command::Terminate { usage: early });
+        model.session_bye_request(early).unwrap();
+        let started = model.bye_started(early, Ok(())).unwrap();
+        model.bye_answered(started, Ok(()));
+        model.take_effects();
+        assert_eq!(model.dialogs.len(), 0, "the BYE is over");
+
+        model.receive_provisional(attempt, &ringing).unwrap();
+        assert!(model.take_effects().is_empty());
+        model
+            .receive_2xx(attempt, &fork("early", "sip:bob@192.0.2.4"), offer())
+            .unwrap();
+        model.check();
+
+        let effects = model.take_effects();
+        assert!(confirmations(&effects).is_empty());
+        let cleanup = acks(&effects)[0];
+        model.ack_written(cleanup, true);
+        assert_eq!(byes(&model.take_effects()), [cleanup]);
+        let bye = model.bye_request(cleanup).unwrap().request;
+        assert_eq!(bye.headers().get("CSeq").unwrap(), "314161 BYE");
+        let state = model.attempt_state(attempt).unwrap();
+        assert!(state.sessions.is_empty() && state.complete);
     }
 }

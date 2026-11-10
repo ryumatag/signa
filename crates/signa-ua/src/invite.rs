@@ -27,10 +27,10 @@ response collection.
 
 use std::time::Instant;
 
-use signa_core::StatusCode;
+use signa_core::{StatusCode, transport::Flow};
 
 use crate::{
-    dialog::{Dialog, DialogKey, Origin},
+    dialog::{Dialog, DialogId, DialogKey, Origin},
     error::Error,
     negotiation::{Description, Negotiation},
     operation::OperationId,
@@ -88,6 +88,73 @@ pub(crate) struct InviteAttempt {
     /// Whether the application gave the attempt up, so that a 2xx that
     /// comes later is acknowledged and ended rather than kept.
     pub(crate) abandoned: bool,
+    /// Where the CANCEL of the INVITE stands. There is one at most, as the
+    /// core allows.
+    pub(crate) cancel: CancelIntent,
+    /// Each early dialog of the attempt that this user agent ended with a
+    /// BYE, with the last CSeq number it gave out. The callee may have sent
+    /// a 2xx before the BYE reached it, and goes on sending it until its ACK
+    /// (RFC 3261 section 13.3.1.4), so the 2xx can arrive after the BYE's
+    /// response, when the dialog itself is gone. Such a 2xx is acknowledged
+    /// and ended, not taken for a new session, and a late provisional forms
+    /// nothing. Each entry was a fork, so `forks` bounds them, and they go
+    /// with the attempt, when no more responses can arrive.
+    pub(crate) ended_early: Vec<(DialogId, Option<u32>)>,
+}
+
+/// Where the CANCEL of an INVITE this user agent sent stands.
+///
+/// The CANCEL itself is the core's. It waits for a provisional response
+/// and goes as a transaction of its own (RFC 3261 section 9.1). The UA only
+/// asks for it once.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CancelIntent {
+    /// Nobody asked for one.
+    None,
+    /// Asked for before the INVITE reached the core. It is asked of the core
+    /// once the core has the INVITE, for the operation, if any.
+    Waiting(Option<OperationId>),
+    /// Asked of the core.
+    Asked,
+}
+
+/// What asking for the CANCEL of an INVITE came to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+#[cfg_attr(not(feature = "tokio"), allow(unreachable_pub))]
+pub enum CancelResult {
+    /// The endpoint has the CANCEL, as a transaction of its own. That is not
+    /// the end of the INVITE. A 2xx can still come, and the UA acknowledges
+    /// it as any other (RFC 3261 section 9.1).
+    Sent,
+    /// The INVITE had its final response, or never reached the endpoint, so
+    /// there was nothing to cancel and nothing was sent.
+    NotNeeded,
+}
+
+/// Why a session ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+#[cfg_attr(not(feature = "tokio"), allow(unreachable_pub))]
+pub enum EndReason {
+    /// This UA ended it with a BYE, which reached the endpoint. The BYE may
+    /// have been the application's, or the UA's own for an attempt given
+    /// up. RFC 3261 section 15.1.1 ends the session then, whatever the
+    /// response to the BYE.
+    LocalBye,
+    /// The peer ended it with a BYE (RFC 3261 section 15.1.2).
+    #[non_exhaustive]
+    RemoteBye {
+        /// Where the BYE arrived.
+        flow: Flow,
+    },
+    /// No ACK came for this UA's 2xx in time, so the UA ended the session
+    /// with a BYE, as RFC 3261 section 13.3.1.4 asks, or without one if the
+    /// BYE could not reach the endpoint.
+    AckTimeout,
+    /// Its early dialog ended without a 2xx: the INVITE got another final
+    /// response or failed, or its responses stopped (RFC 3261 section 12.3).
+    Unconfirmed,
 }
 
 impl InviteAttempt {
@@ -107,7 +174,23 @@ impl InviteAttempt {
             complete: true,
             degraded: false,
             abandoned: false,
+            cancel: CancelIntent::None,
+            ended_early: Vec::new(),
         }
+    }
+
+    /// Returns the last number an early dialog this user agent ended gave
+    /// out, if `id` is one.
+    pub(crate) fn ended_early(&self, id: &DialogId) -> Option<Option<u32>> {
+        self.ended_early
+            .iter()
+            .find(|(ended, _)| ended == id)
+            .map(|&(_, numbered)| numbered)
+    }
+
+    /// Says whether the core has the INVITE, after which it can cancel it.
+    pub(crate) fn started(&self) -> bool {
+        self.operation.is_none()
     }
 }
 
@@ -150,6 +233,21 @@ pub(crate) struct InviteUsage {
     /// of an INVITE this user agent took, or the answer in the 2xx of one it
     /// sent.
     pub(crate) remote: Option<Description>,
+    /// The BYE that is to end the usage, once asked for.
+    pub(crate) bye: ByeIntent,
+}
+
+/// Where the BYE that ends a usage stands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ByeIntent {
+    /// Nobody asked to end the usage.
+    None,
+    /// The application asked, and the BYE waits for the ACK of this user
+    /// agent's 2xx. RFC 3261 section 15 keeps a callee from sending a BYE
+    /// before that ACK or the end of its server transaction.
+    Deferred { operation: Option<OperationId> },
+    /// The BYE is on its way to the core.
+    Sending,
 }
 
 impl InviteUsage {
@@ -166,6 +264,7 @@ impl InviteUsage {
             phase: UsagePhase::Establishing,
             negotiation,
             remote: None,
+            bye: ByeIntent::None,
         }
     }
 
@@ -180,6 +279,7 @@ impl InviteUsage {
             phase: UsagePhase::Established,
             negotiation,
             remote: None,
+            bye: ByeIntent::None,
         }
     }
 
@@ -199,6 +299,16 @@ impl InviteUsage {
     pub(crate) fn begin_ending(&mut self) {
         if self.phase != UsagePhase::Ended {
             self.phase = UsagePhase::Ending;
+        }
+    }
+
+    /// Takes back the intent to end a usage whose BYE never reached the
+    /// core, which leaves the usage as it was before, in `phase`.
+    pub(crate) fn resume(&mut self, phase: UsagePhase) {
+        debug_assert_ne!(phase, UsagePhase::Ended);
+        if self.phase == UsagePhase::Ending {
+            self.phase = phase;
+            self.bye = ByeIntent::None;
         }
     }
 
@@ -232,6 +342,27 @@ pub(crate) enum Scope {
         /// The last provisional response the application chose, and when it
         /// is due again, while no final is under way.
         provisional: Option<(StatusCode, Instant)>,
+        /// How the caller gave the INVITE up before it had a final response,
+        /// if it did. It is rare, and a BYE's flow is large, so it is boxed.
+        withdrawn: Option<Box<Withdrawal>>,
+    },
+}
+
+/// How a caller gives up an INVITE that has no final response yet.
+///
+/// Either way, a UAS that has not decided answers the INVITE with a 487. A
+/// final under way when it arrives goes on, and decides. A CANCEL then has
+/// no effect (RFC 3261 section 9.2), while a BYE still ends the session the
+/// 2xx forms (section 15.1.2, and the BYE in the early dialog of RFC 5407
+/// section 3.1.3).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Withdrawal {
+    Cancel,
+    /// A BYE in the early dialog, which arrived on `flow`. RFC 3261 section
+    /// 15 lets the caller send one, and section 15.1.2 has the UAS answer
+    /// the INVITE it leaves pending with a 487.
+    Bye {
+        flow: Flow,
     },
 }
 
@@ -310,6 +441,7 @@ impl InviteExchange {
                 decision_due,
                 expires_due,
                 provisional: None,
+                withdrawn: None,
             },
             cseq,
             state: ExchangeState::Pending,

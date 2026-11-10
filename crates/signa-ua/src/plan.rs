@@ -34,9 +34,7 @@ use crate::{
 };
 
 /// The methods this UA takes, as an Allow value.
-///
-/// TODO: Add CANCEL and BYE once the UA answers them.
-pub(crate) const ALLOWED: &str = "INVITE, ACK, OPTIONS";
+pub(crate) const ALLOWED: &str = "INVITE, ACK, CANCEL, BYE, OPTIONS";
 
 /// The headers the UA writes itself. A plan that sets one of them is
 /// refused. Require and Proxy-Require are among them, since they would ask

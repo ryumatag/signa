@@ -54,7 +54,7 @@ What dropping each application-side handle means:
 
 use crate::{
     error::Error,
-    invite::{AttemptKey, UsageKey},
+    invite::{AttemptKey, CancelResult, UsageKey},
     slot::{Key, Slots},
 };
 
@@ -84,6 +84,8 @@ pub(crate) enum Completion {
     Session(UsageKey),
     /// An INVITE went to the core, which collects its responses.
     Attempt(AttemptKey),
+    /// The CANCEL of an INVITE was asked of the core.
+    Cancel(CancelResult),
     /// The operation did what it was for, and has nothing to show.
     Done,
 }

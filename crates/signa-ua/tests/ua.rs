@@ -22,9 +22,9 @@ use signa_core::{
     transaction::Timers,
 };
 use signa_ua::{
-    AttachError, AttemptResult, Config, Description, Error, Event, InvitePlan,
-    Query, Resolve, ResolveError, Session, StaticResolver, Ua, UaEvents,
-    attach,
+    AttachError, AttemptResult, CancelResult, Config, Description, EndReason,
+    Error, Event, InvitePlan, Query, Resolve, ResolveError, Session,
+    SessionPhase, StaticResolver, Ua, UaEvents, attach,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -255,7 +255,7 @@ CSeq: 1 INVITE
 Contact: <sip:peer@{peer}>
 Record-Route: <sip:proxy.example.com;lr>
 Content-Type: application/sdp
-Content-Length: 4
+Content-Length: 5
 
 v=0
 "
@@ -392,7 +392,7 @@ async fn waiting_operation_drop_does_not_withdraw_accepted_command() {
     assert!(header(&ok, "To")[0].contains(";tag="));
     assert_eq!(header(&ok, "Contact"), ["<sip:ua@127.0.0.1>"]);
     assert_eq!(header(&ok, "Record-Route"), ["<sip:proxy.example.com;lr>"]);
-    assert_eq!(header(&ok, "Allow"), ["INVITE, ACK, OPTIONS"]);
+    assert_eq!(header(&ok, "Allow"), ["INVITE, ACK, CANCEL, BYE, OPTIONS"]);
 }
 
 /// Dropping every handle of the application sends nothing on its own. The
@@ -762,15 +762,23 @@ async fn matching_ack_stops_retransmission_unrelated_ack_does_not() {
     peer.quiet("SIP/2.0", Duration::from_millis(400)).await;
 }
 
+/// An INVITE from `peer` straight to the UA, with no proxy on the way, so
+/// that the dialog's requests go to the peer.
+fn direct_invite(peer: SocketAddr, call: &str) -> String {
+    invite_to_ua(peer, call)
+        .replace("Record-Route: <sip:proxy.example.com;lr>\n", "")
+}
+
 /// Without an ACK, the copies stop 64 T1 after the first 2xx, and the
-/// session ends, with the reason before the end.
+/// session ends with a BYE (RFC 3261 section 13.3.1.4), with the reason
+/// before the end. The session's snapshot still says why afterwards.
 #[tokio::test]
 async fn an_unacknowledged_2xx_ends_its_session() {
     let (mut ua, udp, _) = start_fast();
     tokio::spawn(ua.driver);
     let peer = Peer::new().await;
 
-    peer.send(&invite_to_ua(peer.address(), "no-ack"), udp).await;
+    peer.send(&direct_invite(peer.address(), "no-ack"), udp).await;
     let accepted = invite(&mut ua.events).await.try_accept(sdp()).unwrap();
     let session = accepted.await.unwrap();
 
@@ -780,7 +788,10 @@ async fn an_unacknowledged_2xx_ends_its_session() {
             Event::AckTimeout { session: ended, .. } => {
                 ends.push(("timeout", ended))
             }
-            Event::Ended { session: ended, .. } => ends.push(("ended", ended)),
+            Event::Ended { session: ended, reason, .. } => {
+                assert_eq!(reason, EndReason::AckTimeout);
+                ends.push(("ended", ended));
+            }
             _ => {}
         }
     }
@@ -788,9 +799,13 @@ async fn an_unacknowledged_2xx_ends_its_session() {
         ends,
         [("timeout", session.clone()), ("ended", session.clone())]
     );
-    peer.drain(Duration::from_millis(50)).await;
+    let (bye, _) = peer.recv_starting("BYE").await;
+    assert!(bye.starts_with(&format!("BYE sip:peer@{} ", peer.address())));
+    assert_eq!(header(&bye, "Call-ID"), ["no-ack"]);
     peer.quiet("SIP/2.0 200", Duration::from_millis(300)).await;
-    assert_eq!(ua.handle.snapshot(&session).await.unwrap(), None);
+    let snapshot = ua.handle.snapshot(&session).await.unwrap().unwrap();
+    assert_eq!(snapshot.phase, SessionPhase::Ended);
+    assert_eq!(snapshot.end_reason, Some(EndReason::AckTimeout));
 }
 
 /// A retransmission of the INVITE is the core's to absorb, before and after
@@ -854,7 +869,7 @@ async fn an_offerless_or_extended_invite_is_refused() {
     tokio::spawn(ua.driver);
     let peer = Peer::new().await;
     let offerless = invite_to_ua(peer.address(), "offerless").replace(
-        "Content-Type: application/sdp\nContent-Length: 4\n\nv=0\n",
+        "Content-Type: application/sdp\nContent-Length: 5\n\nv=0\n",
         "Content-Length: 0\n\n",
     );
     let extended = invite_to_ua(peer.address(), "extended").replace(
@@ -1352,7 +1367,7 @@ Content-Length: 0
         assert_eq!(header(&response, "Call-ID"), [method]);
         assert!(header(&response, "To")[0].contains(";tag="), "{method}");
         let expected: &[&str] =
-            if allow { &["INVITE, ACK, OPTIONS"] } else { &[] };
+            if allow { &["INVITE, ACK, CANCEL, BYE, OPTIONS"] } else { &[] };
         assert_eq!(header(&response, "Allow"), expected, "{method}");
     }
 }
@@ -1684,4 +1699,525 @@ async fn a_sips_target_behind_a_strict_router_is_not_sent() {
 
     assert_eq!(result.unwrap_err(), Error::Unroutable);
     strict.quiet("INVITE", Duration::from_millis(200)).await;
+}
+
+/// A response of the peer to `request`, with `tag` on its To unless it has
+/// one, and nothing else.
+fn reply_with(request: &str, status: u16, tag: &str) -> String {
+    let request = Request::from_bytes(request.as_bytes()).unwrap();
+    let response = Response::reply_to(&request)
+        .status(status)
+        .to_tag(tag)
+        .body(Bytes::new());
+    String::from_utf8(response.unwrap().to_bytes().to_vec()).unwrap()
+}
+
+/// The CANCEL of the INVITE [`invite_over`] made for `call` (RFC 3261
+/// section 9.1): its Request-URI, top Via, From, To, Call-ID and CSeq
+/// number.
+fn cancel_of(transport: &str, peer: SocketAddr, call: &str) -> String {
+    format!(
+        "CANCEL sip:ua@127.0.0.1 SIP/2.0
+Via: SIP/2.0/{transport} {peer};branch=z9hG4bK-{call}
+Max-Forwards: 70
+To: <sip:ua@127.0.0.1>
+From: <sip:peer@{peer}>;tag=peer-{call}
+Call-ID: {call}
+CSeq: 1 CANCEL
+Content-Length: 0
+
+"
+    )
+}
+
+/// A request of the peer in the dialog its INVITE `call` formed with the
+/// 2xx `ok`, numbered `cseq`.
+fn in_dialog(
+    method: &str,
+    transport: &str,
+    ok: &str,
+    peer: SocketAddr,
+    call: &str,
+    cseq: u32,
+) -> String {
+    format!(
+        "{method} sip:ua@127.0.0.1 SIP/2.0
+Via: SIP/2.0/{transport} {peer};branch=z9hG4bK-{method}-{call}-{cseq}
+Max-Forwards: 70
+To: {to}
+From: <sip:peer@{peer}>;tag=peer-{call}
+Call-ID: {call}
+CSeq: {cseq} {method}
+Content-Length: 0
+
+",
+        to = header(ok, "To")[0],
+    )
+}
+
+/// Receives events until `pick` takes one.
+async fn event<T>(
+    events: &mut UaEvents,
+    mut pick: impl FnMut(Event) -> Option<T>,
+) -> T {
+    loop {
+        let next = timeout(WAIT, events.recv()).await.unwrap().unwrap();
+        if let Some(found) = pick(next) {
+            return found;
+        }
+    }
+}
+
+/// The caller cancels an INVITE the application has not decided. The
+/// CANCEL gets a 200 with the To tag the INVITE's 487 carries (RFC 3261
+/// section 9.2), the application is told, and its accept after that sends
+/// nothing. A CANCEL that matches no INVITE gets a 481.
+#[tokio::test]
+async fn an_incoming_cancel_gets_a_200_and_its_invite_a_487() {
+    let (mut ua, udp, _) = start_fast();
+    tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+
+    peer.send(&invite_to_ua(peer.address(), "cancelled"), udp).await;
+    let invite = invite(&mut ua.events).await;
+    let id = invite.id();
+    peer.send(&cancel_of("UDP", peer.address(), "cancelled"), udp).await;
+
+    let (ok, _) = peer.recv_starting("SIP/2.0 200").await;
+    assert_eq!(header(&ok, "CSeq"), ["1 CANCEL"]);
+    let (terminated, _) = peer.recv_starting("SIP/2.0 487").await;
+    assert_eq!(header(&terminated, "CSeq"), ["1 INVITE"]);
+    assert_eq!(header(&ok, "To"), header(&terminated, "To"));
+    let cancelled = event(&mut ua.events, |event| match event {
+        Event::Cancelled { invite, .. } => Some(invite),
+        _ => None,
+    })
+    .await;
+    assert_eq!(cancelled, id);
+    let late = invite.try_accept(sdp()).unwrap().await.unwrap_err();
+    assert!(matches!(late, Error::AlreadyFinalized | Error::StaleDecision));
+    peer.quiet("SIP/2.0 200", Duration::from_millis(200)).await;
+
+    peer.send(&cancel_of("UDP", peer.address(), "unknown"), udp).await;
+    let (unknown, _) = peer.recv_starting("SIP/2.0 481").await;
+    assert_eq!(header(&unknown, "Call-ID"), ["unknown"]);
+    assert!(header(&unknown, "To")[0].contains(";tag="));
+}
+
+/// A CANCEL asked for before any provisional response waits in the
+/// endpoint until one comes (RFC 3261 section 9.1). Then it goes, its own
+/// transaction, and the INVITE ends with the peer's 487.
+#[tokio::test]
+async fn cancel_before_provisional_is_deferred_by_core() {
+    let (mut ua, _, _) = start_fast();
+    tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+    let to = peer.address().to_string();
+
+    let attempt =
+        ua.handle.try_invite(plan_to(&to, "early")).unwrap().await.unwrap();
+    let (request, from) = peer.recv_starting("INVITE").await;
+    let cancelled = ua.handle.try_cancel(&attempt).unwrap();
+    peer.quiet("CANCEL", Duration::from_millis(200)).await;
+
+    peer.send(&reply_with(&request, 180, "callee"), from).await;
+    let (cancel, cancel_from) = peer.recv_starting("CANCEL").await;
+    assert_eq!(branch(&cancel), branch(&request));
+    assert_eq!(header(&cancel, "Call-ID"), header(&request, "Call-ID"));
+    let number = header(&request, "CSeq")[0].replace("INVITE", "CANCEL");
+    assert_eq!(header(&cancel, "CSeq"), [number]);
+    peer.send(&reply_with(&cancel, 200, "callee"), cancel_from).await;
+    peer.send(&reply_with(&request, 487, "callee"), from).await;
+
+    assert_eq!(cancelled.await.unwrap(), CancelResult::Sent);
+    let terminated = StatusCode::from_u16(487).unwrap();
+    assert_eq!(
+        attempt_end(&mut ua.events).await,
+        (AttemptResult::Failed(Error::RemoteFailure(terminated)), true),
+    );
+}
+
+/// The 200 to a CANCEL ends nothing (RFC 3261 section 9.1, RFC 5407
+/// section 3.1.2). A 2xx to the INVITE that wins the race forms a session,
+/// which gets its ACK and stays up, since only giving the attempt up ends
+/// the sessions it formed.
+#[tokio::test]
+async fn cancel_200_does_not_imply_invite_terminated() {
+    let (mut ua, _, _) = start_fast();
+    tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+    let to = peer.address().to_string();
+
+    let attempt =
+        ua.handle.try_invite(plan_to(&to, "race")).unwrap().await.unwrap();
+    let (request, from) = peer.recv_starting("INVITE").await;
+    peer.send(&reply_with(&request, 180, "callee"), from).await;
+    let cancelled = ua.handle.try_cancel(&attempt).unwrap();
+    let (cancel, cancel_from) = peer.recv_starting("CANCEL").await;
+    peer.send(
+        &answer(&request, "200", "callee", &format!("sip:peer@{to}")),
+        from,
+    )
+    .await;
+    peer.send(&reply_with(&cancel, 200, "callee"), cancel_from).await;
+
+    peer.recv_starting("ACK").await;
+    assert_eq!(cancelled.await.unwrap(), CancelResult::Sent);
+    let session = event(&mut ua.events, |event| match event {
+        Event::Confirmed { session, .. } => Some(session),
+        _ => None,
+    })
+    .await;
+    peer.quiet("BYE", Duration::from_millis(200)).await;
+    let snapshot = ua.handle.snapshot(&session).await.unwrap().unwrap();
+    assert_eq!(snapshot.phase, SessionPhase::Established);
+}
+
+/// A 481 to the CANCEL is a failure of the CANCEL alone, and says nothing
+/// about the INVITE, whose final response is what counts (RFC 5407 section
+/// 3.1.2). The session the INVITE's 2xx confirmed stays up.
+#[tokio::test]
+async fn cancel_481_does_not_terminate_confirmed_usage() {
+    let (mut ua, _, _) = start_fast();
+    tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+    let to = peer.address().to_string();
+
+    let attempt =
+        ua.handle.try_invite(plan_to(&to, "lost")).unwrap().await.unwrap();
+    let (request, from) = peer.recv_starting("INVITE").await;
+    peer.send(&reply_with(&request, 180, "callee"), from).await;
+    let cancelled = ua.handle.try_cancel(&attempt).unwrap();
+    let (cancel, cancel_from) = peer.recv_starting("CANCEL").await;
+    peer.send(
+        &answer(&request, "200", "callee", &format!("sip:peer@{to}")),
+        from,
+    )
+    .await;
+    peer.recv_starting("ACK").await;
+    peer.send(&reply_with(&cancel, 481, "callee"), cancel_from).await;
+
+    assert_eq!(cancelled.await.unwrap(), CancelResult::Sent);
+    let session = event(&mut ua.events, |event| match event {
+        Event::Confirmed { session, .. } => Some(session),
+        _ => None,
+    })
+    .await;
+    peer.quiet("BYE", Duration::from_millis(300)).await;
+    let snapshot = ua.handle.snapshot(&session).await.unwrap().unwrap();
+    assert_eq!(snapshot.phase, SessionPhase::Established);
+    assert_eq!(snapshot.end_reason, None);
+}
+
+/// Giving an attempt up sends its CANCEL, and a 2xx that crosses it gets
+/// its ACK and then a BYE (RFC 3261 section 15). No session forms.
+#[tokio::test]
+async fn a_2xx_after_giving_up_gets_its_ack_and_a_bye() {
+    let (mut ua, _, _) = start_fast();
+    tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+    let to = peer.address().to_string();
+    let contact = format!("sip:peer@{to}");
+
+    let attempt =
+        ua.handle.try_invite(plan_to(&to, "given")).unwrap().await.unwrap();
+    let (request, from) = peer.recv_starting("INVITE").await;
+    peer.send(&reply_with(&request, 180, "callee"), from).await;
+    ua.handle.try_abandon(&attempt).unwrap().await.unwrap();
+    let (cancel, cancel_from) = peer.recv_starting("CANCEL").await;
+    peer.send(&reply_with(&cancel, 200, "callee"), cancel_from).await;
+    peer.send(&answer(&request, "200", "callee", &contact), from).await;
+
+    let (ack, _) = peer.recv_starting("ACK").await;
+    let (bye, bye_from) = peer.recv_starting("BYE").await;
+    peer.send(&reply_with(&bye, 200, "callee"), bye_from).await;
+    assert_eq!(header(&bye, "To"), header(&ack, "To"));
+    let ending = ending(&mut ua.events).await;
+    assert!(ending.confirmed.is_empty());
+    assert!(ending.sessions.is_empty());
+    assert_eq!(ending.result, AttemptResult::Answered);
+}
+
+/// The flow a request arrived on reaches the application: that of an
+/// INVITE through [`IncomingInvite::flow`], and that of the BYE that ends
+/// its session in the reason the session ended. Over UDP and TCP, the BYE
+/// gets a 200 (RFC 3261 section 15.1.2).
+#[tokio::test]
+async fn incoming_requests_report_their_flow() {
+    let (mut ua, udp, tcp) = start_fast();
+    tokio::spawn(ua.driver);
+    let transport = signa_core::transport::Transport::Udp;
+
+    let peer = Peer::new().await;
+    peer.send(&invite_to_ua(peer.address(), "flow-udp"), udp).await;
+    let incoming = invite(&mut ua.events).await;
+    let flow = incoming.flow();
+    assert_eq!(flow.transport, transport);
+    assert_eq!((flow.local, flow.remote), (udp, peer.address()));
+    let session = incoming.try_accept(sdp()).unwrap().await.unwrap();
+    let (ok, _) = peer.recv_starting("SIP/2.0 200").await;
+    peer.send(&ack_for(&ok, peer.address(), "flow-udp", 1), udp).await;
+    let bye = in_dialog("BYE", "UDP", &ok, peer.address(), "flow-udp", 2);
+    peer.send(&bye, udp).await;
+
+    let (bye_ok, _) = peer.recv_starting("SIP/2.0 200").await;
+    assert_eq!(header(&bye_ok, "CSeq"), ["2 BYE"]);
+    let (ended, reason) = event(&mut ua.events, |event| match event {
+        Event::Ended { session, reason, .. } => Some((session, reason)),
+        _ => None,
+    })
+    .await;
+    assert_eq!(ended, session);
+    let EndReason::RemoteBye { flow, .. } = reason else {
+        panic!("not ended by the peer: {reason:?}");
+    };
+    assert_eq!((flow.local, flow.remote), (udp, peer.address()));
+
+    let mut peer = TcpPeer::connect(tcp).await;
+    let address = peer.address();
+    peer.send(&invite_over("TCP", address, "flow-tcp")).await;
+    let incoming = invite(&mut ua.events).await;
+    let flow = incoming.flow();
+    assert_eq!(flow.transport, signa_core::transport::Transport::Tcp);
+    assert_eq!((flow.local, flow.remote), (tcp, address));
+    incoming.try_accept(sdp()).unwrap().await.unwrap();
+    let ok = peer.recv_starting("SIP/2.0 200").await;
+    let ack = ack_for(&ok, address, "flow-tcp", 1).replace("UDP", "TCP");
+    peer.send(&ack).await;
+    peer.send(&in_dialog("BYE", "TCP", &ok, address, "flow-tcp", 2)).await;
+    let bye_ok = peer.recv_starting("SIP/2.0 200").await;
+    assert_eq!(header(&bye_ok, "CSeq"), ["2 BYE"]);
+}
+
+/// A UA with its own endpoint on loopback, whose Contact names its address,
+/// so that another UA's requests in the dialog reach it.
+fn ua_on(transport: &str) -> (Ua, SocketAddr) {
+    let local = "127.0.0.1:0".parse().unwrap();
+    let builder = Endpoint::builder().timers(fast());
+    let builder = if transport == "tcp" {
+        builder.tcp(local)
+    } else {
+        builder.udp(local)
+    };
+    let (endpoint, incoming) = builder.bind().unwrap();
+    let address = if transport == "tcp" {
+        endpoint.tcp_addr().unwrap()
+    } else {
+        endpoint.udp_addr().unwrap()
+    };
+    let contact = format!("sip:ua@{address};transport={transport}");
+    let config = Config::new(&contact).unwrap().timers(fast());
+    (attach(endpoint, incoming, config).unwrap(), address)
+}
+
+/// Two UAs make a call, over UDP and over TCP. The caller's INVITE is
+/// accepted and acknowledged, and each side then ends a call with a BYE:
+/// the caller the first, the callee the second. The side that gets the
+/// BYE answers it with a 200 and reports its peer's end, and the side that
+/// sent it reports its own, then the 200 as the operation's outcome.
+#[tokio::test]
+async fn two_uas_call_and_hang_up_over_udp_and_tcp() {
+    for transport in ["udp", "tcp"] {
+        let (Ua { handle: caller, events: mut caller_events, driver }, _) =
+            ua_on(transport);
+        tokio::spawn(driver);
+        let (
+            Ua { handle: callee, events: mut callee_events, driver },
+            address,
+        ) = ua_on(transport);
+        tokio::spawn(driver);
+
+        for hangs_up in ["caller", "callee"] {
+            let plan = InvitePlan::new(
+                format!("sip:ua@{address};transport={transport}")
+                    .parse()
+                    .unwrap(),
+                "sip:caller@127.0.0.1".parse().unwrap(),
+                sdp(),
+            );
+            caller.try_invite(plan).unwrap().await.unwrap();
+            let incoming = invite(&mut callee_events).await;
+            let answered = incoming.try_accept(sdp()).unwrap().await.unwrap();
+            let calling = event(&mut caller_events, |event| match event {
+                Event::Confirmed { session, .. } => Some(session),
+                _ => None,
+            })
+            .await;
+            // The ACK lets the callee's BYE go, so it waits for the 2xx's
+            // retransmissions to stop.
+            let deadline = Duration::from_millis(100);
+            tokio::time::sleep(deadline).await;
+
+            let (hanging, hung, ending, other) = if hangs_up == "caller" {
+                (&caller, &mut callee_events, calling, answered)
+            } else {
+                (&callee, &mut caller_events, answered, calling)
+            };
+            let bye = hanging.try_terminate(&ending).unwrap();
+            assert_eq!(bye.await, Ok(()), "{transport} {hangs_up}");
+            let (ended, reason) = event(hung, |event| match event {
+                Event::Ended { session, reason, .. } => {
+                    Some((session, reason))
+                }
+                _ => None,
+            })
+            .await;
+            assert_eq!(ended, other, "{transport} {hangs_up}");
+            assert!(matches!(reason, EndReason::RemoteBye { .. }));
+            let snapshot = hanging.snapshot(&ending).await.unwrap().unwrap();
+            assert_eq!(snapshot.end_reason, Some(EndReason::LocalBye));
+        }
+    }
+}
+
+/// Each UA numbers its sessions and attempts from the same start, so the
+/// handles of one would name the other's if a UA took them. A UA refuses
+/// the handles of another, before anything is admitted, and nothing goes
+/// on the wire for its own session either.
+#[tokio::test]
+async fn handles_of_another_ua_are_refused() {
+    let (Ua { handle: caller, events: mut caller_events, driver }, _) =
+        ua_on("udp");
+    tokio::spawn(driver);
+    let (Ua { handle: callee, events: mut callee_events, driver }, address) =
+        ua_on("udp");
+    tokio::spawn(driver);
+    let plan = InvitePlan::new(
+        format!("sip:ua@{address}").parse().unwrap(),
+        "sip:caller@127.0.0.1".parse().unwrap(),
+        sdp(),
+    );
+
+    let attempt = caller.try_invite(plan).unwrap().await.unwrap();
+    let answered = invite(&mut callee_events)
+        .await
+        .try_accept(sdp())
+        .unwrap()
+        .await
+        .unwrap();
+    let calling = event(&mut caller_events, |event| match event {
+        Event::Confirmed { session, .. } => Some(session),
+        _ => None,
+    })
+    .await;
+
+    let refused = callee.try_terminate(&calling).unwrap_err();
+    assert_eq!(refused.error(), Error::InvalidInput);
+    assert_eq!(
+        callee.try_cancel(&attempt).unwrap_err().error(),
+        Error::InvalidInput
+    );
+    assert_eq!(
+        callee.try_abandon(&attempt).unwrap_err().error(),
+        Error::InvalidInput
+    );
+    assert_eq!(callee.snapshot(&calling).await, Err(Error::InvalidInput));
+    assert_eq!(
+        callee.attempt_snapshot(&attempt).await,
+        Err(Error::InvalidInput)
+    );
+    assert_ne!(calling.id(), answered.id());
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    for (handle, session) in [(&caller, &calling), (&callee, &answered)] {
+        let snapshot = handle.snapshot(session).await.unwrap().unwrap();
+        assert_eq!(snapshot.phase, SessionPhase::Established);
+    }
+}
+
+/// A BYE that requires an extension gets a 420 that lists it (RFC 3261
+/// section 8.2.2.3, which section 15.1.2 applies to BYE), and ends nothing.
+/// So does an OPTIONS outside a dialog. The same BYE without Require then
+/// ends the session.
+#[tokio::test]
+async fn a_bye_that_requires_an_extension_gets_a_420() {
+    let (mut ua, udp, _) = start_fast();
+    tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+    peer.send(&direct_invite(peer.address(), "required"), udp).await;
+    let session =
+        invite(&mut ua.events).await.try_accept(sdp()).unwrap().await.unwrap();
+    let (ok, _) = peer.recv_starting("SIP/2.0 200").await;
+    peer.send(&ack_for(&ok, peer.address(), "required", 1), udp).await;
+    let bye = in_dialog("BYE", "UDP", &ok, peer.address(), "required", 2);
+    let options =
+        in_dialog("OPTIONS", "UDP", &ok, peer.address(), "options", 1)
+            .replace(
+                &format!(
+                    ";tag={}",
+                    header(&ok, "To")[0].rsplit("tag=").next().unwrap()
+                ),
+                "",
+            );
+    let require = "Max-Forwards: 70\r\nRequire: x-feature\r\n";
+
+    peer.send(&bye.replace("Max-Forwards: 70\n", require), udp).await;
+    let (bad, _) = peer.recv_starting("SIP/2.0 420").await;
+    assert_eq!(header(&bad, "Unsupported"), ["x-feature"]);
+    assert_eq!(header(&bad, "CSeq"), ["2 BYE"]);
+    peer.send(&options.replace("Max-Forwards: 70\n", require), udp).await;
+    let (bad, _) = peer.recv_starting("SIP/2.0 420").await;
+    assert_eq!(header(&bad, "CSeq"), ["1 OPTIONS"]);
+    let snapshot = ua.handle.snapshot(&session).await.unwrap().unwrap();
+    assert_eq!(snapshot.phase, SessionPhase::Established);
+
+    peer.send(
+        &bye.replace("-required-2", "-required-3").replace("2 BYE", "3 BYE"),
+        udp,
+    )
+    .await;
+    let (ended, _) = peer.recv_starting("SIP/2.0 200").await;
+    assert_eq!(header(&ended, "CSeq"), ["3 BYE"]);
+}
+
+/// A BYE that arrives while every job is taken changes nothing: its
+/// session stays up, and signa-core answers it with a 500. Once there is
+/// room, the next BYE ends the session and gets its 200 (RFC 3261 section
+/// 15.1.2), never a 500 for a session that ended.
+#[tokio::test]
+async fn a_bye_without_room_for_its_answer_changes_nothing() {
+    let peer = Peer::new().await;
+    let hosts = Hosts::new(peer.address());
+    let gate = hosts.gate.clone();
+    let config = config()
+        .resolver(hosts)
+        .max_jobs(1)
+        .resolve_timeout(Duration::from_secs(1));
+    let (mut ua, udp, _) = start_fast_with(config);
+    tokio::spawn(ua.driver);
+    peer.send(&direct_invite(peer.address(), "busy"), udp).await;
+    let session =
+        invite(&mut ua.events).await.try_accept(sdp()).unwrap().await.unwrap();
+    let (ok, _) = peer.recv_starting("SIP/2.0 200").await;
+    peer.send(&ack_for(&ok, peer.address(), "busy", 1), udp).await;
+    peer.drain(Duration::from_millis(100)).await;
+
+    // One INVITE holds the only job while its next hop resolves, and the
+    // other waits in the backlog, which is then full.
+    let _held =
+        ua.handle.try_invite(plan_to("gated.invalid", "held")).unwrap();
+    let _waiting =
+        ua.handle.try_invite(plan_to("gated.invalid", "waiting")).unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let bye = in_dialog("BYE", "UDP", &ok, peer.address(), "busy", 2);
+    peer.send(&bye, udp).await;
+
+    let (failed, _) = peer.recv_starting("SIP/2.0 500").await;
+    assert_eq!(header(&failed, "CSeq"), ["2 BYE"]);
+    let snapshot = ua.handle.snapshot(&session).await.unwrap().unwrap();
+    assert_eq!(snapshot.phase, SessionPhase::Established);
+
+    gate.notify_waiters();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    gate.notify_waiters();
+    let again = bye.replace("-busy-2", "-busy-3").replace("2 BYE", "3 BYE");
+    peer.send(&again, udp).await;
+    let (ended, _) = peer.recv_starting("SIP/2.0 200").await;
+    assert_eq!(header(&ended, "CSeq"), ["3 BYE"]);
+    let reason = event(&mut ua.events, |event| match event {
+        Event::Ended { reason, .. } => Some(reason),
+        _ => None,
+    })
+    .await;
+    assert!(matches!(reason, EndReason::RemoteBye { .. }));
 }

@@ -22,19 +22,17 @@ This is an early stage of the crate, and much of a UA core is missing:
 * The UA neither supplies nor checks the answer an ACK carries. So an
   incoming INVITE without an offer gets a 488, and the UA refuses to send
   one.
-* A session whose 2xx gets no ACK ends without the BYE RFC 3261 asks for.
 * A 2xx without the answer to the INVITE's offer confirms its session, which
   then never reports a completed negotiation, rather than fail it.
 * A 2xx that cannot form a dialog, such as one without a Contact, gets no
   ACK. One beyond the UA's limits gets its ACK and a BYE, while the room
   kept for that lasts.
-* An INVITE this UA sent cannot be given up, so each 2xx of every fork forms
-  a session until the application ends it.
-* There is no CANCEL of an INVITE this UA sent. CANCEL, BYE and every other
-  request in a dialog get signa-core's 500.
+* In a dialog, the UA takes BYE itself. Other requests than INVITE are
+  answered as outside a dialog, without asking the application.
 * Outside a dialog, OPTIONS gets a 200 with the methods the UA takes, without
   asking the application, and other requests but INVITE a 405 or a 501.
-* There is no re-INVITE, and no graceful shutdown of the UA.
+* There is no re-INVITE, and an INVITE in a dialog gets a 500. There is no
+  graceful shutdown of the UA.
 * There is no TLS, so a request that asks for SIPS is refused, and the UA
   sends none.
 * The UA neither answers a challenge nor sends credentials.
@@ -46,18 +44,20 @@ This is an early stage of the crate, and much of a UA core is missing:
 )]
 #![deny(unreachable_pub, rustdoc::broken_intra_doc_links)]
 #![warn(missing_docs, missing_debug_implementations)]
-// TODO: Drive the rest of the state model from the runtime: requests in a
-// dialog, the remote CSeq, and ending a usage. Until then only the tests use
-// those parts, and without the `tokio` feature only the tests use any.
+// TODO: Drive the rest of the state model from the runtime: the target
+// refresh of a re-INVITE, and the stages of an operation for a snapshot.
+// Until then only the tests use those parts, and without the `tokio` feature
+// only the tests use any.
 #![cfg_attr(not(test), allow(dead_code))]
 
 #[cfg(feature = "tokio")]
 pub use self::ua::{
-    AttachError, AttemptId, AttemptResult, AttemptSnapshot, Config,
-    Description, Error, Event, IncomingInvite, InvalidContact, InviteAttempt,
-    InvitePlan, NegotiationState, Operation, Query, Resolve, ResolveError,
-    Session, SessionId, SessionPhase, SessionSnapshot, StaticResolver,
-    SubmitError, Ua, UaDriver, UaEvents, UaHandle, WireEffect, attach,
+    AttachError, AttemptId, AttemptResult, AttemptSnapshot, CancelResult,
+    Config, Description, EndReason, Error, Event, IncomingInvite,
+    InvalidContact, InviteAttempt, InviteId, InvitePlan, NegotiationState,
+    Operation, Query, Resolve, ResolveError, Session, SessionId, SessionPhase,
+    SessionSnapshot, StaticResolver, SubmitError, Ua, UaDriver, UaEvents,
+    UaHandle, WireEffect, attach,
 };
 
 // The private state model. `dialog` knows nothing of `invite`, so other
