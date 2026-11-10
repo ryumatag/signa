@@ -3,21 +3,57 @@
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=common.sh
 source "$(dirname -- "$0")/common.sh"
-[[ $# -le 1 ]] || die "Usage: $(basename "$0") [version]"
-require_clean
+[[ $# -ge 1 ]] || die "Usage: $(basename "$0") <crate>[=<version>]..."
+for arg in "$@"; do
+  validate_crate "${arg%%=*}"
+done
 
-version="${1:-$("$release_dir/get-next-version")}"
-validate_version "$version"
-[[ "$version" != "$(current_version)" ]] || die 'version is already current'
-if git show-ref --verify --quiet "refs/tags/$version"; then
-  die "tag $version already exists"
-fi
+# Each named crate with the version it is released at, in a fixed order, so
+# that the message reads the same however the crates were named. Indexed
+# arrays, since macOS ships Bash 3.2 without associative ones.
+packages=()
+names=()
+for crate in "${crates[@]}"; do
+  version=
+  for arg in "$@"; do
+    [[ "${arg%%=*}" == "$crate" ]] || continue
+    [[ -z "$version" ]] || die "$crate is named twice"
+    if [[ "$arg" == *=* ]]; then
+      version="${arg#*=}"
+    else
+      version="$("$release_dir/get-next-version" "$crate")"
+    fi
+  done
+  [[ -n "$version" ]] || continue
 
-"$release_dir/update-version" "$version"
+  validate_version "$version"
+  [[ "$version" != "$(current_version "$crate")" ]] \
+    || die "$crate $version is already current"
+  tag="$(tag_of "$crate" "$version")"
+  if git show-ref --verify --quiet "refs/tags/$tag"; then
+    die "tag $tag already exists"
+  fi
+  packages+=(-p "$crate")
+  names+=("$crate $version")
+done
+
+for name in "${names[@]}"; do
+  "$release_dir/update-version" "${name% *}" "${name#* }"
+done
+
 cargo test --workspace
 cargo test --workspace --no-default-features
-cargo publish -p signa --dry-run --allow-dirty
+# Cargo packages the crates together, so each one verifies against the others
+# being released, not against crates.io.
+cargo publish --dry-run --allow-dirty "${packages[@]}"
 
-git add -- "$manifest"
-git commit -m "release: $version"
-printf 'Merge the release commit into main, then run scripts/release/publish.\n'
+# The bump touches the crates' manifests and the requirements on them.
+git add -- crates/*/Cargo.toml
+message="${names[0]}"
+for name in "${names[@]:1}"; do
+  message+=", $name"
+done
+git commit -m "release: $message"
+printf 'Merge the release commit into main, then run scripts/release/publish'
+printf ' %s' "${names[@]% *}"
+printf '.\n'

@@ -3,8 +3,9 @@
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=common.sh
 source "$(dirname -- "$0")/common.sh"
-[[ $# == 0 ]] || die "Usage: $(basename "$0")"
+[[ $# == 1 ]] || die "Usage: $(basename "$0") <crate>"
+validate_crate "$1"
 
-version="$(current_version)"
+version="$(current_version "$1")"
 validate_version "$version"
 printf '%s.%s\n' "${version%.*}" "$(( ${version##*.} + 1 ))"

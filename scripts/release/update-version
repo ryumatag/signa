@@ -3,16 +3,29 @@
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=common.sh
 source "$(dirname -- "$0")/common.sh"
-[[ $# == 1 ]] || die "Usage: $(basename "$0") <version>"
-version="$1"
+[[ $# == 2 ]] || die "Usage: $(basename "$0") <crate> <version>"
+crate="$1"
+version="$2"
+validate_crate "$crate"
 validate_version "$version"
 
-# I avoid sed -i because its syntax differs between macOS and Linux.
-# Only replace the [package] version so dependency versions stay untouched,
-# and keep the `#:version` mark after it.
-manifest_tmp="$(mktemp "$manifest.XXXXXX")"
-trap 'rm -f -- "$manifest_tmp"' EXIT
-awk -v version="$version" '
+# Rewrites the manifest `$1` with the awk program `$2`, which exits 1 when it
+# finds nothing to change. I avoid sed -i because its syntax differs between
+# macOS and Linux.
+rewrite() {
+  local manifest="$1" program="$2" tmp
+  tmp="$(mktemp "$manifest.XXXXXX")"
+  if awk -v crate="$crate" -v version="$version" "$program" "$manifest" \
+    >"$tmp"; then
+    cat "$tmp" >"$manifest"
+  fi
+  rm -f -- "$tmp"
+}
+
+# Only the [package] version, so that dependency versions stay untouched, and
+# keep the `#:version` mark after it.
+# shellcheck disable=SC2016 # `$0` belongs to the awk program.
+rewrite "$(manifest_of "$crate")" '
   /^\[/ { package = ($0 == "[package]") }
   package && /^version = "/ {
     sub(/"[^"]*"/, "\"" version "\"")
@@ -20,7 +33,20 @@ awk -v version="$version" '
   }
   { print }
   END { if (count != 1) exit 1 }
-' "$manifest" > "$manifest_tmp"
-cat "$manifest_tmp" > "$manifest"
+' || die "no [package] version in $(manifest_of "$crate")"
 
-printf 'Updated signa to %s\n' "$version"
+# The requirement of each crate that depends on this one, so that it asks for
+# the version being released.
+for manifest in crates/*/Cargo.toml; do
+  # shellcheck disable=SC2016 # `$0` belongs to the awk program.
+  rewrite "$manifest" '
+    index($0, crate " = { version = \"") == 1 {
+      sub(/"[^"]*"/, "\"" version "\"")
+      count++
+    }
+    { print }
+    END { if (count == 0) exit 1 }
+  ' || true
+done
+
+printf 'Updated %s to %s\n' "$crate" "$version"

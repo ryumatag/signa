@@ -1,16 +1,28 @@
 # Modeled on jiff's publish workflow (jiff/.github/workflows/publish.yml).
 #
-# Pushing a version tag such as `0.1.0` publishes the crate to crates.io
-# through Trusted Publishing. crates.io must list this repository, this
-# workflow file, and the `publish` environment as a trusted publisher.
+# `scripts/release/publish` pushes a tag per crate onto one release commit:
+# `0.4.0` for signa, and `signa-core-0.1.0` or `signa-ua-0.0.1` for the
+# others. Each tag starts a
+# run, and a run publishes every crate tagged on its commit through Trusted
+# Publishing. crates.io must list this repository, this workflow file, and the
+# `publish` environment as a trusted publisher of each crate.
 name: publish
 
 on:
   push:
     tags:
       - '[0-9]+.[0-9]+.[0-9]+*'
-  # Allows retrying a failed publish without moving the tag.
+      - 'signa-core-[0-9]+.[0-9]+.[0-9]+*'
+      - 'signa-ua-[0-9]+.[0-9]+.[0-9]+*'
+  # Allows retrying a failed publish without moving the tags. Run it on the
+  # release tag, which selects the commit.
   workflow_dispatch:
+
+# The runs of one release commit go one at a time. The first publishes every
+# crate, and the others find them on crates.io.
+concurrency:
+  group: publish-${{ github.sha }}
+  cancel-in-progress: false
 
 jobs:
   publish:
@@ -23,26 +35,58 @@ jobs:
         uses: actions/checkout@v7
         with:
           persist-credentials: false
+          # The other release tags on this commit.
+          fetch-depth: 0
+          fetch-tags: true
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
-      # Catches a tag pushed before the version bump was committed.
-      - name: Check that the tag matches the crate version
-        if: github.ref_type == 'tag'
+      # Catches a tag pushed before the version bump was committed, and leaves
+      # out a version a first release by hand or an earlier run uploaded.
+      - name: Pick the crates to publish
         run: |
-          version="$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name == "signa") | .version')"
-          if [ "$version" != "$GITHUB_REF_NAME" ]; then
-            echo "Tag $GITHUB_REF_NAME does not match version $version."
+          metadata="$(cargo metadata --no-deps --format-version 1)"
+          packages=()
+          tagged=0
+          for tag in $(git tag --points-at HEAD); do
+            case "$tag" in
+              signa-core-[0-9]*) crate=signa-core version="${tag#signa-core-}" ;;
+              signa-ua-[0-9]*) crate=signa-ua version="${tag#signa-ua-}" ;;
+              [0-9]*) crate=signa version="$tag" ;;
+              *) continue ;;
+            esac
+            tagged=$((tagged + 1))
+            current="$(jq -r --arg crate "$crate" \
+              '.packages[] | select(.name == $crate) | .version' <<<"$metadata")"
+            if [[ "$current" != "$version" ]]; then
+              echo "Tag $tag does not match $crate $current."
+              exit 1
+            fi
+            status="$(curl -s -o /dev/null -w '%{http_code}' \
+              -A 'signa publish workflow (https://github.com/ryumatag/signa)' \
+              "https://crates.io/api/v1/crates/$crate/$version")"
+            case "$status" in
+              200) echo "$crate $version is on crates.io already." ;;
+              404) packages+=(-p "$crate") ;;
+              *)
+                echo "crates.io answered $status for $crate $version."
+                exit 1
+                ;;
+            esac
+          done
+          if ((tagged == 0)); then
+            echo "No release tag on $GITHUB_SHA. Run this on a release tag."
             exit 1
           fi
+          echo "PACKAGES=${packages[*]}" >> "$GITHUB_ENV"
       - name: Authenticate with crates.io
+        if: env.PACKAGES != ''
         uses: rust-lang/crates-io-auth-action@v1
         id: auth
-      # TODO: Publish signa-core first, and signa-ua once it is published,
-      # with the multi-crate release in `scripts/release`.
+      # Cargo publishes the crates in dependency order.
       - name: Publish
-        run: cargo publish -p signa
+        if: env.PACKAGES != ''
+        run: cargo publish $PACKAGES
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
