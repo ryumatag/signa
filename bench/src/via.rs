@@ -2,9 +2,9 @@ use std::hint::black_box as bb;
 
 use criterion::Criterion;
 use signa::{
+    Method,
     bench::{CSeq, Via},
     message::header::HeaderValue,
-    Method,
 };
 
 use crate::benchmark;

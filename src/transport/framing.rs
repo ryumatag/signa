@@ -15,13 +15,13 @@ how to read and when to close.
 use std::{error, fmt, mem};
 
 use bytes::{Buf, Bytes, BytesMut};
-use siparse::{find_head_end, parse_ping, parse_pong, Status};
+use siparse::{Status, find_head_end, parse_ping, parse_pong};
 
 use super::MessageLimits;
 use crate::message::{
+    Message,
     error::{InvalidMessage, InvalidMessageKind},
     parse::{self, Head},
-    Message,
 };
 
 /// Splits a byte stream into messages and RFC 5626 keepalives.
@@ -161,7 +161,7 @@ impl Decoder {
                                 InvalidMessage::new(
                                     InvalidMessageKind::IncompleteHead,
                                 ),
-                            ))
+                            ));
                         }
                     };
 
@@ -242,8 +242,8 @@ impl error::Error for DecodeError {
 mod tests {
     use super::*;
     use crate::message::{
-        header::{CALL_ID, VIA},
         Method, StatusCode,
+        header::{CALL_ID, VIA},
     };
 
     const INVITE: &[u8] = b"INVITE sip:bob@biloxi.example.com SIP/2.0\r\n\

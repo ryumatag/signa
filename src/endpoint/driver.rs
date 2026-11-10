@@ -38,14 +38,14 @@ left for the driver to do.
 
 use std::{
     collections::HashMap,
-    future::{poll_fn, Future},
+    future::{Future, poll_fn},
     io, mem,
     net::{IpAddr, SocketAddr},
     ops::{Deref, DerefMut},
-    pin::{pin, Pin},
+    pin::{Pin, pin},
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
     time::{Duration, Instant},
@@ -54,8 +54,8 @@ use std::{
 use bytes::Bytes;
 use foldhash::fast::RandomState;
 use tokio::{
-    sync::{mpsc, oneshot, watch, Semaphore},
-    time::{sleep_until, Sleep},
+    sync::{Semaphore, mpsc, oneshot, watch},
+    time::{Sleep, sleep_until},
 };
 
 use crate::{
@@ -70,8 +70,8 @@ use crate::{
         error::Error,
         reply::{Admission, Completion, ReplyError, ReplyRoute},
         routing::{
-            mark_via, reply_flow, sent_by, sent_by_is, source_toward,
-            via_value, via_value_with, Branches, Link,
+            Branches, Link, mark_via, reply_flow, sent_by, sent_by_is,
+            source_toward, via_value, via_value_with,
         },
         send::ViaMode,
         server::{
@@ -83,20 +83,20 @@ use crate::{
         timer::{Key, TimerQueue},
     },
     message::{
+        Message, Method, StatusCode,
         header::{
-            address::has_tag, cseq::CSeq, via::Via, HeaderMap, Tag, CALL_ID,
-            CSEQ, FROM, TO, VIA,
+            CALL_ID, CSEQ, FROM, HeaderMap, TO, Tag, VIA, address::has_tag,
+            cseq::CSeq, via::Via,
         },
         request::Request,
-        response::{bare_response, reply_headers, Response},
-        Message, Method, StatusCode,
+        response::{Response, bare_response, reply_headers},
     },
     transaction::{
         invite,
         key::{ClientKey, ServerKey},
         non_invite::{ClientEvent, ClientTransaction, ServerTransaction},
     },
-    transport::{budget::Budget, tcp, udp, Flow, Transport, WriteLimits},
+    transport::{Flow, Transport, WriteLimits, budget::Budget, tcp, udp},
 };
 
 mod cancels;
@@ -576,37 +576,40 @@ impl Stopping {
     async fn join(&mut self) {
         let Stopping { tasks, shutdown, control, sleep, .. } = self;
         let mut finished = pin!(tasks.finished());
-        poll_fn(|cx| loop {
-            if finished.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(());
-            }
-            if let Some(receiver) = control {
-                match receiver.poll_recv(cx) {
-                    Poll::Ready(Some(())) => {
-                        if let Some(Some(at)) = shutdown.take() {
-                            let at = tokio::time::Instant::from_std(at);
-                            match sleep {
-                                Some(sleep) if sleep.deadline() <= at => {}
-                                Some(sleep) => sleep.as_mut().reset(at),
-                                None => {
-                                    *sleep = Some(Box::pin(sleep_until(at)))
+        poll_fn(|cx| {
+            loop {
+                if finished.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(());
+                }
+                if let Some(receiver) = control {
+                    match receiver.poll_recv(cx) {
+                        Poll::Ready(Some(())) => {
+                            if let Some(Some(at)) = shutdown.take() {
+                                let at = tokio::time::Instant::from_std(at);
+                                match sleep {
+                                    Some(sleep) if sleep.deadline() <= at => {}
+                                    Some(sleep) => sleep.as_mut().reset(at),
+                                    None => {
+                                        *sleep =
+                                            Some(Box::pin(sleep_until(at)))
+                                    }
                                 }
                             }
+                            continue;
                         }
+                        Poll::Ready(None) => *control = None,
+                        Poll::Pending => {}
+                    }
+                }
+                if let Some(deadline) = sleep {
+                    if deadline.as_mut().poll(cx).is_ready() {
+                        tasks.advance(tcp::Phase::Abort);
+                        *sleep = None;
                         continue;
                     }
-                    Poll::Ready(None) => *control = None,
-                    Poll::Pending => {}
                 }
+                return Poll::Pending;
             }
-            if let Some(deadline) = sleep {
-                if deadline.as_mut().poll(cx).is_ready() {
-                    tasks.advance(tcp::Phase::Abort);
-                    *sleep = None;
-                    continue;
-                }
-            }
-            return Poll::Pending;
         })
         .await;
     }
@@ -918,11 +921,7 @@ impl Driver {
         while let Ok(command) = self.commands.try_recv() {
             self.on_command(command);
         }
-        if self.is_drained() {
-            End::Drained
-        } else {
-            End::Expired
-        }
+        if self.is_drained() { End::Drained } else { End::Expired }
     }
 
     /// Stops the transport tasks and publishes the outcome.
@@ -2597,7 +2596,7 @@ impl Driver {
         match writer.prepare(bytes.clone()) {
             Ok(write) => return Ok(PreparedServerOutput::Tcp(write, None)),
             Err(tcp::SendError::Full) => {
-                return Err(SubmitError::TransportBusy)
+                return Err(SubmitError::TransportBusy);
             }
             Err(tcp::SendError::Closed) => {}
         }
@@ -3145,13 +3144,13 @@ mod tests {
     use super::*;
     use crate::{
         endpoint::{
+            Client, Endpoint,
             client::{ClientControl, Responses},
             tests::{
-                fixture_endpoint, invite, reply, reply_driver,
-                reply_driver_with, route_request, route_response,
-                udp_reply_link, DriverFixture, TestServe, REPLY_LOCAL,
+                DriverFixture, REPLY_LOCAL, TestServe, fixture_endpoint,
+                invite, reply, reply_driver, reply_driver_with, route_request,
+                route_response, udp_reply_link,
             },
-            Client, Endpoint,
         },
         transaction::Timers,
     };
@@ -3680,22 +3679,26 @@ mod tests {
         );
         assert_eq!(driver.servers.get(b).unwrap().tx.deadline(), before);
         assert!(driver.servers.get(b).unwrap().tx.headers().is_some());
-        assert!(!other
-            .transaction
-            .responder
-            .shared
-            .final_sent
-            .load(Ordering::Acquire));
+        assert!(
+            !other
+                .transaction
+                .responder
+                .shared
+                .final_sent
+                .load(Ordering::Acquire)
+        );
 
         drop(blocker);
         driver.accept_response(b, status(200), response_b, None).unwrap();
 
-        assert!(other
-            .transaction
-            .responder
-            .shared
-            .final_sent
-            .load(Ordering::Acquire));
+        assert!(
+            other
+                .transaction
+                .responder
+                .shared
+                .final_sent
+                .load(Ordering::Acquire)
+        );
         assert!(driver.work.is_idle());
     }
 
@@ -3903,8 +3906,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timer_j_returns_server_capacity_and_old_ids_do_not_touch_reused_slots(
-    ) {
+    async fn timer_j_returns_server_capacity_and_old_ids_do_not_touch_reused_slots()
+     {
         let (mut driver, _commands, local) = reply_driver_with(Config {
             max_server_transactions: 1,
             ..Config::default()
@@ -3977,8 +3980,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_before_enqueue_has_no_effect_and_after_enqueue_keeps_the_write(
-    ) {
+    async fn cancellation_before_enqueue_has_no_effect_and_after_enqueue_keeps_the_write()
+     {
         let (mut driver, commands, local) = reply_driver();
         let peer = UdpSocket::bind(REPLY_LOCAL).await.unwrap();
         let link = udp_reply_link(local, peer.local_addr().unwrap());
@@ -4091,11 +4094,13 @@ mod tests {
         }
         assert_eq!(driver.clients.len(), 0);
         drop(responses.pop().unwrap());
-        assert!(client
-            .call(route_request("SIP/2.0/UDP example.com:9;rport"))
-            .await
-            .unwrap_err()
-            .is_busy());
+        assert!(
+            client
+                .call(route_request("SIP/2.0/UDP example.com:9;rport"))
+                .await
+                .unwrap_err()
+                .is_busy()
+        );
         assert!(driver.commands.is_empty());
         let TcpState::Connecting(pending) = &driver.routes[&remote].tcp else {
             panic!("connect is still pending");
@@ -4140,11 +4145,7 @@ mod tests {
             poll_fn(|cx| {
                 let udp = driver.udp.as_mut().unwrap();
                 udp.poll_flush(cx);
-                if udp.is_idle() {
-                    Poll::Ready(())
-                } else {
-                    Poll::Pending
-                }
+                if udp.is_idle() { Poll::Ready(()) } else { Poll::Pending }
             }),
         )
         .await
@@ -4163,11 +4164,13 @@ mod tests {
         assert!(response.await.is_ok());
         assert_eq!(driver.clients.len(), 1);
         assert!(!driver.clients.get(id).unwrap().is_terminated());
-        assert!(client
-            .call(route_request("SIP/2.0/UDP example.com:9;rport"))
-            .await
-            .unwrap_err()
-            .is_busy());
+        assert!(
+            client
+                .call(route_request("SIP/2.0/UDP example.com:9;rport"))
+                .await
+                .unwrap_err()
+                .is_busy()
+        );
         let timers = driver.config.timers;
         let entry = driver.clients.get_mut(id).unwrap();
         let deadline = entry.deadline().unwrap();
@@ -4185,8 +4188,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pre_transaction_errors_release_admission_before_waking_the_caller(
-    ) {
+    async fn pre_transaction_errors_release_admission_before_waking_the_caller()
+     {
         #[derive(Debug)]
         enum Failure {
             Connect,
@@ -4236,10 +4239,12 @@ mod tests {
                 request: next,
             })
             .into();
-            assert!(response
-                .as_mut()
-                .poll(&mut Context::from_waker(&waker))
-                .is_pending());
+            assert!(
+                response
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
 
             let command = driver.commands.try_recv().unwrap();
             driver.on_command(command);
@@ -4292,10 +4297,12 @@ mod tests {
         let mut response = Box::pin(client.call(request.clone()));
         let waker: Waker =
             Arc::new(SendNext { client: Mutex::new(client), request }).into();
-        assert!(response
-            .as_mut()
-            .poll(&mut Context::from_waker(&waker))
-            .is_pending());
+        assert!(
+            response
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
 
         let command = driver.commands.try_recv().unwrap();
         driver.on_command(command);
@@ -4311,10 +4318,12 @@ mod tests {
         .await
         .unwrap();
         // Start acceptance wakes separately from final-response delivery.
-        assert!(response
-            .as_mut()
-            .poll(&mut Context::from_waker(&waker))
-            .is_pending());
+        assert!(
+            response
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
         driver.on_received_response(route_response(&wire_request));
 
         assert!(response.await.is_ok());
@@ -4334,11 +4343,7 @@ mod tests {
             poll_fn(|cx| {
                 let udp = driver.udp.as_mut().unwrap();
                 udp.poll_flush(cx);
-                if udp.is_idle() {
-                    Poll::Ready(())
-                } else {
-                    Poll::Pending
-                }
+                if udp.is_idle() { Poll::Ready(()) } else { Poll::Pending }
             }),
         )
         .await
@@ -4396,9 +4401,11 @@ mod tests {
         assert_eq!(again, first);
         assert!(driver.clients.get(id).is_some());
         assert_eq!(driver.client_writes.len(), 1);
-        assert!(poll_fn(|cx| Poll::Ready(response.as_mut().poll(cx)))
-            .await
-            .is_pending());
+        assert!(
+            poll_fn(|cx| Poll::Ready(response.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
     }
 
     // Deterministic INVITE timers. The tests drive the driver by hand on a
@@ -4478,11 +4485,7 @@ mod tests {
             let udp = self.fixture.udp.as_mut().unwrap();
             poll_fn(|cx| {
                 udp.poll_flush(cx);
-                if udp.is_idle() {
-                    Poll::Ready(())
-                } else {
-                    Poll::Pending
-                }
+                if udp.is_idle() { Poll::Ready(()) } else { Poll::Pending }
             })
             .await;
         }

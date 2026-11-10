@@ -340,11 +340,13 @@ mod tests {
     #[test]
     fn sip_access_distinguishes_opaque_schemes_from_bad_sip_structure() {
         for text in ["tel:+12025550123", "urn:service:sos", "opaque"] {
-            assert!(Uri::from_bytes(text.as_bytes())
-                .unwrap()
-                .sip()
-                .unwrap()
-                .is_none());
+            assert!(
+                Uri::from_bytes(text.as_bytes())
+                    .unwrap()
+                    .sip()
+                    .unwrap()
+                    .is_none()
+            );
         }
         let bad = Uri::from_static("sip:example.com;transport=");
         assert_eq!(

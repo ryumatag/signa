@@ -2,8 +2,8 @@ use std::hint::black_box as bb;
 
 use criterion::{BatchSize, Criterion};
 use signa::{
-    message::header::{HeaderValue, VIA},
     Request,
+    message::header::{HeaderValue, VIA},
 };
 
 use crate::{benchmark, message::REQUEST_TYPICAL};

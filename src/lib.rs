@@ -360,14 +360,13 @@ pub mod bench {
     pub use crate::{
         message::header::{cseq::CSeq, via::Via},
         transaction::{
-            invite,
+            Timers, invite,
             key::{ClientKey, ServerKey},
             non_invite::{ClientEvent, ClientTransaction, ServerTransaction},
-            Timers,
         },
         transport::{
-            framing::{DecodeError, Decoder, Frame, Role},
             Flow, MessageLimits, Transport,
+            framing::{DecodeError, Decoder, Frame, Role},
         },
     };
 }

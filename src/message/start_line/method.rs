@@ -42,9 +42,9 @@ use siparse::check;
 use crate::message::error::InvalidMethod;
 
 use self::{
-    extension::{AllocatedExtension, InlineExtension},
     Known::*,
     Repr::*,
+    extension::{AllocatedExtension, InlineExtension},
 };
 
 /// A SIP request method.

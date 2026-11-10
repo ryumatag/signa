@@ -253,16 +253,22 @@ unsafe fn write_cmsg<T: Copy>(
     value: T,
 ) -> usize {
     let size = mem::size_of::<T>() as u32;
-    let space = libc::CMSG_SPACE(size) as usize;
+    // SAFETY: libc declares these `unsafe`, but they only compute lengths
+    // from `size`.
+    let (space, len) =
+        unsafe { (libc::CMSG_SPACE(size) as usize, libc::CMSG_LEN(size)) };
 
     assert!(space <= Control::LEN, "control message does not fit");
 
-    (*cmsg).cmsg_level = level;
-    (*cmsg).cmsg_type = ty;
-    (*cmsg).cmsg_len = libc::CMSG_LEN(size) as _;
-
-    // The data is only aligned for `cmsghdr`.
-    ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<T>(), value);
+    // SAFETY: The caller guarantees `space` bytes from `cmsg`, which holds
+    // the header and the data after it. The data is only aligned for
+    // `cmsghdr`, so it is written unaligned.
+    unsafe {
+        (*cmsg).cmsg_level = level;
+        (*cmsg).cmsg_type = ty;
+        (*cmsg).cmsg_len = len as _;
+        ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<T>(), value);
+    }
 
     space
 }

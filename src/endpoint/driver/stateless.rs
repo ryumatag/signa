@@ -28,7 +28,7 @@ counted, and the sender's retransmission tries again.
 
 use bytes::Bytes;
 
-use super::{identity_bytes, increment, Driver, Link};
+use super::{Driver, Link, identity_bytes, increment};
 use crate::{
     endpoint::{
         admission::request_bytes,
@@ -37,10 +37,10 @@ use crate::{
         server::{self, IncomingEvent, ReceivedRequest, ReceivedResponse},
     },
     message::{
-        header::{via::Via, VIA},
+        Method,
+        header::{VIA, via::Via},
         request::Request,
         response::Response,
-        Method,
     },
     transport::Flow,
 };

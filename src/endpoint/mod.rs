@@ -210,13 +210,13 @@ while let Some(event) = incoming.recv().await {
 use std::{
     fmt,
     net::SocketAddr,
-    sync::{atomic::Ordering, Arc},
+    sync::{Arc, atomic::Ordering},
     time::Duration,
 };
 
 #[cfg(feature = "__bench")]
 use bytes::Bytes;
-use tokio::sync::{mpsc, watch, Semaphore};
+use tokio::sync::{Semaphore, mpsc, watch};
 
 #[cfg(all(test, not(miri)))]
 use self::client::compatibility::Client;
@@ -225,7 +225,7 @@ use self::{admission::ClientAdmission, driver::Command};
 use self::{builder::Config, driver::Driver};
 #[cfg(all(test, not(miri)))]
 use crate::transport::Transport;
-use crate::transport::{budget::Budget, WriteLimits};
+use crate::transport::{WriteLimits, budget::Budget};
 #[cfg(feature = "__bench")]
 use crate::{
     message::Request,
@@ -637,16 +637,16 @@ pub fn reply_driver(
 #[cfg(all(test, not(miri)))]
 mod tests {
     use std::{
-        collections::{hash_map::DefaultHasher, HashMap},
+        collections::{HashMap, hash_map::DefaultHasher},
         convert::Infallible,
-        future::{self, poll_fn, Future, Ready},
+        future::{self, Future, Ready, poll_fn},
         hash::{Hash, Hasher},
         io,
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
         pin::{self, Pin},
         sync::{
-            atomic::{AtomicUsize, Ordering},
             Arc,
+            atomic::{AtomicUsize, Ordering},
         },
         task::{Context, Poll},
         time::{Duration, Instant},
@@ -656,35 +656,35 @@ mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream, UdpSocket},
-        sync::{mpsc, oneshot, Notify},
-        task::{spawn_blocking, yield_now, JoinHandle},
+        sync::{Notify, mpsc, oneshot},
+        task::{JoinHandle, spawn_blocking, yield_now},
         time::{sleep, timeout, timeout_at},
     };
-    use tower::{limit::ConcurrencyLimit, service_fn, ServiceExt};
+    use tower::{ServiceExt, limit::ConcurrencyLimit, service_fn};
     use tower_service::Service;
 
     use crate::{
         endpoint::{
-            builder::Config,
-            driver::{Command, Driver, TCP_INBOUND},
-            error::Error,
-            routing::{sent_by_is, Link},
             Branch, Builder, CancelError, CancelOutcome, Endpoint, Incoming,
             IncomingEvent, ReceivedRequest, ReceivedResponse, Reception,
             ReplyError, Responses, ServerEvent, ServerEvents, ServerRequest,
             ShutdownOutcome, SubmitError, Target, ViaMode, WorkGuard,
+            builder::Config,
+            driver::{Command, Driver, TCP_INBOUND},
+            error::Error,
+            routing::{Link, sent_by_is},
         },
         message::{
+            HeaderName, Message, Method, StatusCode,
             header::{
-                via::Via, HeaderMap, HeaderValue, Tag, CALL_ID, CSEQ, FROM,
-                ROUTE, TO, VIA,
+                CALL_ID, CSEQ, FROM, HeaderMap, HeaderValue, ROUTE, TO, Tag,
+                VIA, via::Via,
             },
             request::Request,
             response::Response,
-            HeaderName, Message, Method, StatusCode,
         },
         transaction::Timers,
-        transport::{budget::Budget, tcp, udp, Flow, Transport, WriteLimits},
+        transport::{Flow, Transport, WriteLimits, budget::Budget, tcp, udp},
     };
 
     const LOCALHOST: SocketAddr =
@@ -724,8 +724,8 @@ mod tests {
     // RFC 3261 section 17.1.2 delivers provisional responses and the first
     // final. Timer K remains independent of response observation.
     #[tokio::test]
-    async fn client_tu_reports_flow_via_provisionals_and_final_on_both_transports(
-    ) {
+    async fn client_tu_reports_flow_via_provisionals_and_final_on_both_transports()
+     {
         for transport in [Transport::Udp, Transport::Tcp] {
             let (server, mut incoming) = Endpoint::builder()
                 .udp(LOCALHOST)
@@ -755,15 +755,22 @@ mod tests {
             else {
                 panic!("request")
             };
-            assert!(envelope
-                .request
-                .headers()
-                .get(VIA)
-                .unwrap()
-                .as_str()
-                .contains(
-                    control.via().as_str().split("branch=").nth(1).unwrap()
-                ));
+            assert!(
+                envelope
+                    .request
+                    .headers()
+                    .get(VIA)
+                    .unwrap()
+                    .as_str()
+                    .contains(
+                        control
+                            .via()
+                            .as_str()
+                            .split("branch=")
+                            .nth(1)
+                            .unwrap()
+                    )
+            );
 
             let (responder, _) = envelope.transaction.into_parts();
             // Reliable non-INVITE transactions allow an immediate 100.
@@ -903,20 +910,24 @@ mod tests {
             responses.next().await.unwrap().unwrap().status().as_u16(),
             100
         );
-        assert!(responses
-            .next()
-            .await
-            .unwrap()
-            .unwrap_err()
-            .is_delivery_overflow());
+        assert!(
+            responses
+                .next()
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_delivery_overflow()
+        );
         assert!(responses.next().await.is_none());
 
         drop(control);
-        assert!(endpoint
-            .start(request("OPTIONS"), target)
-            .await
-            .unwrap_err()
-            .is_busy());
+        assert!(
+            endpoint
+                .start(request("OPTIONS"), target)
+                .await
+                .unwrap_err()
+                .is_busy()
+        );
 
         peer.send(
             endpoint.udp_addr().unwrap(),
@@ -951,11 +962,13 @@ mod tests {
         }
 
         assert!(peer.recv().await.is_some());
-        assert!(endpoint
-            .start(request("OPTIONS"), target)
-            .await
-            .unwrap_err()
-            .is_busy());
+        assert!(
+            endpoint
+                .start(request("OPTIONS"), target)
+                .await
+                .unwrap_err()
+                .is_busy()
+        );
         assert!(
             peer.recv().await.is_some(),
             "dropping start must not stop retransmission"
@@ -985,11 +998,13 @@ mod tests {
         assert!(responses.next().await.is_none());
 
         drop(responses);
-        assert!(endpoint
-            .start(request("OPTIONS"), target)
-            .await
-            .unwrap_err()
-            .is_busy());
+        assert!(
+            endpoint
+                .start(request("OPTIONS"), target)
+                .await
+                .unwrap_err()
+                .is_busy()
+        );
 
         drop(control);
         let (control, mut responses) = endpoint
@@ -1064,9 +1079,11 @@ mod tests {
         }
 
         assert!(peer.recv().await.is_none());
-        assert!(timeout(Duration::from_millis(100), listener.accept())
-            .await
-            .is_err());
+        assert!(
+            timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
 
         endpoint.shutdown(Duration::ZERO).await;
     }
@@ -1077,8 +1094,8 @@ mod tests {
     // of RFC 3261 section 12.2.1.1, where the top Route has `lr` but is not
     // the next hop. The hosts are never resolved.
     #[tokio::test]
-    async fn client_tu_sends_to_the_target_with_request_uri_and_route_as_given(
-    ) {
+    async fn client_tu_sends_to_the_target_with_request_uri_and_route_as_given()
+     {
         const ROUTES: [&str; 2] = [
             "<sip:loose.example.net;lr>, <sip:edge.example.net;lr>",
             "<sip:bob@example.com>",
@@ -1700,8 +1717,8 @@ mod tests {
         }
     }
 
-    pub(super) fn reply_driver(
-    ) -> (DriverFixture, mpsc::UnboundedSender<Command>, SocketAddr) {
+    pub(super) fn reply_driver()
+    -> (DriverFixture, mpsc::UnboundedSender<Command>, SocketAddr) {
         reply_driver_with(Config {
             timers: Timers::default(),
             tcp: tcp::Config::default(),
@@ -2197,8 +2214,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_servers_refuse_new_transactions_but_answer_retransmissions(
-    ) {
+    async fn completed_servers_refuse_new_transactions_but_answer_retransmissions()
+     {
         let service = Counting::default();
         let server = Endpoint::builder()
             .udp(LOCALHOST)
@@ -2614,9 +2631,9 @@ mod tests {
         assert!(trying.starts_with("SIP/2.0 100 "), "{trying}");
 
         let mut shutdown = Box::pin(server.shutdown(Duration::from_secs(5)));
-        assert!(timeout(Duration::from_millis(50), &mut shutdown)
-            .await
-            .is_err());
+        assert!(
+            timeout(Duration::from_millis(50), &mut shutdown).await.is_err()
+        );
 
         // A new request is refused, and a retransmission of the first is still
         // absorbed by its transaction.
@@ -2652,9 +2669,9 @@ mod tests {
         let other = client_end.clone();
         let mut shutdown =
             Box::pin(client_end.shutdown(Duration::from_secs(5)));
-        assert!(timeout(Duration::from_millis(50), &mut shutdown)
-            .await
-            .is_err());
+        assert!(
+            timeout(Duration::from_millis(50), &mut shutdown).await.is_err()
+        );
 
         // A request after the call is refused. The one in flight is waited
         // for.
@@ -2777,8 +2794,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn udp_route_preserves_local_address_and_rport_and_can_outlive_other_handles(
-    ) {
+    async fn udp_route_preserves_local_address_and_rport_and_can_outlive_other_handles()
+     {
         let (driver, commands, local) = reply_driver();
         let peer = UdpSocket::bind(REPLY_LOCAL).await.unwrap();
         let link = udp_reply_link(local, peer.local_addr().unwrap());
@@ -3051,8 +3068,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exhausted_write_bytes_report_busy_without_leaking_client_admission(
-    ) {
+    async fn exhausted_write_bytes_report_busy_without_leaking_client_admission()
+     {
         let service = Counting::default();
         let server = serve(service.clone());
         let limits = WriteLimits { messages: 1, bytes: 1 };
@@ -3291,8 +3308,8 @@ mod tests {
     // the TU until Timer M, including retransmissions and other forks, and
     // the TU acknowledges each with an ACK of its own. signa sends none.
     #[tokio::test]
-    async fn invite_client_delivers_forked_2xx_until_timer_m_for_the_tu_to_ack(
-    ) {
+    async fn invite_client_delivers_forked_2xx_until_timer_m_for_the_tu_to_ack()
+     {
         for transport in [Transport::Udp, Transport::Tcp] {
             let (endpoint, _incoming) = invite_endpoint(short_timers());
             let far = Far::new().await;
@@ -3381,11 +3398,13 @@ mod tests {
         let (control, _responses) =
             endpoint.start(invite(), target).await.unwrap().into_parts();
         assert!(endpoint.start(invite(), target).await.unwrap_err().is_busy());
-        assert!(endpoint
-            .start(request("OPTIONS"), target)
-            .await
-            .unwrap_err()
-            .is_busy());
+        assert!(
+            endpoint
+                .start(request("OPTIONS"), target)
+                .await
+                .unwrap_err()
+                .is_busy()
+        );
 
         let mut remote = far.remote(Transport::Udp, &endpoint).await;
         let sent = into_request(remote.next().await.unwrap());
@@ -3541,9 +3560,11 @@ mod tests {
                 server_event(&mut events).await,
                 ServerEvent::Terminated
             ));
-            assert!(timeout(Duration::from_millis(50), incoming.recv())
-                .await
-                .is_err());
+            assert!(
+                timeout(Duration::from_millis(50), incoming.recv())
+                    .await
+                    .is_err()
+            );
 
             // The state never allowed these, so the end of the transaction
             // does not change why they are refused.
@@ -3803,9 +3824,9 @@ mod tests {
         );
         remote.send(&raw("ACK", &via, Some("ringing"))).await;
         assert!(remote.next().await.is_none());
-        assert!(timeout(Duration::from_millis(50), incoming.recv())
-            .await
-            .is_err());
+        assert!(
+            timeout(Duration::from_millis(50), incoming.recv()).await.is_err()
+        );
     }
 
     // RFC 6026 section 8.8. A response transport failure is reported, and
@@ -3835,9 +3856,9 @@ mod tests {
 
         responder.respond(reply(&request, 200, "b")).await.unwrap();
         assert_eq!(status_of(remote.next().await), 200);
-        assert!(timeout(Duration::from_millis(50), events.next())
-            .await
-            .is_err());
+        assert!(
+            timeout(Duration::from_millis(50), events.next()).await.is_err()
+        );
     }
 
     // RFC 3261 section 17. No ACK gets a response. One that matches no
@@ -3860,9 +3881,9 @@ mod tests {
         let broken =
             raw("ACK", &via, Some("x")).replace("Call-ID: raw-call\r\n", "");
         remote.send(&broken).await;
-        assert!(timeout(Duration::from_millis(50), incoming.recv())
-            .await
-            .is_err());
+        assert!(
+            timeout(Duration::from_millis(50), incoming.recv()).await.is_err()
+        );
         assert!(remote.next().await.is_none());
     }
 
@@ -3919,16 +3940,12 @@ mod tests {
         let IncomingEvent::Ack(ack) = event(&mut incoming).await else {
             panic!("the first ACK");
         };
-        assert!(ack
-            .request
-            .headers()
-            .get(TO)
-            .unwrap()
-            .as_str()
-            .ends_with("first"));
-        assert!(timeout(Duration::from_millis(50), incoming.recv())
-            .await
-            .is_err());
+        assert!(
+            ack.request.headers().get(TO).unwrap().as_str().ends_with("first")
+        );
+        assert!(
+            timeout(Duration::from_millis(50), incoming.recv()).await.is_err()
+        );
         assert!(remote.next().await.is_none());
         assert_eq!(endpoint.reception_stats().dropped_acks, 1);
 
@@ -4010,9 +4027,9 @@ mod tests {
 
         second.send(&cancel).await;
         assert_eq!(status_of(second.next_except("INVITE").await), 200);
-        assert!(timeout(Duration::from_millis(50), incoming.recv())
-            .await
-            .is_err());
+        assert!(
+            timeout(Duration::from_millis(50), incoming.recv()).await.is_err()
+        );
         drop(one);
     }
 
@@ -4586,9 +4603,9 @@ mod tests {
 
         drop(received);
         assert!(peer.recv().await.is_none(), "no response on drop");
-        assert!(timeout(Duration::from_millis(50), incoming.recv())
-            .await
-            .is_err());
+        assert!(
+            timeout(Duration::from_millis(50), incoming.recv()).await.is_err()
+        );
     }
 
     // A stateless request's route answers it once, and the route of an ACK
@@ -4650,9 +4667,11 @@ mod tests {
             let response = reply(&request, code, "uas");
             peer.send_message(stateful.udp_addr().unwrap(), &response).await;
         }
-        assert!(timeout(Duration::from_millis(100), incoming.recv())
-            .await
-            .is_err());
+        assert!(
+            timeout(Duration::from_millis(100), incoming.recv())
+                .await
+                .is_err()
+        );
     }
 
     // RFC 3261 sections 16.6 and 16.11. The caller's branch is the top Via as
@@ -4736,9 +4755,9 @@ mod tests {
         }
         // Timer E would have fired several times by now with these timers.
         assert!(peer.recv().await.is_none());
-        assert!(timeout(Duration::from_millis(50), incoming.recv())
-            .await
-            .is_err());
+        assert!(
+            timeout(Duration::from_millis(50), incoming.recv()).await.is_err()
+        );
     }
 
     /// A request size that fits 1300 bytes alone but not with the Via a
@@ -4951,9 +4970,9 @@ mod tests {
         for _ in 0..3 {
             held.push(event(&mut incoming).await);
         }
-        assert!(timeout(Duration::from_millis(50), incoming.recv())
-            .await
-            .is_err());
+        assert!(
+            timeout(Duration::from_millis(50), incoming.recv()).await.is_err()
+        );
         assert!(peer.recv().await.is_none(), "a full queue sends nothing");
 
         // The TU has taken every event, so each queue has room again, even
@@ -5005,9 +5024,9 @@ mod tests {
                 && stats.dropped_stateless_responses == 1
         })
         .await;
-        assert!(timeout(Duration::from_millis(50), incoming.recv())
-            .await
-            .is_err());
+        assert!(
+            timeout(Duration::from_millis(50), incoming.recv()).await.is_err()
+        );
 
         let (endpoint, mut incoming) = Builder::new()
             .udp(LOCALHOST)
@@ -5181,9 +5200,11 @@ mod tests {
             server_event(&mut events).await,
             ServerEvent::Terminated
         ));
-        assert!(timeout(Duration::from_millis(50), uas_incoming.recv())
-            .await
-            .is_err());
+        assert!(
+            timeout(Duration::from_millis(50), uas_incoming.recv())
+                .await
+                .is_err()
+        );
 
         let mut branches = HashMap::new();
         while let Ok((method, via)) = forwarded.try_recv() {
@@ -5200,8 +5221,8 @@ mod tests {
     // a new event, and the proxy's stable branch makes the UAS absorb it in
     // the transaction of the first (section 17.2.3), answering it from there.
     #[tokio::test]
-    async fn a_retransmission_through_a_stateless_proxy_reaches_one_transaction(
-    ) {
+    async fn a_retransmission_through_a_stateless_proxy_reaches_one_transaction()
+     {
         let (uas, mut uas_incoming) = Endpoint::builder()
             .udp(LOCALHOST)
             .timers(short_timers())
@@ -5223,9 +5244,11 @@ mod tests {
         uac.send(proxy_addr, &invite).await;
         assert_eq!(status_of(uac.message().await), 100);
 
-        assert!(timeout(Duration::from_millis(50), uas_incoming.recv())
-            .await
-            .is_err());
+        assert!(
+            timeout(Duration::from_millis(50), uas_incoming.recv())
+                .await
+                .is_err()
+        );
         let (_, first) = forwarded.recv().await.unwrap();
         let (_, second) = forwarded.recv().await.unwrap();
         assert_eq!(first, second);
@@ -5742,9 +5765,9 @@ mod tests {
         let mut shutdown =
             Box::pin(endpoint.shutdown(Duration::from_secs(30)));
 
-        assert!(timeout(Duration::from_millis(200), &mut shutdown)
-            .await
-            .is_err());
+        assert!(
+            timeout(Duration::from_millis(200), &mut shutdown).await.is_err()
+        );
         let reading = tokio::spawn(async move {
             let mut all = Vec::new();
             stream.read_to_end(&mut all).await.unwrap();

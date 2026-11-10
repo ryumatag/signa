@@ -29,13 +29,13 @@ reports that it has stopped, so nothing it owns writes after that.
 
 use std::{
     fmt,
-    future::{poll_fn, Future},
+    future::{Future, poll_fn},
     io,
     net::SocketAddr,
     pin::pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Weak,
+        atomic::{AtomicBool, Ordering},
     },
     task::Poll,
     time::Duration,
@@ -44,16 +44,16 @@ use std::{
 use bytes::{Buf, Bytes, BytesMut};
 use tokio::{
     io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{tcp::OwnedReadHalf, TcpListener, TcpStream},
-    sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore},
+    net::{TcpListener, TcpStream, tcp::OwnedReadHalf},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
     task::JoinHandle,
     time::{sleep, timeout},
 };
 
 use super::{
+    Flow, MessageLimits, Transport, WriteLimits,
     budget::{Budget, Permit},
     framing::{Decoder, Frame, Role},
-    Flow, MessageLimits, Transport, WriteLimits,
 };
 use crate::message::Message;
 
@@ -327,11 +327,7 @@ impl Writer {
             return Err(SendError::Closed);
         }
         self.0.capacity.acquire(bytes).ok_or_else(|| {
-            if self.is_closed() {
-                SendError::Closed
-            } else {
-                SendError::Full
-            }
+            if self.is_closed() { SendError::Closed } else { SendError::Full }
         })
     }
 
@@ -1518,9 +1514,11 @@ mod tests {
                 writer.submit(Bytes::from_static(b"done")).unwrap();
             let next = Arc::new(SendNext(writer, AtomicBool::new(false)));
             let waker: Waker = next.clone().into();
-            assert!(std::pin::Pin::new(&mut receipt)
-                .poll(&mut Context::from_waker(&waker))
-                .is_pending());
+            assert!(
+                std::pin::Pin::new(&mut receipt)
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
             let mut batch = Queue {
                 items: vec![pending.try_recv().unwrap()],
                 remaining: 4,

@@ -6,9 +6,9 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use criterion::Criterion;
 use signa::{
-    bench::{tcp, udp, Flow, Transport},
-    transport::WriteLimits,
     Message,
+    bench::{Flow, Transport, tcp, udp},
+    transport::WriteLimits,
 };
 use tokio::{runtime, sync::mpsc};
 

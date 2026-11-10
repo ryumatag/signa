@@ -5,13 +5,13 @@ Client transaction submission, cancellation and bounded response observation.
 use std::{
     collections::VecDeque,
     error, fmt,
-    future::{poll_fn, Future},
+    future::{Future, poll_fn},
     hash::{Hash, Hasher},
     io,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll, Waker},
 };
@@ -20,21 +20,21 @@ use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 
 use super::{
-    admission, builder::Reception, driver::Command, table::Id, Endpoint, Error,
+    Endpoint, Error, admission, builder::Reception, driver::Command, table::Id,
 };
 use crate::{
     message::{
+        Method, Uri,
         header::{
-            address, cseq::CSeq, HeaderName, HeaderValue, CALL_ID, CSEQ, FROM,
-            TO,
+            CALL_ID, CSEQ, FROM, HeaderName, HeaderValue, TO, address,
+            cseq::CSeq,
         },
         request::Request,
         response::Response,
-        Method, Uri,
     },
     transport::{
-        budget::{Budget, Permit},
         Flow, Transport, WriteLimits,
+        budget::{Budget, Permit},
     },
 };
 
@@ -1194,12 +1194,14 @@ mod tests {
                     responses.next().await.unwrap().unwrap().status().as_u16(),
                     100
                 );
-                assert!(responses
-                    .next()
-                    .await
-                    .unwrap()
-                    .unwrap_err()
-                    .is_delivery_overflow());
+                assert!(
+                    responses
+                        .next()
+                        .await
+                        .unwrap()
+                        .unwrap_err()
+                        .is_delivery_overflow()
+                );
                 assert!(responses.next().await.is_none());
                 assert!(responses.next().await.is_none());
             }
@@ -1218,12 +1220,14 @@ mod tests {
 
             let (other, mut overflow) = stream(limits, budget.clone());
             other.send(Ok(response(200)));
-            assert!(overflow
-                .next()
-                .await
-                .unwrap()
-                .unwrap_err()
-                .is_delivery_overflow());
+            assert!(
+                overflow
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .is_delivery_overflow()
+            );
 
             assert!(responses.next().await.unwrap().is_ok());
             assert!(budget.is_idle());

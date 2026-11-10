@@ -11,7 +11,7 @@ A low-level SIP library for Rust that handles transactions, down to the last ret
 '''
 keywords = ["sip", "rfc3261", "voip", "telephony"]
 categories = ["network-programming"]
-edition = "2021"
+edition = "2024"
 rust-version = "1.85"
 include = [
   "/src/**/*.rs",

@@ -20,8 +20,8 @@ use std::{io, time::Instant};
 use bytes::Bytes;
 
 use super::{
-    has_identity, increment, send_on, Cancel, ClientEntry, ClientMachine,
-    Driver, Link, Pending, ServerMachine,
+    Cancel, ClientEntry, ClientMachine, Driver, Link, Pending, ServerMachine,
+    has_identity, increment, send_on,
 };
 use crate::{
     endpoint::{
@@ -32,7 +32,7 @@ use crate::{
     },
     message::{request::Request, response::Response},
     transaction::{invite, key::ServerKey},
-    transport::{tcp, Flow},
+    transport::{Flow, tcp},
 };
 
 impl Driver {

@@ -64,16 +64,16 @@ use std::{
 
 use bytes::Bytes;
 use signa::{
+    Method, Request, Response,
     endpoint::{
         CancelOutcome, ClientControl, Endpoint, Responses, ShutdownOutcome,
         Target, ViaMode,
     },
     message::header::{
-        HeaderName, HeaderValue, CALL_ID, CONTACT, CSEQ, FROM, TO, VIA,
+        CALL_ID, CONTACT, CSEQ, FROM, HeaderName, HeaderValue, TO, VIA,
     },
     transaction::Timers,
     transport::Transport,
-    Method, Request, Response,
 };
 use tokio::{net::UdpSocket, task::JoinHandle, time::timeout};
 

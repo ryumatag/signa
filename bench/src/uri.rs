@@ -40,14 +40,22 @@ pub(super) fn structured(c: &mut Criterion) {
         ("typical", "sip:bob@biloxi.example.com"),
         ("ipv6", "sips:bob@[2001:db8::1]:5061"),
         ("userinfo", "sip:alice;phone?work:secret%3a@example.com"),
-        ("long", "sip:bob@biloxi.example.com:5060;transport=tcp;lr;maddr=192.0.2.1?Subject=lunch&Priority=urgent"),
+        (
+            "long",
+            "sip:bob@biloxi.example.com:5060;transport=tcp;lr;maddr=192.0.2.1?Subject=lunch&Priority=urgent",
+        ),
     ] {
-        benchmark(c, format!("parse/sip_uri/{variant}"), input.len() as u64, |b| {
-            b.iter(|| {
-                let uri = SipUri::parse(bb(input)).unwrap();
-                assert_eq!(bb(uri).as_str(), input);
-            });
-        });
+        benchmark(
+            c,
+            format!("parse/sip_uri/{variant}"),
+            input.len() as u64,
+            |b| {
+                b.iter(|| {
+                    let uri = SipUri::parse(bb(input)).unwrap();
+                    assert_eq!(bb(uri).as_str(), input);
+                });
+            },
+        );
     }
 
     let input = "sip:example.com;transport=tcp;lr;%6daddr=192.0.2.1?Subject=lunch&Priority=urgent";

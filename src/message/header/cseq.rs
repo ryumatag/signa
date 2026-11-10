@@ -7,7 +7,7 @@
 
 use siparse::scan;
 
-use crate::message::{header::value::HeaderValue, Method};
+use crate::message::{Method, header::value::HeaderValue};
 
 /// A parsed `CSeq` value.
 #[derive(Clone, Debug, PartialEq, Eq)]

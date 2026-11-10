@@ -5,7 +5,7 @@ use std::{
     num::ParseIntError,
 };
 
-use super::component::{hex, Component};
+use super::component::{Component, hex};
 
 /// A SIP URI scheme. Recognizing SIPS does not enable a secure transport.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -282,11 +282,7 @@ impl<'a> SipUri<'a> {
     /// validated using RFC 5954's grammar. No name resolution is performed.
     pub fn host(&self) -> &'a str {
         let raw = &self.src[self.host_start..self.host_end];
-        if raw.starts_with('[') {
-            &raw[1..raw.len() - 1]
-        } else {
-            raw
-        }
+        if raw.starts_with('[') { &raw[1..raw.len() - 1] } else { raw }
     }
 
     /// Returns the original explicit port digits, or `None` when omitted.
@@ -766,8 +762,10 @@ mod tests {
                     "{byte:#x}"
                 );
                 if allowed(byte) {
-                    assert!(SipUri::parse(std::str::from_utf8(&src).unwrap())
-                        .is_ok());
+                    assert!(
+                        SipUri::parse(std::str::from_utf8(&src).unwrap())
+                            .is_ok()
+                    );
                 }
             }
         }

@@ -20,16 +20,16 @@ is sufficient. A count reserved while the byte reservation fails is rolled back.
 */
 
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use bytes::Bytes;
 
 use super::Error;
 use crate::{
-    message::header::{CALL_ID, CSEQ, FROM, MAX_FORWARDS, ROUTE, TO},
     Request,
+    message::header::{CALL_ID, CSEQ, FROM, MAX_FORWARDS, ROUTE, TO},
 };
 
 #[derive(Clone, Debug)]
@@ -280,9 +280,9 @@ mod tests {
         let counter = AtomicUsize::new(usize::MAX - 1);
         assert!(reserve(&counter, 2, usize::MAX).unwrap_err().is_busy());
         assert_eq!(counter.load(Ordering::Relaxed), usize::MAX - 1);
-        assert!(ClientAdmission::new(0, usize::MAX)
-            .acquire(&request())
-            .is_err());
+        assert!(
+            ClientAdmission::new(0, usize::MAX).acquire(&request()).is_err()
+        );
         assert!(ClientAdmission::new(1, 0).acquire(&request()).is_err());
     }
 

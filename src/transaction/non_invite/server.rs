@@ -8,10 +8,10 @@ use bytes::Bytes;
 
 use crate::{
     message::{
+        StatusCode,
         header::HeaderMap,
         request::Request,
         response::{bare_response, reply_headers},
-        StatusCode,
     },
     transaction::Timers,
 };
@@ -355,9 +355,15 @@ mod tests {
             rows,
             [
                 ("Via", "SIP/2.0/UDP proxy.example.com;branch=z9hG4bKnashds8"),
-                ("Via", "SIP/2.0/UDP pc33.atlanta.example.com;branch=z9hG4bKhjhs8ass877"),
+                (
+                    "Via",
+                    "SIP/2.0/UDP pc33.atlanta.example.com;branch=z9hG4bKhjhs8ass877"
+                ),
                 ("To", "<sip:carol@chicago.example.com>"),
-                ("From", "Alice <sip:alice@atlanta.example.com>;tag=1928301774"),
+                (
+                    "From",
+                    "Alice <sip:alice@atlanta.example.com>;tag=1928301774"
+                ),
                 ("Call-ID", "a84b4c76e66710"),
                 ("CSeq", "63104 OPTIONS"),
                 ("Content-Length", "0"),

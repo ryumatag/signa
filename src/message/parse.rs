@@ -15,11 +15,11 @@ use siparse::{
 };
 
 use crate::message::{
+    Message, Method, ReasonPhrase, StatusCode, Uri,
     error::{InvalidMessage, InvalidMessageKind},
-    header::{HeaderMap, HeaderName, HeaderValue, CONTENT_LENGTH},
+    header::{CONTENT_LENGTH, HeaderMap, HeaderName, HeaderValue},
     request::{self, Request},
     response::{self, Response},
-    Message, Method, ReasonPhrase, StatusCode, Uri,
 };
 
 /// The most header rows a message can have.
@@ -228,7 +228,9 @@ fn body(
     let rest = src.len() - head_end;
     let len = match content_length(headers)? {
         Some(len) if len > rest => {
-            return Err(InvalidMessage::new(InvalidMessageKind::TruncatedBody))
+            return Err(InvalidMessage::new(
+                InvalidMessageKind::TruncatedBody,
+            ));
         }
         Some(len) => len,
         None => rest,

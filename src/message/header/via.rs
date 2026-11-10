@@ -233,8 +233,7 @@ mod tests {
 
     #[test]
     fn parses_every_parameter_signa_reads() {
-        const VALUE: &str =
-            "SIP/2.0/TCP 192.0.2.4:5061;ttl=16;maddr=224.2.0.1\
+        const VALUE: &str = "SIP/2.0/TCP 192.0.2.4:5061;ttl=16;maddr=224.2.0.1\
                      ;received=192.0.2.207;rport=49154;branch=z9hG4bKa;x=1";
         assert_eq!(
             top!(VALUE),

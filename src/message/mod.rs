@@ -25,7 +25,7 @@ pub use self::{
     header::{HeaderMap, HeaderName, HeaderValue},
     request::Request,
     response::Response,
-    start_line::{uri, Method, ReasonPhrase, StatusCode, Uri, Version},
+    start_line::{Method, ReasonPhrase, StatusCode, Uri, Version, uri},
 };
 
 mod byte_str;
@@ -403,9 +403,11 @@ mod tests {
             .reason("Maintenance until 05:00")
             .body(Bytes::new())
             .unwrap();
-        assert!(response
-            .to_bytes()
-            .starts_with(b"SIP/2.0 503 Maintenance until 05:00\r\n"));
+        assert!(
+            response
+                .to_bytes()
+                .starts_with(b"SIP/2.0 503 Maintenance until 05:00\r\n")
+        );
 
         // An extension code has no canonical reason.
         let response =

@@ -8,8 +8,8 @@ batching and partial writes, and returns both quotas on completion or teardown.
 */
 
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 
 use super::WriteLimits;

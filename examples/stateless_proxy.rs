@@ -70,16 +70,16 @@ use std::{error::Error, net::SocketAddr, time::Duration};
 
 use bytes::Bytes;
 use signa::{
+    Request, Response,
     endpoint::{
         Branch, Endpoint, Incoming, IncomingEvent, Reception, ServerEvent,
         Target, ViaMode,
     },
     message::header::{
-        HeaderMap, HeaderValue, Tag, CSEQ, MAX_FORWARDS, TO, VIA,
+        CSEQ, HeaderMap, HeaderValue, MAX_FORWARDS, TO, Tag, VIA,
     },
     transaction::Timers,
     transport::Transport,
-    Request, Response,
 };
 use tokio::{net::UdpSocket, time::timeout};
 

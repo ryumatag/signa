@@ -4,7 +4,7 @@ SIP header field names, values, and the map that holds them.
 
 pub use self::{
     map::{AsHeaderName, GetAll, HeaderMap, IntoIter, Iter},
-    name::{konst::*, HeaderName},
+    name::{HeaderName, konst::*},
     tag::Tag,
     value::{HeaderValue, ValueLines},
 };

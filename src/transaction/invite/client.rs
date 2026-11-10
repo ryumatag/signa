@@ -4,13 +4,13 @@ use bytes::Bytes;
 
 use crate::{
     message::{
+        Method,
         header::{
-            cseq::CSeq, via::Via, HeaderName, HeaderValue, CALL_ID, CSEQ,
-            FROM, MAX_FORWARDS, ROUTE, TO, VIA,
+            CALL_ID, CSEQ, FROM, HeaderName, HeaderValue, MAX_FORWARDS, ROUTE,
+            TO, VIA, cseq::CSeq, via::Via,
         },
         request::{self, Request},
         response::Response,
-        Method,
     },
     transaction::Timers,
 };
@@ -406,7 +406,7 @@ fn template(
 mod tests {
     use std::time::Duration;
 
-    use super::super::tests::{request, response, T1, TIMERS};
+    use super::super::tests::{T1, TIMERS, request, response};
     use super::ClientEvent as C;
     use super::*;
     use crate::message::header::CONTENT_TYPE;

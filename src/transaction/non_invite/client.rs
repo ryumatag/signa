@@ -183,7 +183,7 @@ impl ClientTransaction {
                 (e, f)
             }
             State::Completed { .. } | State::Terminated => {
-                return ClientEvent::None
+                return ClientEvent::None;
             }
         };
 

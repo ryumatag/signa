@@ -75,18 +75,18 @@ use std::{
 
 use bytes::Bytes;
 use signa::{
+    Method, Request, Response,
     endpoint::{
         self, CancelOutcome, ClientControl, Endpoint, Incoming, IncomingEvent,
         Responder, Responses, ServerEvent, ServerTransactionId,
         ShutdownOutcome, SubmitError, Target, ViaMode,
     },
     message::header::{
-        HeaderMap, HeaderValue, Tag, CALL_ID, CONTACT, CSEQ, FROM,
-        MAX_FORWARDS, TO, VIA,
+        CALL_ID, CONTACT, CSEQ, FROM, HeaderMap, HeaderValue, MAX_FORWARDS,
+        TO, Tag, VIA,
     },
     transaction::Timers,
     transport::Transport,
-    Method, Request, Response,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -389,11 +389,7 @@ fn better(
         let code = response.status().as_u16();
         (code < 600, code)
     };
-    if rank(&new) < rank(&best) {
-        new
-    } else {
-        best
-    }
+    if rank(&new) < rank(&best) { new } else { best }
 }
 
 /// A response the proxy makes itself, with a To tag of its own.

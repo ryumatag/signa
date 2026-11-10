@@ -25,7 +25,7 @@ use std::{
     future::poll_fn,
     io,
     net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6},
-    task::{ready, Context, Poll},
+    task::{Context, Poll, ready},
 };
 
 use bytes::{Bytes, BytesMut};

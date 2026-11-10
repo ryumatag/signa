@@ -3,16 +3,16 @@ use std::{hint::black_box as bb, time::Instant};
 use bytes::Bytes;
 use criterion::{BatchSize, Criterion};
 use signa::{
+    Request, Response,
     bench::{
+        ClientEvent, ClientKey, ClientTransaction, ServerKey,
+        ServerTransaction, Timers,
         invite::{
             ClientEvent as InviteEvent, ClientTransaction as InviteClient,
             ServerEvent as InviteServerEvent,
             ServerTransaction as InviteServer,
         },
-        ClientEvent, ClientKey, ClientTransaction, ServerKey,
-        ServerTransaction, Timers,
     },
-    Request, Response,
 };
 
 use crate::{

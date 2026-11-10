@@ -9,10 +9,10 @@ use std::fmt;
 use bytes::{Bytes, BytesMut};
 
 use crate::message::{
+    Method, Uri, Version,
     error::{BuildError, InvalidMessage},
     extensions::Extensions,
     header::{HeaderMap, HeaderName, HeaderValue},
-    Method, Uri, Version,
 };
 
 /// A SIP request: a request-line, header fields, and a body.
@@ -486,7 +486,7 @@ impl Default for Builder {
 
 #[cfg(test)]
 mod tests {
-    use crate::message::header::{HeaderValue, CSEQ, VIA};
+    use crate::message::header::{CSEQ, HeaderValue, VIA};
 
     use super::*;
 

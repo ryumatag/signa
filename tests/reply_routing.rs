@@ -12,9 +12,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use signa::{
+    Request, Response,
     endpoint::{Endpoint, Incoming, IncomingEvent, ServerRequest},
     message::header::Tag,
-    Request, Response,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},

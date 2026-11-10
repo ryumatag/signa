@@ -8,8 +8,8 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
     },
     task::{Context, Poll},
     time::{Duration, Instant},
@@ -17,7 +17,7 @@ use std::{
 
 use tokio::sync::{mpsc, watch};
 
-use super::{driver::Command, Error};
+use super::{Error, driver::Command};
 
 /// How an endpoint stopped, as [`Shutdown`] reports it.
 ///

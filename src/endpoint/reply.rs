@@ -5,24 +5,24 @@ One-shot responses on an endpoint-issued reply capability.
 use std::{error, fmt, io, sync::Arc};
 
 use bytes::Bytes;
-use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 use super::{
-    driver::Command, routing::Link, send::SentRequest, server, Error,
+    Error, driver::Command, routing::Link, send::SentRequest, server,
 };
 use crate::{
     message::{
+        Method,
         header::{
-            address::has_tag, HeaderMap, HeaderValue, CALL_ID, CSEQ, FROM, TO,
-            VIA,
+            CALL_ID, CSEQ, FROM, HeaderMap, HeaderValue, TO, VIA,
+            address::has_tag,
         },
         request::Request,
         response::Response,
-        Method,
     },
     transport::{
-        budget::{Budget, Permit},
         Flow,
+        budget::{Budget, Permit},
     },
 };
 
@@ -519,7 +519,7 @@ mod tests {
     #[test]
     fn enqueue_drops_the_original_response_before_waiting_for_io() {
         use std::{
-            future::{poll_fn, Future},
+            future::{Future, poll_fn},
             sync::atomic::{AtomicBool, Ordering},
             task::Poll,
         };
@@ -568,7 +568,7 @@ mod tests {
     fn shared_reply_bytes_remain_charged_after_the_future_is_dropped() {
         use crate::transport::WriteLimits;
         use std::{
-            future::{poll_fn, Future},
+            future::{Future, poll_fn},
             task::Poll,
         };
 
@@ -635,7 +635,7 @@ mod tests {
     fn oversized_reply_returns_busy_without_consuming_the_operation_slot() {
         use crate::transport::WriteLimits;
         use std::{
-            future::{poll_fn, Future},
+            future::{Future, poll_fn},
             task::Poll,
         };
 

@@ -12,8 +12,8 @@ use std::{
     io,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
 };
@@ -25,8 +25,8 @@ use super::{driver::Command, reply::ReplyRoute, table::Id};
 use crate::{
     message::{Method, Request, Response},
     transport::{
-        budget::{Budget, Permit},
         Flow,
+        budget::{Budget, Permit},
     },
 };
 
@@ -981,8 +981,8 @@ mod integration {
     use super::*;
     use crate::{
         endpoint::{
-            tests::{route_request, route_response},
             Builder, Endpoint, ShutdownOutcome,
+            tests::{route_request, route_response},
         },
         message::header::{HeaderValue, TO, VIA},
         transport::WriteLimits,
@@ -1041,11 +1041,13 @@ mod integration {
             udp(Endpoint::builder().max_pending_requests(1)).await;
         send(&peer, &endpoint, "first").await;
         let envelope = request(&mut incoming).await;
-        assert!(envelope
-            .request
-            .extensions()
-            .get::<crate::transport::Flow>()
-            .is_none());
+        assert!(
+            envelope
+                .request
+                .extensions()
+                .get::<crate::transport::Flow>()
+                .is_none()
+        );
         let (responder, _events) = envelope.transaction.into_parts();
 
         send(&peer, &endpoint, "second").await;
@@ -1103,9 +1105,11 @@ mod integration {
 
         assert_eq!(response(&peer).await.status().as_u16(), 200);
         let mut bytes = [0; 8192];
-        assert!(timeout(Duration::from_millis(20), peer.recv(&mut bytes))
-            .await
-            .is_err());
+        assert!(
+            timeout(Duration::from_millis(20), peer.recv(&mut bytes))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1146,8 +1150,8 @@ mod integration {
     }
 
     #[tokio::test]
-    async fn accepted_io_failure_precedes_termination_and_retains_operation_id(
-    ) {
+    async fn accepted_io_failure_precedes_termination_and_retains_operation_id()
+     {
         let (endpoint, mut incoming, peer) = udp(Endpoint::builder()).await;
         send(&peer, &endpoint, "io-failure").await;
         let envelope = request(&mut incoming).await;
@@ -1187,9 +1191,9 @@ mod integration {
             responder.respond(route_response(&envelope.request)).await,
             Err(SubmitError::TransportBusy)
         );
-        assert!(timeout(Duration::from_millis(10), events.next())
-            .await
-            .is_err());
+        assert!(
+            timeout(Duration::from_millis(10), events.next()).await.is_err()
+        );
         drop(responder);
 
         assert!(matches!(
@@ -1231,9 +1235,9 @@ mod integration {
             observe(&mut events).await,
             Some(ServerEvent::OutputRejected { operation: None })
         ));
-        assert!(timeout(Duration::from_millis(20), incoming.recv())
-            .await
-            .is_err());
+        assert!(
+            timeout(Duration::from_millis(20), incoming.recv()).await.is_err()
+        );
         assert_eq!(
             responder.respond(route_response(&envelope.request)).await,
             Err(SubmitError::TransportBusy)
@@ -1296,9 +1300,11 @@ mod integration {
         }
 
         let mut bytes = [0; 4096];
-        assert!(timeout(Duration::from_millis(20), peer.recv(&mut bytes))
-            .await
-            .is_err());
+        assert!(
+            timeout(Duration::from_millis(20), peer.recv(&mut bytes))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1394,9 +1400,9 @@ mod integration {
             .unwrap();
 
         assert_eq!(response(&peer).await.status().as_u16(), 400);
-        assert!(timeout(Duration::from_millis(20), incoming.recv())
-            .await
-            .is_err());
+        assert!(
+            timeout(Duration::from_millis(20), incoming.recv()).await.is_err()
+        );
         let mut repeated = route_request(&via);
         repeated
             .headers_mut()
@@ -1431,12 +1437,14 @@ mod integration {
         .unwrap();
 
         let mut bytes = [0; 4096];
-        assert!(timeout(Duration::from_millis(20), peer.recv(&mut bytes))
-            .await
-            .is_err());
-        assert!(timeout(Duration::from_millis(1), incoming.recv())
-            .await
-            .is_err());
+        assert!(
+            timeout(Duration::from_millis(20), peer.recv(&mut bytes))
+                .await
+                .is_err()
+        );
+        assert!(
+            timeout(Duration::from_millis(1), incoming.recv()).await.is_err()
+        );
     }
 
     async fn tcp_response(stream: &mut TcpStream) -> Response<Bytes> {

@@ -26,8 +26,8 @@ use std::{
 
 use super::Error;
 use crate::{
-    message::header::{via::Via, HeaderValue, VIA},
-    transport::{tcp, Flow, Transport},
+    message::header::{HeaderValue, VIA, via::Via},
+    transport::{Flow, Transport, tcp},
 };
 
 /// The port `sent-by` means when it names none (RFC 3261 section 18.2.2).

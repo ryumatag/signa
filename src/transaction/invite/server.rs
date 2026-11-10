@@ -7,10 +7,10 @@ use bytes::Bytes;
 
 use crate::{
     message::{
+        StatusCode,
         header::HeaderMap,
         request::Request,
         response::{bare_response, reply_headers},
-        StatusCode,
     },
     transaction::Timers,
 };
@@ -271,7 +271,7 @@ impl ServerTransaction {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{request, response, T1, TIMERS};
+    use super::super::tests::{T1, TIMERS, request, response};
     use super::ServerEvent as S;
     use super::*;
     use crate::message::Response;
@@ -509,37 +509,51 @@ mod tests {
             let deadline = tx.deadline();
 
             for code in [100, 180, 300, 486, 699] {
-                assert!(tx
-                    .on_response(
+                assert!(
+                    tx.on_response(
                         StatusCode::from_u16(code).unwrap(),
                         Bytes::new(),
                         &TIMERS,
                         start
                     )
-                    .is_err());
+                    .is_err()
+                );
                 assert_eq!(tx.deadline(), deadline);
             }
 
             if initial == 486 {
-                assert!(tx
-                    .on_response(StatusCode::OK, Bytes::new(), &TIMERS, start)
-                    .is_err());
+                assert!(
+                    tx.on_response(
+                        StatusCode::OK,
+                        Bytes::new(),
+                        &TIMERS,
+                        start
+                    )
+                    .is_err()
+                );
                 tx.on_ack(&TIMERS, start);
-                assert!(tx
-                    .on_response(StatusCode::OK, Bytes::new(), &TIMERS, start)
-                    .is_err());
+                assert!(
+                    tx.on_response(
+                        StatusCode::OK,
+                        Bytes::new(),
+                        &TIMERS,
+                        start
+                    )
+                    .is_err()
+                );
             }
 
             tx.on_timeout(&TIMERS, start + 64 * T1);
 
-            assert!(tx
-                .on_response(
+            assert!(
+                tx.on_response(
                     StatusCode::OK,
                     Bytes::new(),
                     &TIMERS,
                     start + 64 * T1
                 )
-                .is_err());
+                .is_err()
+            );
         }
     }
 }

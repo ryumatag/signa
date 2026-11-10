@@ -17,9 +17,9 @@ use bytes::Bytes;
 use tokio::sync::oneshot;
 
 use super::{
-    identity_bytes, now, send_client, send_on, Cancel, CancelStart,
-    ClientEntry, ClientMachine, Driver, Key, Link, Pending, ServerMachine,
-    SERVICE_UNAVAILABLE,
+    Cancel, CancelStart, ClientEntry, ClientMachine, Driver, Key, Link,
+    Pending, SERVICE_UNAVAILABLE, ServerMachine, identity_bytes, now,
+    send_client, send_on,
 };
 use crate::{
     endpoint::{

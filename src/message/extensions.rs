@@ -5,7 +5,7 @@ Adapted from the `Extensions` type in the `http` crate.
 */
 
 use std::{
-    any::{type_name, Any, TypeId},
+    any::{Any, TypeId, type_name},
     collections::HashMap,
     fmt,
     hash::{BuildHasherDefault, Hasher},

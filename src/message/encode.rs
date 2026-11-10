@@ -8,7 +8,7 @@ out cannot fail.
 use bytes::{BufMut, BytesMut};
 
 use crate::message::{
-    header::{HeaderMap, CONTENT_LENGTH},
+    header::{CONTENT_LENGTH, HeaderMap},
     request::Request,
     response::Response,
 };

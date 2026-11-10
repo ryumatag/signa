@@ -37,11 +37,11 @@ use std::{
 
 use bytes::Bytes;
 use signa::{
+    Request, Response, StatusCode,
     endpoint::{Endpoint, IncomingEvent, Target, ViaMode},
     message::header::{CALL_ID, FROM, TO},
     transaction::Timers,
     transport::{Transport, WriteLimits},
-    Request, Response, StatusCode,
 };
 
 const LOCALHOST: SocketAddr =

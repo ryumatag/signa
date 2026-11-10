@@ -18,13 +18,13 @@ use bytes::Bytes;
 use tokio::sync::oneshot;
 
 use super::{
-    builder::Reception, client::Target, driver::Command, reply::Completion,
-    routing::forward_destination, Endpoint, Error,
+    Endpoint, Error, builder::Reception, client::Target, driver::Command,
+    reply::Completion, routing::forward_destination,
 };
 use crate::{
     message::{
-        header::{cseq::CSeq, via::Via, HeaderValue, CSEQ, VIA},
         Request, Response,
+        header::{CSEQ, HeaderValue, VIA, cseq::CSeq, via::Via},
     },
     transport::{Flow, Transport},
 };
@@ -142,11 +142,7 @@ impl FromStr for Branch {
             && src.len() <= MAX_BRANCH
             && src.starts_with(COOKIE)
             && matches!(siparse::scan::token(src), Some((_, "")));
-        if valid {
-            Ok(Branch(src.into()))
-        } else {
-            Err(InvalidBranch(()))
-        }
+        if valid { Ok(Branch(src.into())) } else { Err(InvalidBranch(())) }
     }
 }
 

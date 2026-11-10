@@ -1,5 +1,5 @@
 use std::{
-    collections::{hash_map::DefaultHasher, HashMap},
+    collections::{HashMap, hash_map::DefaultHasher},
     convert::Infallible,
     future::{self, Future},
     hash::{Hash, Hasher},
@@ -13,15 +13,15 @@ use std::{
 use bytes::Bytes;
 use criterion::Criterion;
 use signa::{
-    bench::{reply_driver, tcp, udp, Flow},
+    Request, Response, StatusCode,
+    bench::{Flow, reply_driver, tcp, udp},
     endpoint::{
         Branch, Builder, CancelOutcome, Endpoint, Error, Incoming,
         IncomingEvent, Reception, ReplyRoute, Responder, Target, ViaMode,
     },
-    message::header::{HeaderValue, CSEQ, VIA},
+    message::header::{CSEQ, HeaderValue, VIA},
     transaction::Timers,
     transport::Transport,
-    Request, Response, StatusCode,
 };
 use tokio::runtime;
 use tower_service::Service;
@@ -744,7 +744,7 @@ async fn reply_route_fixture(
 pub(super) fn client_admission(c: &mut Criterion) {
     use std::{
         future::Future,
-        pin::{pin, Pin},
+        pin::{Pin, pin},
         task::Waker,
     };
 

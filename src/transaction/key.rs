@@ -7,10 +7,10 @@ use std::hash::{Hash, Hasher};
 use bytes::Bytes;
 
 use crate::message::{
-    header::{cseq::CSeq, via::Via, CSEQ, VIA},
+    Method,
+    header::{CSEQ, VIA, cseq::CSeq, via::Via},
     request::Request,
     response::Response,
-    Method,
 };
 
 /// The magic cookie that starts every branch an RFC 3261 element makes.
@@ -328,7 +328,10 @@ mod tests {
             "SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP a.example.com;branch=z9hG4bK1\r\nCSeq: x\r\n",
             "SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP a.example.com;branch=1\r\nCSeq: 1 OPTIONS\r\n",
         ] {
-            assert!(ClientKey::from_response(&response(head)).is_none(), "{head:?}");
+            assert!(
+                ClientKey::from_response(&response(head)).is_none(),
+                "{head:?}"
+            );
         }
     }
 

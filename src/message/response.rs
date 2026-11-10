@@ -9,14 +9,14 @@ use std::fmt;
 use bytes::{Bytes, BytesMut};
 
 use crate::message::{
+    ReasonPhrase, StatusCode, Version,
     error::{BuildError, InvalidMessage},
     extensions::Extensions,
     header::{
-        address::has_tag, HeaderMap, HeaderName, HeaderValue, Tag, CALL_ID,
-        CSEQ, FROM, TO, VIA,
+        CALL_ID, CSEQ, FROM, HeaderMap, HeaderName, HeaderValue, TO, Tag, VIA,
+        address::has_tag,
     },
     request::Request,
-    ReasonPhrase, StatusCode, Version,
 };
 
 /// A SIP response: a status-line, header fields, and a body.

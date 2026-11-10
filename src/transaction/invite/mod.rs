@@ -26,8 +26,8 @@ mod server;
 mod tests {
 
     use crate::message::{
-        header::{HeaderValue, TO},
         Request, Response,
+        header::{HeaderValue, TO},
     };
     use bytes::Bytes;
     use std::time::Duration;

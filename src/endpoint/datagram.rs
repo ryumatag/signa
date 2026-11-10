@@ -17,7 +17,7 @@ use super::{
     reply::{Completion, ReplyError},
     server::{Shared, WriteObservation},
 };
-use crate::transport::{udp, Flow, WriteLimits};
+use crate::transport::{Flow, WriteLimits, udp};
 
 /// The UDP socket, its read buffer, and the datagrams waiting for it to be
 /// writable.
@@ -295,14 +295,14 @@ impl Datagram {
 #[cfg(all(test, not(miri)))]
 mod tests {
     use std::{
-        future::{poll_fn, Future},
+        future::{Future, poll_fn},
         sync::Arc,
         time::Duration,
     };
 
     use tokio::{
         net::UdpSocket,
-        sync::{mpsc, Semaphore},
+        sync::{Semaphore, mpsc},
         time::timeout,
     };
 
@@ -313,7 +313,7 @@ mod tests {
             driver::Command,
             reply::ReplyRoute,
             tests::{
-                route_request, route_response, udp_reply_link, REPLY_LOCAL,
+                REPLY_LOCAL, route_request, route_response, udp_reply_link,
             },
         },
         message::response::Response,

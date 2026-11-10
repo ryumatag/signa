@@ -83,21 +83,21 @@ use std::{
 
 use bytes::Bytes;
 use signa::{
+    Method, Request, Response,
     endpoint::{
         Endpoint, Incoming, IncomingEvent, ReplyError, ReplyRoute, Responder,
         Responses, ServerEvent, ServerEvents, ServerTransactionId,
         ShutdownOutcome, Target, ViaMode,
     },
     message::header::{
-        HeaderMap, HeaderValue, Tag, CALL_ID, CONTACT, CSEQ, FROM, TO, VIA,
+        CALL_ID, CONTACT, CSEQ, FROM, HeaderMap, HeaderValue, TO, Tag, VIA,
     },
     transaction::Timers,
     transport::Transport,
-    Method, Request, Response,
 };
 use tokio::{
     sync::oneshot,
-    time::{sleep, sleep_until, timeout, Instant},
+    time::{Instant, sleep, sleep_until, timeout},
 };
 
 type BoxError = Box<dyn Error + Send + Sync>;

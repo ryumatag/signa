@@ -37,37 +37,37 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
     fmt,
-    future::{pending, poll_fn, Future},
+    future::{Future, pending, poll_fn},
     mem,
     net::SocketAddr,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    task::{ready, Context, Poll, Waker},
+    task::{Context, Poll, Waker, ready},
     time::Duration,
 };
 
 use bytes::Bytes;
 use signa::{
+    Request, Response,
     endpoint::{
         Endpoint, Incoming, IncomingEvent, ReceivedAck, ReceivedRequest,
         ReplyRoute, Responder, ResponseSubmission, ServerEvent, ServerEvents,
         ServerRequest, ServerTransactionId, ShutdownOutcome, SubmitError,
     },
-    message::header::{Tag, CALL_ID, CSEQ},
+    message::header::{CALL_ID, CSEQ, Tag},
     transaction::Timers,
     transport::Flow,
-    Request, Response,
 };
 use tokio::{
     net::UdpSocket,
-    sync::{mpsc, oneshot, Notify},
+    sync::{Notify, mpsc, oneshot},
     task::{JoinHandle, JoinSet},
-    time::{sleep, timeout, Instant},
+    time::{Instant, sleep, timeout},
 };
-use tower::{layer::util::Identity, Layer, Service, ServiceBuilder};
+use tower::{Layer, Service, ServiceBuilder, layer::util::Identity};
 
 // The adapter, as an external crate would write it.
 
@@ -928,9 +928,11 @@ async fn wrappers_see_every_submission_and_no_protocol_output() {
 
     // The handler has returned, and the transaction is still in Accepted
     // until Timer L.
-    assert!(timeout(Duration::from_millis(200), observe_end(events))
-        .await
-        .is_err());
+    assert!(
+        timeout(Duration::from_millis(200), observe_end(events))
+            .await
+            .is_err()
+    );
     let outcome = harness.endpoint.shutdown(Duration::from_secs(10)).await;
     assert_eq!(outcome, ShutdownOutcome::Drained);
     let stats = dispatching.await.unwrap();

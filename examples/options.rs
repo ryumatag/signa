@@ -46,6 +46,7 @@ use std::{env, error::Error, time::Duration};
 
 use bytes::Bytes;
 use signa::{
+    Request, Response,
     endpoint::{
         Endpoint, IncomingEvent, ServerEvent, ServerTransaction,
         ShutdownOutcome, SubmitError, Target,
@@ -53,7 +54,6 @@ use signa::{
     message::header::Tag,
     transaction::Timers,
     transport::{Flow, Transport},
-    Request, Response,
 };
 
 type BoxError = Box<dyn Error + Send + Sync>;
