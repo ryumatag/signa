@@ -101,6 +101,8 @@ pub struct Config<R = StaticResolver> {
     pending_invites: usize,
     attempts: usize,
     dialogs: usize,
+    forks: usize,
+    cleanups: usize,
     routes: usize,
     jobs: usize,
     resolve_timeout: Duration,
@@ -155,6 +157,8 @@ impl Config {
             pending_invites: 256,
             attempts: 256,
             dialogs: 1024,
+            forks: 16,
+            cleanups: 64,
             routes: 16,
             jobs: 256,
             resolve_timeout: Duration::from_secs(4),
@@ -179,6 +183,8 @@ impl<R> Config<R> {
             pending_invites: self.pending_invites,
             attempts: self.attempts,
             dialogs: self.dialogs,
+            forks: self.forks,
+            cleanups: self.cleanups,
             routes: self.routes,
             jobs: self.jobs,
             resolve_timeout: self.resolve_timeout,
@@ -240,6 +246,30 @@ impl<R> Config<R> {
         self
     }
 
+    /// Sets how many dialogs the responses to one INVITE this UA sent may
+    /// form and the UA keep, early or confirmed, so that a forking proxy
+    /// cannot take the room of every other call. The default is 16.
+    ///
+    /// A 2xx beyond it forms no session. The UA acknowledges it and ends its
+    /// dialog with a BYE, as RFC 3261 section 13.2.2.4 asks of a dialog the
+    /// UAC does not want, and the attempt ends incomplete.
+    pub fn max_forks(mut self, limit: usize) -> Config<R> {
+        self.forks = bounded(limit);
+        self
+    }
+
+    /// Sets how many 2xx responses the UA may hold at once without a
+    /// session, to acknowledge them and end their dialogs with a BYE. Each
+    /// is held until no more copies of it can arrive. The default is 64.
+    ///
+    /// They have room of their own, apart from [`Config::max_dialogs`], so
+    /// that a fork the UA has no room for still gets its ACK and BYE. Beyond
+    /// this limit too, a 2xx gets neither, and the attempt ends degraded.
+    pub fn max_cleanups(mut self, limit: usize) -> Config<R> {
+        self.cleanups = bounded(limit);
+        self
+    }
+
     /// Sets how many URIs a dialog's route set may have. A request or
     /// response with more cannot form a dialog. The default is 16.
     pub fn max_routes(mut self, limit: usize) -> Config<R> {
@@ -293,6 +323,8 @@ impl<R> Config<R> {
             // A replay context outlives its dialog while copies of its 2xx
             // can arrive, so a dialog can leave one behind.
             replays: self.dialogs.saturating_mul(2),
+            forks: self.forks,
+            cleanups: self.cleanups,
             routes: self.routes,
             operations: self.operations,
             // The driver runs each command as it arrives.
@@ -785,9 +817,13 @@ pub enum Event {
         /// Whether every response the endpoint took for the INVITE reached
         /// the UA and was kept. It is `false` when the endpoint drops
         /// responses for want of room, and a fork's 2xx may be among them,
-        /// or when the UA could not keep a 2xx as a session, such as one
-        /// without a Contact.
+        /// or when the UA could not keep a dialog as a session, such as a
+        /// fork beyond [`Config::max_forks`] or a 2xx without a Contact.
         complete: bool,
+        /// Whether the UA left a 2xx without its ACK and BYE, since it had
+        /// no room even to end the dialog, beyond [`Config::max_cleanups`].
+        /// The peer then gives up on the ACK, and ends the dialog itself.
+        degraded: bool,
     },
     /// Notifications were dropped because the queue was full.
     #[non_exhaustive]
@@ -1024,15 +1060,24 @@ pub struct SessionSnapshot {
 }
 
 /// What an INVITE this UA sent has come to so far.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct AttemptSnapshot {
     /// Whether a 2xx came, or why none did, once the first final response
     /// or a failure of the transaction is in.
     pub result: Option<AttemptResult>,
     /// Whether every response the endpoint took for the INVITE so far
-    /// reached the UA.
+    /// reached the UA and became part of a session, as
+    /// [`Event::AttemptEnded`] says at the end.
     pub complete: bool,
+    /// Whether the UA left a 2xx without its ACK and BYE so far, as
+    /// [`Event::AttemptEnded`] says at the end.
+    pub degraded: bool,
+    /// The session of each dialog the responses formed that is still up,
+    /// early or confirmed, in the order they formed. Forks are sessions of
+    /// their own. None is preferred over another, and ending one ends no
+    /// other.
+    pub sessions: Vec<Session>,
 }
 
 /// The phase of a session.

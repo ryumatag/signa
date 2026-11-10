@@ -18,7 +18,7 @@ Every task belongs to one of two [`JoinSet`]s, so that dropping the driver
 aborts all of them. Jobs are bounded by the configuration. More wait in a
 backlog, which the model's own tables bound, since each job is for one of their
 records, and a record has at most one copy of its 2xx or its ACK on the way at
-a time. A job that writes to the network gives up after a while, so that a
+a time, and one BYE ever. A job that writes to the network gives up after a while, so that a
 peer that does not read holds no job for long. Response readers are one per
 attempt, which the attempt table bounds.
 */
@@ -207,6 +207,8 @@ enum Job {
     Refuse { responder: Arc<Responder>, response: Response<Bytes> },
     /// Resolve and send the INVITE of an attempt.
     Start { attempt: AttemptKey, request: Request<Bytes>, query: Query },
+    /// Resolve and send the BYE of a cleanup.
+    Bye { replay: ReplayKey, request: Request<Bytes>, query: Query },
     /// Resolve and send the ACK of a 2xx, or send it again to where it went,
     /// waiting no longer than `timeout` for the write.
     Ack {
@@ -244,6 +246,10 @@ enum Done {
     Started {
         attempt: AttemptKey,
         result: Result<ClientTransaction, Error>,
+    },
+    /// The BYE of a cleanup went to the endpoint, or could not.
+    Byed {
+        replay: ReplayKey,
     },
     /// `target` is where the ACK went, if it resolved, and `written`
     /// whether the endpoint wrote it in time.
@@ -585,9 +591,19 @@ impl<R: Resolve> Driver<R> {
                 let _ = reply.send(snapshot);
             }
             Command::AttemptSnapshot { attempt, reply } => {
-                let snapshot = self.model.attempt_state(attempt).map(
-                    |(result, complete)| AttemptSnapshot { result, complete },
-                );
+                let snapshot =
+                    self.model.attempt_state(attempt).map(|state| {
+                        AttemptSnapshot {
+                            result: state.result,
+                            complete: state.complete,
+                            degraded: state.degraded,
+                            sessions: state
+                                .sessions
+                                .into_iter()
+                                .map(Session::new)
+                                .collect(),
+                        }
+                    });
                 let _ = reply.send(snapshot);
             }
         }
@@ -635,6 +651,7 @@ impl<R: Resolve> Driver<R> {
                     Err(error) => self.model.invite_failed(key, error),
                 }
             }
+            Done::Byed { replay } => self.model.bye_done(replay),
             Done::Acked { replay, target, written } => {
                 // The replay context and its ACK may have gone while the job
                 // ran, and nothing is left to record then.
@@ -670,13 +687,10 @@ impl<R: Resolve> Driver<R> {
         match item {
             Some(Ok(response)) => {
                 let status = response.status();
-                // An error here is a response that cannot form a dialog, such
-                // as one that does not carry the INVITE's identity. The UA
-                // keeps nothing for it.
-                //
-                // TODO: Report such a response, and send the ACK and a BYE
-                // for a 2xx that cannot form a dialog (RFC 3261 section
-                // 13.2.2.4).
+                // An error here is a response the UA keeps no session for.
+                // The model has queued what the wire still needs, such as
+                // the ACK and BYE of a fork beyond the limits, and noted on
+                // the attempt that its set of responses is not complete.
                 let _ = match status.as_u16() {
                     100..=199 => {
                         self.model.receive_provisional(attempt, &response)
@@ -752,14 +766,16 @@ impl<R: Resolve> Driver<R> {
             Effect::StartInvite { attempt } => self.start_invite(attempt),
             Effect::SendAck { replay } => self.send_ack(replay),
             Effect::ResendAck { replay } => self.resend_ack(replay),
+            Effect::SendBye { replay } => self.send_bye(replay),
             Effect::Notify(event) => self.notify(event, attempt),
             Effect::OperationEnded { operation } => self.deliver(operation),
-            Effect::AttemptEnded { attempt, result, complete } => {
+            Effect::AttemptEnded { attempt, result, complete, degraded } => {
                 if let Some(permit) = self.endings.remove(&attempt) {
                     permit.send(Event::AttemptEnded {
                         attempt: AttemptId(attempt),
                         result,
                         complete,
+                        degraded,
                     });
                 }
             }
@@ -914,7 +930,10 @@ impl<R: Resolve> Driver<R> {
     /// from now on, whether or not it gets out, so that each copy of the
     /// 2xx gets the same one, also after the dialog is gone.
     fn send_ack(&mut self, replay: ReplayKey) {
+        // An ACK that cannot be built counts as one that did not get out, so
+        // that a cleanup's BYE still follows it.
         let Some(outgoing) = self.model.ack_request(replay) else {
+            self.model.ack_written(replay, false);
             return;
         };
         // A secure hop needs TLS, which this UA does not have.
@@ -971,6 +990,26 @@ impl<R: Resolve> Driver<R> {
             branch: ack.branch.clone(),
             timeout: self.resend_timeout,
         });
+    }
+
+    /// Sends the BYE that ends the dialog of a 2xx the UA did not keep, once
+    /// its ACK has had its first try (RFC 3261 section 13.2.2.4). It goes in
+    /// a client transaction of its own (section 15.1.1), through the
+    /// dialog's route set, as the ACK does.
+    fn send_bye(&mut self, replay: ReplayKey) {
+        let Some(outgoing) = self.model.bye_request(replay) else {
+            self.model.bye_done(replay);
+            return;
+        };
+        // A secure hop needs TLS, which this UA does not have.
+        if outgoing.target.secure {
+            self.model.bye_done(replay);
+            return;
+        }
+
+        let request = outgoing.request.map(|()| Bytes::new());
+        let query = query(outgoing.target.next_hop, &request);
+        self.backlog.push_back(Job::Bye { replay, request, query });
     }
 
     /// Makes a fresh branch, with the magic cookie and 64 random bits.
@@ -1093,6 +1132,7 @@ impl Job {
     /// * An INVITE that never started fails its attempt.
     /// * An ACK counts as not written, and the next copy of its 2xx tries
     ///   again.
+    /// * A BYE counts as sent, since a BYE is never sent twice.
     fn fallback(&self) -> Done {
         match self {
             Job::Final { exchange, .. } => Done::Final {
@@ -1116,6 +1156,7 @@ impl Job {
                 attempt: *attempt,
                 result: Err(Error::Internal),
             },
+            Job::Bye { replay, .. } => Done::Byed { replay: *replay },
             Job::Ack { replay, route, .. } => Done::Acked {
                 replay: *replay,
                 target: match route {
@@ -1185,6 +1226,18 @@ impl Job {
                     Err(_) => Err(Error::Unroutable),
                 };
                 Done::Started { attempt, result }
+            }
+            // The UA keeps nothing of the BYE's transaction. Dropping it
+            // leaves signa-core to retransmit the BYE and take its response,
+            // which changes nothing here (RFC 3261 section 15.1.1). A BYE the
+            // endpoint could not take is not tried again, so that a dialog
+            // the UA never kept costs no more than this one try.
+            Job::Bye { replay, request, query } => {
+                if let Ok(target) = resolve(&*resolver, &query, timeout).await
+                {
+                    let _ = endpoint.start(request, target).await;
+                }
+                Done::Byed { replay }
             }
             // An ACK stuck behind a full endpoint or a peer that does not
             // read is given up after `timeout`, as a copy of a 2xx is, so

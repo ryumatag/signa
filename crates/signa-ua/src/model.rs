@@ -57,7 +57,7 @@ use crate::{
     plan::{Identity, InvitePlan},
     protocol::{self, Field, Malformed},
     retention::{
-        AckObligation, ReplayContext, ReplayId, ReplayKey, Retention,
+        AckObligation, Bye, ReplayContext, ReplayId, ReplayKey, Retention,
         Retransmission, Source,
     },
     slot::Slots,
@@ -93,7 +93,16 @@ pub(crate) struct Limits {
     pub(crate) incoming: usize,
     pub(crate) dialogs: usize,
     pub(crate) usages: usize,
+    /// Replay contexts of sessions, including those whose usage ended.
     pub(crate) replays: usize,
+    /// Dialogs one attempt may form and keep, early or confirmed, so that a
+    /// forking proxy cannot take the room of every other call.
+    pub(crate) forks: usize,
+    /// Replay contexts of 2xx responses the UA acknowledges and ends with a
+    /// BYE rather than keep, as for a fork beyond the limits. They have room
+    /// of their own, apart from the sessions', so that the 2xx a full table
+    /// turns away still gets its ACK and BYE.
+    pub(crate) cleanups: usize,
     /// URIs in the route set of one dialog.
     pub(crate) routes: usize,
     pub(crate) operations: usize,
@@ -178,10 +187,19 @@ pub(crate) enum Effect {
     SendAck { replay: ReplayKey },
     /// Send the ACK already sent for a 2xx again, for a copy of that 2xx.
     ResendAck { replay: ReplayKey },
+    /// Send the BYE of a cleanup, which [`Model::bye_request`] builds, then
+    /// report with [`Model::bye_done`] once the core has it or cannot take
+    /// it. Nothing waits for the BYE's response.
+    SendBye { replay: ReplayKey },
     /// Tell the application what an attempt came to, now that the core has
     /// finished collecting its responses. This cannot be lost, so the
     /// runtime sets room aside for it when it sends the INVITE.
-    AttemptEnded { attempt: AttemptKey, result: AttemptResult, complete: bool },
+    AttemptEnded {
+        attempt: AttemptKey,
+        result: AttemptResult,
+        complete: bool,
+        degraded: bool,
+    },
     /// Tell the application.
     Notify(Event),
     /// Hand the outcome of an operation to its waiter, if it still has one.
@@ -307,6 +325,18 @@ pub(crate) enum Event {
     AttemptFailed { attempt: AttemptKey, error: Error },
 }
 
+/// What an attempt has come to so far.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AttemptState {
+    /// What the first final response or failure decided, once it is in.
+    pub(crate) result: Option<AttemptResult>,
+    pub(crate) complete: bool,
+    pub(crate) degraded: bool,
+    /// The sessions of the dialogs it formed that are still up, in the order
+    /// they formed.
+    pub(crate) sessions: Vec<UsageKey>,
+}
+
 /// The UA's state.
 pub(crate) struct Model<R> {
     limits: Limits,
@@ -317,7 +347,11 @@ pub(crate) struct Model<R> {
     exchanges: Slots<InviteExchange>,
     dialogs: Slots<Dialog>,
     usages: Slots<InviteUsage>,
+    /// The replay contexts of sessions and cleanups, each kind within its
+    /// own limit.
     replays: Slots<ReplayContext>,
+    /// How many of `replays` are cleanups.
+    cleanups: usize,
     /// Finds a dialog from the identity a message carries.
     dialog_index: HashMap<DialogId, DialogKey>,
     /// Finds the replay context of a 2xx or ACK from the wire.
@@ -346,7 +380,10 @@ impl<R: Random> Model<R> {
             ),
             dialogs: Slots::new(limits.dialogs),
             usages: Slots::new(limits.usages),
-            replays: Slots::new(limits.replays),
+            replays: Slots::new(
+                limits.replays.saturating_add(limits.cleanups),
+            ),
+            cleanups: 0,
             dialog_index: HashMap::new(),
             replay_index: HashMap::new(),
             merge_index: HashMap::new(),
@@ -1038,7 +1075,9 @@ impl<R: Random> Model<R> {
         if let Source::Exchange(exchange) = source {
             self.drop_exchange(exchange);
         }
-        if let Some(record) = self.usages.get_mut(usage) {
+        if let Some((usage, record)) =
+            usage.and_then(|usage| Some((usage, self.usages.get_mut(usage)?)))
+        {
             // TODO: Treat an ACK without the answer it owes as a negotiation
             // failure. RFC 3261 section 13.2.1 requires the answer in the
             // ACK when the 2xx carried the offer.
@@ -1119,7 +1158,9 @@ impl<R: Random> Model<R> {
         if let Source::Exchange(exchange) = source {
             self.drop_exchange(exchange);
         }
-        if self.usages.get(usage).is_some() {
+        if let Some(usage) =
+            usage.filter(|&usage| self.usages.get(usage).is_some())
+        {
             self.effects.push(Effect::Notify(Event::AckTimeout { usage }));
             self.end_usage(usage);
         }
@@ -1149,15 +1190,7 @@ impl<R: Random> Model<R> {
             .exchanges
             .insert(InviteExchange::outgoing(origin.cseq()))
             .map_err(|_| Error::CapacityExceeded)?;
-        let attempt = InviteAttempt {
-            origin,
-            offer_in_request,
-            exchange,
-            request: None,
-            operation: None,
-            result: None,
-            complete: true,
-        };
+        let attempt = InviteAttempt::new(origin, offer_in_request, exchange);
 
         self.attempts.insert(attempt).map_err(|_| {
             self.exchanges.remove(exchange);
@@ -1246,14 +1279,39 @@ impl<R: Random> Model<R> {
         }
     }
 
-    /// Returns what an attempt came to so far, and whether every response
-    /// reached the UA, or `None` once the attempt has ended.
+    /// Returns what an attempt came to so far, or `None` once it has ended.
     pub(crate) fn attempt_state(
         &self,
         attempt: AttemptKey,
-    ) -> Option<(Option<AttemptResult>, bool)> {
+    ) -> Option<AttemptState> {
         let attempt = self.attempts.get(attempt)?;
-        Some((attempt.result, attempt.complete))
+        let sessions = attempt
+            .forks
+            .iter()
+            .copied()
+            .filter(|&usage| self.usages.get(usage).is_some())
+            .collect();
+
+        Some(AttemptState {
+            result: attempt.result,
+            complete: attempt.complete,
+            degraded: attempt.degraded,
+            sessions,
+        })
+    }
+
+    /// Gives an attempt up, as the application intends. Each 2xx that comes
+    /// for it from now on, also one for an early dialog, gets its ACK and a
+    /// BYE that ends its dialog, and forms no session (RFC 3261 section
+    /// 13.2.2.4). The sessions it formed before are left alone.
+    ///
+    /// TODO: Cancel the INVITE while it is pending, and end the sessions it
+    /// formed, once the UA has CANCEL and the BYE of a usage. Until then
+    /// nothing but the model gives an attempt up.
+    pub(crate) fn abandon_attempt(&mut self, attempt: AttemptKey) {
+        if let Some(record) = self.attempts.get_mut(attempt) {
+            record.abandoned = true;
+        }
     }
 
     /// Takes in the end of an attempt without a 2xx: a final response other
@@ -1298,16 +1356,15 @@ impl<R: Random> Model<R> {
         let Some(record) = self.attempts.get(attempt) else {
             return;
         };
-        let early: Vec<UsageKey> = self
-            .usages
+        let early: Vec<UsageKey> = record
+            .forks
             .iter()
-            .filter(|(_, usage)| usage.phase() == UsagePhase::Establishing)
-            .filter(|(_, usage)| {
-                self.dialogs
-                    .get(usage.dialog)
-                    .is_some_and(|dialog| record.origin.formed(dialog.id()))
+            .copied()
+            .filter(|&usage| {
+                self.usages.get(usage).is_some_and(|usage| {
+                    usage.phase() == UsagePhase::Establishing
+                })
             })
-            .map(|(usage, _)| usage)
             .collect();
 
         for usage in early {
@@ -1322,19 +1379,53 @@ impl<R: Random> Model<R> {
     }
 
     /// Builds the ACK of the 2xx a replay context is for, from its dialog
-    /// (RFC 3261 section 13.2.2.4).
+    /// (RFC 3261 section 13.2.2.4). A cleanup builds it from the dialog it
+    /// holds, which no table does.
     pub(crate) fn ack_request(
         &mut self,
         replay: ReplayKey,
     ) -> Option<Outgoing> {
-        let context = self.replays.get(replay)?;
+        let context = self.replays.get_mut(replay)?;
         let cseq = context.id.cseq;
+        if let Some(dialog) = &mut context.dialog {
+            return dialog.request(Method::ACK, Sequence::Of(cseq)).ok();
+        }
         let dialog = *self.dialog_index.get(&context.id.dialog)?;
 
         self.dialogs
             .get_mut(dialog)?
             .request(Method::ACK, Sequence::Of(cseq))
             .ok()
+    }
+
+    /// Builds the BYE of a cleanup from its dialog, as any request in a
+    /// dialog is built (RFC 3261 section 15.1.1). The dialog goes with it,
+    /// so the BYE is built once, and the next number after the INVITE's is
+    /// its own.
+    pub(crate) fn bye_request(
+        &mut self,
+        replay: ReplayKey,
+    ) -> Option<Outgoing> {
+        let mut dialog = self.replays.get_mut(replay)?.dialog.take()?;
+
+        // A UAC's dialog numbers on from its INVITE, so it needs no seed.
+        dialog.request(Method::BYE, Sequence::Next { seed: 0 }).ok()
+    }
+
+    /// Records that the BYE of a cleanup went to the core, or could not go.
+    ///
+    /// Nothing waits for its response. RFC 3261 section 15.1.1 has the UAC
+    /// take the session as ended once the BYE is in its client transaction,
+    /// and whatever the response says, this dialog was never a session of
+    /// the application's.
+    pub(crate) fn bye_done(&mut self, replay: ReplayKey) {
+        let Some(context) = self.replays.get_mut(replay) else {
+            return;
+        };
+
+        context.bye = Some(Bye::Done);
+        context.dialog = None;
+        self.reclaim_replay(replay);
     }
 
     /// Takes in a provisional response to an attempt.
@@ -1344,6 +1435,11 @@ impl<R: Random> Model<R> {
     /// changes nothing. It is not reliable, so it refreshes neither the
     /// remote target ([RFC 6141 section 4.9]) nor the route set, which RFC
     /// 3261 section 13.2.2.4 recomputes from the 2xx.
+    ///
+    /// An early dialog beyond the attempt's forks or the UA's tables is not
+    /// formed, which leaves the attempt's set of responses incomplete. Nor is
+    /// one of an abandoned attempt. A 2xx for either is acknowledged and its
+    /// dialog ended, as a fork the UA does not keep.
     ///
     /// [RFC 6141 section 4.9]: https://www.rfc-editor.org/rfc/rfc6141.html#section-4.9
     pub(crate) fn receive_provisional<B>(
@@ -1366,7 +1462,19 @@ impl<R: Random> Model<R> {
             return Ok(());
         };
         let id = attempt.origin.dialog_id(Some(remote_tag));
-        if self.dialog_index.contains_key(&id) {
+        // RFC 3261 section 13.2.2.1 forms an early dialog only for a dialog
+        // ID that matches none. A tag whose 2xx is in, kept as a session or
+        // cleaned up, has its dialog, even once the session ended and its
+        // record went, so a provisional that comes late for it forms nothing.
+        let answered = ReplayId {
+            dialog: id.clone(),
+            cseq: attempt.origin.cseq(),
+            direction: Direction::Outgoing,
+        };
+        if attempt.abandoned
+            || self.dialog_index.contains_key(&id)
+            || self.replay_index.contains_key(&answered)
+        {
             return Ok(());
         }
 
@@ -1378,13 +1486,16 @@ impl<R: Random> Model<R> {
         } else {
             Negotiation::Stable
         };
-        // TODO: Report an early dialog that does not fit, as a fork that
-        // does not fit is to be reported.
-        if !self.usages.reserve() {
-            return Err(Error::CapacityExceeded);
+        let mut inserted = None;
+        if attempt.forks.len() < self.limits.forks && self.usages.reserve() {
+            inserted = self.dialogs.insert(dialog).ok();
+            if inserted.is_none() {
+                self.usages.release();
+            }
         }
-        let Ok(dialog) = self.dialogs.insert(dialog) else {
-            self.usages.release();
+        let Some(dialog) = inserted else {
+            let attempt = self.attempts.get_mut(key).expect("checked above");
+            attempt.complete = false;
             return Err(Error::CapacityExceeded);
         };
         let usage = self.usages.insert_reserved(InviteUsage::early(
@@ -1393,6 +1504,8 @@ impl<R: Random> Model<R> {
             negotiation,
         ));
         self.dialog_index.insert(id, dialog);
+        let attempt = self.attempts.get_mut(key).expect("checked above");
+        attempt.forks.push(usage);
 
         self.effects
             .push(Effect::Notify(Event::EarlyDialog { dialog, usage }));
@@ -1407,17 +1520,24 @@ impl<R: Random> Model<R> {
     ///
     /// A 2xx for an early dialog confirms it, and one for a new remote tag
     /// forms a confirmed dialog of its own, as RFC 3261 section 13.2.2.4
-    /// requires of a fork. No 2xx is preferred over another. Each one is a
-    /// session of its own for the application to keep or end.
+    /// requires of a fork. So does one whose early dialog ended before it,
+    /// as at a non-2xx from another fork, since its dialog ID then matches
+    /// no dialog. No 2xx is preferred over another. Each one is a
+    /// session of its own for the application to keep or end, and the ACK
+    /// goes whatever the application makes of it.
     ///
-    /// A 2xx the UA cannot keep, such as one without a Contact, one with
-    /// another identity, or one beyond the UA's limits, leaves the attempt's
-    /// set of responses incomplete, since the attempt cannot report every
-    /// 2xx as a session. One with the INVITE's identity still answered it.
+    /// A fork beyond the attempt's limit or the UA's tables, or any 2xx of
+    /// an abandoned attempt, forms no session. The UA acknowledges it and
+    /// ends its dialog with a BYE, which section 13.2.2.4 asks of a UAC that
+    /// does not want the dialog, from room kept for that alone. Without that
+    /// room the 2xx gets neither, and the attempt says it is degraded.
     ///
-    /// TODO: Send the ACK and a BYE for such a 2xx too, from a cleanup
-    /// budget. RFC 3261 section 13.2.2.4 asks for the ACK of every 2xx, and
-    /// a BYE for each dialog the UAC does not keep.
+    /// A 2xx with the INVITE's identity answered the INVITE, kept or not.
+    /// One the UA does not keep for want of room, or cannot form a dialog
+    /// from, such as one without a Contact, leaves the attempt's set of
+    /// responses incomplete, since the attempt cannot report it as a
+    /// session. One that cannot form a dialog gets no ACK, since the ACK is
+    /// built from the dialog (section 13.2.2.4).
     pub(crate) fn receive_2xx<B>(
         &mut self,
         key: AttemptKey,
@@ -1431,18 +1551,22 @@ impl<R: Random> Model<R> {
             attempt.complete = false;
             return Err(Error::InvalidInput);
         }
+        attempt.result.get_or_insert(AttemptResult::Answered);
+        self.exchanges
+            .get_mut(attempt.exchange)
+            .expect("an attempt keeps its exchange")
+            .final_received();
 
         let result = self.take_2xx(key, response, description);
         if result.is_err() {
             let attempt = self.attempts.get_mut(key).expect("checked above");
             attempt.complete = false;
-            attempt.result.get_or_insert(AttemptResult::Answered);
         }
         result
     }
 
     /// Does what [`Model::receive_2xx`] says for a 2xx with the INVITE's
-    /// identity.
+    /// identity. Every path that leaves an ACK to send queues it.
     fn take_2xx<B>(
         &mut self,
         key: AttemptKey,
@@ -1458,82 +1582,122 @@ impl<R: Random> Model<R> {
             cseq: attempt.origin.cseq(),
             direction: Direction::Outgoing,
         };
-        let (exchange, offer_in_request) =
-            (attempt.exchange, attempt.offer_in_request);
 
+        // The 2xx and its copies share one context. A copy, of a session or
+        // of a cleanup, gets the ACK again, and neither a new session nor a
+        // second BYE.
         if let Some(&replay) = self.replay_index.get(&replay) {
             self.effects.push(Effect::ResendAck { replay });
             return Ok(());
         }
+        if let Some(dialog) = self.dialog_index.get(&id).copied() {
+            return self.confirm_early(
+                key,
+                dialog,
+                response,
+                replay,
+                description,
+            );
+        }
 
-        let replay = match self.dialog_index.get(&id).copied() {
-            Some(dialog) => {
-                self.confirm_early(dialog, response, replay, key, description)?
-            }
-            None => {
-                let dialog =
-                    Dialog::uac(&attempt.origin, response, self.limits.routes)
-                        .map_err(|_| Error::InvalidInput)?;
-                if !self.reserve_session() {
-                    return Err(Error::CapacityExceeded);
-                }
+        let (abandoned, forks) = (attempt.abandoned, attempt.forks.len());
+        let offer_in_request = attempt.offer_in_request;
+        let dialog =
+            Dialog::uac(&attempt.origin, response, self.limits.routes)
+                .map_err(|_| Error::InvalidInput)?;
+        if abandoned {
+            return self
+                .clean_up(key, dialog, replay)
+                .then_some(())
+                .ok_or(Error::CapacityExceeded);
+        }
+        if forks >= self.limits.forks || !self.reserve_session() {
+            self.clean_up(key, dialog, replay);
+            return Err(Error::CapacityExceeded);
+        }
 
-                // With an offer in the INVITE, the 2xx carries the answer.
-                // Without one, it carries the offer and the ACK owes the
-                // answer (RFC 3261 section 13.2.1).
-                let mut negotiation = if offer_in_request {
-                    Negotiation::LocalOfferOutstanding
-                } else {
-                    Negotiation::Stable
-                };
-                settle_at_2xx(&mut negotiation, description.is_some());
-                let (replay, usage) = self.establish(
-                    dialog,
-                    Direction::Outgoing,
-                    negotiation,
-                    replay,
-                    Source::Attempt(key),
-                );
-                self.usages.get_mut(usage).expect("just made").remote =
-                    description;
-                replay
-            }
+        // With an offer in the INVITE, the 2xx carries the answer. Without
+        // one, it carries the offer and the ACK owes the answer (RFC 3261
+        // section 13.2.1). Each fork starts from the INVITE's offer and
+        // goes on alone, since each answer comes from another peer.
+        let mut negotiation = if offer_in_request {
+            Negotiation::LocalOfferOutstanding
+        } else {
+            Negotiation::Stable
         };
-
-        let attempt = self.attempts.get_mut(key).expect("checked above");
-        attempt.result.get_or_insert(AttemptResult::Answered);
-        self.exchanges
-            .get_mut(exchange)
-            .expect("an attempt keeps its exchange")
-            .final_received();
+        settle_at_2xx(&mut negotiation, description.is_some());
+        let (replay, usage) = self.establish(
+            dialog,
+            Direction::Outgoing,
+            negotiation,
+            replay,
+            Source::Attempt(key),
+        );
+        self.usages.get_mut(usage).expect("just made").remote = description;
+        self.attempts.get_mut(key).expect("checked above").forks.push(usage);
         self.effects.push(Effect::SendAck { replay });
         Ok(())
     }
 
     /// Confirms an early dialog with its 2xx and makes the replay context for
     /// the 2xx's ACK.
+    ///
+    /// For an abandoned attempt, or without room for the context, the early
+    /// session ends instead, and the 2xx is cleaned up with the dialog it
+    /// confirmed. The dialog keeps what it had, such as the numbers of
+    /// requests sent in it while early, which section 13.2.2.4 does not
+    /// recompute. Without room for the cleanup either, nothing changes and
+    /// the attempt is degraded, so that a copy of the 2xx tries again with
+    /// the early dialog as it was.
     fn confirm_early<B>(
         &mut self,
+        attempt: AttemptKey,
         dialog: DialogKey,
         response: &Response<B>,
         replay: ReplayId,
-        attempt: AttemptKey,
         description: Option<Description>,
-    ) -> Result<ReplayKey, Error> {
-        if !self.replays.reserve() {
+    ) -> Result<(), Error> {
+        let record =
+            self.attempts.get(attempt).expect("checked by the caller");
+        let abandoned = record.abandoned;
+        let usage = record
+            .forks
+            .iter()
+            .copied()
+            .find(|&usage| {
+                self.usages
+                    .get(usage)
+                    .is_some_and(|usage| usage.dialog == dialog)
+            })
+            .expect("an early dialog has its usage");
+        let room = !abandoned && self.reserve_replay();
+        if !room && self.cleanups >= self.limits.cleanups {
+            let record = self.attempts.get_mut(attempt).expect("checked");
+            record.degraded = true;
             return Err(Error::CapacityExceeded);
         }
         let record = self.dialogs.get_mut(dialog).expect("indexed");
         if record.confirm_with(response, self.limits.routes).is_err() {
-            self.replays.release();
+            if room {
+                self.replays.release();
+            }
             return Err(Error::InvalidInput);
         }
 
-        let (usage, record) = self
-            .usages
-            .iter_mut()
-            .find(|(_, usage)| usage.dialog == dialog)
-            .expect("an early dialog has its usage");
+        if !room {
+            let record = self.dialogs.remove(dialog).expect("indexed");
+            self.dialog_index.remove(record.id());
+            self.end_usage(usage);
+            let cleaned = self.clean_up(attempt, record, replay);
+            debug_assert!(cleaned, "the room was checked above");
+            return if abandoned {
+                Ok(())
+            } else {
+                Err(Error::CapacityExceeded)
+            };
+        }
+
+        let record = self.usages.get_mut(usage).expect("found above");
         record.establish();
         settle_at_2xx(&mut record.negotiation, description.is_some());
         record.remote = description;
@@ -1553,7 +1717,47 @@ impl<R: Random> Model<R> {
             self.effects
                 .push(Effect::Notify(Event::NegotiationCompleted { usage }));
         }
-        Ok(key)
+        self.effects.push(Effect::SendAck { replay: key });
+        Ok(())
+    }
+
+    /// Keeps a 2xx the UA does not keep as a session, so that it gets its
+    /// ACK, and a BYE after it that ends its dialog (RFC 3261 section
+    /// 13.2.2.4). Returns whether there was room.
+    ///
+    /// Without room the 2xx gets neither, and the attempt is degraded. The
+    /// peer then retransmits the 2xx until it gives up on the ACK, and ends
+    /// the dialog itself with a BYE (section 13.3.1.4). A cleanup makes no
+    /// session, so the application hears nothing of it but what the attempt
+    /// reports.
+    ///
+    /// TODO: Carry the answer in the ACK of a 2xx that holds an offer, which
+    /// section 13.2.2.4 asks of a dialog the UAC ends too. The UA sends no
+    /// INVITE without an offer yet, so each 2xx it gets holds an answer.
+    fn clean_up(
+        &mut self,
+        attempt: AttemptKey,
+        dialog: Dialog,
+        replay: ReplayId,
+    ) -> bool {
+        let key = if self.cleanups < self.limits.cleanups {
+            let context =
+                ReplayContext::cleanup(replay.clone(), attempt, dialog);
+            self.replays.insert(context).ok()
+        } else {
+            None
+        };
+        let Some(key) = key else {
+            if let Some(record) = self.attempts.get_mut(attempt) {
+                record.degraded = true;
+            }
+            return false;
+        };
+
+        self.cleanups += 1;
+        self.replay_index.insert(replay, key);
+        self.effects.push(Effect::SendAck { replay: key });
+        true
     }
 
     /// Records whether an ACK of a received 2xx was written.
@@ -1561,6 +1765,9 @@ impl<R: Random> Model<R> {
     /// A failure is not final. The next copy of the 2xx gets the ACK again
     /// (RFC 3261 section 13.2.2.4), and a write that succeeds then satisfies
     /// the obligation.
+    ///
+    /// The first try of a cleanup's ACK, whatever came of it, lets its BYE
+    /// go, since the BYE follows the ACK.
     pub(crate) fn ack_written(&mut self, key: ReplayKey, written: bool) {
         let Some(replay) = self.replays.get_mut(key) else {
             return;
@@ -1574,6 +1781,10 @@ impl<R: Random> Model<R> {
                 replay.ack = AckObligation::Failed;
             }
             _ => {}
+        }
+        if replay.bye == Some(Bye::Owed) {
+            replay.bye = Some(Bye::Sending);
+            self.effects.push(Effect::SendBye { replay: key });
         }
     }
 
@@ -1617,6 +1828,7 @@ impl<R: Random> Model<R> {
             attempt: key,
             result,
             complete: attempt.complete,
+            degraded: attempt.degraded,
         });
     }
 }
@@ -1661,7 +1873,7 @@ impl<R: Random> Model<R> {
         let replays: Vec<ReplayKey> = self
             .replays
             .iter()
-            .filter(|(_, replay)| replay.usage == key)
+            .filter(|(_, replay)| replay.usage == Some(key))
             .map(|(replay, _)| replay)
             .collect();
         for replay in replays {
@@ -1681,12 +1893,20 @@ impl<R: Random> Model<R> {
             self.dialogs.release();
             return false;
         }
-        if !self.replays.reserve() {
+        if !self.reserve_replay() {
             self.dialogs.release();
             self.usages.release();
             return false;
         }
         true
+    }
+
+    /// Sets aside a replay context for a session. The cleanups' room is in
+    /// the same table, and a session does not take it.
+    fn reserve_replay(&mut self) -> bool {
+        let sessions =
+            self.replays.len() - self.cleanups + self.replays.reserved();
+        sessions < self.limits.replays && self.replays.reserve()
     }
 
     /// Stores a confirmed dialog, its usage and the replay context of its 2xx
@@ -1728,6 +1948,9 @@ impl<R: Random> Model<R> {
 
         if reclaimable {
             let replay = self.replays.remove(key).expect("checked");
+            if replay.usage.is_none() {
+                self.cleanups -= 1;
+            }
             self.replay_index.remove(&replay.id);
             self.effects.push(Effect::Released(Released::Replay(key)));
         }
@@ -1781,6 +2004,8 @@ mod tests {
             dialogs: 4,
             usages: 4,
             replays: 4,
+            forks: 4,
+            cleanups: 4,
             routes: 8,
             operations: 4,
             commands: 4,
@@ -1821,14 +2046,31 @@ mod tests {
     impl<R> Model<R> {
         /// Checks what must hold between the tables after every input.
         fn check(&self) {
+            let mut cleanups = 0;
             for (key, replay) in self.replays.iter() {
                 assert_eq!(self.replay_index.get(&replay.id), Some(&key));
                 assert_ne!(replay.retention(), Retention::Reclaimable);
-                if let Some(usage) = self.usages.get(replay.usage) {
-                    assert_eq!(usage.direction, replay.id.direction);
+                match replay.usage {
+                    Some(usage) => {
+                        assert_eq!(replay.bye, None);
+                        if let Some(usage) = self.usages.get(usage) {
+                            assert_eq!(usage.direction, replay.id.direction);
+                        }
+                    }
+                    None => {
+                        cleanups += 1;
+                        assert!(replay.bye.is_some());
+                        assert_eq!(replay.id.direction, Direction::Outgoing);
+                    }
                 }
             }
             assert_eq!(self.replay_index.len(), self.replays.len());
+            assert_eq!(self.cleanups, cleanups);
+            assert!(cleanups <= self.limits.cleanups);
+            assert!(self.replays.len() - cleanups <= self.limits.replays);
+            for (_, attempt) in self.attempts.iter() {
+                assert!(attempt.forks.len() <= self.limits.forks);
+            }
 
             for (_, usage) in self.usages.iter() {
                 let dialog = self.dialogs.get(usage.dialog).unwrap();
@@ -2123,6 +2365,7 @@ mod tests {
                     attempt,
                     result: AttemptResult::Answered,
                     complete: true,
+                    degraded: false,
                 },
             ],
         );
@@ -3416,6 +3659,16 @@ mod tests {
         assert_eq!(model.next_deadline(), None);
     }
 
+    /// Returns what an attempt came to so far, and whether its set of
+    /// responses is complete.
+    fn progress(
+        model: &Model<Counter>,
+        attempt: AttemptKey,
+    ) -> Option<(Option<AttemptResult>, bool)> {
+        let state = model.attempt_state(attempt)?;
+        Some((state.result, state.complete))
+    }
+
     /// Returns what `effects` say an attempt came to at its end.
     fn ended(effects: &[Effect]) -> (AttemptResult, bool) {
         effects
@@ -3456,7 +3709,7 @@ mod tests {
 
         assert!(model.take_effects().is_empty());
         assert_eq!(model.dialogs.len(), 0);
-        assert_eq!(model.attempt_state(attempt), Some((None, false)));
+        assert_eq!(progress(&model, attempt), Some((None, false)));
     }
 
     /// A 2xx the UA cannot keep, here one without a Contact, still answered
@@ -3479,7 +3732,7 @@ mod tests {
         );
         model.check();
         assert_eq!(
-            model.attempt_state(attempt),
+            progress(&model, attempt),
             Some((Some(AttemptResult::Answered), false)),
         );
 
@@ -3541,11 +3794,11 @@ mod tests {
         model.check();
 
         let failed = Some(AttemptResult::Failed(Error::RemoteFailure(busy)));
-        assert_eq!(model.attempt_state(rejected), Some((failed, true)));
+        assert_eq!(progress(&model, rejected), Some((failed, true)));
         let lost_state = Some(AttemptResult::Failed(Error::TransportFailure));
-        assert_eq!(model.attempt_state(lost), Some((lost_state, true)));
+        assert_eq!(progress(&model, lost), Some((lost_state, true)));
         assert_eq!(
-            model.attempt_state(answered),
+            progress(&model, answered),
             Some((Some(AttemptResult::Answered), true)),
         );
         let notified: Vec<Event> = notices(&model.take_effects())
@@ -3585,7 +3838,7 @@ mod tests {
         model.responses_lost(answered);
         model.responses_lost(unknown);
         assert_eq!(
-            model.attempt_state(answered),
+            progress(&model, answered),
             Some((Some(AttemptResult::Answered), false)),
         );
 
@@ -3604,7 +3857,7 @@ mod tests {
             ended(&model.take_effects()),
             (AttemptResult::Failed(Error::DriverStopped), true),
         );
-        assert_eq!(model.attempt_state(answered), None);
+        assert_eq!(progress(&model, answered), None);
         model.check();
     }
 
@@ -3658,5 +3911,571 @@ mod tests {
             matches!(ended[0], Event::UsageEnded { usage } if usage != kept)
         );
         assert!(model.usage_state(kept).is_some());
+    }
+
+    /// Returns the replay contexts whose ACK `effects` send, in order.
+    fn acks(effects: &[Effect]) -> Vec<ReplayKey> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::SendAck { replay } => Some(*replay),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Returns the cleanups whose BYE `effects` send, in order.
+    fn byes(effects: &[Effect]) -> Vec<ReplayKey> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::SendBye { replay } => Some(*replay),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Returns the sessions whose dialogs `effects` confirm, in order.
+    fn confirmations(effects: &[Effect]) -> Vec<UsageKey> {
+        notices(effects)
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::DialogConfirmed { usage, .. } => Some(usage),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The 2xx of the fork whose tag is `tag`, at `contact`.
+    fn fork(tag: &str, contact: &str) -> Response<Bytes> {
+        reply("200 OK", tag, contact, "")
+    }
+
+    /// A session description that differs from others by `text`.
+    fn description(text: &'static str) -> Description {
+        Description::new(
+            signa_core::HeaderValue::from_static("application/sdp"),
+            Bytes::from_static(text.as_bytes()),
+        )
+    }
+
+    /// A forking proxy has two callees answer the INVITE. Each 2xx forms a
+    /// confirmed dialog and a session of its own, and gets an ACK of its own,
+    /// sent to its own Contact with its own To tag and the INVITE's CSeq
+    /// number (RFC 3261 section 13.2.2.4). The attempt lists both sessions.
+    #[test]
+    fn two_successful_forks_create_two_dialogs_and_two_acks() {
+        let mut model = model(limits());
+        let attempt = model.start_attempt(&request(INVITE), true).unwrap();
+
+        model
+            .receive_2xx(attempt, &fork("bob", "sip:bob@192.0.2.4"), offer())
+            .unwrap();
+        model
+            .receive_2xx(
+                attempt,
+                &fork("carol", "sip:carol@192.0.2.5"),
+                offer(),
+            )
+            .unwrap();
+        model.check();
+
+        let effects = model.take_effects();
+        let sessions = confirmations(&effects);
+        assert_eq!(sessions.len(), 2);
+        assert_ne!(sessions[0], sessions[1]);
+        assert_eq!(model.dialogs.len(), 2);
+        let sent: Vec<(String, String, String)> = acks(&effects)
+            .into_iter()
+            .map(|replay| {
+                let ack = model.ack_request(replay).unwrap().request;
+                let header = |name| ack.headers().get(name).unwrap().as_str();
+                (
+                    ack.uri().as_str().to_owned(),
+                    header("To").to_owned(),
+                    header("CSeq").to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                (
+                    "sip:bob@192.0.2.4".to_owned(),
+                    "<sip:bob@biloxi.example.com>;tag=bob".to_owned(),
+                    "314159 ACK".to_owned(),
+                ),
+                (
+                    "sip:carol@192.0.2.5".to_owned(),
+                    "<sip:bob@biloxi.example.com>;tag=carol".to_owned(),
+                    "314159 ACK".to_owned(),
+                ),
+            ],
+        );
+        let state = model.attempt_state(attempt).unwrap();
+        assert_eq!(state.sessions, sessions);
+        assert!(state.complete);
+    }
+
+    /// A copy of a 2xx asks nothing of the application again. Neither the
+    /// copy of a session's 2xx nor that of a fork the UA ends confirms a
+    /// dialog, completes a negotiation or forms a session. Each gets its ACK
+    /// again, and the fork no second BYE.
+    #[test]
+    fn same_branch_duplicate_does_not_repeat_application_acceptance() {
+        let mut model = model(Limits { forks: 1, ..limits() });
+        let attempt = model.start_attempt(&request(INVITE), true).unwrap();
+        let ringing = reply("180 Ringing", "kept", "sip:bob@192.0.2.4", "");
+        let (kept, ended) = (
+            fork("kept", "sip:bob@192.0.2.4"),
+            fork("ended", "sip:carol@192.0.2.5"),
+        );
+        model.receive_provisional(attempt, &ringing).unwrap();
+        model.receive_2xx(attempt, &kept, offer()).unwrap();
+        let effects = model.take_effects();
+        let (session, first) = (confirmations(&effects), acks(&effects));
+        assert!(negotiated(&effects));
+        assert_eq!(
+            model.receive_2xx(attempt, &ended, offer()),
+            Err(Error::CapacityExceeded),
+        );
+        let cleanup = acks(&model.take_effects())[0];
+        model.ack_written(cleanup, true);
+        assert_eq!(byes(&model.take_effects()), [cleanup]);
+
+        model.receive_2xx(attempt, &kept, offer()).unwrap();
+        model.receive_2xx(attempt, &ended, offer()).unwrap();
+        model.ack_written(cleanup, true);
+        model.check();
+
+        assert_eq!(
+            model.take_effects(),
+            [
+                Effect::ResendAck { replay: first[0] },
+                Effect::ResendAck { replay: cleanup },
+            ],
+        );
+        assert_eq!(model.usages.len(), 1);
+        assert_eq!(model.attempt_state(attempt).unwrap().sessions, session);
+    }
+
+    /// Once the application gives an attempt up, a 2xx that comes later,
+    /// for an early dialog or a new fork, forms no session. Each gets its
+    /// ACK, and a BYE after it built from its dialog, which is the request
+    /// after the INVITE (RFC 3261 section 13.2.2.4). A session formed before
+    /// is left alone, and so is the attempt's set of responses, since giving
+    /// up was the application's choice.
+    #[test]
+    fn late_2xx_after_attempt_abandon_is_cleaned_up() {
+        let mut model = model(limits());
+        let attempt = model.start_attempt(&request(INVITE), true).unwrap();
+        let early = reply("180 Ringing", "early", "sip:bob@192.0.2.4", "");
+        model.receive_provisional(attempt, &early).unwrap();
+        model
+            .receive_2xx(attempt, &fork("kept", "sip:dan@192.0.2.6"), offer())
+            .unwrap();
+        let kept = confirmations(&model.take_effects())[0];
+
+        model.abandon_attempt(attempt);
+        model
+            .receive_2xx(attempt, &fork("early", "sip:bob@192.0.2.4"), offer())
+            .unwrap();
+        model
+            .receive_2xx(
+                attempt,
+                &fork("late", "sip:carol@192.0.2.5"),
+                offer(),
+            )
+            .unwrap();
+        let after = reply("180 Ringing", "after", "sip:eve@192.0.2.7", "");
+        model.receive_provisional(attempt, &after).unwrap();
+        model.check();
+
+        let effects = model.take_effects();
+        assert!(confirmations(&effects).is_empty());
+        let early_usage = notices(&effects)
+            .into_iter()
+            .find_map(|event| match event {
+                Event::UsageEnded { usage } => Some(usage),
+                _ => None,
+            })
+            .unwrap();
+        assert_ne!(early_usage, kept);
+        let cleanups = acks(&effects);
+        assert_eq!(cleanups.len(), 2);
+        for &cleanup in &cleanups {
+            model.ack_written(cleanup, true);
+        }
+        assert_eq!(byes(&model.take_effects()), cleanups);
+        let bye = model.bye_request(cleanups[1]).unwrap().request;
+        assert_eq!(bye.method(), &Method::BYE);
+        assert_eq!(bye.uri().as_str(), "sip:carol@192.0.2.5");
+        assert_eq!(bye.headers().get("CSeq").unwrap(), "314160 BYE");
+        assert_eq!(
+            bye.headers().get("To").unwrap(),
+            "<sip:bob@biloxi.example.com>;tag=late",
+        );
+        assert!(model.bye_request(cleanups[1]).is_none(), "built once");
+
+        let state = model.attempt_state(attempt).unwrap();
+        assert_eq!(state.sessions, [kept]);
+        assert!(state.complete && !state.degraded);
+        assert_eq!(model.dialogs.len(), 1);
+    }
+
+    /// Each fork negotiates on its own. One 2xx carries an answer and
+    /// settles its session, another carries none and leaves its own offer
+    /// outstanding, and each session keeps the description its peer sent.
+    #[test]
+    fn fork_sdp_state_is_not_shared() {
+        let mut model = model(limits());
+        let attempt = model.start_attempt(&request(INVITE), true).unwrap();
+        let (bob, carol) =
+            (description("v=0 bob\r\n"), description("v=0 carol\r\n"));
+
+        model
+            .receive_2xx(
+                attempt,
+                &fork("bob", "sip:bob@192.0.2.4"),
+                Some(bob.clone()),
+            )
+            .unwrap();
+        model
+            .receive_2xx(attempt, &fork("dan", "sip:dan@192.0.2.6"), None)
+            .unwrap();
+        model
+            .receive_2xx(
+                attempt,
+                &fork("carol", "sip:carol@192.0.2.5"),
+                Some(carol.clone()),
+            )
+            .unwrap();
+        model.check();
+
+        let effects = model.take_effects();
+        let sessions = confirmations(&effects);
+        let completed: Vec<UsageKey> = notices(&effects)
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::NegotiationCompleted { usage } => Some(usage),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completed, [sessions[0], sessions[2]]);
+        let state = |usage| {
+            let (_, negotiation, remote) = model.usage_state(usage).unwrap();
+            (negotiation, remote)
+        };
+        assert_eq!(state(sessions[0]), (Negotiation::Stable, Some(bob)));
+        assert_eq!(
+            state(sessions[1]),
+            (Negotiation::LocalOfferOutstanding, None),
+        );
+        assert_eq!(state(sessions[2]), (Negotiation::Stable, Some(carol)));
+    }
+
+    /// What copies of a 2xx need stays until the core stops collecting the
+    /// attempt's responses, whatever happens to the session first. A session
+    /// that ended, as with a BYE, leaves its dialog to go at once, so the
+    /// retained context holds nothing up. A cleanup whose BYE went stays as
+    /// long, and one whose BYE is still owed at the end stays until it goes.
+    #[test]
+    fn replay_cleanup_waits_for_required_response_collection() {
+        let mut model = model(Limits { forks: 1, ..limits() });
+        let attempt = model.start_attempt(&request(INVITE), true).unwrap();
+        let (kept, ended) = (
+            fork("kept", "sip:bob@192.0.2.4"),
+            fork("ended", "sip:carol@192.0.2.5"),
+        );
+        model.receive_2xx(attempt, &kept, offer()).unwrap();
+        let effects = model.take_effects();
+        let (session, replay) =
+            (confirmations(&effects)[0], acks(&effects)[0]);
+        let _ = model.receive_2xx(attempt, &ended, offer());
+        let cleanup = acks(&model.take_effects())[0];
+        model.ack_written(replay, true);
+        model.ack_written(cleanup, true);
+        model.take_effects();
+
+        model.end_usage(session);
+        model.bye_done(cleanup);
+        model.check();
+        assert_eq!(
+            model.take_effects(),
+            [Effect::Notify(Event::UsageEnded { usage: session })],
+        );
+        assert_eq!(model.dialogs.len(), 0, "an ended session holds no dialog");
+        assert!(model.has_replay(replay) && model.has_replay(cleanup));
+        model.receive_2xx(attempt, &kept, offer()).unwrap();
+        model.receive_2xx(attempt, &ended, offer()).unwrap();
+        assert_eq!(
+            model.take_effects(),
+            [
+                Effect::ResendAck { replay },
+                Effect::ResendAck { replay: cleanup },
+            ],
+        );
+
+        model.response_collection_finished(attempt);
+        model.check();
+        let effects = model.take_effects();
+        assert!(!model.has_replay(replay) && !model.has_replay(cleanup));
+        assert_eq!(
+            effects.last(),
+            Some(&Effect::AttemptEnded {
+                attempt,
+                result: AttemptResult::Answered,
+                complete: false,
+                degraded: false,
+            }),
+        );
+
+        // A cleanup whose ACK has not had its try when the responses end
+        // stays until its BYE goes.
+        let late =
+            model.start_attempt(&invite("late@example.com"), true).unwrap();
+        let late_fork = |tag, contact| {
+            let text =
+                String::from_utf8(fork(tag, contact).to_bytes().to_vec())
+                    .unwrap()
+                    .replace("\r\n", "\n")
+                    .replace(
+                        "a84b4c76e66710@pc33.atlanta.example.com",
+                        "late@example.com",
+                    );
+            response(&text)
+        };
+        model
+            .receive_2xx(
+                late,
+                &late_fork("kept", "sip:bob@192.0.2.4"),
+                offer(),
+            )
+            .unwrap();
+        model.take_effects();
+        let _ = model.receive_2xx(
+            late,
+            &late_fork("ended", "sip:carol@192.0.2.5"),
+            offer(),
+        );
+        let cleanup = acks(&model.take_effects())[0];
+
+        model.response_collection_finished(late);
+        model.check();
+        model.take_effects();
+        assert!(model.has_replay(cleanup), "its BYE is still owed");
+        model.ack_written(cleanup, false);
+        assert_eq!(byes(&model.take_effects()), [cleanup]);
+        model.bye_done(cleanup);
+        model.check();
+        assert!(!model.has_replay(cleanup));
+    }
+
+    /// A UA whose tables are full turns a fork away from a session, not from
+    /// its ACK. A 2xx for a new tag beyond the dialog table, and one for an
+    /// early dialog without room for its replay context, get their ACK and
+    /// a BYE. The early session ends.
+    #[test]
+    fn a_fork_beyond_the_tables_is_cleaned_up() {
+        let mut model = model(Limits { dialogs: 2, replays: 1, ..limits() });
+        let attempt = model.start_attempt(&request(INVITE), true).unwrap();
+        for tag in ["first", "second"] {
+            let ringing = reply("180 Ringing", tag, "sip:bob@192.0.2.4", "");
+            model.receive_provisional(attempt, &ringing).unwrap();
+        }
+        let second = match notices(&model.take_effects())[..] {
+            [_, Event::EarlyDialog { usage, .. }] => usage,
+            ref other => panic!("not two early dialogs: {other:?}"),
+        };
+
+        model
+            .receive_2xx(attempt, &fork("first", "sip:bob@192.0.2.4"), offer())
+            .unwrap();
+        let confirmed = model.take_effects();
+        assert_eq!(
+            model.receive_2xx(
+                attempt,
+                &fork("second", "sip:bob@192.0.2.4"),
+                offer()
+            ),
+            Err(Error::CapacityExceeded),
+        );
+        let early_end = model.take_effects();
+        assert_eq!(
+            model.receive_2xx(
+                attempt,
+                &fork("third", "sip:carol@192.0.2.5"),
+                offer()
+            ),
+            Err(Error::CapacityExceeded),
+        );
+        let beyond = model.take_effects();
+        model.check();
+
+        assert_eq!(acks(&confirmed).len(), 1);
+        assert_eq!(confirmations(&early_end), []);
+        assert_eq!(notices(&early_end), [Event::UsageEnded { usage: second }]);
+        assert_eq!(acks(&early_end).len(), 1);
+        assert_eq!(acks(&beyond).len(), 1);
+        assert_eq!(model.cleanups, 2);
+        let state = model.attempt_state(attempt).unwrap();
+        assert!(!state.complete && !state.degraded);
+        assert_eq!(state.sessions.len(), 1);
+    }
+
+    /// A forking proxy that floods an attempt with 2xx responses from new
+    /// tags gets no more sessions than the attempt's fork limit, and no more
+    /// cleanups than their own limit. A 2xx beyond both gets nothing, and
+    /// the attempt reports that it is incomplete and degraded rather than
+    /// a success. An early dialog beyond the limit is not formed either.
+    #[test]
+    fn fork_flood_remains_bounded_and_reports_degradation() {
+        let mut model = model(Limits { forks: 2, cleanups: 2, ..limits() });
+        let attempt = model.start_attempt(&request(INVITE), true).unwrap();
+
+        let results: Vec<Result<(), Error>> = (0..6)
+            .map(|n| {
+                let tag = format!("fork{n}");
+                let ok =
+                    fork(&tag, &format!("sip:fork{n}@192.0.2.{}", n + 10));
+                model.receive_2xx(attempt, &ok, offer())
+            })
+            .collect();
+        let ringing = reply("180 Ringing", "early", "sip:bob@192.0.2.4", "");
+        let early = model.receive_provisional(attempt, &ringing);
+        model.check();
+
+        assert_eq!(
+            results,
+            [
+                Ok(()),
+                Ok(()),
+                Err(Error::CapacityExceeded),
+                Err(Error::CapacityExceeded),
+                Err(Error::CapacityExceeded),
+                Err(Error::CapacityExceeded),
+            ],
+        );
+        assert_eq!(early, Err(Error::CapacityExceeded));
+        let effects = model.take_effects();
+        assert_eq!(confirmations(&effects).len(), 2);
+        let sent = acks(&effects);
+        assert_eq!(sent.len(), 4, "two sessions and two cleanups");
+        assert_eq!((model.dialogs.len(), model.usages.len()), (2, 2));
+        assert_eq!((model.replays.len(), model.cleanups), (4, 2));
+        let state = model.attempt_state(attempt).unwrap();
+        assert!(!state.complete && state.degraded);
+
+        for &replay in &sent {
+            model.ack_written(replay, true);
+        }
+        for cleanup in byes(&model.take_effects()) {
+            model.bye_done(cleanup);
+        }
+        model.response_collection_finished(attempt);
+        model.check();
+        let effects = model.take_effects();
+        assert_eq!(
+            effects.last(),
+            Some(&Effect::AttemptEnded {
+                attempt,
+                result: AttemptResult::Answered,
+                complete: false,
+                degraded: true,
+            }),
+        );
+        assert_eq!((model.replays.len(), model.cleanups), (0, 0));
+    }
+
+    /// A provisional response that comes late for a tag whose 2xx is in
+    /// forms no early dialog (RFC 3261 section 13.2.2.1), whether that 2xx
+    /// is a session that ended, a fork the UA ended for want of room, or a
+    /// 2xx of an attempt given up. It counts against no limit and leaves the
+    /// attempt as it was.
+    #[test]
+    fn a_late_provisional_forms_no_dialog_for_an_answered_tag() {
+        let mut model = model(Limits { forks: 2, ..limits() });
+        let attempt = model.start_attempt(&request(INVITE), true).unwrap();
+        let late = |model: &mut Model<Counter>, tag| {
+            let late =
+                reply("183 Session Progress", tag, "sip:x@192.0.2.9", "");
+            model.receive_provisional(attempt, &late)
+        };
+        model
+            .receive_2xx(attempt, &fork("ended", "sip:bob@192.0.2.4"), offer())
+            .unwrap();
+        let session = confirmations(&model.take_effects())[0];
+        model.end_usage(session);
+        model
+            .receive_2xx(attempt, &fork("kept", "sip:dan@192.0.2.6"), offer())
+            .unwrap();
+        let _ = model.receive_2xx(
+            attempt,
+            &fork("beyond", "sip:carol@192.0.2.5"),
+            offer(),
+        );
+        model.take_effects();
+        let before = model.attempt_state(attempt).unwrap();
+
+        assert_eq!(late(&mut model, "ended"), Ok(()));
+        assert_eq!(late(&mut model, "beyond"), Ok(()));
+        model.abandon_attempt(attempt);
+        model
+            .receive_2xx(attempt, &fork("given", "sip:eve@192.0.2.7"), offer())
+            .unwrap();
+        model.take_effects();
+        assert_eq!(late(&mut model, "given"), Ok(()));
+        model.check();
+
+        assert!(model.take_effects().is_empty());
+        assert_eq!(model.attempt_state(attempt).unwrap(), before);
+        assert_eq!(model.attempts.get(attempt).unwrap().forks.len(), 2);
+        assert_eq!(model.dialogs.len(), 1);
+    }
+
+    /// A 2xx for an early dialog that finds room neither for its session's
+    /// replay context nor for a cleanup changes nothing but the attempt,
+    /// which is degraded. The early session stays as it was, so that a copy
+    /// of the 2xx can try again.
+    #[test]
+    fn an_early_dialog_without_any_room_stays_early() {
+        let mut model = model(Limits { replays: 1, cleanups: 1, ..limits() });
+        let attempt = model.start_attempt(&request(INVITE), true).unwrap();
+        for tag in ["first", "second", "third"] {
+            let ringing = reply("180 Ringing", tag, "sip:bob@192.0.2.4", "");
+            model.receive_provisional(attempt, &ringing).unwrap();
+        }
+        let third = match notices(&model.take_effects())[..] {
+            [_, _, Event::EarlyDialog { usage, .. }] => usage,
+            ref other => panic!("not three early dialogs: {other:?}"),
+        };
+        model
+            .receive_2xx(attempt, &fork("first", "sip:bob@192.0.2.4"), offer())
+            .unwrap();
+        let _ = model.receive_2xx(
+            attempt,
+            &fork("second", "sip:bob@192.0.2.4"),
+            offer(),
+        );
+        model.take_effects();
+
+        for _ in 0..2 {
+            assert_eq!(
+                model.receive_2xx(
+                    attempt,
+                    &fork("third", "sip:carol@192.0.2.5"),
+                    offer()
+                ),
+                Err(Error::CapacityExceeded),
+            );
+        }
+        model.check();
+
+        assert!(model.take_effects().is_empty());
+        let (phase, _, _) = model.usage_state(third).unwrap();
+        assert_eq!(phase, UsagePhase::Establishing);
+        let state = model.attempt_state(attempt).unwrap();
+        assert!(state.degraded && !state.complete);
+        assert!(state.sessions.contains(&third));
     }
 }

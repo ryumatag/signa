@@ -55,6 +55,10 @@ pub(crate) enum Direction {
 ///
 /// The model drops it when the core finishes collecting its responses. Its
 /// key then goes stale, so no later branch can attach to it.
+///
+/// Each dialog its responses form is a fork of its own, with its own usage,
+/// negotiation and ACK, none preferred over another. The attempt only lists
+/// them. Ending one ends neither the attempt nor the other forks.
 #[derive(Debug)]
 pub(crate) struct InviteAttempt {
     /// What the INVITE says about the dialogs its responses form.
@@ -70,9 +74,41 @@ pub(crate) struct InviteAttempt {
     /// What the INVITE came to, once its first final response or failure
     /// is in.
     pub(crate) result: Option<AttemptResult>,
-    /// Whether every response the core took for the INVITE reached the UA.
-    /// A response overflow in the core clears it for good.
+    /// The usage of each dialog the attempt's responses formed and the UA
+    /// kept, in the order they formed. A usage that ends stays listed, so
+    /// the length counts the forks the attempt took against its limit.
+    pub(crate) forks: Vec<UsageKey>,
+    /// Whether every response the core took for the INVITE reached the UA
+    /// and became part of a session. A response overflow in the core, or a
+    /// dialog the UA had no room to keep, clears it for good.
     pub(crate) complete: bool,
+    /// Whether the UA had to leave a 2xx without its ACK and BYE, since even
+    /// the room for ending dialogs it does not keep was full.
+    pub(crate) degraded: bool,
+    /// Whether the application gave the attempt up, so that a 2xx that
+    /// comes later is acknowledged and ended rather than kept.
+    pub(crate) abandoned: bool,
+}
+
+impl InviteAttempt {
+    pub(crate) fn new(
+        origin: Origin,
+        offer_in_request: bool,
+        exchange: ExchangeKey,
+    ) -> InviteAttempt {
+        InviteAttempt {
+            origin,
+            offer_in_request,
+            exchange,
+            request: None,
+            operation: None,
+            result: None,
+            forks: Vec::new(),
+            complete: true,
+            degraded: false,
+            abandoned: false,
+        }
+    }
 }
 
 /// What an INVITE this user agent sent came to.

@@ -197,11 +197,6 @@ impl Origin {
             && method == "INVITE"
     }
 
-    /// Says whether a response to this request formed the dialog `id`.
-    pub(crate) fn formed(&self, id: &DialogId) -> bool {
-        id.call_id == self.call_id && id.local_tag == self.local_tag
-    }
-
     /// Returns the identity of the dialog a response with `remote_tag` forms.
     pub(crate) fn dialog_id(&self, remote_tag: Option<Tag>) -> DialogId {
         DialogId::new(self.call_id.clone(), self.local_tag.clone(), remote_tag)

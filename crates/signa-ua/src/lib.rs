@@ -25,8 +25,11 @@ This is an early stage of the crate, and much of a UA core is missing:
 * A session whose 2xx gets no ACK ends without the BYE RFC 3261 asks for.
 * A 2xx without the answer to the INVITE's offer confirms its session, which
   then never reports a completed negotiation, rather than fail it.
-* A 2xx that cannot form a dialog, or does not fit in the UA's limits, gets
-  no ACK and no BYE.
+* A 2xx that cannot form a dialog, such as one without a Contact, gets no
+  ACK. One beyond the UA's limits gets its ACK and a BYE, while the room
+  kept for that lasts.
+* An INVITE this UA sent cannot be given up, so each 2xx of every fork forms
+  a session until the application ends it.
 * There is no CANCEL of an INVITE this UA sent. CANCEL, BYE and every other
   request in a dialog get signa-core's 500.
 * Outside a dialog, OPTIONS gets a 200 with the methods the UA takes, without

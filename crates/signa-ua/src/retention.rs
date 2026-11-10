@@ -4,7 +4,7 @@ What the UA keeps of a 2xx after its usage moves on.
 A 2xx to an INVITE leaves an ACK obligation and a window in which copies of it
 keep arriving. For a sent INVITE, the peer retransmits the 2xx until it sees
 the ACK, and the core delivers each copy until Timer M ends the response
-collection ([RFC 6026 section 7.2]). For a received one, this user agent
+collection ([RFC 6026 section 8.4]). For a received one, this user agent
 retransmits the 2xx until the ACK or its deadline
 ([RFC 3261 section 13.3.1.4]). Neither window cares whether the session is
 still up. A BYE can end the usage while the window is open, and the duplicates
@@ -13,16 +13,25 @@ session.
 
 A [`ReplayContext`] holds that state, keyed by what identifies a 2xx on the
 wire: the dialog, the INVITE's CSeq and the direction. It keeps the `DialogId`
-itself rather than the dialog's key, so it can outlive the dialog record.
+itself rather than the dialog's key, so it can outlive the dialog record. It
+only answers duplicates. Nothing waits for it to go, so the core keeping the
+INVITE transaction in Accepted holds up no request in the dialog.
 
-[RFC 6026 section 7.2]: https://www.rfc-editor.org/rfc/rfc6026.html#section-7.2
+A 2xx to a sent INVITE that the UA does not keep as a session gets a context
+too, a cleanup. RFC 3261 section 13.2.2.4 asks for the ACK of every 2xx, and
+for a BYE after it for each dialog the UAC does not want, as for a fork beyond
+the UA's limits. A cleanup has no usage. It holds the dialog that no table
+does, to build the ACK and the BYE from, and stays until both the duplicates
+and the BYE are done with.
+
+[RFC 6026 section 8.4]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.4
 [RFC 3261 section 13.3.1.4]: https://www.rfc-editor.org/rfc/rfc3261.html#section-13.3.1.4
 */
 
 use std::time::{Duration, Instant};
 
 use crate::{
-    dialog::DialogId,
+    dialog::{Dialog, DialogId},
     invite::{AttemptKey, Direction, ExchangeKey, UsageKey},
     slot::Key,
 };
@@ -53,14 +62,30 @@ pub(crate) enum AckObligation {
     Failed,
 }
 
+/// Where the BYE of a cleanup stands.
+///
+/// RFC 3261 section 13.2.2.4 has the UAC send the BYE after it acknowledged
+/// the 2xx, so the BYE waits for the first try of the ACK, whether or not
+/// that got out. A copy of the 2xx brings the ACK again, not the BYE.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Bye {
+    /// The BYE goes once the ACK has had its first try.
+    Owed,
+    /// The runtime is sending the BYE.
+    Sending,
+    /// The BYE went to the core, or could not.
+    Done,
+}
+
 /// Whether a replay context is still needed, and why.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Retention {
     /// Its usage is up, and duplicates may still arrive.
     Live,
-    /// Its usage ended, and duplicates may still arrive.
+    /// Its usage ended, or it never had one, and duplicates may still
+    /// arrive or its BYE is still to go.
     ReplayOnly,
-    /// No more duplicates can arrive. The model drops it.
+    /// No more duplicates can arrive and no BYE is owed. The model drops it.
     Reclaimable,
 }
 
@@ -100,10 +125,16 @@ pub(crate) struct Retransmission {
 pub(crate) struct ReplayContext {
     pub(crate) id: ReplayId,
     pub(crate) source: Source,
-    pub(crate) usage: UsageKey,
+    /// The session the 2xx formed, or `None` for a cleanup.
+    pub(crate) usage: Option<UsageKey>,
     pub(crate) ack: AckObligation,
     /// Set for a 2xx this user agent sent, while it awaits the ACK.
     pub(crate) retransmission: Option<Retransmission>,
+    /// The dialog of a cleanup, until its BYE is built. A session's dialog
+    /// is in the dialog table instead.
+    pub(crate) dialog: Option<Box<Dialog>>,
+    /// Set for a cleanup only. A session's BYE is its usage's.
+    pub(crate) bye: Option<Bye>,
     usage_ended: bool,
     duplicates_end: bool,
 }
@@ -122,10 +153,34 @@ impl ReplayContext {
         ReplayContext {
             id,
             source,
-            usage,
+            usage: Some(usage),
             ack,
             retransmission: None,
+            dialog: None,
+            bye: None,
             usage_ended: false,
+            duplicates_end: false,
+        }
+    }
+
+    /// Creates the context of a 2xx to `attempt` that the UA acknowledges
+    /// and then ends with a BYE, built from `dialog`, without a session.
+    pub(crate) fn cleanup(
+        id: ReplayId,
+        attempt: AttemptKey,
+        dialog: Dialog,
+    ) -> ReplayContext {
+        debug_assert_eq!(id.direction, Direction::Outgoing);
+
+        ReplayContext {
+            id,
+            source: Source::Attempt(attempt),
+            usage: None,
+            ack: AckObligation::NeedToSend,
+            retransmission: None,
+            dialog: Some(Box::new(dialog)),
+            bye: Some(Bye::Owed),
+            usage_ended: true,
             duplicates_end: false,
         }
     }
@@ -141,9 +196,10 @@ impl ReplayContext {
         self.duplicates_end = true;
     }
 
-    /// Derived from the two facts above, so it cannot disagree with them.
+    /// Derived from the facts above, so it cannot disagree with them.
     pub(crate) fn retention(&self) -> Retention {
-        match (self.duplicates_end, self.usage_ended) {
+        let bye_owed = matches!(self.bye, Some(Bye::Owed | Bye::Sending));
+        match (self.duplicates_end && !bye_owed, self.usage_ended) {
             (true, _) => Retention::Reclaimable,
             (false, true) => Retention::ReplayOnly,
             (false, false) => Retention::Live,
@@ -155,7 +211,8 @@ impl ReplayContext {
 mod tests {
     use super::*;
     use crate::{
-        invite::{InviteExchange, InviteUsage},
+        dialog::Origin,
+        invite::{InviteAttempt, InviteExchange, InviteUsage},
         negotiation::Negotiation,
         slot::Slots,
     };
@@ -179,6 +236,24 @@ mod tests {
             Source::Exchange(exchange),
             usage,
         )
+    }
+
+    fn cleanup() -> ReplayContext {
+        let request = crate::tests::request(crate::tests::INVITE);
+        let origin = Origin::from_request(&request).unwrap();
+        let exchange =
+            Slots::new(1).insert(InviteExchange::outgoing(1)).unwrap();
+        let attempt = Slots::new(1)
+            .insert(InviteAttempt::new(origin, true, exchange))
+            .unwrap();
+        let dialog = crate::tests::dialog();
+        let id = ReplayId {
+            dialog: dialog.id().clone(),
+            cseq: 1,
+            direction: Direction::Outgoing,
+        };
+
+        ReplayContext::cleanup(id, attempt, dialog)
     }
 
     #[test]
@@ -210,6 +285,23 @@ mod tests {
         let mut replay = context(Direction::Incoming);
 
         replay.duplicates_ended();
+        assert_eq!(replay.retention(), Retention::Reclaimable);
+    }
+
+    /// A cleanup has no usage to wait for, but stays until its BYE is done
+    /// with, even once no more duplicates can arrive.
+    #[test]
+    fn a_cleanup_waits_for_its_bye() {
+        let mut replay = cleanup();
+        assert_eq!(replay.usage, None);
+        assert_eq!(replay.retention(), Retention::ReplayOnly);
+
+        replay.duplicates_ended();
+        assert_eq!(replay.retention(), Retention::ReplayOnly);
+        replay.bye = Some(Bye::Sending);
+        assert_eq!(replay.retention(), Retention::ReplayOnly);
+
+        replay.bye = Some(Bye::Done);
         assert_eq!(replay.retention(), Retention::Reclaimable);
     }
 }

@@ -105,6 +105,11 @@ impl<T> Slots<T> {
         self.len
     }
 
+    /// Returns how many slots [`Slots::reserve`] has set aside.
+    pub(crate) fn reserved(&self) -> usize {
+        self.reserved
+    }
+
     /// Stores `value`, or hands it back when the table is full.
     pub(crate) fn insert(&mut self, value: T) -> Result<Key<T>, T> {
         if self.len + self.reserved >= self.limit {
