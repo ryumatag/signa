@@ -173,9 +173,12 @@ impl<R: Respond> Respond for Observed<R> {
     type Submission<'a>
         = Observing<R::Submission<'a>>
     where
-        Self: 'a;
+        Observed<R>: 'a;
 
-    fn respond(&self, response: Response<Bytes>) -> Self::Submission<'_> {
+    fn respond(
+        &self,
+        response: Response<Bytes>,
+    ) -> Observing<R::Submission<'_>> {
         let status = response.status().as_u16();
         Observing {
             inner: self.inner.respond(response),
@@ -197,9 +200,9 @@ where
     type Output = Result<(), SubmitError>;
 
     fn poll(
-        mut self: Pin<&mut Self>,
+        mut self: Pin<&mut Observing<F>>,
         cx: &mut Context<'_>,
-    ) -> Poll<Self::Output> {
+    ) -> Poll<Result<(), SubmitError>> {
         let result = ready!(Pin::new(&mut self.inner).poll(cx));
         if let Some((status, log)) = self.pending.take() {
             let outcome = match result {
@@ -230,9 +233,9 @@ impl<R: Respond> Respond for Counted<R> {
     type Submission<'a>
         = R::Submission<'a>
     where
-        Self: 'a;
+        Counted<R>: 'a;
 
-    fn respond(&self, response: Response<Bytes>) -> Self::Submission<'_> {
+    fn respond(&self, response: Response<Bytes>) -> R::Submission<'_> {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.inner.respond(response)
     }
@@ -565,7 +568,10 @@ where
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, exchange: Exchange<R>) -> Self::Future {
+    fn call(
+        &mut self,
+        exchange: Exchange<R>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Infallible>> + Send>> {
         assert!(
             mem::replace(&mut self.ready, false),
             "readiness was polled on the instance that is called"
@@ -658,7 +664,10 @@ impl Service<Control<Responder>> for ControlService {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, event: Control<Responder>) -> Self::Future {
+    fn call(
+        &mut self,
+        event: Control<Responder>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Infallible>> + Send>> {
         assert!(mem::replace(&mut self.ready, false));
         let calls = self.calls.clone();
         let acks = self.acks.clone();

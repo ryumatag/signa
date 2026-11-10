@@ -88,12 +88,12 @@ pub enum InvalidInvite {
 impl fmt::Display for InvalidInvite {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Method => f.write_str("expected an INVITE"),
-            Self::Missing(name) => {
+            InvalidInvite::Method => f.write_str("expected an INVITE"),
+            InvalidInvite::Missing(name) => {
                 write!(f, "missing {name} for the INVITE ACK")
             }
-            Self::CSeq => f.write_str("invalid INVITE CSeq"),
-            Self::Via => f.write_str("invalid INVITE Via"),
+            InvalidInvite::CSeq => f.write_str("invalid INVITE CSeq"),
+            InvalidInvite::Via => f.write_str("invalid INVITE Via"),
         }
     }
 }

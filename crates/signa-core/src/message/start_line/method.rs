@@ -272,7 +272,7 @@ impl AsRef<str> for Method {
 }
 
 impl From<&Method> for Method {
-    fn from(method: &Method) -> Self {
+    fn from(method: &Method) -> Method {
         method.clone()
     }
 }
@@ -280,7 +280,7 @@ impl From<&Method> for Method {
 impl TryFrom<&[u8]> for Method {
     type Error = InvalidMethod;
 
-    fn try_from(src: &[u8]) -> Result<Self, Self::Error> {
+    fn try_from(src: &[u8]) -> Result<Method, InvalidMethod> {
         Method::from_bytes(src)
     }
 }
@@ -288,7 +288,7 @@ impl TryFrom<&[u8]> for Method {
 impl TryFrom<&str> for Method {
     type Error = InvalidMethod;
 
-    fn try_from(src: &str) -> Result<Self, Self::Error> {
+    fn try_from(src: &str) -> Result<Method, InvalidMethod> {
         TryFrom::try_from(src.as_bytes())
     }
 }
@@ -296,7 +296,7 @@ impl TryFrom<&str> for Method {
 impl FromStr for Method {
     type Err = InvalidMethod;
 
-    fn from_str(src: &str) -> Result<Self, Self::Err> {
+    fn from_str(src: &str) -> Result<Method, InvalidMethod> {
         TryFrom::try_from(src)
     }
 }

@@ -3767,7 +3767,7 @@ mod tests {
         }
 
         impl Wake for Next {
-            fn wake(self: Arc<Self>) {
+            fn wake(self: Arc<Next>) {
                 let mut context = Context::from_waker(Waker::noop());
                 let mut send = self.responder.respond(self.response.clone());
                 self.queued.store(
@@ -3898,7 +3898,7 @@ mod tests {
     }
 
     impl Wake for SendNext {
-        fn wake(self: Arc<Self>) {
+        fn wake(self: Arc<SendNext>) {
             // Run at the exact wakeup point, before the driver callback
             // returns, rather than relying on a scheduler race.
             drop(self.client.lock().unwrap().call(self.request.clone()));

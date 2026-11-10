@@ -483,13 +483,13 @@ impl fmt::Debug for ResponseSubmission<'_> {
     }
 }
 
-impl Future for ResponseSubmission<'_> {
+impl<'a> Future for ResponseSubmission<'a> {
     type Output = Result<(), SubmitError>;
 
     fn poll(
-        mut self: Pin<&mut Self>,
+        mut self: Pin<&mut ResponseSubmission<'a>>,
         cx: &mut Context<'_>,
-    ) -> Poll<Self::Output> {
+    ) -> Poll<Result<(), SubmitError>> {
         if let Some(response) = self.response.take() {
             if self.responder.commands.is_closed() {
                 return Poll::Ready(Err(SubmitError::Closed));
@@ -592,23 +592,27 @@ pub enum SubmitError {
 impl fmt::Display for SubmitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::InvalidResponse => {
+            SubmitError::InvalidResponse => {
                 "response identity does not match the request"
             }
-            Self::TooEarly => "100 is not allowed yet on this transport",
-            Self::ProhibitedStatus => {
+            SubmitError::TooEarly => {
+                "100 is not allowed yet on this transport"
+            }
+            SubmitError::ProhibitedStatus => {
                 "this status is prohibited for a non-INVITE response"
             }
-            Self::FinalAlreadySent => "a final response was already accepted",
-            Self::Terminated => "the server transaction has terminated",
-            Self::Busy => "the response submission queue is full",
-            Self::RetentionFull => {
+            SubmitError::FinalAlreadySent => {
+                "a final response was already accepted"
+            }
+            SubmitError::Terminated => "the server transaction has terminated",
+            SubmitError::Busy => "the response submission queue is full",
+            SubmitError::RetentionFull => {
                 "retained server responses are at their limit"
             }
-            Self::TransportBusy => {
+            SubmitError::TransportBusy => {
                 "the transport cannot take the response now"
             }
-            Self::Closed => "the endpoint has closed",
+            SubmitError::Closed => "the endpoint has closed",
         })
     }
 }
@@ -877,7 +881,7 @@ impl Shared {
     }
 
     pub(super) fn write(
-        self: &Arc<Self>,
+        self: &Arc<Shared>,
         operation: Option<ResponseId>,
     ) -> WriteObservation {
         self.transport.fetch_add(1, Ordering::Relaxed);

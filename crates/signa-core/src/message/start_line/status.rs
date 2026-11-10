@@ -182,7 +182,7 @@ impl From<StatusCode> for u16 {
 impl TryFrom<u16> for StatusCode {
     type Error = InvalidStatusCode;
 
-    fn try_from(src: u16) -> Result<Self, Self::Error> {
+    fn try_from(src: u16) -> Result<StatusCode, InvalidStatusCode> {
         StatusCode::from_u16(src)
     }
 }
@@ -190,7 +190,7 @@ impl TryFrom<u16> for StatusCode {
 impl TryFrom<&[u8]> for StatusCode {
     type Error = InvalidStatusCode;
 
-    fn try_from(src: &[u8]) -> Result<Self, Self::Error> {
+    fn try_from(src: &[u8]) -> Result<StatusCode, InvalidStatusCode> {
         StatusCode::from_bytes(src)
     }
 }
@@ -198,7 +198,7 @@ impl TryFrom<&[u8]> for StatusCode {
 impl TryFrom<&str> for StatusCode {
     type Error = InvalidStatusCode;
 
-    fn try_from(src: &str) -> Result<Self, Self::Error> {
+    fn try_from(src: &str) -> Result<StatusCode, InvalidStatusCode> {
         TryFrom::try_from(src.as_bytes())
     }
 }
@@ -206,7 +206,7 @@ impl TryFrom<&str> for StatusCode {
 impl FromStr for StatusCode {
     type Err = InvalidStatusCode;
 
-    fn from_str(src: &str) -> Result<Self, Self::Err> {
+    fn from_str(src: &str) -> Result<StatusCode, InvalidStatusCode> {
         TryFrom::try_from(src)
     }
 }

@@ -1333,7 +1333,10 @@ mod tests {
             Poll::Ready(Ok(()))
         }
 
-        fn call(&mut self, request: Request<Bytes>) -> Self::Future {
+        fn call(
+            &mut self,
+            request: Request<Bytes>,
+        ) -> future::Ready<Result<Response<Bytes>, Infallible>> {
             self.requests.fetch_add(1, Ordering::SeqCst);
             let flow = *request.extensions().get::<Flow>().expect("a flow");
             self.flows.lock().unwrap().push(flow);
@@ -1664,16 +1667,19 @@ mod tests {
     impl Service<Request<Bytes>> for RouteService {
         type Response = Response<Bytes>;
         type Error = Infallible;
-        type Future = Ready<Result<Self::Response, Self::Error>>;
+        type Future = Ready<Result<Response<Bytes>, Infallible>>;
 
         fn poll_ready(
             &mut self,
             _: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
+        ) -> Poll<Result<(), Infallible>> {
             Poll::Pending
         }
 
-        fn call(&mut self, _: Request<Bytes>) -> Self::Future {
+        fn call(
+            &mut self,
+            _: Request<Bytes>,
+        ) -> Ready<Result<Response<Bytes>, Infallible>> {
             future::ready(Ok(Response::builder()
                 .status(500)
                 .body(Bytes::new())
@@ -1702,7 +1708,7 @@ mod tests {
 
     impl DriverFixture {
         pub(super) async fn run(self) {
-            let Self { driver, incoming } = self;
+            let DriverFixture { driver, incoming } = self;
             let _incoming = incoming;
             driver.run().await;
         }
@@ -2581,7 +2587,15 @@ mod tests {
             Poll::Ready(Ok(()))
         }
 
-        fn call(&mut self, request: Request<Bytes>) -> Self::Future {
+        fn call(
+            &mut self,
+            request: Request<Bytes>,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<Response<Bytes>, Infallible>>
+                    + Send,
+            >,
+        > {
             let gate = self.gate.clone();
             Box::pin(async move {
                 gate.notified().await;

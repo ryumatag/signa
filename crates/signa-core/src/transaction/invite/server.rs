@@ -73,10 +73,12 @@ pub enum ResponseError {
 impl fmt::Display for ResponseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::FinalAlreadySent => {
+            ResponseError::FinalAlreadySent => {
                 "a final response was sent and only another 2xx can follow"
             }
-            Self::Terminated => "the INVITE server transaction has terminated",
+            ResponseError::Terminated => {
+                "the INVITE server transaction has terminated"
+            }
         })
     }
 }

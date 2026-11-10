@@ -74,7 +74,7 @@ impl Target {
 pub struct ClientTransactionId(Arc<Permit>);
 
 impl PartialEq for ClientTransactionId {
-    fn eq(&self, other: &Self) -> bool {
+    fn eq(&self, other: &ClientTransactionId) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
 }
@@ -291,17 +291,19 @@ pub enum CancelError {
 impl fmt::Display for CancelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotInvite => f.write_str("only an INVITE can be cancelled"),
-            Self::AlreadyRequested => {
+            CancelError::NotInvite => {
+                f.write_str("only an INVITE can be cancelled")
+            }
+            CancelError::AlreadyRequested => {
                 f.write_str("cancellation was already requested")
             }
-            Self::Busy => {
+            CancelError::Busy => {
                 f.write_str("no connection to the next hop could be admitted")
             }
-            Self::Transport(error) => {
+            CancelError::Transport(error) => {
                 write!(f, "the next hop could not be reached: {error}")
             }
-            Self::Closed => f.write_str("the endpoint is closed"),
+            CancelError::Closed => f.write_str("the endpoint is closed"),
         }
     }
 }
@@ -309,7 +311,7 @@ impl fmt::Display for CancelError {
 impl error::Error for CancelError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
-            Self::Transport(error) => Some(error),
+            CancelError::Transport(error) => Some(error),
             _ => None,
         }
     }
@@ -1132,9 +1134,9 @@ pub(super) mod compatibility {
         type Output = Result<Response<Bytes>, Error>;
 
         fn poll(
-            mut self: Pin<&mut Self>,
+            mut self: Pin<&mut ResponseFuture>,
             cx: &mut Context<'_>,
-        ) -> Poll<Self::Output> {
+        ) -> Poll<Result<Response<Bytes>, Error>> {
             match &mut self.state {
                 LegacyState::Waiting(future) => future.as_mut().poll(cx),
                 LegacyState::Failed(error) => {

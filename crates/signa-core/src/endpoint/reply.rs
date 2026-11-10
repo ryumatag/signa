@@ -304,13 +304,13 @@ pub enum ReplyError {
 impl fmt::Display for ReplyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidResponse => {
+            ReplyError::InvalidResponse => {
                 f.write_str("response does not preserve reply-route identity")
             }
-            Self::Unsupported => f.write_str("cannot respond to ACK"),
-            Self::Busy => f.write_str("write capacity is exhausted"),
-            Self::Closed => f.write_str("endpoint is closed"),
-            Self::Transport(error) => {
+            ReplyError::Unsupported => f.write_str("cannot respond to ACK"),
+            ReplyError::Busy => f.write_str("write capacity is exhausted"),
+            ReplyError::Closed => f.write_str("endpoint is closed"),
+            ReplyError::Transport(error) => {
                 write!(f, "response transport failed: {error}")
             }
         }
@@ -320,7 +320,7 @@ impl fmt::Display for ReplyError {
 impl error::Error for ReplyError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
-            Self::Transport(error) => Some(error),
+            ReplyError::Transport(error) => Some(error),
             _ => None,
         }
     }
