@@ -1,7 +1,7 @@
 use std::hint::black_box as bb;
 
 use criterion::Criterion;
-use signa::{
+use signa_core::{
     Method,
     bench::{CSeq, Via},
     message::header::HeaderValue,

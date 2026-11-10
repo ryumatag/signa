@@ -1,0 +1,46 @@
+[package]
+name = "signa"
+version = "0.3.1"  #:version
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ryumatag/signa"
+documentation = "https://docs.rs/signa"
+readme = "README.md"
+description = '''
+A low-level SIP library for Rust that handles transactions, down to the last retransmission.
+'''
+keywords = ["sip", "rfc3261", "voip", "telephony"]
+categories = ["network-programming"]
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# The README is a symlink to the one at the workspace root. Cargo packages the
+# file it points to, so `include_str!` reads the same path in a checkout and in
+# a package.
+include = [
+  "/src/**/*.rs",
+  "/tests/**/*.rs",
+  "/README.md",
+  "LICENSE-APACHE",
+  "LICENSE-MIT",
+]
+
+[features]
+default = ["tokio"]
+# The endpoint and its sockets, from signa-core.
+tokio = ["signa-core/tokio"]
+# Dialogs and INVITE usage, from signa-ua. It has no API yet.
+ua = ["dep:signa-ua"]
+
+[dependencies]
+signa-core = { version = "0.3.1", path = "../signa-core", default-features = false }
+signa-ua = { version = "0.0.0", path = "../signa-ua", optional = true }
+
+[dev-dependencies]
+bytes = "1.12.1"
+# The README's quick start runs as a doctest.
+tokio = { version = "1.54", features = ["macros", "rt-multi-thread"] }
+
+# The facade's re-exports through the public API.
+[[test]]
+name = "facade"
+required-features = ["tokio"]

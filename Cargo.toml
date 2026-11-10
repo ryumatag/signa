@@ -1,109 +1,12 @@
-[package]
-name = "signa"
-version = "0.3.1"
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+# Each has a `[workspace]` of its own, so that the benchmark and example
+# dependencies do not pile up on the crates. `tmp/` holds scratch copies of
+# older trees, such as those `scripts/tables` measures.
+exclude = ["bench", "examples", "tmp"]
+
+[workspace.package]
 authors = ["Ryuma Taguchi <ryumatag@gmail.com>"]
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/ryumatag/signa"
-documentation = "https://docs.rs/signa"
-readme = "README.md"
-description = '''
-A low-level SIP library for Rust that handles transactions, down to the last retransmission.
-'''
-keywords = ["sip", "rfc3261", "voip", "telephony"]
-categories = ["network-programming"]
 edition = "2024"
 rust-version = "1.85"
-include = [
-  "/src/**/*.rs",
-  "/docs/rustdoc/**/*.md",
-  "/examples/**/*.rs",
-  "/tests/**/*.rs",
-  "/README.md",
-  "LICENSE-APACHE",
-  "LICENSE-MIT",
-]
-
-[features]
-default = ["tokio"]
-# The endpoint and sockets run on tokio. Without this feature, messages,
-# timer configuration and transport metadata remain runtime independent.
-tokio = [
-  "dep:tokio",
-  "dep:libc",
-  "dep:foldhash",
-  "dep:hashbrown",
-]
-# Exposes crate internals to the benchmark crate in `bench/`. Unstable, with no
-# semver guarantee. Not for use outside this repository.
-__bench = []
-
-[dependencies]
-bytes = { version = "1.12.1", default-features = false, features = ["std"] }
-siparse = "0.4.4"
-# RFC 3261 section 19.3 requires tags with cryptographic randomness.
-getrandom = { version = "0.4", default-features = false }
-tokio = { version = "1.54", default-features = false, features = ["io-util", "net", "rt", "sync", "time"], optional = true }
-# Keys the transaction tables. Branches come from the network, so the hasher
-# must be seeded, and it must be fast, since every message is looked up.
-foldhash = { version = "0.2", optional = true }
-# The tables index a slab of transactions through a `HashTable`, so that each
-# key is stored once. The `HashMap` of the standard library is hashbrown too,
-# but it keeps the value in the bucket.
-hashbrown = { version = "0.17", default-features = false, features = ["inline-more"], optional = true }
-
-# `recvmsg` and `sendmsg` with the `PKTINFO` control messages, which tokio does
-# not expose.
-[target.'cfg(unix)'.dependencies]
-libc = { version = "0.2.191", optional = true }
-
-[dev-dependencies]
-tower-service = "0.3.3"
-quickcheck = { version = "1.1", default-features = false }
-# `test-util` pauses the clock for timer tests that drive the endpoint's
-# driver by hand, so Timer D and the other long timers keep their real values.
-tokio = { version = "1.54", features = [
-  "macros",
-  "rt-multi-thread",
-  "test-util",
-] }
-tower = { version = "0.5.3", features = ["limit", "timeout", "util"] }
-
-# The example runs an endpoint, which needs the `tokio` feature.
-[[example]]
-name = "options"
-required-features = ["tokio"]
-
-# What the transaction tables cost. `scripts/tables` runs it.
-[[example]]
-name = "tables"
-required-features = ["tokio"]
-
-# A UDP stateless proxy between a raw UAC and a stateful UAS.
-[[example]]
-name = "stateless_proxy"
-required-features = ["tokio"]
-
-# An INVITE UAS with its 2xx retransmission, ACK wait and work guard.
-[[example]]
-name = "invite_uas"
-required-features = ["tokio"]
-
-# An INVITE UAC with forked 2xx, its own ACKs, and cancellation.
-[[example]]
-name = "invite_uac"
-required-features = ["tokio"]
-
-# A stateful proxy that forks INVITEs, relays 2xx and cancels branches.
-[[example]]
-name = "fork_proxy"
-required-features = ["tokio"]
-
-# An external Tower adapter and bounded dispatcher on the public API.
-[[test]]
-name = "tower_fixture"
-required-features = ["tokio"]
-
-# Reply routing through the public API.
-[[test]]
-name = "reply_routing"
-required-features = ["tokio"]

@@ -1,7 +1,7 @@
 use std::hint::black_box as bb;
 
 use criterion::{BatchSize, Criterion};
-use signa::{
+use signa_core::{
     Request,
     message::header::{HeaderValue, VIA},
 };

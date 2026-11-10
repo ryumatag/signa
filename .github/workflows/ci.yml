@@ -39,14 +39,18 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
       - name: Test
-        run: cargo test --verbose
+        run: cargo test --workspace --verbose
       - name: Test without default features
-        run: cargo test --no-default-features --verbose
+        run: cargo test --workspace --no-default-features --verbose
+      - name: Test each crate on its own
+        shell: bash
+        run: scripts/test-packages
 
   # Runs the examples, which check their own outcomes and fail otherwise. They
   # use RFC 3261's timers, so each one's graceful shutdown waits about 32 s for
-  # Timer J, L, M or D. The external Tower fixture in `tests/` runs with the
-  # tests above.
+  # Timer J, L, M or D. Each is a workspace of its own, built through the
+  # `signa` facade. The external Tower fixture in signa-core's `tests/` runs
+  # with the tests above.
   examples:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -55,10 +59,10 @@ jobs:
       matrix:
         example:
           - options
-          - invite_uas
-          - invite_uac
-          - fork_proxy
-          - stateless_proxy
+          - invite-uas
+          - invite-uac
+          - fork-proxy
+          - stateless-proxy
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -67,7 +71,7 @@ jobs:
         with:
           toolchain: stable
       - name: Run the example
-        run: cargo run --example ${{ matrix.example }}
+        run: cargo run --manifest-path examples/${{ matrix.example }}/Cargo.toml
 
   # Runs every benchmark once and checks its assertions, so a change that
   # breaks a benchmark fails here instead of in a later comparison.
@@ -93,11 +97,15 @@ jobs:
         with:
           toolchain: stable
           components: clippy
+      # The examples are outside the workspace, so each gets its own run.
       - name: Run clippy
         run: |
-          cargo clippy --all-targets -- -D warnings
-          cargo clippy --all-targets --no-default-features -- -D warnings
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy --workspace --all-targets --no-default-features -- -D warnings
           cargo clippy --manifest-path bench/Cargo.toml --all-targets -- -D warnings
+          for manifest in examples/*/Cargo.toml; do
+            cargo clippy --manifest-path "$manifest" --all-targets -- -D warnings
+          done
 
   rustfmt:
     name: rustfmt
@@ -112,8 +120,11 @@ jobs:
           components: rustfmt
       - name: Check formatting
         run: |
-          cargo fmt -- --check
+          cargo fmt --all -- --check
           cargo fmt --manifest-path bench/Cargo.toml -- --check
+          for manifest in examples/*/Cargo.toml; do
+            cargo fmt --manifest-path "$manifest" -- --check
+          done
 
   # A dependency's newest release can need a newer Rust than the MSRV. The
   # fallback resolver picks the newest release that the MSRV can build.
@@ -127,7 +138,7 @@ jobs:
         with:
           toolchain: "1.85"
       - name: Test
-        run: cargo +1.85 test --verbose
+        run: cargo +1.85 test --workspace --verbose
         env:
           CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
 
@@ -143,7 +154,7 @@ jobs:
         with:
           toolchain: stable
       - name: Build docs
-        run: cargo doc --all-features --verbose
+        run: cargo doc --workspace --all-features --verbose
 
   # signa's own `unsafe` is `from_utf8_unchecked` on bytes a check has
   # accepted, which Miri cannot verify. The tests still drive siparse's
@@ -164,4 +175,4 @@ jobs:
           toolchain: nightly
           components: miri
       - name: Run tests under Miri
-        run: cargo miri test --verbose
+        run: cargo miri test --workspace --verbose

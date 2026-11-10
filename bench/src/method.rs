@@ -1,7 +1,7 @@
 use std::hint::black_box as bb;
 
 use criterion::Criterion;
-use signa::Method;
+use signa_core::Method;
 
 use crate::benchmark;
 

@@ -13,16 +13,21 @@
 #   scripts/tables -H -c 0.2.1    and the heap histograms
 #   scripts/tables -m invite -o   INVITEs in Accepted, with handles kept
 #
-# `-m` picks what each transaction is, see `examples/tables.rs`: `options`
-# (the default), `invite` or `reject`. `-o` keeps the TU's handles. With either,
-# the copy of a ref measures this checkout's `examples/tables.rs`, which uses
+# `-m` picks what each transaction is, see `examples/tables/main.rs`:
+# `options` (the default), `invite` or `reject`. `-o` keeps the TU's handles.
+# With either, the copy of a ref measures this checkout's fixture, which uses
 # the public API only, so an older ref can run a mode its own fixture lacks.
 #
 # The runs alternate between the trees, so that a drift of the machine shows
 # in both. A copy of a ref is made with `git archive` under `tmp/tables/` and
 # keeps its `target/`, so the next comparison against the same ref rebuilds
-# only what changed. It gets this checkout's `Cargo.lock`, so both trees build
-# with the same dependencies.
+# only what changed. It gets the lockfile this checkout builds the example
+# with, so both trees build with the same dependencies.
+#
+# The example is a workspace of its own under `examples/tables/` since signa
+# split into crates, and a file in `examples/` before. A tree of either layout
+# can be measured, and a copy of an older ref gets this checkout's fixture in
+# the place its layout expects.
 #
 # You'll need Bash, Cargo, Git, and GNU or BSD time at `/usr/bin/time`. On
 # Debian and Ubuntu that is the `time` package.
@@ -101,6 +106,41 @@ if $heap && [[ "$(uname -s)" != Darwin ]]; then
   die 'heap is a macOS tool'
 fi
 
+# Whether a checkout has the example as a workspace of its own.
+split_layout() {
+  [[ -f "$1/examples/tables/Cargo.toml" ]]
+}
+
+# The fixture's source, its manifest, and the binary a release build makes,
+# relative to a checkout.
+fixture() {
+  if split_layout "$1"; then
+    echo examples/tables/main.rs
+  else
+    echo examples/tables.rs
+  fi
+}
+manifest() {
+  if split_layout "$1"; then
+    echo examples/tables/Cargo.toml
+  else
+    echo Cargo.toml
+  fi
+}
+binary() {
+  if split_layout "$1"; then
+    echo target/release/tables
+  else
+    echo target/release/examples/tables
+  fi
+}
+
+# The lockfile of this checkout's example, made if it has none yet.
+lockfile="$(dirname -- "$repo/$(manifest "$repo")")/Cargo.lock"
+if [[ ! -f "$lockfile" ]]; then
+  cargo generate-lockfile -q --manifest-path "$repo/$(manifest "$repo")"
+fi
+
 # The trees to measure, as directories, and a label for each. The copies of
 # refs come first, so that a comparison reads base, then head.
 dirs=()
@@ -108,15 +148,16 @@ labels=()
 for ref in ${refs[@]+"${refs[@]}"}; do
   commit="$(git -C "$repo" rev-parse --short "$ref^{commit}")" \
     || die "$ref is not a commit"
-  git -C "$repo" cat-file -e "$ref:examples/tables.rs" 2>/dev/null \
-    || die "$ref has no examples/tables.rs"
+  git -C "$repo" cat-file -e "$ref:examples/tables/Cargo.toml" 2>/dev/null \
+    || git -C "$repo" cat-file -e "$ref:examples/tables.rs" 2>/dev/null \
+    || die "$ref has no tables example"
   dir="$repo/tmp/tables/${ref//\//-}"
   mkdir -p "$dir"
   find "$dir" -mindepth 1 -maxdepth 1 ! -name target -exec rm -rf {} +
   git -C "$repo" archive "$ref" | tar -xf - -C "$dir"
-  cp "$repo/Cargo.lock" "$dir/Cargo.lock"
+  cp "$lockfile" "$(dirname -- "$dir/$(manifest "$dir")")/Cargo.lock"
   if [[ -n "$mode" ]] || $observe; then
-    cp "$repo/examples/tables.rs" "$dir/examples/tables.rs"
+    cp "$repo/$(fixture "$repo")" "$dir/$(fixture "$dir")"
   fi
   dirs+=("$dir")
   # A ref that is a hash already is shown short, as `git log` would.
@@ -131,8 +172,8 @@ if [[ $# == 0 ]]; then
   labels+=('working tree')
 fi
 for tree in "$@"; do
-  [[ -f "$tree/examples/tables.rs" ]] \
-    || die "$tree is not a checkout with examples/tables.rs"
+  [[ -f "$tree/$(fixture "$tree")" ]] \
+    || die "$tree is not a checkout with the tables example"
   dirs+=("$(cd -- "$tree" && pwd)")
   labels+=("$tree")
 done
@@ -141,9 +182,14 @@ done
 # so the binary is where this script looks for it.
 bins=()
 for dir in "${dirs[@]}"; do
-  CARGO_TARGET_DIR="$dir/target" \
-    cargo build -q --release --example tables --manifest-path "$dir/Cargo.toml"
-  bins+=("$dir/target/release/examples/tables")
+  if split_layout "$dir"; then
+    CARGO_TARGET_DIR="$dir/target" \
+      cargo build -q --release --manifest-path "$dir/$(manifest "$dir")"
+  else
+    CARGO_TARGET_DIR="$dir/target" cargo build -q --release --example tables \
+      --manifest-path "$dir/$(manifest "$dir")"
+  fi
+  bins+=("$dir/$(binary "$dir")")
 done
 
 # Prints the time per round trip in microseconds and the maximum RSS in

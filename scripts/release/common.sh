@@ -26,11 +26,19 @@
 # If a check fails after the version bump, fix it and finish the commit by
 # hand. The changes stay in your working tree.
 
+# TODO: Release signa-core and signa-ua with signa, in dependency order. Since
+# the split into crates these scripts still bump and publish the `signa` crate
+# alone, and its dry run fails until the signa-core it requires is on
+# crates.io. A multi-crate release, modeled on jiff's, comes with signa-ua's
+# first release.
+
 # Find the repository from this script so the commands work from any directory.
 set -euo pipefail
 
 release_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd -- "$release_dir/../.."
+# shellcheck disable=SC2034 # The scripts that source this file use it.
+manifest=crates/signa/Cargo.toml
 
 die() {
   printf '%s\n' "$*" >&2

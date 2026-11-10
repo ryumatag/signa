@@ -1,0 +1,26 @@
+[package]
+name = "signa-ua"
+version = "0.0.0"  #:version
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ryumatag/signa"
+documentation = "https://docs.rs/signa-ua"
+readme = "README.md"
+description = '''
+Dialogs and INVITE usage on signa-core, for SIP user agents.
+'''
+keywords = ["sip", "rfc3261", "voip", "telephony"]
+categories = ["network-programming"]
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# It has no API yet, and a crate without one is not published to hold its name.
+publish = false
+include = [
+  "/src/**/*.rs",
+  "/README.md",
+  "LICENSE-APACHE",
+  "LICENSE-MIT",
+]
+
+[dependencies]
+signa-core = { version = "0.3.1", path = "../signa-core", default-features = false }

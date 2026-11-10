@@ -1,7 +1,7 @@
 use std::hint::black_box as bb;
 
 use criterion::Criterion;
-use signa::Uri;
+use signa_core::Uri;
 
 use crate::benchmark;
 
@@ -34,7 +34,7 @@ pub(super) fn from_bytes(c: &mut Criterion) {
 }
 
 pub(super) fn structured(c: &mut Criterion) {
-    use signa::message::uri::SipUri;
+    use signa_core::message::uri::SipUri;
 
     for (variant, input) in [
         ("typical", "sip:bob@biloxi.example.com"),

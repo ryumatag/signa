@@ -2,7 +2,7 @@ use std::hint::black_box as bb;
 
 use bytes::Bytes;
 use criterion::Criterion;
-use signa::HeaderValue;
+use signa_core::HeaderValue;
 
 use crate::benchmark;
 

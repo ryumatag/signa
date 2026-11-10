@@ -21,6 +21,14 @@ B2BUAs. It is not one of them, and it is not a PBX.
 
 Its design draws heavily on the [hyper] and [http] crates.
 
+The repository is a Cargo workspace of three crates:
+
+* `signa`, the crate to depend on. It re-exports signa-core and is to become
+  the front of a SIP application framework.
+* `signa-core`, the messages, transports and transactions described below.
+* `signa-ua`, dialogs and INVITE usage for user agents. It has no API yet and
+  is not published.
+
 [RFC 3261 section 17]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17
 [hyper]: https://docs.rs/hyper
 [http]: https://docs.rs/http
@@ -141,26 +149,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### Examples
 
 Each example runs on the loopback, checks its own outcome, and says which TU
-duties it takes on and which it leaves out. CI runs them with RFC 3261's
-timers. `--t1-ms 50` makes most of them quicker.
+duties it takes on and which it leaves out. Each is a workspace of its own
+that builds on the `signa` crate, so it runs with its manifest:
 
-* [`examples/options.rs`](examples/options.rs): a non-INVITE responder over
+```sh
+cargo run --manifest-path examples/options/Cargo.toml
+```
+
+CI runs them with RFC 3261's timers. `--t1-ms 50` makes most of them quicker.
+
+* [`examples/options`](examples/options): a non-INVITE responder over
   UDP and TCP, with transaction observation and a drained shutdown.
-* [`examples/invite_uas.rs`](examples/invite_uas.rs): an INVITE UAS that
+* [`examples/invite-uas`](examples/invite-uas): an INVITE UAS that
   retransmits its 2xx until the ACK under a work guard, answers CANCEL, and
   compares a drained shutdown with a forced one.
-* [`examples/invite_uac.rs`](examples/invite_uac.rs): an INVITE UAC that
+* [`examples/invite-uac`](examples/invite-uac): an INVITE UAC that
   acknowledges forked and retransmitted 2xx and cancels calls, including a
   CANCEL that loses to a 2xx.
-* [`examples/fork_proxy.rs`](examples/fork_proxy.rs): a stateful proxy that
+* [`examples/fork-proxy`](examples/fork-proxy): a stateful proxy that
   forks an INVITE to two UASes, relays every 2xx, and cancels the other
   branches.
-* [`examples/stateless_proxy.rs`](examples/stateless_proxy.rs): a UDP
+* [`examples/stateless-proxy`](examples/stateless-proxy): a UDP
   stateless proxy with a stable branch for an INVITE, its CANCEL and its ACK.
 
-[`tests/tower_fixture.rs`](tests/tower_fixture.rs) builds a Tower adapter and
-a bounded dispatcher outside signa, against its public API only. signa has no
-Tower dependency.
+signa-core's [`tests/tower_fixture.rs`](crates/signa-core/tests/tower_fixture.rs)
+builds a Tower adapter and a bounded dispatcher outside signa, against its
+public API only. signa has no Tower dependency.
 
 ### Supported RFC scope
 

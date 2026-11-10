@@ -1,0 +1,78 @@
+[package]
+name = "signa-core"
+version = "0.3.1"  #:version
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ryumatag/signa"
+documentation = "https://docs.rs/signa-core"
+readme = "README.md"
+description = '''
+The SIP messages, transports and transactions of signa, down to the last retransmission.
+'''
+keywords = ["sip", "rfc3261", "voip", "telephony"]
+categories = ["network-programming"]
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+include = [
+  "/src/**/*.rs",
+  "/docs/rustdoc/**/*.md",
+  "/tests/**/*.rs",
+  "/README.md",
+  "LICENSE-APACHE",
+  "LICENSE-MIT",
+]
+
+[features]
+default = ["tokio"]
+# The endpoint and sockets run on tokio. Without this feature, messages,
+# timer configuration and transport metadata remain runtime independent.
+tokio = [
+  "dep:tokio",
+  "dep:libc",
+  "dep:foldhash",
+  "dep:hashbrown",
+]
+# Exposes crate internals to the benchmark crate in `bench/`. Unstable, with no
+# semver guarantee. Not for use outside this repository.
+__bench = []
+
+[dependencies]
+bytes = { version = "1.12.1", default-features = false, features = ["std"] }
+siparse = "0.4.4"
+# RFC 3261 section 19.3 requires tags with cryptographic randomness.
+getrandom = { version = "0.4", default-features = false }
+tokio = { version = "1.54", default-features = false, features = ["io-util", "net", "rt", "sync", "time"], optional = true }
+# Keys the transaction tables. Branches come from the network, so the hasher
+# must be seeded, and it must be fast, since every message is looked up.
+foldhash = { version = "0.2", optional = true }
+# The tables index a slab of transactions through a `HashTable`, so that each
+# key is stored once. The `HashMap` of the standard library is hashbrown too,
+# but it keeps the value in the bucket.
+hashbrown = { version = "0.17", default-features = false, features = ["inline-more"], optional = true }
+
+# `recvmsg` and `sendmsg` with the `PKTINFO` control messages, which tokio does
+# not expose.
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2.191", optional = true }
+
+[dev-dependencies]
+tower-service = "0.3.3"
+quickcheck = { version = "1.1", default-features = false }
+# `test-util` pauses the clock for timer tests that drive the endpoint's
+# driver by hand, so Timer D and the other long timers keep their real values.
+tokio = { version = "1.54", features = [
+  "macros",
+  "rt-multi-thread",
+  "test-util",
+] }
+tower = { version = "0.5.3", features = ["limit", "timeout", "util"] }
+
+# An external Tower adapter and bounded dispatcher on the public API.
+[[test]]
+name = "tower_fixture"
+required-features = ["tokio"]
+
+# Reply routing through the public API.
+[[test]]
+name = "reply_routing"
+required-features = ["tokio"]

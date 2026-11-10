@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+
+# Tests each crate on its own, with and without its default features, and the
+# facade with signa-ua.
+#
+# `cargo test --workspace` builds every member with the union of their
+# features, so a crate that compiles only because a sibling turns a feature on
+# for it passes there. Here each crate gets only the features it asks for.
+
+set -euo pipefail
+
+cd -- "$(dirname -- "$0")/.."
+
+for package in signa-core signa-ua signa; do
+  echo "===== $package ====="
+  cargo test -p "$package"
+  echo "===== $package, no default features ====="
+  cargo test -p "$package" --no-default-features
+done
+echo "===== signa with ua ====="
+cargo test -p signa --features ua

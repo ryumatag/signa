@@ -5,7 +5,7 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use criterion::Criterion;
-use signa::{
+use signa_core::{
     Message,
     bench::{Flow, Transport, tcp, udp},
     transport::WriteLimits,

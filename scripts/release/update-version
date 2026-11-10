@@ -8,18 +8,19 @@ version="$1"
 validate_version "$version"
 
 # I avoid sed -i because its syntax differs between macOS and Linux.
-# Only replace the [package] version so dependency versions stay untouched.
-manifest_tmp="$(mktemp Cargo.toml.XXXXXX)"
+# Only replace the [package] version so dependency versions stay untouched,
+# and keep the `#:version` mark after it.
+manifest_tmp="$(mktemp "$manifest.XXXXXX")"
 trap 'rm -f -- "$manifest_tmp"' EXIT
 awk -v version="$version" '
   /^\[/ { package = ($0 == "[package]") }
   package && /^version = "/ {
-    $0 = "version = \"" version "\""
+    sub(/"[^"]*"/, "\"" version "\"")
     count++
   }
   { print }
   END { if (count != 1) exit 1 }
-' Cargo.toml > "$manifest_tmp"
-cat "$manifest_tmp" > Cargo.toml
+' "$manifest" > "$manifest_tmp"
+cat "$manifest_tmp" > "$manifest"
 
 printf 'Updated signa to %s\n' "$version"

@@ -1,0 +1,27 @@
+# What the transaction tables cost. `scripts/tables` runs it.
+[package]
+publish = false
+name = "tables"
+version = "0.0.0"
+edition = "2024"
+# The crates' MSRV, so that clippy suggests nothing they could not use.
+rust-version = "1.85"
+
+# Each example is a workspace of its own, so that its dependencies do not pile
+# up on the crates.
+[workspace]
+
+[dependencies]
+bytes = "1.12.1"
+signa = { path = "../../crates/signa" }
+tokio = { version = "1.54", features = [
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
+
+[[bin]]
+name = "tables"
+path = "main.rs"

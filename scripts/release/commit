@@ -14,10 +14,10 @@ if git show-ref --verify --quiet "refs/tags/$version"; then
 fi
 
 "$release_dir/update-version" "$version"
-cargo test
-cargo test --no-default-features
-cargo publish --dry-run --allow-dirty
+cargo test --workspace
+cargo test --workspace --no-default-features
+cargo publish -p signa --dry-run --allow-dirty
 
-git add -- Cargo.toml
+git add -- "$manifest"
 git commit -m "release: $version"
 printf 'Merge the release commit into main, then run scripts/release/publish.\n'

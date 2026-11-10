@@ -2,7 +2,7 @@ use std::hint::black_box as bb;
 
 use bytes::BytesMut;
 use criterion::{BatchSize, Criterion};
-use signa::bench::{Decoder, Frame, MessageLimits, Role};
+use signa_core::bench::{Decoder, Frame, MessageLimits, Role};
 
 use crate::{
     benchmark,

@@ -2,7 +2,7 @@ use std::{hint::black_box as bb, time::Instant};
 
 use bytes::Bytes;
 use criterion::{BatchSize, Criterion};
-use signa::{
+use signa_core::{
     Request, Response,
     bench::{
         ClientEvent, ClientKey, ClientTransaction, ServerKey,
@@ -70,7 +70,7 @@ pub(super) fn non_invite(c: &mut Criterion) {
     });
 
     let mut waiting = ServerTransaction::new(&request, false, &timers, now);
-    let trying = signa::StatusCode::from_u16(100).unwrap();
+    let trying = signa_core::StatusCode::from_u16(100).unwrap();
     benchmark(c, "transaction/non_invite/server_response/early_100", 1, |b| {
         b.iter(|| {
             assert!(!waiting.on_response(

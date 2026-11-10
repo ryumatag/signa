@@ -12,7 +12,7 @@ use std::{
 
 use bytes::Bytes;
 use criterion::Criterion;
-use signa::{
+use signa_core::{
     Request, Response, StatusCode,
     bench::{Flow, reply_driver, tcp, udp},
     endpoint::{
@@ -946,8 +946,8 @@ impl Serve for Builder {
                         .as_str();
                     let tagged = format!("{to};tag=bench");
                     response.headers_mut().insert(
-                        signa::message::header::TO,
-                        signa::HeaderValue::from_bytes(tagged.as_bytes())
+                        signa_core::message::header::TO,
+                        signa_core::HeaderValue::from_bytes(tagged.as_bytes())
                             .unwrap(),
                     );
                     if let Some(responder) = responder {
