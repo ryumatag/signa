@@ -116,6 +116,25 @@ impl RouteSet {
         Ok(RouteSet(routes.into()))
     }
 
+    /// Takes a route set the application gives, in the order requests visit
+    /// it, such as an outbound proxy for a request outside a dialog (RFC 3261
+    /// section 8.1.1.1).
+    pub(crate) fn from_uris<'a>(
+        uris: impl IntoIterator<Item = &'a str>,
+    ) -> Result<RouteSet, InvalidRouteSet> {
+        let mut routes = Vec::new();
+        for uri in uris {
+            let parsed =
+                SipUri::parse(uri).map_err(|_| InvalidRouteSet::Malformed)?;
+            let loose = parsed
+                .parameter("lr")
+                .map_err(|_| InvalidRouteSet::Malformed)?
+                .is_some();
+            routes.push(Route { uri: uri.into(), loose });
+        }
+        Ok(RouteSet(routes.into()))
+    }
+
     pub(crate) fn iter(&self) -> impl Iterator<Item = &Route> {
         self.0.iter()
     }
@@ -244,7 +263,83 @@ fn request_uri(src: &str) -> String {
     let mut out = String::with_capacity(src.len());
     out.push_str(&src[..address_end(&uri)]);
     for parameter in uri.parameters() {
-        if parameter.name().as_str().eq_ignore_ascii_case("method") {
+        // Parameter names compare after percent-decoding (RFC 3261 section
+        // 19.1.4), so `m%65thod` is a `method` parameter too.
+        if parameter.name().decode().eq_ignore_ascii_case(b"method") {
+            continue;
+        }
+        out.push(';');
+        out.push_str(parameter.name().as_str());
+        if let Some(value) = parameter.value() {
+            out.push('=');
+            out.push_str(value.as_str());
+        }
+    }
+    out
+}
+
+/// Where a URI goes in a request, which decides the components it may have
+/// (Table 1 of RFC 3261 section 19.1.1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Place {
+    /// The Request-URI.
+    RequestUri,
+    /// The URI of a To or From.
+    Party,
+    /// A Contact that forms a dialog, or a Route or Record-Route value.
+    Dialog,
+}
+
+impl Place {
+    /// Says whether a URI in this place may have the parameter `name`,
+    /// lowercase.
+    fn allows(self, name: &[u8]) -> bool {
+        let refused: &[&[u8]] = match self {
+            Place::RequestUri => &[b"method"],
+            Place::Party => {
+                &[b"method", b"maddr", b"ttl", b"transport", b"lr"]
+            }
+            Place::Dialog => &[b"method", b"ttl"],
+        };
+        !refused.contains(&name)
+    }
+}
+
+/// Says whether `uri` is a SIP or SIPS URI with only the components Table 1
+/// of RFC 3261 section 19.1.1 allows in `place`. No place but a redirect's
+/// Contact allows headers, and To and From allow no port.
+pub(crate) fn allowed_in(uri: &str, place: Place) -> bool {
+    let Ok(parsed) = SipUri::parse(uri) else {
+        return false;
+    };
+    let port = place == Place::Party && parsed.port().is_some();
+
+    !port
+        && parsed.headers().next().is_none()
+        && parsed.parameters().all(|parameter| {
+            place.allows(&parameter.name().decode().to_ascii_lowercase())
+        })
+}
+
+/// Copies a SIP or SIPS URI without what Table 1 of RFC 3261 section 19.1.1
+/// does not allow in a To or From: the port, the `method`, `maddr`, `ttl`,
+/// `transport` and `lr` parameters, and the headers. The section has an
+/// element ignore such components, which is what this does for a To taken
+/// from the Request-URI.
+pub(crate) fn party_uri(src: &str) -> String {
+    let Ok(uri) = SipUri::parse(src) else {
+        return src.into();
+    };
+
+    let mut end = address_end(&uri);
+    if let Some(port) = uri.port() {
+        end -= port.len() + 1;
+    }
+    let mut out = String::with_capacity(src.len());
+    out.push_str(&src[..end]);
+    for parameter in uri.parameters() {
+        let name = parameter.name().decode().to_ascii_lowercase();
+        if !Place::Party.allows(&name) {
             continue;
         }
         out.push(';');
@@ -620,6 +715,12 @@ mod tests {
             false,
         );
         assert_eq!(direct.request_uri, "sip:[2001:db8::1]");
+        let escaped = request_target(
+            &RouteSet::default(),
+            &target("sip:[2001:db8::1];M%65THOD=BYE;lr"),
+            false,
+        );
+        assert_eq!(escaped.request_uri, "sip:[2001:db8::1];lr");
     }
 
     #[test]

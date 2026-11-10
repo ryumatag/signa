@@ -29,6 +29,8 @@ use crate::{invite::ExchangeKey, retention::ReplayKey};
 pub(crate) enum Timer {
     /// The application has not decided an incoming INVITE in time.
     Decision(ExchangeKey),
+    /// An incoming INVITE expired, as its Expires said.
+    Expires(ExchangeKey),
     /// The provisional response of an incoming INVITE is due again.
     Provisional(ExchangeKey),
     /// The 2xx of an incoming INVITE is due again.

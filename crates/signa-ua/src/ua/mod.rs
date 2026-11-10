@@ -17,7 +17,6 @@ use bytes::Bytes;
 use signa_core::{
     Request, StatusCode,
     endpoint::{Endpoint, Incoming, Reception, Target},
-    message::uri::SipUri,
     transaction::Timers,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -34,6 +33,7 @@ use crate::{
     model::{self, Authority, Limits},
     negotiation::Negotiation,
     operation::Completion,
+    routing::{Place, allowed_in},
 };
 
 mod driver;
@@ -65,8 +65,10 @@ impl Query {
         &self.uri
     }
 
-    /// The encoded size of the request, which can decide the transport
-    /// (RFC 3261 section 18.1.1).
+    /// The encoded size of the request, with room for the Via the endpoint
+    /// adds, which can decide the transport (RFC 3261 section 18.1.1). A
+    /// request over 1300 bytes then goes over TCP, since the endpoint refuses
+    /// it over UDP.
     pub fn size(&self) -> usize {
         self.size
     }
@@ -86,7 +88,9 @@ impl Resolve for StaticResolver {
 
 /// How a UA is set up.
 ///
-/// Every limit has a finite default, and a limit of zero counts as one.
+/// Every limit has a finite default. A limit of zero counts as one, and one
+/// beyond the largest capacity Tokio's channels and semaphores take,
+/// [`Semaphore::MAX_PERMITS`], counts as that.
 #[derive(Clone, Debug)]
 pub struct Config<R = StaticResolver> {
     contact: Box<str>,
@@ -100,22 +104,31 @@ pub struct Config<R = StaticResolver> {
     routes: usize,
     jobs: usize,
     resolve_timeout: Duration,
-    outcome_retention: Duration,
     timers: Timers,
     decision_timeout: Duration,
 }
 
-/// The Contact URI given to [`Config::new`] is not a SIP or SIPS URI.
+/// The Contact URI given to [`Config::new`] is not a SIP or SIPS URI, or has
+/// what a Contact that forms a dialog may not have.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InvalidContact(());
 
 impl fmt::Display for InvalidContact {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("a Contact URI must be a SIP or SIPS URI")
+        f.write_str(
+            "a Contact URI must be a SIP or SIPS URI without a method or ttl \
+             parameter or headers",
+        )
     }
 }
 
 impl error::Error for InvalidContact {}
+
+/// Keeps a configured limit within what the UA can build, so that
+/// [`attach`] cannot fail on it.
+fn bounded(limit: usize) -> usize {
+    limit.clamp(1, Semaphore::MAX_PERMITS)
+}
 
 impl Config {
     /// Creates a configuration whose responses that form a dialog carry
@@ -125,9 +138,13 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Returns [`InvalidContact`] if `contact` is not a SIP or SIPS URI.
+    /// Returns [`InvalidContact`] if `contact` is not a SIP or SIPS URI, or
+    /// has the `method` or `ttl` parameter or headers, which Table 1 of RFC
+    /// 3261 section 19.1.1 does not allow in a Contact that forms a dialog.
     pub fn new(contact: &str) -> Result<Config, InvalidContact> {
-        SipUri::parse(contact).map_err(|_| InvalidContact(()))?;
+        if !allowed_in(contact, Place::Dialog) {
+            return Err(InvalidContact(()));
+        }
 
         Ok(Config {
             contact: contact.into(),
@@ -141,9 +158,6 @@ impl Config {
             routes: 16,
             jobs: 256,
             resolve_timeout: Duration::from_secs(4),
-            // 64 T1 with RFC 3261's T1, the time a peer may still
-            // retransmit, which is about as long as anyone looks back.
-            outcome_retention: Duration::from_secs(32),
             timers: Timers::new(),
             // A proxy may cancel an INVITE after three minutes without a
             // final response (RFC 3261 section 16.6, Timer C), so a decision
@@ -168,7 +182,6 @@ impl<R> Config<R> {
             routes: self.routes,
             jobs: self.jobs,
             resolve_timeout: self.resolve_timeout,
-            outcome_retention: self.outcome_retention,
             timers: self.timers,
             decision_timeout: self.decision_timeout,
         }
@@ -177,25 +190,26 @@ impl<R> Config<R> {
     /// Sets how many submitted operations may wait for the driver. A
     /// submission beyond it gets [`Error::Busy`]. The default is 256.
     pub fn command_capacity(mut self, capacity: usize) -> Config<R> {
-        self.commands = capacity.max(1);
+        self.commands = bounded(capacity);
         self
     }
 
     /// Sets how many events may wait in [`UaEvents`]. The default is 256.
     ///
-    /// Each [`IncomingInvite`] and each INVITE this UA sends holds a place in
-    /// it until its event is received, so that the event cannot be lost. A
-    /// new INVITE that finds no place gets a 503, and one to send fails with
-    /// [`Error::CapacityExceeded`].
+    /// Each INVITE this UA sends sets one more place aside, for its
+    /// [`Event::AttemptEnded`], so that the end of an attempt cannot be lost
+    /// and INVITEs in flight do not crowd out other events. An incoming
+    /// INVITE that finds no place gets a 503. Once delivered, each event
+    /// holds its place until it is received.
     pub fn event_capacity(mut self, capacity: usize) -> Config<R> {
-        self.events = capacity.max(1);
+        self.events = bounded(capacity);
         self
     }
 
     /// Sets how many operations may run or keep an outcome at once. A
     /// submission beyond it gets [`Error::Busy`]. The default is 1024.
     pub fn max_operations(mut self, limit: usize) -> Config<R> {
-        self.operations = limit.max(1);
+        self.operations = bounded(limit);
         self
     }
 
@@ -204,36 +218,39 @@ impl<R> Config<R> {
     /// [`IncomingInvite`], also after the UA answered it at the decision
     /// timeout. Beyond it, the UA answers a new INVITE with a 503. The default
     /// is 256.
+    ///
+    /// An accepted INVITE is kept until its ACK, apart from this limit and
+    /// [`Config::max_attempts`]. [`Config::max_dialogs`] bounds those.
     pub fn max_pending_invites(mut self, limit: usize) -> Config<R> {
-        self.pending_invites = limit.max(1);
+        self.pending_invites = bounded(limit);
         self
     }
 
     /// Sets how many INVITEs this UA may have sent and still collect
     /// responses for. The default is 256.
     pub fn max_attempts(mut self, limit: usize) -> Config<R> {
-        self.attempts = limit.max(1);
+        self.attempts = bounded(limit);
         self
     }
 
     /// Sets how many dialogs, early or confirmed, the UA keeps. The default
     /// is 1024.
     pub fn max_dialogs(mut self, limit: usize) -> Config<R> {
-        self.dialogs = limit.max(1);
+        self.dialogs = bounded(limit);
         self
     }
 
     /// Sets how many URIs a dialog's route set may have. A request or
     /// response with more cannot form a dialog. The default is 16.
     pub fn max_routes(mut self, limit: usize) -> Config<R> {
-        self.routes = limit.max(1);
+        self.routes = bounded(limit);
         self
     }
 
     /// Sets how many sends and resolutions may run at once. More wait their
     /// turn. The default is 256.
     pub fn max_jobs(mut self, limit: usize) -> Config<R> {
-        self.jobs = limit.max(1);
+        self.jobs = bounded(limit);
         self
     }
 
@@ -268,7 +285,9 @@ impl<R> Config<R> {
     fn limits(&self) -> Limits {
         Limits {
             attempts: self.attempts,
-            exchanges: self.pending_invites + self.attempts,
+            // An incoming INVITE waits for a decision, and an accepted one
+            // for its ACK, which its dialog bounds.
+            incoming: self.pending_invites.saturating_add(self.dialogs),
             dialogs: self.dialogs,
             usages: self.dialogs,
             // A replay context outlives its dialog while copies of its 2xx
@@ -278,7 +297,6 @@ impl<R> Config<R> {
             operations: self.operations,
             // The driver runs each command as it arrives.
             commands: 1,
-            outcome_retention: self.outcome_retention,
             t1: self.timers.t1(),
             t2: self.timers.t2(),
             decision_timeout: self.decision_timeout,
@@ -343,11 +361,12 @@ pub struct Ua {
 /// # Events
 ///
 /// Events arrive in order through a bounded queue. An [`IncomingInvite`] always
-/// gets through, since the UA refuses an INVITE it has no room to report. A
-/// notification that does not fit is dropped and counted, and the next one that
-/// fits is preceded by [`Event::Lagged`]. Nothing the protocol needs is lost with
-/// it. The outcome of an operation comes through its [`Operation`], and the
-/// state of a session through [`UaHandle::snapshot`].
+/// gets through, since the UA answers an INVITE it has no room to report with a
+/// 503, as it does once [`UaEvents`] is dropped. A notification that does not
+/// fit is dropped and counted, and the count comes as [`Event::Lagged`] as soon
+/// as there is room, before any later notification. Nothing the protocol needs
+/// is lost with it. The outcome of an operation comes through its
+/// [`Operation`], and the state of a session through [`UaHandle::snapshot`].
 ///
 /// # Dropping
 ///
@@ -370,7 +389,9 @@ pub fn attach<R: Resolve>(
     }
 
     let (commands, command_receiver) = mpsc::channel(config.commands);
-    let (events, event_receiver) = mpsc::channel(config.events);
+    // The places of the attempts' last events come on top of the others.
+    let capacity = bounded(config.events.saturating_add(config.attempts));
+    let (events, event_receiver) = mpsc::channel(capacity);
     let shared = Arc::new(Shared {
         commands,
         operations: Arc::new(Semaphore::new(config.operations)),
@@ -484,11 +505,23 @@ impl UaHandle {
     /// no more responses can arrive, and [`UaHandle::attempt_snapshot`] says
     /// it before.
     ///
-    /// The operation fails with [`Error::Unroutable`] when the next hop does
-    /// not resolve or needs TLS, with [`Error::CapacityExceeded`] when the
-    /// UA has no room for the attempt or its event, and with
-    /// [`Error::TransportFailure`] or [`Error::CoreSubmissionRejected`] when
-    /// the endpoint cannot take the INVITE.
+    /// The operation fails, with nothing sent unless the error says so:
+    ///
+    /// * with [`Error::Unroutable`] when the next hop does not resolve or
+    ///   needs TLS,
+    /// * with [`Error::CapacityExceeded`] when the UA has no room for the
+    ///   attempt, or none for its last event because the application lets
+    ///   the events pile up,
+    /// * with [`Error::TransportFailure`] when the endpoint could not open a
+    ///   connection or write the INVITE,
+    /// * with [`Error::CoreSubmissionRejected`] when the endpoint refuses the
+    ///   INVITE, as when it is busy or the resolver picked UDP for one too
+    ///   large for it,
+    /// * with [`Error::Internal`] when the UA has no randomness for the
+    ///   INVITE's identifiers, or the resolver panicked,
+    /// * with [`Error::DriverStopped`] when the endpoint stops first, and
+    /// * with [`Error::InvalidInput`] when the endpoint refuses the INVITE as
+    ///   malformed, which would be a bug of the UA.
     ///
     /// # Errors
     ///
@@ -693,6 +726,7 @@ pub enum Event {
     Invite(IncomingInvite),
     /// A provisional response to an INVITE this UA sent formed an early
     /// dialog.
+    #[non_exhaustive]
     Early {
         /// The INVITE the response answered.
         attempt: AttemptId,
@@ -701,6 +735,7 @@ pub enum Event {
     },
     /// A 2xx confirmed a dialog. The ACK may still be owed, and the session
     /// descriptions may not be settled.
+    #[non_exhaustive]
     Confirmed {
         /// The INVITE the 2xx answered, if this UA sent it.
         attempt: Option<AttemptId>,
@@ -708,23 +743,28 @@ pub enum Event {
         session: Session,
     },
     /// The offer/answer exchange of a session completed.
+    #[non_exhaustive]
     Negotiated {
         /// The session.
         session: Session,
     },
-    /// No ACK came for the 2xx of an incoming INVITE within 64 T1 of its
-    /// first transmission. The session ends next, with [`Event::Ended`].
+    /// No ACK came for the 2xx of an incoming INVITE within 64 T1 of the
+    /// endpoint taking it, which is a little after its first transmission.
+    /// The session ends next, with [`Event::Ended`].
+    #[non_exhaustive]
     AckTimeout {
         /// The session.
         session: Session,
     },
     /// A session ended.
+    #[non_exhaustive]
     Ended {
         /// The session.
         session: Session,
     },
     /// An INVITE this UA sent got no 2xx, which ended its early dialogs:
     /// its first final response was not a 2xx, or its transaction failed.
+    #[non_exhaustive]
     Failed {
         /// The INVITE.
         attempt: AttemptId,
@@ -736,17 +776,21 @@ pub enum Event {
     /// came to. It is the last event of the attempt, and it is never dropped
     /// for a full queue, since the UA set its place aside when it sent the
     /// INVITE.
+    #[non_exhaustive]
     AttemptEnded {
         /// The INVITE.
         attempt: AttemptId,
         /// Whether a 2xx came.
         result: AttemptResult,
         /// Whether every response the endpoint took for the INVITE reached
-        /// the UA. When the endpoint drops responses for want of room, it is
-        /// `false`, and a fork's 2xx may be among them.
+        /// the UA and was kept. It is `false` when the endpoint drops
+        /// responses for want of room, and a fork's 2xx may be among them,
+        /// or when the UA could not keep a 2xx as a session, such as one
+        /// without a Contact.
         complete: bool,
     },
     /// Notifications were dropped because the queue was full.
+    #[non_exhaustive]
     Lagged {
         /// How many.
         missed: u64,

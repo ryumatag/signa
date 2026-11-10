@@ -20,23 +20,34 @@ use bytes::Bytes;
 use signa_core::{
     HeaderMap, HeaderName, HeaderValue, Method, Request, Uri,
     message::header::{
-        ALLOW, CALL_ID, CONTACT, CONTENT_LENGTH, CONTENT_TYPE, CSEQ, FROM,
-        MAX_FORWARDS, PROXY_REQUIRE, RECORD_ROUTE, REQUIRE, ROUTE, SUPPORTED,
-        TO, Tag, VIA,
+        ALLOW, AUTHORIZATION, CALL_ID, CONTACT, CONTENT_LENGTH, CONTENT_TYPE,
+        CSEQ, FROM, MAX_FORWARDS, PROXY_AUTHORIZATION, PROXY_REQUIRE,
+        RECORD_ROUTE, REQUIRE, ROUTE, SUPPORTED, TO, Tag, VIA,
     },
 };
 
-use crate::negotiation::Description;
+use crate::{
+    negotiation::Description,
+    routing::{
+        Place, RemoteTarget, RouteSet, allowed_in, party_uri, request_target,
+    },
+};
 
 /// The methods this UA takes, as an Allow value.
 ///
 /// TODO: Add CANCEL and BYE once the UA answers them.
-pub(crate) const ALLOWED: &str = "INVITE, ACK";
+pub(crate) const ALLOWED: &str = "INVITE, ACK, OPTIONS";
 
 /// The headers the UA writes itself. A plan that sets one of them is
 /// refused. Require and Proxy-Require are among them, since they would ask
-/// for an extension this UA does not have.
-const OWNED: [HeaderName; 15] = [
+/// for an extension this UA does not have. So are Authorization and
+/// Proxy-Authorization, since the ACK of a 2xx has to carry the INVITE's
+/// credentials (RFC 3261 section 13.2.2.4), and the UA builds that ACK from
+/// the dialog without them.
+///
+/// TODO: Take credentials, and copy them into the ACK, once the UA answers
+/// a challenge.
+const OWNED: [HeaderName; 17] = [
     VIA,
     FROM,
     TO,
@@ -52,6 +63,8 @@ const OWNED: [HeaderName; 15] = [
     SUPPORTED,
     REQUIRE,
     PROXY_REQUIRE,
+    AUTHORIZATION,
+    PROXY_AUTHORIZATION,
 ];
 
 /// An initial INVITE to send, with the offer it carries.
@@ -103,6 +116,11 @@ impl InvitePlan {
     /// Adds `route` to the end of the INVITE's route set, such as an outbound
     /// proxy (RFC 3261 section 8.1.1.1). The UA sends the INVITE to the first
     /// route, or to the Request-URI without one.
+    ///
+    /// A first route without `lr` is a strict router, which takes the request
+    /// with itself as the Request-URI. The UA builds the INVITE as RFC 3261
+    /// section 12.2.1.1 builds a request in a dialog then, with the
+    /// Request-URI last in Route, as section 8.1.1.1 asks.
     pub fn route(mut self, route: Uri) -> InvitePlan {
         self.routes.push(route);
         self
@@ -118,17 +136,20 @@ impl InvitePlan {
         self
     }
 
-    /// Says whether the UA can send the plan: each URI is a SIP or SIPS URI,
+    /// Says whether the UA can send the plan: each URI is a SIP or SIPS URI
+    /// with only what Table 1 of RFC 3261 section 19.1.1 allows where it goes,
     /// no header is one the UA writes, the offer has a body, and the display
     /// name can be quoted.
     pub(crate) fn is_valid(&self) -> bool {
-        let uris = [&self.request_uri, &self.from]
+        let fits = |uri: &Uri, place| allowed_in(uri.as_str(), place);
+        let parties = [&self.from]
             .into_iter()
             .chain(&self.to)
-            .chain(&self.routes);
-        let sip = |uri: &Uri| matches!(uri.sip(), Ok(Some(_)));
+            .all(|uri| fits(uri, Place::Party));
 
-        uris.into_iter().all(sip)
+        fits(&self.request_uri, Place::RequestUri)
+            && parties
+            && self.routes.iter().all(|uri| fits(uri, Place::Dialog))
             && self.headers.iter().all(|(name, _)| !OWNED.contains(name))
             && !self.offer.body().is_empty()
             && self.display_name.as_deref().is_none_or(quotable)
@@ -145,7 +166,16 @@ impl InvitePlan {
             return None;
         }
 
-        let to = self.to.as_ref().unwrap_or(&self.request_uri);
+        // A To taken from the Request-URI leaves out what a To may not have,
+        // such as the port.
+        let to = match &self.to {
+            Some(to) => to.as_str().to_owned(),
+            None => party_uri(self.request_uri.as_str()),
+        };
+        let routes =
+            RouteSet::from_uris(self.routes.iter().map(Uri::as_str)).ok()?;
+        let target = RemoteTarget::new(self.request_uri.as_str()).ok()?;
+        let target = request_target(&routes, &target, false);
         let from = match &self.display_name {
             Some(name) => {
                 format!("{} <{}>;tag={}", quote(name), self.from, identity.tag)
@@ -155,14 +185,14 @@ impl InvitePlan {
 
         let mut request = Request::builder()
             .method(Method::INVITE)
-            .uri(self.request_uri.clone())
+            .uri(target.request_uri.as_str())
             .header(TO, format!("<{to}>").as_str())
             .header(FROM, from.as_str())
             .header(CALL_ID, identity.call_id.as_ref())
             .header(CSEQ, format!("{} INVITE", identity.cseq).as_str())
             .header(MAX_FORWARDS, "70")
             .header(CONTACT, format!("<{contact}>").as_str());
-        for route in &self.routes {
+        for route in &target.route {
             request = request.header(ROUTE, format!("<{route}>").as_str());
         }
         request = request.header(ALLOW, ALLOWED);
@@ -309,6 +339,14 @@ mod tests {
             plan().route(uri("tel:+15551234567")),
             plan().to(uri("mailto:bob@example.com")),
             plan().display_name("Alice\r\nVia: x"),
+            plan().header(AUTHORIZATION, HeaderValue::from_static("Digest x")),
+            plan().header(PROXY_AUTHORIZATION, HeaderValue::from_static("x")),
+            // What Table 1 of RFC 3261 section 19.1.1 does not allow.
+            plan().to(uri("sip:bob@example.com:5070")),
+            plan().to(uri("sip:bob@example.com;transport=tcp")),
+            plan().to(uri("sip:bob@example.com?Subject=x")),
+            plan().route(uri("sip:p1.example.com;lr;method=INVITE")),
+            plan().route(uri("sip:p1.example.com;lr?Subject=x")),
         ];
 
         for plan in refused {
@@ -316,5 +354,54 @@ mod tests {
             assert!(plan.build(&identity(), "sip:a@192.0.2.1").is_none());
         }
         assert!(plan().is_valid());
+    }
+
+    /// A first route without `lr` takes the Request-URI, and the planned
+    /// Request-URI goes last in Route (RFC 3261 sections 8.1.1.1 and
+    /// 12.2.1.1), so that the INVITE reaches the strict router first.
+    #[test]
+    fn a_strict_router_takes_the_request_uri() {
+        let request = plan()
+            .route(uri("sip:192.0.2.10"))
+            .route(uri("sip:p2.example.com;lr"))
+            .build(&identity(), "sip:alice@192.0.2.1")
+            .unwrap();
+        let routes: Vec<_> = request
+            .headers()
+            .get_all(ROUTE)
+            .map(|value| value.as_str())
+            .collect();
+
+        assert_eq!(request.uri().as_str(), "sip:192.0.2.10");
+        assert_eq!(
+            routes,
+            ["<sip:p2.example.com;lr>", "<sip:bob@biloxi.example.com>"]
+        );
+        assert_eq!(
+            request.headers().get(TO).unwrap(),
+            "<sip:bob@biloxi.example.com>"
+        );
+    }
+
+    /// A To taken from the Request-URI leaves out what Table 1 of RFC 3261
+    /// section 19.1.1 does not allow in a To, and keeps the rest.
+    #[test]
+    fn a_to_from_the_request_uri_drops_what_a_to_may_not_have() {
+        let request = InvitePlan::new(
+            uri("sip:bob@192.0.2.4:5070;transport=tcp;user=phone;x=y"),
+            uri("sip:alice@atlanta.example.com"),
+            plan().offer,
+        )
+        .build(&identity(), "sip:alice@192.0.2.1")
+        .unwrap();
+
+        assert_eq!(
+            request.uri().as_str(),
+            "sip:bob@192.0.2.4:5070;transport=tcp;user=phone;x=y"
+        );
+        assert_eq!(
+            request.headers().get(TO).unwrap(),
+            "<sip:bob@192.0.2.4;user=phone;x=y>"
+        );
     }
 }

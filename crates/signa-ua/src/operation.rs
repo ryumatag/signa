@@ -29,16 +29,16 @@ An operation ends with one outcome, set once. A later attempt to set another is
 ignored, so a race between, say, an accept and a CANCEL cannot report both. The
 outcome does not travel through the notification queue, where an overflow could
 lose it. It stays in the operation's record until its waiter takes it. If the
-waiter is gone, the record stays for a fixed time after the outcome so that a
-snapshot can still read it, and is then reclaimed. The table has a fixed size,
-so this retention is bounded too.
+waiter is gone, the record is reclaimed as soon as the outcome is in, since
+nothing else can read it. What the operation did stays visible in the state of
+its session or attempt, which their snapshots show.
 
 # Dropping handles
 
 What dropping each application-side handle means:
 
 * An operation waiter: nothing happens to the operation. It runs to its
-  outcome, and the outcome is kept for a while.
+  outcome, which nobody reads.
 * The decision authority of an incoming INVITE that has no final yet: the UA
   sends the final of its abandonment policy, unless a CANCEL or a final got
   there first. Drop only sets a flag reserved when the INVITE arrived. It sends
@@ -47,12 +47,10 @@ What dropping each application-side handle means:
 * A session or attempt handle: neither BYE nor CANCEL. The protocol work
   goes on, including the ACK of every 2xx.
 * The event receiver: notifications stop. Protocol work does not depend on
-  them.
+  them. A new INVITE gets a 503, since nobody could decide it.
 * The driver: a forced stop, not a graceful shutdown.
 * A shutdown future: the shutdown it started goes on.
 */
-
-use std::time::{Duration, Instant};
 
 use crate::{
     error::Error,
@@ -92,22 +90,10 @@ pub(crate) enum Completion {
 
 pub(crate) type Outcome = Result<Completion, Error>;
 
-/// Whether someone still waits for the outcome.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum Waiter {
-    #[default]
-    Attached,
-    Dropped,
-}
-
 #[derive(Debug, Default)]
 pub(crate) struct Record {
     stage: Stage,
     outcome: Option<Outcome>,
-    waiter: Waiter,
-    /// When the record may be reclaimed. Set once the outcome is in and the
-    /// waiter is gone.
-    expires: Option<Instant>,
 }
 
 /// What a snapshot of an operation shows.
@@ -128,13 +114,11 @@ pub(crate) struct SubmitError<C> {
 #[derive(Debug)]
 pub(crate) struct Operations {
     records: Slots<Record>,
-    /// How long an outcome nobody waits for is kept.
-    retention: Duration,
 }
 
 impl Operations {
-    pub(crate) fn new(limit: usize, retention: Duration) -> Operations {
-        Operations { records: Slots::new(limit), retention }
+    pub(crate) fn new(limit: usize) -> Operations {
+        Operations { records: Slots::new(limit) }
     }
 
     /// Opens a record for a command being admitted, or returns `None` when
@@ -156,7 +140,6 @@ impl Operations {
         &mut self,
         id: OperationId,
         outcome: Outcome,
-        now: Instant,
     ) -> bool {
         let Some(record) = self.records.get_mut(id) else {
             return false;
@@ -166,27 +149,11 @@ impl Operations {
         }
 
         record.outcome = Some(outcome);
-        if record.waiter == Waiter::Dropped {
-            record.expires = Some(now + self.retention);
-        }
         true
     }
 
-    /// Records that nobody waits for the outcome any more. The operation
-    /// itself goes on.
-    pub(crate) fn drop_waiter(&mut self, id: OperationId, now: Instant) {
-        let Some(record) = self.records.get_mut(id) else {
-            return;
-        };
-
-        record.waiter = Waiter::Dropped;
-        if record.outcome.is_some() {
-            record.expires = Some(now + self.retention);
-        }
-    }
-
-    /// Hands the outcome to its waiter and reclaims the record, or returns
-    /// `None` while the operation runs.
+    /// Hands the outcome to its waiter, or drops it when the waiter is gone,
+    /// and reclaims the record. Returns `None` while the operation runs.
     pub(crate) fn take(&mut self, id: OperationId) -> Option<Outcome> {
         let outcome = self.records.get(id)?.outcome?;
 
@@ -198,43 +165,19 @@ impl Operations {
         let record = self.records.get(id)?;
         Some(Snapshot { stage: record.stage, outcome: record.outcome })
     }
-
-    /// Reclaims the records whose outcome has been kept long enough, and
-    /// returns them.
-    pub(crate) fn expire(&mut self, now: Instant) -> Vec<OperationId> {
-        let expired: Vec<OperationId> = self
-            .records
-            .iter()
-            .filter(|(_, record)| record.expires.is_some_and(|at| at <= now))
-            .map(|(id, _)| id)
-            .collect();
-
-        for &id in &expired {
-            self.records.remove(id);
-        }
-        expired
-    }
-
-    /// Returns the earliest time a kept outcome may be reclaimed.
-    pub(crate) fn next_expiry(&self) -> Option<Instant> {
-        self.records.iter().filter_map(|(_, record)| record.expires).min()
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const RETENTION: Duration = Duration::from_secs(32);
-
     #[test]
     fn the_first_outcome_sticks() {
-        let mut operations = Operations::new(1, RETENTION);
-        let now = Instant::now();
+        let mut operations = Operations::new(1);
         let id = operations.admit().unwrap();
 
-        assert!(operations.complete(id, Err(Error::AlreadyFinalized), now));
-        assert!(!operations.complete(id, Err(Error::Busy), now));
+        assert!(operations.complete(id, Err(Error::AlreadyFinalized)));
+        assert!(!operations.complete(id, Err(Error::Busy)));
 
         assert_eq!(operations.take(id), Some(Err(Error::AlreadyFinalized)));
         assert_eq!(operations.snapshot(id), None);
@@ -242,7 +185,7 @@ mod tests {
 
     #[test]
     fn stages_only_move_forward() {
-        let mut operations = Operations::new(1, RETENTION);
+        let mut operations = Operations::new(1);
         let id = operations.admit().unwrap();
 
         for stage in [Stage::Committed, Stage::Answered, Stage::Written] {
@@ -255,28 +198,8 @@ mod tests {
     }
 
     #[test]
-    fn an_unwatched_outcome_is_kept_for_the_retention_time() {
-        let mut operations = Operations::new(1, RETENTION);
-        let start = Instant::now();
-        let id = operations.admit().unwrap();
-
-        operations.drop_waiter(id, start);
-        operations.expire(start + 2 * RETENTION);
-        assert!(operations.snapshot(id).is_some(), "still running");
-
-        let done = start + Duration::from_secs(1);
-        operations.complete(id, Err(Error::TransportFailure), done);
-
-        operations.expire(done + RETENTION - Duration::from_millis(1));
-        assert!(operations.snapshot(id).is_some());
-        operations.expire(done + RETENTION);
-        assert_eq!(operations.snapshot(id), None);
-        assert!(operations.admit().is_some(), "the slot is free again");
-    }
-
-    #[test]
     fn a_running_operation_has_nothing_to_take() {
-        let mut operations = Operations::new(1, RETENTION);
+        let mut operations = Operations::new(1);
         let id = operations.admit().unwrap();
 
         assert_eq!(operations.take(id), None);

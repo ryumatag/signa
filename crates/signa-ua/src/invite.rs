@@ -190,6 +190,9 @@ pub(crate) enum Scope {
         merge: MergeKey,
         /// When the application's decision is due, while it is.
         decision_due: Option<Instant>,
+        /// When the INVITE expires, if its Expires gave a time, while no
+        /// final is under way.
+        expires_due: Option<Instant>,
         /// The last provisional response the application chose, and when it
         /// is due again, while no final is under way.
         provisional: Option<(StatusCode, Instant)>,
@@ -260,6 +263,7 @@ impl InviteExchange {
         merge: MergeKey,
         offer: Option<Description>,
         decision_due: Option<Instant>,
+        expires_due: Option<Instant>,
     ) -> InviteExchange {
         let cseq = merge.cseq;
         InviteExchange {
@@ -268,6 +272,7 @@ impl InviteExchange {
                 offer,
                 merge,
                 decision_due,
+                expires_due,
                 provisional: None,
             },
             cseq,

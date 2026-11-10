@@ -71,6 +71,7 @@ pub enum Error {
 
 /// What a failure says about the wire.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 #[cfg_attr(not(feature = "tokio"), allow(unreachable_pub))]
 pub enum WireEffect {
     /// Nothing was sent.

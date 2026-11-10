@@ -29,7 +29,12 @@ This is an early stage of the crate, and much of a UA core is missing:
   no ACK and no BYE.
 * There is no CANCEL of an INVITE this UA sent. CANCEL, BYE and every other
   request in a dialog get signa-core's 500.
+* Outside a dialog, OPTIONS gets a 200 with the methods the UA takes, without
+  asking the application, and other requests but INVITE a 405 or a 501.
 * There is no re-INVITE, and no graceful shutdown of the UA.
+* There is no TLS, so a request that asks for SIPS is refused, and the UA
+  sends none.
+* The UA neither answers a challenge nor sends credentials.
 * Next hops resolve from IP literals and a fixed table, with no DNS.
 */
 #![cfg_attr(

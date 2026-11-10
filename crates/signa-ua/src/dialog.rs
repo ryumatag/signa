@@ -272,9 +272,13 @@ pub(crate) enum Sequence {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RequestError {
     Terminated,
-    /// ACK and CANCEL take the number of their INVITE, and every other
-    /// request takes the next number. The sequence asked for the other one.
+    /// ACK takes the number of its INVITE, and every other request takes
+    /// the next number. The sequence asked for the other one.
     WrongSequence,
+    /// A CANCEL copies the request it cancels, To tag and all (RFC 3261
+    /// section 9.1), so it is not built from a dialog. signa-core's
+    /// `ClientControl::cancel` builds it from the INVITE.
+    Cancel,
     CSeqExhausted,
     /// A stored value no longer forms a valid header, which would be a bug.
     Invalid,
@@ -501,10 +505,11 @@ impl Dialog {
     /// Builds the head of a request in the dialog (RFC 3261 section
     /// 12.2.1.1).
     ///
-    /// ACK and CANCEL take [`Sequence::Of`] and leave the local number alone.
-    /// Every other method takes [`Sequence::Next`], which uses up the next
-    /// number even if the request is never sent. A number that may have
-    /// reached the peer is never given out again.
+    /// ACK takes [`Sequence::Of`] and leaves the local number alone. Every
+    /// other method takes [`Sequence::Next`], which uses up the next number
+    /// even if the request is never sent. A number that may have reached the
+    /// peer is never given out again. CANCEL is refused, see
+    /// [`RequestError::Cancel`].
     pub(crate) fn request(
         &mut self,
         method: Method,
@@ -513,10 +518,11 @@ impl Dialog {
         if self.phase == DialogPhase::Terminated {
             return Err(RequestError::Terminated);
         }
+        if method == Method::CANCEL {
+            return Err(RequestError::Cancel);
+        }
 
-        let numbered_by_invite =
-            method == Method::ACK || method == Method::CANCEL;
-        let cseq = match (sequence, numbered_by_invite) {
+        let cseq = match (sequence, method == Method::ACK) {
             (Sequence::Of(number), true) => number,
             (Sequence::Next { seed }, false) => self.next_cseq(seed)?,
             _ => return Err(RequestError::WrongSequence),
@@ -775,11 +781,12 @@ mod tests {
         let mut dialog = uac(ok("200 OK", "a6c85cf", "", "sip:bob@192.0.2.4"));
 
         let ack = dialog.request(Method::ACK, Sequence::Of(314159)).unwrap();
-        let cancel =
-            dialog.request(Method::CANCEL, Sequence::Of(314159)).unwrap();
+        let cancel = dialog.request(Method::CANCEL, Sequence::Of(314159));
 
         assert_eq!(header(&ack.request, CSEQ), ["314159 ACK"]);
-        assert_eq!(header(&cancel.request, CSEQ), ["314159 CANCEL"]);
+        // A CANCEL copies its INVITE, which signa-core does, so the dialog
+        // builds none, and none takes a number.
+        assert_eq!(cancel.unwrap_err(), RequestError::Cancel);
         assert_eq!(dialog.local_cseq(), Some(314159));
 
         for (method, sequence) in [

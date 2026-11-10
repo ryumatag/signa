@@ -14,7 +14,10 @@ it needs.
 
 use signa_core::{
     HeaderMap,
-    message::header::{CALL_ID, CONTACT, CSEQ, FROM, HeaderName, REQUIRE, TO},
+    message::header::{
+        CALL_ID, CONTACT, CSEQ, EXPIRES, FROM, HeaderName, RECORD_ROUTE,
+        REQUIRE, TO,
+    },
 };
 use siparse::scan;
 
@@ -37,6 +40,7 @@ pub(crate) enum Field {
     Route,
     RecordRoute,
     Require,
+    Expires,
 }
 
 /// The URI and tag of a From or To value.
@@ -151,6 +155,53 @@ pub(crate) fn cseq(headers: &HeaderMap) -> Result<(u32, &str), Malformed> {
     } else {
         Err(malformed)
     }
+}
+
+/// Returns the seconds of the Expires value, if there is one.
+///
+/// RFC 3261 section 20.19 makes it a number of seconds from 0 to 2^32 - 1,
+/// `delta-seconds` in section 25.1. A larger number is malformed rather than
+/// cut down, since the value is not one an RFC 3261 element writes.
+pub(crate) fn expires(headers: &HeaderMap) -> Result<Option<u32>, Malformed> {
+    let malformed = Malformed(Field::Expires);
+    let mut rows = headers.get_all(EXPIRES);
+    let Some(value) = rows.next() else {
+        return Ok(None);
+    };
+    if rows.next().is_some() {
+        return Err(malformed);
+    }
+
+    let rest = scan::sws(value.as_str());
+    let (digits, rest) = scan::digits(rest).ok_or(malformed)?;
+    if !scan::sws(rest).is_empty() {
+        return Err(malformed);
+    }
+    digits.parse().map(Some).map_err(|_| malformed)
+}
+
+/// Says whether the request asks for SIPS on the way back to its sender: a
+/// SIPS URI in the top Record-Route value, or in the Contact when there is
+/// no Record-Route. RFC 3261 section 12.1.1 then requires a SIPS Contact in
+/// the response. The Request-URI is the caller's to check.
+pub(crate) fn sips_on_the_way_back(
+    headers: &HeaderMap,
+) -> Result<bool, Malformed> {
+    let top = match headers.get(RECORD_ROUTE) {
+        Some(value) => match addresses(value.as_str()).next() {
+            Some(address) => {
+                Some(address.map_err(|_| Malformed(Field::RecordRoute))?.uri)
+            }
+            None => None,
+        },
+        None => contact(headers)?,
+    };
+    Ok(top.is_some_and(is_sips))
+}
+
+/// Says whether a URI has the SIPS scheme, in any letter case.
+pub(crate) fn is_sips(uri: &str) -> bool {
+    uri.get(..5).is_some_and(|scheme| scheme.eq_ignore_ascii_case("sips:"))
 }
 
 /// Says whether the request requires any extension.
@@ -314,6 +365,66 @@ mod tests {
                 requires_extension(&headers(&[(REQUIRE, value)])),
                 Err(Malformed(Field::Require)),
                 "{value}",
+            );
+        }
+    }
+
+    #[test]
+    fn expires_is_a_number_of_seconds() {
+        assert_eq!(expires(&headers(&[])), Ok(None));
+        for (value, seconds) in
+            [("0", 0), (" 180 ", 180), ("4294967295", u32::MAX)]
+        {
+            assert_eq!(
+                expires(&headers(&[(EXPIRES, value)])),
+                Ok(Some(seconds)),
+                "{value}",
+            );
+        }
+
+        for rows in [
+            &[(EXPIRES, "4294967296")][..],
+            &[(EXPIRES, "-1")],
+            &[(EXPIRES, "10 s")],
+            &[(EXPIRES, "")],
+            &[(EXPIRES, "10"), (EXPIRES, "20")],
+        ] {
+            assert_eq!(
+                expires(&headers(rows)),
+                Err(Malformed(Field::Expires)),
+                "{rows:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn sips_on_the_way_back_reads_the_top_record_route_or_the_contact() {
+        let cases = [
+            (&[(CONTACT, "<sips:a@192.0.2.1>")][..], true),
+            (&[(CONTACT, "<sip:a@192.0.2.1>")], false),
+            (
+                &[
+                    (RECORD_ROUTE, "<sips:p1.example.com;lr>, <sip:p2;lr>"),
+                    (CONTACT, "<sip:a@192.0.2.1>"),
+                ],
+                true,
+            ),
+            (
+                &[
+                    (RECORD_ROUTE, "<sip:p1.example.com;lr>"),
+                    (RECORD_ROUTE, "<sips:p2.example.com;lr>"),
+                    (CONTACT, "<sips:a@192.0.2.1>"),
+                ],
+                false,
+            ),
+            (&[], false),
+        ];
+
+        for (rows, sips) in cases {
+            assert_eq!(
+                sips_on_the_way_back(&headers(rows)),
+                Ok(sips),
+                "{rows:?}"
             );
         }
     }
