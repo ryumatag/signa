@@ -822,7 +822,7 @@ impl From<&HeaderName> for HeaderName {
 impl TryFrom<&[u8]> for HeaderName {
     type Error = InvalidHeaderName;
 
-    fn try_from(src: &[u8]) -> Result<Self, Self::Error> {
+    fn try_from(src: &[u8]) -> Result<HeaderName, InvalidHeaderName> {
         HeaderName::from_bytes(src)
     }
 }
@@ -830,7 +830,7 @@ impl TryFrom<&[u8]> for HeaderName {
 impl TryFrom<&str> for HeaderName {
     type Error = InvalidHeaderName;
 
-    fn try_from(src: &str) -> Result<Self, Self::Error> {
+    fn try_from(src: &str) -> Result<HeaderName, InvalidHeaderName> {
         HeaderName::from_bytes(src.as_bytes())
     }
 }
@@ -838,7 +838,7 @@ impl TryFrom<&str> for HeaderName {
 impl FromStr for HeaderName {
     type Err = InvalidHeaderName;
 
-    fn from_str(src: &str) -> Result<Self, Self::Err> {
+    fn from_str(src: &str) -> Result<HeaderName, InvalidHeaderName> {
         HeaderName::try_from(src)
     }
 }

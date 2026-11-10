@@ -276,7 +276,7 @@ pub struct Iter<'a>(slice::Iter<'a, (HeaderName, HeaderValue)>);
 impl<'a> Iterator for Iter<'a> {
     type Item = (&'a HeaderName, &'a HeaderValue);
 
-    fn next(&mut self) -> Option<Self::Item> {
+    fn next(&mut self) -> Option<(&'a HeaderName, &'a HeaderValue)> {
         self.0.next().map(|(name, value)| (name, value))
     }
 
@@ -285,8 +285,8 @@ impl<'a> Iterator for Iter<'a> {
     }
 }
 
-impl DoubleEndedIterator for Iter<'_> {
-    fn next_back(&mut self) -> Option<Self::Item> {
+impl<'a> DoubleEndedIterator for Iter<'a> {
+    fn next_back(&mut self) -> Option<(&'a HeaderName, &'a HeaderValue)> {
         self.0.next_back().map(|(name, value)| (name, value))
     }
 }
@@ -304,7 +304,7 @@ pub struct IntoIter(vec::IntoIter<(HeaderName, HeaderValue)>);
 impl Iterator for IntoIter {
     type Item = (HeaderName, HeaderValue);
 
-    fn next(&mut self) -> Option<Self::Item> {
+    fn next(&mut self) -> Option<(HeaderName, HeaderValue)> {
         self.0.next()
     }
 
@@ -314,7 +314,7 @@ impl Iterator for IntoIter {
 }
 
 impl DoubleEndedIterator for IntoIter {
-    fn next_back(&mut self) -> Option<Self::Item> {
+    fn next_back(&mut self) -> Option<(HeaderName, HeaderValue)> {
         self.0.next_back()
     }
 }
@@ -346,8 +346,8 @@ impl<'a> Iterator for GetAll<'a> {
     }
 }
 
-impl DoubleEndedIterator for GetAll<'_> {
-    fn next_back(&mut self) -> Option<Self::Item> {
+impl<'a> DoubleEndedIterator for GetAll<'a> {
+    fn next_back(&mut self) -> Option<&'a HeaderValue> {
         let name = self.name.as_ref()?;
         self.rows
             .by_ref()

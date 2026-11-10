@@ -279,7 +279,7 @@ impl<T: Clone + Send + Sync + 'static> AnyClone for T {
         self
     }
 
-    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+    fn into_any(self: Box<T>) -> Box<dyn Any> {
         self
     }
 
@@ -289,7 +289,7 @@ impl<T: Clone + Send + Sync + 'static> AnyClone for T {
 }
 
 impl Clone for Box<dyn AnyClone + Send + Sync> {
-    fn clone(&self) -> Self {
+    fn clone(&self) -> Box<dyn AnyClone + Send + Sync> {
         (**self).clone_box()
     }
 }

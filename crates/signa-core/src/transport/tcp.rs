@@ -366,9 +366,9 @@ impl Future for Receipt {
     type Output = io::Result<()>;
 
     fn poll(
-        mut self: std::pin::Pin<&mut Self>,
+        mut self: std::pin::Pin<&mut Receipt>,
         cx: &mut std::task::Context<'_>,
-    ) -> Poll<Self::Output> {
+    ) -> Poll<io::Result<()>> {
         std::pin::Pin::new(&mut self.0).poll(cx).map(|result| {
             result.unwrap_or_else(|_| {
                 Err(io::Error::new(
@@ -420,7 +420,7 @@ impl Write {
 }
 
 impl From<Bytes> for Write {
-    fn from(bytes: Bytes) -> Self {
+    fn from(bytes: Bytes) -> Write {
         Write { bytes, done: None, permit: None, close: false }
     }
 }
@@ -921,7 +921,7 @@ mod tests {
         }
 
         fn poll_write_vectored(
-            mut self: std::pin::Pin<&mut Self>,
+            mut self: std::pin::Pin<&mut FailsAfter>,
             _: &mut std::task::Context<'_>,
             buffers: &[io::IoSlice<'_>],
         ) -> Poll<io::Result<usize>> {
@@ -940,7 +940,7 @@ mod tests {
         }
 
         fn poll_write(
-            mut self: std::pin::Pin<&mut Self>,
+            mut self: std::pin::Pin<&mut FailsAfter>,
             _: &mut std::task::Context<'_>,
             bytes: &[u8],
         ) -> Poll<io::Result<usize>> {
@@ -954,14 +954,14 @@ mod tests {
         }
 
         fn poll_flush(
-            self: std::pin::Pin<&mut Self>,
+            self: std::pin::Pin<&mut FailsAfter>,
             _: &mut std::task::Context<'_>,
         ) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
         }
 
         fn poll_shutdown(
-            self: std::pin::Pin<&mut Self>,
+            self: std::pin::Pin<&mut FailsAfter>,
             _: &mut std::task::Context<'_>,
         ) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
@@ -973,7 +973,7 @@ mod tests {
 
     impl AsyncWrite for Stalled {
         fn poll_write(
-            mut self: std::pin::Pin<&mut Self>,
+            mut self: std::pin::Pin<&mut Stalled>,
             _: &mut std::task::Context<'_>,
             _: &[u8],
         ) -> Poll<io::Result<usize>> {
@@ -984,14 +984,14 @@ mod tests {
         }
 
         fn poll_flush(
-            self: std::pin::Pin<&mut Self>,
+            self: std::pin::Pin<&mut Stalled>,
             _: &mut std::task::Context<'_>,
         ) -> Poll<io::Result<()>> {
             Poll::Pending
         }
 
         fn poll_shutdown(
-            self: std::pin::Pin<&mut Self>,
+            self: std::pin::Pin<&mut Stalled>,
             _: &mut std::task::Context<'_>,
         ) -> Poll<io::Result<()>> {
             Poll::Pending
@@ -1500,7 +1500,7 @@ mod tests {
         struct SendNext(Writer, AtomicBool);
 
         impl Wake for SendNext {
-            fn wake(self: Arc<Self>) {
+            fn wake(self: Arc<SendNext>) {
                 self.1.store(
                     self.0.send(Bytes::from_static(b"next")).is_ok(),
                     Ordering::Relaxed,

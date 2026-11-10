@@ -61,7 +61,10 @@ impl Service<Request<Bytes>> for Ok200 {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, request: Request<Bytes>) -> Self::Future {
+    fn call(
+        &mut self,
+        request: Request<Bytes>,
+    ) -> future::Ready<Result<Response<Bytes>, Infallible>> {
         let response = Response::reply_to(&request)
             .status(StatusCode::OK)
             .body(Bytes::new())
@@ -667,16 +670,19 @@ struct NoDispatch;
 impl Service<Request<Bytes>> for NoDispatch {
     type Response = Response<Bytes>;
     type Error = Infallible;
-    type Future = future::Ready<Result<Self::Response, Self::Error>>;
+    type Future = future::Ready<Result<Response<Bytes>, Infallible>>;
 
     fn poll_ready(
         &mut self,
         _: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
+    ) -> Poll<Result<(), Infallible>> {
         Poll::Pending
     }
 
-    fn call(&mut self, _: Request<Bytes>) -> Self::Future {
+    fn call(
+        &mut self,
+        _: Request<Bytes>,
+    ) -> future::Ready<Result<Response<Bytes>, Infallible>> {
         unreachable!("fixture sends responses only")
     }
 }

@@ -59,7 +59,7 @@ impl<'a> From<&'a str> for ByteStr {
 }
 
 impl From<ByteStr> for Bytes {
-    fn from(src: ByteStr) -> Self {
+    fn from(src: ByteStr) -> Bytes {
         src.bytes
     }
 }

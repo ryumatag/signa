@@ -20,8 +20,8 @@ impl Scheme {
     /// Returns the lowercase scheme name without its colon.
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Sip => "sip",
-            Self::Sips => "sips",
+            Scheme::Sip => "sip",
+            Scheme::Sips => "sips",
         }
     }
 }
@@ -399,7 +399,7 @@ pub struct Parameters<'a>(&'a str);
 impl<'a> Iterator for Parameters<'a> {
     type Item = Parameter<'a>;
 
-    fn next(&mut self) -> Option<Self::Item> {
+    fn next(&mut self) -> Option<Parameter<'a>> {
         let pair = take(&mut self.0, ';')?;
         let (name, value) = pair
             .split_once('=')
@@ -436,7 +436,7 @@ pub struct Headers<'a>(&'a str);
 impl<'a> Iterator for Headers<'a> {
     type Item = Header<'a>;
 
-    fn next(&mut self) -> Option<Self::Item> {
+    fn next(&mut self) -> Option<Header<'a>> {
         let pair = take(&mut self.0, '&')?;
         let (name, value) =
             pair.split_once('=').expect("validated URI header pair");
