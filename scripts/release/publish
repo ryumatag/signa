@@ -33,7 +33,9 @@ for crate in "$@"; do
   refs+=("refs/tags/$tag")
 done
 
-# One push, so that the workflow runs it starts all see every tag.
-git push origin "${refs[@]}"
+# One atomic push, so that every workflow run it starts sees every tag.
+# Only the run of the first tag publishes, and a tag that landed after
+# that run looked would never be published.
+git push --atomic origin "${refs[@]}"
 printf 'Pushed %s. Follow the publish workflow on GitHub Actions.\n' \
   "${refs[*]#refs/tags/}"

@@ -2,10 +2,10 @@
 #
 # `scripts/release/publish` pushes a tag per crate onto one release commit:
 # `0.4.0` for signa, and `signa-core-0.1.0` or `signa-ua-0.0.1` for the
-# others. Each tag starts a
-# run, and a run publishes every crate tagged on its commit through Trusted
-# Publishing. crates.io must list this repository, this workflow file, and the
-# `publish` environment as a trusted publisher of each crate.
+# others. Each tag starts a run, and the run of the first tag publishes every
+# crate tagged on the commit through Trusted Publishing. crates.io must list
+# this repository, this workflow file, and the `publish` environment as a
+# trusted publisher of each crate.
 name: publish
 
 on:
@@ -14,15 +14,9 @@ on:
       - '[0-9]+.[0-9]+.[0-9]+*'
       - 'signa-core-[0-9]+.[0-9]+.[0-9]+*'
       - 'signa-ua-[0-9]+.[0-9]+.[0-9]+*'
-  # Allows retrying a failed publish without moving the tags. Run it on the
-  # release tag, which selects the commit.
+  # Allows retrying a failed publish without moving the tags. Run it on any
+  # release tag of the commit.
   workflow_dispatch:
-
-# The runs of one release commit go one at a time. The first publishes every
-# crate, and the others find them on crates.io.
-concurrency:
-  group: publish-${{ github.sha }}
-  cancel-in-progress: false
 
 jobs:
   publish:
@@ -46,17 +40,36 @@ jobs:
       # out a version a first release by hand or an earlier run uploaded.
       - name: Pick the crates to publish
         run: |
-          metadata="$(cargo metadata --no-deps --format-version 1)"
-          packages=()
-          tagged=0
+          tags=()
           for tag in $(git tag --points-at HEAD); do
             case "$tag" in
-              signa-core-[0-9]*) crate=signa-core version="${tag#signa-core-}" ;;
-              signa-ua-[0-9]*) crate=signa-ua version="${tag#signa-ua-}" ;;
-              [0-9]*) crate=signa version="$tag" ;;
-              *) continue ;;
+              signa-core-[0-9]* | signa-ua-[0-9]* | [0-9]*) tags+=("$tag") ;;
             esac
-            tagged=$((tagged + 1))
+          done
+          if ((${#tags[@]} == 0)); then
+            echo "No release tag on $GITHUB_SHA. Run this on a release tag."
+            exit 1
+          fi
+          # A concurrency group would queue the runs of one commit, but it
+          # holds only one pending run and cancels it for the next, so a
+          # release of three crates showed a cancelled run. Instead only the
+          # run of the first tag, in the order Git lists them, publishes.
+          # The publish script pushes the tags atomically, so every run sees
+          # all of them. A tag pushed later onto a commit with an earlier tag
+          # needs a run by hand.
+          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF_NAME" != "${tags[0]}" ]]; then
+            echo "The run of ${tags[0]} publishes the crates of $GITHUB_SHA."
+            echo "If $GITHUB_REF_NAME was pushed after it, run this workflow on $GITHUB_REF_NAME by hand."
+            exit 0
+          fi
+          metadata="$(cargo metadata --no-deps --format-version 1)"
+          packages=()
+          for tag in "${tags[@]}"; do
+            case "$tag" in
+              signa-core-*) crate=signa-core version="${tag#signa-core-}" ;;
+              signa-ua-*) crate=signa-ua version="${tag#signa-ua-}" ;;
+              *) crate=signa version="$tag" ;;
+            esac
             current="$(jq -r --arg crate "$crate" \
               '.packages[] | select(.name == $crate) | .version' <<<"$metadata")"
             if [[ "$current" != "$version" ]]; then
@@ -75,10 +88,6 @@ jobs:
                 ;;
             esac
           done
-          if ((tagged == 0)); then
-            echo "No release tag on $GITHUB_SHA. Run this on a release tag."
-            exit 1
-          fi
           echo "PACKAGES=${packages[*]}" >> "$GITHUB_ENV"
       - name: Authenticate with crates.io
         if: env.PACKAGES != ''
