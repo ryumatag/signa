@@ -20,19 +20,20 @@ values say where its requests go.
 
 use std::{
     collections::HashMap,
+    error, fmt,
     net::{IpAddr, SocketAddr},
 };
 
 use signa_core::{
     HeaderMap,
     message::{
-        header::RECORD_ROUTE,
+        header::{RECORD_ROUTE, ROUTE},
         uri::{Scheme, SipUri},
     },
     transport::Transport,
 };
 
-use crate::protocol::addresses;
+use crate::protocol::{Field, Malformed, addresses};
 
 /// One URI of a route set.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -273,6 +274,41 @@ fn address_end(uri: &SipUri<'_>) -> usize {
     }
 }
 
+/// Returns the URI to resolve for a request outside a dialog, and whether
+/// its first hop must be secured.
+///
+/// RFC 3261 section 8.1.2 resolves the top Route value, or the Request-URI
+/// without one. When the top Route value is a strict router, the request was
+/// built as section 12.2.1.1 builds it, and the Request-URI is resolved. A
+/// SIPS Request-URI makes the hop secure whatever is resolved.
+pub(crate) fn initial_next_hop(
+    request_uri: &str,
+    headers: &HeaderMap,
+) -> Result<(Box<str>, bool), Malformed> {
+    let malformed = Malformed(Field::Route);
+    let top = match headers.get(ROUTE) {
+        Some(value) => addresses(value.as_str())
+            .next()
+            .transpose()
+            .map_err(|_| malformed)?,
+        None => None,
+    };
+
+    let next_hop = match top {
+        // `route-param = name-addr *( SEMI rr-param )` (RFC 3261 section
+        // 25.1), so a bare `addr-spec` does not belong here either.
+        Some(route) if !route.bracketed => return Err(malformed),
+        Some(route) => {
+            let uri = SipUri::parse(route.uri).map_err(|_| malformed)?;
+            let loose = uri.parameter("lr").map_err(|_| malformed)?.is_some();
+            if loose { route.uri } else { request_uri }
+        }
+        None => request_uri,
+    };
+    let secure = is_sips(request_uri) || is_sips(next_hop);
+    Ok((next_hop.into(), secure))
+}
+
 /// Where the first hop of a request goes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct NextHop {
@@ -280,9 +316,11 @@ pub(crate) struct NextHop {
     pub(crate) address: SocketAddr,
 }
 
-/// Why a URI did not resolve.
+/// Why a next hop did not resolve.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ResolveError {
+#[non_exhaustive]
+#[cfg_attr(not(feature = "tokio"), allow(unreachable_pub))]
+pub enum ResolveError {
     /// The hop must be secured, and there is no TLS to secure it with.
     SecureTransportUnavailable,
     /// The host is a name without an entry in the table.
@@ -293,15 +331,43 @@ pub(crate) enum ResolveError {
     InvalidUri,
 }
 
+impl fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            ResolveError::SecureTransportUnavailable => {
+                "the hop must be secured, and there is no TLS"
+            }
+            ResolveError::Unresolved => "the host has no known address",
+            ResolveError::UnsupportedTransport => {
+                "the URI asks for a transport other than UDP or TCP"
+            }
+            ResolveError::InvalidUri => "the URI cannot be resolved",
+        })
+    }
+}
+
+impl error::Error for ResolveError {}
+
 /// Resolves next-hop URIs from IP literals and a fixed table of host names.
 ///
-/// This stands in for RFC 3263 until a resolver that does DNS exists. RFC
-/// 3261 section 8.1.2 lets local policy pick the destination, and the table
-/// is that policy. It never sends a SIPS hop over plain UDP or TCP. RFC 3261
-/// section 26.2.2 requires TLS on every hop toward a SIPS URI, and RFC 5630
-/// section 5.1.1 forbids a UAC to turn a SIPS URI into a SIP one.
+/// It does no DNS, so it is not an RFC 3263 resolver. RFC 3261 section 8.1.2
+/// lets local policy pick the destination, and the table is that policy. A
+/// host name without an entry does not resolve.
+///
+/// * The `maddr` parameter stands for the host, as RFC 3263 section 4 has
+///   it.
+/// * The `transport` parameter picks UDP or TCP, and UDP is the default for
+///   a SIP URI (RFC 3263 section 4.1). Any other transport does not resolve.
+/// * The port is the URI's, or 5060.
+/// * A request over 1300 bytes goes over TCP even where UDP was picked, as
+///   RFC 3261 section 18.1.1 requires.
+///
+/// It never resolves a SIPS URI, since there is no TLS. RFC 3261 section
+/// 26.2.2 requires TLS on every hop toward one, and RFC 5630 section 5.1.1
+/// forbids a UAC to turn it into a SIP URI.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct StaticResolver {
+#[cfg_attr(not(feature = "tokio"), allow(unreachable_pub))]
+pub struct StaticResolver {
     hosts: HashMap<Box<str>, IpAddr>,
 }
 
@@ -313,13 +379,17 @@ const UDP_LIMIT: usize = 1300;
 const DEFAULT_PORT: u16 = 5060;
 
 impl StaticResolver {
-    pub(crate) fn new() -> StaticResolver {
+    /// Creates a resolver with an empty table, which resolves IP literals
+    /// only.
+    #[cfg_attr(not(feature = "tokio"), allow(unreachable_pub))]
+    pub fn new() -> StaticResolver {
         StaticResolver::default()
     }
 
     /// Maps a host name to an address. Host names compare without regard
     /// to ASCII case or a trailing dot, as DNS names do.
-    pub(crate) fn insert(&mut self, host: &str, address: IpAddr) {
+    #[cfg_attr(not(feature = "tokio"), allow(unreachable_pub))]
+    pub fn insert(&mut self, host: &str, address: IpAddr) {
         self.hosts.insert(host_key(host).into(), address);
     }
 
@@ -332,8 +402,16 @@ impl StaticResolver {
         if target.secure {
             return Err(ResolveError::SecureTransportUnavailable);
         }
-        let uri = SipUri::parse(&target.next_hop)
-            .map_err(|_| ResolveError::InvalidUri)?;
+        self.resolve_uri(&target.next_hop, size)
+    }
+
+    /// Resolves a next-hop URI for a request of `size` bytes.
+    pub(crate) fn resolve_uri(
+        &self,
+        uri: &str,
+        size: usize,
+    ) -> Result<NextHop, ResolveError> {
+        let uri = SipUri::parse(uri).map_err(|_| ResolveError::InvalidUri)?;
         if uri.scheme() == Scheme::Sips {
             return Err(ResolveError::SecureTransportUnavailable);
         }
@@ -667,5 +745,45 @@ mod tests {
             resolver.resolve(&request, 100).unwrap().address,
             "192.0.2.4:5060".parse().unwrap()
         );
+    }
+
+    /// RFC 3261 section 8.1.2 sends a request outside a dialog to its top
+    /// Route, or to its Request-URI without one or past a strict router.
+    #[test]
+    fn the_first_hop_of_an_initial_request() {
+        let route = |value: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.append(ROUTE, HeaderValue::from_static(value));
+            headers
+        };
+        let uri = "sip:bob@192.0.2.4";
+
+        assert_eq!(
+            initial_next_hop(uri, &HeaderMap::new()),
+            Ok((uri.into(), false)),
+        );
+        assert_eq!(
+            initial_next_hop(uri, &route("<sip:p1.example.com;lr>, <sip:p2>")),
+            Ok(("sip:p1.example.com;lr".into(), false)),
+        );
+        assert_eq!(
+            initial_next_hop(uri, &route("<sip:p1.example.com>")),
+            Ok((uri.into(), false)),
+        );
+        assert_eq!(
+            initial_next_hop(uri, &route("<sips:p1.example.com;lr>")),
+            Ok(("sips:p1.example.com;lr".into(), true)),
+        );
+        assert_eq!(
+            initial_next_hop("sips:bob@192.0.2.4", &HeaderMap::new()),
+            Ok(("sips:bob@192.0.2.4".into(), true)),
+        );
+        for malformed in ["sip:p1.example.com;lr", "<tel:+15551234>"] {
+            assert_eq!(
+                initial_next_hop(uri, &route(malformed)),
+                Err(Malformed(Field::Route)),
+                "{malformed}",
+            );
+        }
     }
 }

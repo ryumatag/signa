@@ -25,6 +25,9 @@ response collection.
 [RFC 5057]: https://www.rfc-editor.org/rfc/rfc5057.html
 */
 
+use bytes::Bytes;
+use signa_core::{Request, StatusCode};
+
 use crate::{
     dialog::{Dialog, DialogKey, Origin},
     negotiation::Negotiation,
@@ -57,6 +60,10 @@ pub(crate) struct InviteAttempt {
     /// negotiation from it.
     pub(crate) offer_in_request: bool,
     pub(crate) exchange: ExchangeKey,
+    /// The INVITE until the runtime takes it to send.
+    pub(crate) request: Option<Box<Request<Bytes>>>,
+    /// The operation that sent the INVITE, until it is in the core.
+    pub(crate) operation: Option<OperationId>,
 }
 
 /// Where an INVITE usage is in its life.
@@ -159,8 +166,12 @@ pub(crate) enum ExchangeState {
     /// No final response yet.
     Pending,
     /// A final response was handed to the core and its verdict has not come
-    /// back. Nothing may submit a competing final meanwhile.
-    FinalSubmissionPending { operation: OperationId },
+    /// back. Nothing may submit a competing final meanwhile. `operation` is
+    /// `None` for a final the UA sends on its own.
+    FinalSubmissionPending {
+        operation: Option<OperationId>,
+        status: StatusCode,
+    },
     /// A final response was received, or the core took the one this user
     /// agent sent.
     FinalObserved,
@@ -176,6 +187,11 @@ pub(crate) struct InviteExchange {
     pub(crate) scope: Scope,
     pub(crate) cseq: u32,
     state: ExchangeState,
+    /// An ACK that arrived while the 2xx was handed to the core and its
+    /// verdict had not come back, and whether it carried an answer. The core
+    /// takes the 2xx before it sends it, so the ACK is for this 2xx, and it
+    /// applies once the verdict is in.
+    pub(crate) early_ack: Option<bool>,
 }
 
 /// The final response of an exchange is already decided or under way.
@@ -188,6 +204,7 @@ impl InviteExchange {
             scope: Scope::Outgoing,
             cseq,
             state: ExchangeState::Pending,
+            early_ack: None,
         }
     }
 
@@ -203,6 +220,7 @@ impl InviteExchange {
             },
             cseq,
             state: ExchangeState::Pending,
+            early_ack: None,
         }
     }
 
@@ -214,26 +232,47 @@ impl InviteExchange {
     /// flight or decided.
     pub(crate) fn submit_final(
         &mut self,
-        operation: OperationId,
+        operation: Option<OperationId>,
+        status: StatusCode,
     ) -> Result<(), AlreadyFinalized> {
         if self.state != ExchangeState::Pending {
             return Err(AlreadyFinalized(self.state));
         }
 
-        self.state = ExchangeState::FinalSubmissionPending { operation };
+        self.state =
+            ExchangeState::FinalSubmissionPending { operation, status };
         Ok(())
     }
 
     /// Records that the core took the final response in flight, and returns
-    /// the operation that submitted it.
-    pub(crate) fn final_committed(&mut self) -> Option<OperationId> {
-        let ExchangeState::FinalSubmissionPending { operation } = self.state
+    /// the operation that submitted it and its status.
+    pub(crate) fn final_committed(
+        &mut self,
+    ) -> Option<(Option<OperationId>, StatusCode)> {
+        let ExchangeState::FinalSubmissionPending { operation, status } =
+            self.state
         else {
             return None;
         };
 
         self.state = ExchangeState::FinalObserved;
-        Some(operation)
+        Some((operation, status))
+    }
+
+    /// Records that the core refused the final response in flight, which
+    /// leaves the exchange pending, and returns what
+    /// [`InviteExchange::final_committed`] would have.
+    pub(crate) fn final_refused(
+        &mut self,
+    ) -> Option<(Option<OperationId>, StatusCode)> {
+        let ExchangeState::FinalSubmissionPending { operation, status } =
+            self.state
+        else {
+            return None;
+        };
+
+        self.state = ExchangeState::Pending;
+        Some((operation, status))
     }
 
     /// Records a final response from the peer. Forked 2xx responses arrive
@@ -261,20 +300,34 @@ mod tests {
     #[test]
     fn one_final_at_a_time() {
         let mut exchange = InviteExchange::outgoing(1);
-        let first = operation();
+        let first = Some(operation());
 
-        exchange.submit_final(first).unwrap();
+        exchange.submit_final(first, StatusCode::OK).unwrap();
         assert_eq!(
-            exchange.submit_final(first),
+            exchange.submit_final(None, StatusCode::OK),
             Err(AlreadyFinalized(ExchangeState::FinalSubmissionPending {
                 operation: first,
+                status: StatusCode::OK,
             })),
         );
 
-        assert_eq!(exchange.final_committed(), Some(first));
+        assert_eq!(exchange.final_committed(), Some((first, StatusCode::OK)));
         assert_eq!(exchange.final_committed(), None);
-        assert!(exchange.submit_final(first).is_err());
+        assert!(exchange.submit_final(first, StatusCode::OK).is_err());
         assert_eq!(exchange.state(), ExchangeState::FinalObserved);
+    }
+
+    #[test]
+    fn a_refused_final_leaves_the_exchange_pending() {
+        let mut exchange = InviteExchange::outgoing(1);
+        let busy = StatusCode::from_u16(486).unwrap();
+
+        exchange.submit_final(None, busy).unwrap();
+        assert_eq!(exchange.final_refused(), Some((None, busy)));
+        assert_eq!(exchange.final_refused(), None);
+
+        assert_eq!(exchange.state(), ExchangeState::Pending);
+        exchange.submit_final(None, StatusCode::OK).unwrap();
     }
 
     #[test]

@@ -16,6 +16,7 @@ use signa_core::{
     message::header::{HeaderName, CALL_ID, CONTACT, CSEQ, FROM, TO},
     HeaderMap,
 };
+use siparse::scan;
 
 pub(crate) use self::address::addresses;
 
@@ -33,6 +34,7 @@ pub(crate) enum Field {
     To,
     CSeq,
     Contact,
+    Route,
     RecordRoute,
 }
 
@@ -66,7 +68,7 @@ fn single(
 /// ["@" word]` of section 25.1.
 pub(crate) fn call_id(headers: &HeaderMap) -> Result<&str, Malformed> {
     let value = single(headers, CALL_ID, Field::CallId)?;
-    let value = siparse::scan::sws(value).trim_end_matches([' ', '\t']);
+    let value = scan::sws(value).trim_end_matches([' ', '\t']);
 
     let mut words = value.splitn(2, '@');
     let valid =
@@ -104,9 +106,7 @@ fn party(value: &str, field: Field) -> Result<Party<'_>, Malformed> {
     // leaves the dialog identity ambiguous, so it is malformed.
     let tag = match address.parameter("tag") {
         Ok(None) => None,
-        Ok(Some(Some(tag)))
-            if siparse::scan::token(tag) == Some((tag, "")) =>
-        {
+        Ok(Some(Some(tag))) if scan::token(tag) == Some((tag, "")) => {
             Some(tag)
         }
         _ => return Err(Malformed(field)),
@@ -141,8 +141,6 @@ pub(crate) fn contact(headers: &HeaderMap) -> Result<Option<&str>, Malformed> {
 /// it. The method is returned as written. RFC 3261 section 20.16 makes the
 /// method of a CSeq case-sensitive, so it is compared exactly.
 pub(crate) fn cseq(headers: &HeaderMap) -> Result<(u32, &str), Malformed> {
-    use siparse::scan;
-
     let malformed = Malformed(Field::CSeq);
     let rest = scan::sws(single(headers, CSEQ, Field::CSeq)?);
     let (digits, rest) = scan::digits(rest).ok_or(malformed)?;

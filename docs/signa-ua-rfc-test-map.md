@@ -7,8 +7,8 @@ the whole section, and nothing here claims conformance to an RFC as a whole.
 Rows whose basis is design or signa-ua policy are decisions of this crate, not
 RFC rules.
 
-signa-ua has no public API yet. What exists is the private state model, and
-most rows below are not implemented.
+signa-ua has an early public API, the runtime, which drives the private state
+model on a signa-core endpoint. Many rows below are not implemented yet.
 
 Test names are the function names, and the file says where to find them.
 
@@ -22,6 +22,8 @@ Type is where the evidence runs. Paths are in `crates/signa-ua/`:
   deterministic randomness, in `src/model.rs`.
 * unit: a test of one module's functions, inline in that module.
 * build: the compiler checks it on every build.
+* loopback: a UA through its public API, against raw UDP peers on loopback,
+  in `tests/ua.rs`.
 
 Status:
 
@@ -39,7 +41,7 @@ These hold across the whole UA core, whatever the message.
 | Requirement | Basis | Expected behavior | Evidence | Type | Scope | Status |
 | --- | --- | --- | --- | --- | --- | --- |
 | Transactions are the core's | [6026 §7](https://www.rfc-editor.org/rfc/rfc6026.html#section-7), design | The UA keeps no transaction state or timer A to M, and acts on what the core reports. The model has no such timer. | none | - | - | not implemented |
-| One writer | design | Only the model changes UA state. Handles hold no mutable state. | none | - | - | not implemented |
+| One writer | design | Only the driver changes UA state, through the model. Handles hold no state, and the application never holds a responder or client transaction. | `observer_drop_does_not_drop_responder_or_client_control`, `single_incoming_owner` | loopback | UDP | covered |
 | Dialog identity | [3261 §12](https://www.rfc-editor.org/rfc/rfc3261.html#section-12) | A dialog is its Call-ID with a local and a remote tag, never the Call-ID alone. Each side names the tags from itself, and swapped tags are another dialog. | `each_side_names_the_tags_and_uris_from_itself` (`dialog.rs`), `a_tagged_request_finds_its_dialog`, `an_unknown_ack_changes_nothing` | unit, model | - | partial: the model only, not on the wire |
 | A copy of a 2xx is not a new session | [3261 §13.2.2.4](https://www.rfc-editor.org/rfc/rfc3261.html#section-13.2.2.4) | A 2xx with the dialog and INVITE CSeq of one seen before gets the ACK again and no new usage, also after the usage ended. | `usage_termination_does_not_destroy_needed_replay` | model | - | partial: the model only, not on the wire |
 | Every 2xx gets its ACK | [3261 §13.2.2.4](https://www.rfc-editor.org/rfc/rfc3261.html#section-13.2.2.4) | Each new 2xx the UA can hold leaves an ACK to send. | `usage_termination_does_not_destroy_needed_replay` | model | - | partial: a branch beyond the limits gets no ACK yet |
@@ -50,10 +52,10 @@ These hold across the whole UA core, whatever the message.
 | Local CSeq | [3261 §12.2.1.1](https://www.rfc-editor.org/rfc/rfc3261.html#section-12.2.1.1) | One counter per dialog, with ACK and CANCEL on their INVITE's number. | `ack_and_cancel_do_not_allocate_new_dialog_cseq`, `confirmed_transition_preserves_sequence_history` (`dialog.rs`) | unit | - | partial: the model only, not on the wire |
 | Target refresh apart from negotiation | [6141 §3.3 to 3.5](https://www.rfc-editor.org/rfc/rfc6141.html#section-3.3) | A failed re-INVITE does not roll the target back with the session. | none | - | - | not implemented |
 | One offer at a time | [3264 §4](https://www.rfc-editor.org/rfc/rfc3264.html#section-4) | A dialog with an offer outstanding refuses another offer, in either direction. | `offers_and_answers_alternate`, `a_second_offer_waits_for_the_first_answer`, `an_answer_needs_an_offer_from_the_other_side` (`negotiation.rs`) | unit | - | partial: state only, not tied to messages yet |
-| Dropping is not CANCEL or BYE | design | Dropping a waiter or handle sends nothing and withdraws nothing. | `accepted_command_survives_waiter_drop` | model | - | partial: operation waiters only, no public handles yet |
-| Protocol work goes on when the application stalls | design | A full application queue stops neither core events nor timers. | none | - | - | not implemented |
+| Dropping is not CANCEL or BYE | design | Dropping an operation, session, attempt or the events sends nothing and withdraws nothing. An undecided INVITE dropped gets a 500, by signa-ua policy. | `accepted_command_survives_waiter_drop`, `waiting_operation_drop_does_not_withdraw_accepted_command`, `observer_drop_does_not_drop_responder_or_client_control`, `an_undecided_invite_gets_a_500_and_a_rejected_one_its_status` | model, loopback | UDP | covered |
+| Protocol work goes on when the application stalls | design | Neither a full event queue nor a slow resolution stops the driver. Each send and resolution runs as a job of its own. | `slow_resolver_does_not_block_other_dialog_ack`, `terminal_outcome_survives_notification_overflow` | loopback | UDP | partial: no timers yet |
 | Everything held is bounded | design | Each table has a limit. A full table refuses new work and hands it back, and the slots a 2xx needs are reserved before it goes out. | `a_full_table_hands_the_value_back`, `a_reservation_keeps_its_slot` (`slot.rs`), `no_2xx_without_room_for_its_session`, `unsent_busy_command_preserves_decision_authority`, `an_unwatched_outcome_is_kept_for_the_retention_time` (`operation.rs`) | unit, model | - | partial: counts only, no byte budgets or timer limits yet |
-| Terminal outcomes are not telemetry | design | An outcome is set once and kept in the operation's record, apart from notifications. | `the_first_outcome_sticks` (`operation.rs`), `accepted_command_survives_waiter_drop` | unit, model | - | partial: no notification queue yet |
+| Terminal outcomes are not telemetry | design | An outcome is set once and reaches its operation apart from notifications. A notification that does not fit is counted and reported. | `the_first_outcome_sticks` (`operation.rs`), `accepted_command_survives_waiter_drop`, `terminal_outcome_survives_notification_overflow` | unit, model, loopback | UDP | covered |
 | Nothing is sent after shutdown | design | Once shutdown completes, no UA task or timer sends. | none | - | - | not implemented |
 | `Drained` claims local work only | design | `Drained` says local work ended, not that the peer got anything. | none | - | - | not implemented |
 | Only the core's public API | design | signa-ua uses no private item of signa-core, and does not turn on its `__bench` feature. | the crate boundary, and `crates/signa-ua/Cargo.toml` | build | - | covered |
@@ -85,6 +87,20 @@ Unless a row says otherwise, these are unit tests in `src/dialog.rs`,
 | Next hop | [3261 §8.1.2](https://www.rfc-editor.org/rfc/rfc3261.html#section-8.1.2), [3263 §4](https://www.rfc-editor.org/rfc/rfc3263.html#section-4), [§4.1](https://www.rfc-editor.org/rfc/rfc3263.html#section-4.1) | The first Route value, or the Request-URI after a strict router or without a route set, is resolved. `maddr` stands for the host, `transport` picks UDP or TCP, and the default is UDP on port 5060. A host name resolves only from the table given. | `literals_resolve_with_their_transport_and_port`, `an_unmapped_hostname_is_not_resolved` | unit | - | partial: no DNS, so RFC 3263 is not implemented |
 | Large requests | [3261 §18.1.1](https://www.rfc-editor.org/rfc/rfc3261.html#section-18.1.1) | A request over 1300 bytes leaves UDP for TCP. | `a_large_request_leaves_udp` | unit | - | covered |
 | SIPS | [3261 §26.2.2](https://www.rfc-editor.org/rfc/rfc3261.html#section-26.2.2), [3261 §8.1.2](https://www.rfc-editor.org/rfc/rfc3261.html#section-8.1.2), [5630 §5.1.1](https://www.rfc-editor.org/rfc/rfc5630.html#section-5.1.1) | A SIPS Request-URI or next hop needs a secured first hop, and is never sent over plain UDP or TCP. | `sips_requirement_never_falls_back_to_plaintext` | unit | - | covered: there is no TLS, so it is always refused |
+
+## Runtime (design)
+
+| Requirement | Basis | Expected behavior | Evidence | Type | Scope | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| One receiver | design | The UA takes the endpoint's only receiver, and refuses a stateless endpoint. | `single_incoming_owner` | loopback | - | covered |
+| Admission | design | A submission beyond the command queue or the operations gets `Busy` and its value back, and sends nothing. | `command_queue_full_returns_busy_without_state_mutation`, `an_invalid_rejection_hands_the_invite_back` | loopback | UDP | covered |
+| Hung resolver | design | A resolution past its timeout counts as unresolved and frees its job, so finals and ACKs still get out. | `a_hung_resolver_gives_up_and_frees_its_job` | loopback | UDP | covered |
+| Forced stop | design | Dropping the driver stops the UA and its endpoint at once. Operations in flight fail with `DriverStopped`, and the handle takes nothing more. | `driver_drop_is_forced_stop_not_graceful_shutdown` | loopback | UDP | covered |
+| ACK before the commit | [3261 §13.3.1.4](https://www.rfc-editor.org/rfc/rfc3261.html#section-13.3.1.4), design | An ACK that reaches the driver before the core's verdict on its 2xx is kept and applied after it. | `an_ack_before_the_commit_is_not_lost` | model | - | covered |
+| Refusing an INVITE | [3261 §8.2.6.2](https://www.rfc-editor.org/rfc/rfc3261.html#section-8.2.6.2), [§21.5.4](https://www.rfc-editor.org/rfc/rfc3261.html#section-21.5.4), signa-ua policy | An INVITE the UA has no room for gets a 503, one that cannot form a dialog a 400, each with a To tag. | `an_invite_without_contact_is_refused`, `no_randomness_refuses_the_invite` | model | - | partial: the 503 is not tested on the wire |
+| The UAS 2xx | [3261 §12.1.1](https://www.rfc-editor.org/rfc/rfc3261.html#section-12.1.1) | The 2xx copies the request's Record-Route and carries the UA's Contact. | `waiting_operation_drop_does_not_withdraw_accepted_command` | loopback | UDP | partial: no session description yet |
+| The ACK of a 2xx | [3261 §13.2.2.4](https://www.rfc-editor.org/rfc/rfc3261.html#section-13.2.2.4) | The UAC sends the ACK of each 2xx to the dialog's next hop, numbered as the INVITE. | `observer_drop_does_not_drop_responder_or_client_control`, `an_ack_is_built_from_its_dialog` | loopback, model | UDP | partial: no answer in the ACK yet |
+| Failed INVITE | [3261 §12.3](https://www.rfc-editor.org/rfc/rfc3261.html#section-12.3) | A non-2xx final ends the attempt's early dialogs, and a 2xx from another fork still forms a dialog. | `a_failure_ends_the_early_dialogs_of_its_attempt` | model | - | covered |
 
 ## State model contracts (design)
 

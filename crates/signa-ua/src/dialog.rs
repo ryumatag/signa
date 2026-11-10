@@ -176,6 +176,11 @@ impl Origin {
         self.cseq
     }
 
+    /// Says whether a response to this request formed the dialog `id`.
+    pub(crate) fn formed(&self, id: &DialogId) -> bool {
+        id.call_id == self.call_id && id.local_tag == self.local_tag
+    }
+
     /// Returns the identity of the dialog a response with `remote_tag` forms.
     pub(crate) fn dialog_id(&self, remote_tag: Option<Tag>) -> DialogId {
         DialogId::new(self.call_id.clone(), self.local_tag.clone(), remote_tag)
@@ -185,6 +190,25 @@ impl Origin {
 /// Parses a tag that `protocol` has already checked to be a token.
 fn tag(tag: Option<&str>, field: Field) -> Result<Option<Tag>, DialogError> {
     tag.map(str::parse).transpose().map_err(|_| DialogError::Malformed(field))
+}
+
+/// Reads the dialog a request names, from this user agent's side, which
+/// takes the To tag as local and the From tag as remote. A request without a
+/// To tag names no dialog (RFC 3261 section 12.2.2).
+pub(crate) fn request_dialog<B>(
+    request: &Request<B>,
+) -> Result<Option<DialogId>, DialogError> {
+    let headers = request.headers();
+    let Some(local_tag) = tag(protocol::to(headers)?.tag, Field::To)? else {
+        return Ok(None);
+    };
+    let remote_tag = tag(protocol::from(headers)?.tag, Field::From)?;
+
+    Ok(Some(DialogId::new(
+        protocol::call_id(headers)?.into(),
+        local_tag,
+        remote_tag,
+    )))
 }
 
 /// Reads the remote tag of a response, the tag of its To.

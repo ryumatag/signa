@@ -20,11 +20,25 @@ include = [
   "LICENSE-MIT",
 ]
 
+[features]
+default = ["tokio"]
+# The runtime that drives the UA on a signa-core endpoint. Without it, only the
+# state model builds, which has no public API.
+tokio = ["dep:tokio", "signa-core/tokio"]
+
 [dependencies]
+bytes = { version = "1.12.1", default-features = false, features = ["std"] }
+# RFC 3261 section 19.3 requires tags with cryptographic randomness.
+getrandom = { version = "0.4", default-features = false }
 signa-core = { version = "0.1.0", path = "../signa-core", default-features = false }
 # The element scans of RFC 3261 section 25.1, for the few headers a UA reads.
 siparse = "0.4.4"
+tokio = { version = "1.54", default-features = false, features = ["macros", "rt", "sync", "time"], optional = true }
 
 [dev-dependencies]
-# Names the body of the messages the tests parse.
-bytes = "1.12.1"
+tokio = { version = "1.54", features = ["macros", "net", "rt-multi-thread", "test-util"] }
+
+# The runtime through the public API, against raw UDP peers.
+[[test]]
+name = "ua"
+required-features = ["tokio"]

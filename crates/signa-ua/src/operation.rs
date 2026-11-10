@@ -56,7 +56,7 @@ use std::time::{Duration, Instant};
 
 use crate::{
     error::Error,
-    invite::UsageKey,
+    invite::{AttemptKey, UsageKey},
     slot::{Key, Slots},
 };
 
@@ -84,6 +84,10 @@ pub(crate) enum Stage {
 pub(crate) enum Completion {
     /// An INVITE usage was established.
     Session(UsageKey),
+    /// An INVITE went to the core, which collects its responses.
+    Attempt(AttemptKey),
+    /// The operation did what it was for, and has nothing to show.
+    Done,
 }
 
 pub(crate) type Outcome = Result<Completion, Error>;
@@ -195,8 +199,9 @@ impl Operations {
         Some(Snapshot { stage: record.stage, outcome: record.outcome })
     }
 
-    /// Reclaims the records whose outcome has been kept long enough.
-    pub(crate) fn expire(&mut self, now: Instant) {
+    /// Reclaims the records whose outcome has been kept long enough, and
+    /// returns them.
+    pub(crate) fn expire(&mut self, now: Instant) -> Vec<OperationId> {
         let expired: Vec<OperationId> = self
             .records
             .iter()
@@ -204,9 +209,15 @@ impl Operations {
             .map(|(id, _)| id)
             .collect();
 
-        for id in expired {
+        for &id in &expired {
             self.records.remove(id);
         }
+        expired
+    }
+
+    /// Returns the earliest time a kept outcome may be reclaimed.
+    pub(crate) fn next_expiry(&self) -> Option<Instant> {
+        self.records.iter().filter_map(|(_, record)| record.expires).min()
     }
 }
 

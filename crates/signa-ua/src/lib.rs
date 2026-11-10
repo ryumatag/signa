@@ -1,17 +1,48 @@
 /*!
 Dialogs and INVITE usage for SIP user agents, on signa-core.
 
-This crate has no API yet. It is to track the dialogs an INVITE creates, send
-the ACK for each 2xx, retransmit a UAS 2xx until its ACK, and serialize
-CANCEL, BYE and re-INVITE against them, leaving call policy, SDP and media to
-the application.
-*/
+signa-ua is the UA core of RFC 3261 sections 12 and 13 on top of signa-core's
+transactions. It keeps the dialogs an INVITE forms, acknowledges each 2xx, and
+answers what the application leaves unanswered. Call policy, SDP and media
+stay with the application.
 
+The runtime, with the `tokio` feature, attaches a UA to a dedicated signa-core
+endpoint.
+*/
+#![cfg_attr(
+    feature = "tokio",
+    doc = "See [`attach`] for its parts, and how submitting, events and \
+           dropping work.\n\n"
+)]
+/*!
+# What it does not do yet
+
+This is an early stage of the crate, and much of a UA core is missing:
+
+* A 2xx carries no session description, and an ACK no answer.
+* A 2xx this UA sends is not retransmitted, and nothing times out its ACK.
+* CANCEL, BYE and every other request in a dialog get signa-core's 500.
+* There is no re-INVITE, and no graceful shutdown of the UA.
+* Next hops resolve from IP literals and a fixed table, with no DNS.
+*/
+#![cfg_attr(
+    not(feature = "tokio"),
+    doc = "\n\nWithout the `tokio` feature, the crate has no public API."
+)]
 #![deny(unreachable_pub, rustdoc::broken_intra_doc_links)]
 #![warn(missing_docs, missing_debug_implementations)]
-// TODO: Drive the state model from a runtime on the endpoint. Until that
-// exists, only the tests call it.
+// TODO: Drive the rest of the state model from the runtime: requests in a
+// dialog, the remote CSeq, and ending a usage. Until then only the tests use
+// those parts, and without the `tokio` feature only the tests use any.
 #![cfg_attr(not(test), allow(dead_code))]
+
+#[cfg(feature = "tokio")]
+pub use self::ua::{
+    attach, AttachError, AttemptId, Config, Error, Event, IncomingInvite,
+    InvalidContact, InviteAttempt, NegotiationState, Operation, Query,
+    Resolve, ResolveError, Session, SessionId, SessionPhase, SessionSnapshot,
+    StaticResolver, SubmitError, Ua, UaDriver, UaEvents, UaHandle, WireEffect,
+};
 
 // The private state model. `dialog` knows nothing of `invite`, so other
 // usages can share it later. `docs/signa-ua-rfc-test-map.md` maps the rules
@@ -26,6 +57,8 @@ mod protocol;
 mod retention;
 mod routing;
 mod slot;
+#[cfg(feature = "tokio")]
+mod ua;
 
 /// Messages and records the tests of several modules share.
 #[cfg(test)]

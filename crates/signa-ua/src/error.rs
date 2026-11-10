@@ -12,11 +12,18 @@ never gets a response, and an internal failure is not a 487 unless a CANCEL
 arrived.
 */
 
+use std::{error, fmt};
+
 use signa_core::StatusCode;
 
 /// Why an operation failed.
+///
+/// Each class says what may have reached the peer, through
+/// [`Error::wire_effect`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Error {
+#[non_exhaustive]
+#[cfg_attr(not(feature = "tokio"), allow(unreachable_pub))]
+pub enum Error {
     /// The request made no sense, such as a malformed plan.
     InvalidInput,
     /// The state does not allow the operation, such as a BYE on an ended
@@ -29,6 +36,9 @@ pub(crate) enum Error {
     /// The core refused the message and kept its state, as its
     /// `SubmitError` does for every variant but `Closed`.
     CoreSubmissionRejected,
+    /// The next hop could not be resolved, or needs a transport this UA does
+    /// not have, such as TLS for a SIPS URI.
+    Unroutable,
     /// A write failed, possibly after some of it went out.
     TransportFailure,
     /// The peer answered with a non-2xx final.
@@ -53,7 +63,8 @@ pub(crate) enum Error {
 
 /// What a failure says about the wire.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum WireEffect {
+#[cfg_attr(not(feature = "tokio"), allow(unreachable_pub))]
+pub enum WireEffect {
     /// Nothing was sent.
     None,
     /// Something may have been sent.
@@ -63,13 +74,16 @@ pub(crate) enum WireEffect {
 }
 
 impl Error {
-    pub(crate) fn wire_effect(self) -> WireEffect {
+    /// Returns what the failure says about the wire.
+    #[cfg_attr(not(feature = "tokio"), allow(unreachable_pub))]
+    pub fn wire_effect(self) -> WireEffect {
         match self {
             Error::InvalidInput
             | Error::InvalidTransition
             | Error::Busy
             | Error::CapacityExceeded
             | Error::CoreSubmissionRejected
+            | Error::Unroutable
             | Error::StaleDecision
             | Error::AlreadyFinalized
             | Error::Closed => WireEffect::None,
@@ -81,6 +95,43 @@ impl Error {
         }
     }
 }
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::InvalidInput => f.write_str("invalid input"),
+            Error::InvalidTransition => {
+                f.write_str("the state does not allow the operation")
+            }
+            Error::Busy => f.write_str("the UA's command queue is full"),
+            Error::CapacityExceeded => f.write_str("a UA limit is reached"),
+            Error::CoreSubmissionRejected => {
+                f.write_str("the endpoint refused the message")
+            }
+            Error::Unroutable => f.write_str("no usable next hop"),
+            Error::TransportFailure => f.write_str("a write failed"),
+            Error::RemoteFailure(status) => {
+                write!(f, "the peer answered {}", status.as_u16())
+            }
+            Error::NegotiationFailure => {
+                f.write_str("the session description provider failed")
+            }
+            Error::ObservationIncomplete => {
+                f.write_str("responses or events were lost")
+            }
+            Error::StaleDecision => {
+                f.write_str("the operation's target is gone")
+            }
+            Error::AlreadyFinalized => {
+                f.write_str("another final response came first")
+            }
+            Error::Closed => f.write_str("the UA admits no new work"),
+            Error::DriverStopped => f.write_str("the UA's driver stopped"),
+        }
+    }
+}
+
+impl error::Error for Error {}
 
 #[cfg(test)]
 mod tests {
@@ -95,6 +146,7 @@ mod tests {
             Error::Busy,
             Error::CapacityExceeded,
             Error::CoreSubmissionRejected,
+            Error::Unroutable,
             Error::TransportFailure,
             Error::RemoteFailure(busy_here),
             Error::NegotiationFailure,
