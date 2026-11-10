@@ -36,7 +36,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bytes::Bytes;
 use signa_core::{
     Method, Request, Response, StatusCode, message::header::Tag,
 };
@@ -54,7 +53,7 @@ use crate::{
     },
     negotiation::{Description, Negotiation},
     operation::{Completion, OperationId, Operations, Stage, SubmitError},
-    plan::{Identity, InvitePlan},
+    plan::{Identity, InvitePlan, PlannedInvite},
     protocol::{self, Field, Malformed},
     retention::{
         AckObligation, Bye, ReplayContext, ReplayId, ReplayKey, Retention,
@@ -199,6 +198,9 @@ pub(crate) enum Effect {
         result: AttemptResult,
         complete: bool,
         degraded: bool,
+        /// The sessions the attempt formed that are still up, in the order
+        /// they formed.
+        sessions: Vec<UsageKey>,
     },
     /// Tell the application.
     Notify(Event),
@@ -1205,11 +1207,11 @@ impl<R: Random> Model<R> {
             self.complete(operation, Err(Error::Internal));
             return;
         };
-        let Some(request) = plan.build(&identity, &self.contact) else {
+        let Some(planned) = plan.build(&identity, &self.contact) else {
             self.complete(operation, Err(Error::InvalidInput));
             return;
         };
-        let attempt = match self.start_attempt(&request, true) {
+        let attempt = match self.start_attempt(&planned.request, true) {
             Ok(attempt) => attempt,
             Err(error) => {
                 self.complete(operation, Err(error));
@@ -1218,7 +1220,7 @@ impl<R: Random> Model<R> {
         };
 
         let record = self.attempts.get_mut(attempt).expect("just opened");
-        record.request = Some(Box::new(request));
+        record.request = Some(Box::new(planned));
         record.operation = Some(operation);
         self.effects.push(Effect::StartInvite { attempt });
     }
@@ -1242,11 +1244,12 @@ impl<R: Random> Model<R> {
         Some(Identity { call_id: call_id.into(), tag, cseq })
     }
 
-    /// Hands the runtime the INVITE of an attempt to send.
+    /// Hands the runtime the INVITE of an attempt to send, with its first
+    /// hop.
     pub(crate) fn take_invite(
         &mut self,
         attempt: AttemptKey,
-    ) -> Option<Request<Bytes>> {
+    ) -> Option<PlannedInvite> {
         let request = self.attempts.get_mut(attempt)?.request.take()?;
         Some(*request)
     }
@@ -1789,9 +1792,9 @@ impl<R: Random> Model<R> {
     }
 
     /// Records that the core finished collecting the attempt's responses,
-    /// and reports what the attempt came to. Copies of its 2xx can no longer
-    /// arrive, and an early dialog no response confirmed can no longer be
-    /// confirmed.
+    /// and reports what the attempt came to, with the sessions that outlive
+    /// it. Copies of its 2xx can no longer arrive, and an early dialog no
+    /// response confirmed can no longer be confirmed.
     ///
     /// An attempt that ends without a final response or a failure, as when
     /// the endpoint stops, failed with `DriverStopped`, or with
@@ -1824,11 +1827,21 @@ impl<R: Random> Model<R> {
                 Error::ObservationIncomplete
             },
         ));
+        // The end of the attempt is the event that cannot be lost, so it
+        // lists the sessions that outlive it. An application that missed
+        // the notification of one finds it here, after the attempt's
+        // snapshot is gone.
+        let sessions = attempt
+            .forks
+            .into_iter()
+            .filter(|&usage| self.usages.get(usage).is_some())
+            .collect();
         self.effects.push(Effect::AttemptEnded {
             attempt: key,
             result,
             complete: attempt.complete,
             degraded: attempt.degraded,
+            sessions,
         });
     }
 }
@@ -2366,6 +2379,7 @@ mod tests {
                     result: AttemptResult::Answered,
                     complete: true,
                     degraded: false,
+                    sessions: vec![],
                 },
             ],
         );
@@ -2926,7 +2940,7 @@ mod tests {
         else {
             panic!("no INVITE to send");
         };
-        let request = model.take_invite(attempt).unwrap();
+        let request = model.take_invite(attempt).unwrap().request;
         let header = |name| request.headers().get(name).unwrap().as_str();
         assert_eq!(request.method(), &Method::INVITE);
         assert_eq!(header("Call-ID"), "00000000000000010000000000000002");
@@ -4227,6 +4241,7 @@ mod tests {
                 result: AttemptResult::Answered,
                 complete: false,
                 degraded: false,
+                sessions: vec![],
             }),
         );
 
@@ -4358,7 +4373,8 @@ mod tests {
         );
         assert_eq!(early, Err(Error::CapacityExceeded));
         let effects = model.take_effects();
-        assert_eq!(confirmations(&effects).len(), 2);
+        let sessions = confirmations(&effects);
+        assert_eq!(sessions.len(), 2);
         let sent = acks(&effects);
         assert_eq!(sent.len(), 4, "two sessions and two cleanups");
         assert_eq!((model.dialogs.len(), model.usages.len()), (2, 2));
@@ -4382,6 +4398,7 @@ mod tests {
                 result: AttemptResult::Answered,
                 complete: false,
                 degraded: true,
+                sessions: sessions.clone(),
             }),
         );
         assert_eq!((model.replays.len(), model.cleanups), (0, 0));

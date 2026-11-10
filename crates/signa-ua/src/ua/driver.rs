@@ -65,7 +65,6 @@ use crate::{
     plan::ALLOWED,
     protocol,
     retention::ReplayKey,
-    routing::initial_next_hop,
 };
 
 /// Randomness from the operating system, which RFC 3261 section 19.3 asks
@@ -769,13 +768,23 @@ impl<R: Resolve> Driver<R> {
             Effect::SendBye { replay } => self.send_bye(replay),
             Effect::Notify(event) => self.notify(event, attempt),
             Effect::OperationEnded { operation } => self.deliver(operation),
-            Effect::AttemptEnded { attempt, result, complete, degraded } => {
+            Effect::AttemptEnded {
+                attempt,
+                result,
+                complete,
+                degraded,
+                sessions,
+            } => {
                 if let Some(permit) = self.endings.remove(&attempt) {
                     permit.send(Event::AttemptEnded {
                         attempt: AttemptId(attempt),
                         result,
                         complete,
                         degraded,
+                        sessions: sessions
+                            .into_iter()
+                            .map(Session::new)
+                            .collect(),
                     });
                 }
             }
@@ -892,7 +901,7 @@ impl<R: Resolve> Driver<R> {
     fn start_invite(&mut self, attempt: AttemptKey) {
         use mpsc::error::TrySendError;
 
-        let Some(request) = self.model.take_invite(attempt) else {
+        let Some(planned) = self.model.take_invite(attempt) else {
             return;
         };
         // The last event of the attempt gets its place now, so that it is
@@ -913,17 +922,14 @@ impl<R: Resolve> Driver<R> {
             Err(TrySendError::Closed(_)) => {}
         }
 
-        match initial_next_hop(request.uri().as_str(), request.headers()) {
-            Ok((uri, false)) => {
-                let query = query(uri, &request);
-                self.backlog.push_back(Job::Start { attempt, request, query });
-            }
-            // A secure hop needs TLS, which this UA does not have.
-            Ok((_, true)) => {
-                self.model.invite_failed(attempt, Error::Unroutable)
-            }
-            Err(_) => self.model.invite_failed(attempt, Error::InvalidInput),
+        // A secure hop needs TLS, which this UA does not have.
+        if planned.secure {
+            self.model.invite_failed(attempt, Error::Unroutable);
+            return;
         }
+        let request = planned.request;
+        let query = query(planned.next_hop, &request);
+        self.backlog.push_back(Job::Start { attempt, request, query });
     }
 
     /// Builds the ACK of a 2xx from its dialog and sends it. The ACK is kept

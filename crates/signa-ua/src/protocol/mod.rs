@@ -37,7 +37,6 @@ pub(crate) enum Field {
     To,
     CSeq,
     Contact,
-    Route,
     RecordRoute,
     Require,
     Expires,

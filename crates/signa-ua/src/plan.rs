@@ -161,7 +161,7 @@ impl InvitePlan {
         &self,
         identity: &Identity,
         contact: &str,
-    ) -> Option<Request<Bytes>> {
+    ) -> Option<PlannedInvite> {
         if !self.is_valid() {
             return None;
         }
@@ -200,11 +200,34 @@ impl InvitePlan {
             request = request.header(name.clone(), value.clone());
         }
 
-        request
+        let request = request
             .header(CONTENT_TYPE, self.offer.content_type().clone())
             .body(self.offer.body().clone())
-            .ok()
+            .ok()?;
+        Some(PlannedInvite {
+            request,
+            next_hop: target.next_hop,
+            secure: target.secure,
+        })
     }
+}
+
+/// An INVITE built from a plan, and where its first hop goes.
+///
+/// The hop comes from the route set, as RFC 3261 section 8.1.2 picks it, and
+/// goes with the request so that nothing reads it back from the headers. Past
+/// a strict router, section 12.2.1.1 puts the router in the Request-URI and
+/// the rest of the route set in Route, and the top Route value may then be a
+/// loose router that is not the first hop. The SIPS requirement is likewise
+/// that of the planned target and routes, which the Request-URI may no longer
+/// show.
+#[derive(Debug)]
+pub(crate) struct PlannedInvite {
+    pub(crate) request: Request<Bytes>,
+    /// The URI to resolve for the first hop.
+    pub(crate) next_hop: Box<str>,
+    /// Whether the first hop must be secured.
+    pub(crate) secure: bool,
 }
 
 /// What the UA picks for an INVITE it sends: the Call-ID, the From tag and
@@ -275,7 +298,8 @@ mod tests {
             .route(uri("sip:p2.example.com;lr"))
             .header(USER_AGENT, HeaderValue::from_static("test"))
             .build(&identity(), "sip:alice@192.0.2.1")
-            .unwrap();
+            .unwrap()
+            .request;
         let headers = request.headers();
         let rows = |name| {
             headers
@@ -313,7 +337,8 @@ mod tests {
         let request = plan()
             .to(uri("sip:bob@example.com"))
             .build(&identity(), "sip:alice@192.0.2.1")
-            .unwrap();
+            .unwrap()
+            .request;
 
         assert_eq!(
             request.headers().get(TO).unwrap(),
@@ -361,11 +386,12 @@ mod tests {
     /// 12.2.1.1), so that the INVITE reaches the strict router first.
     #[test]
     fn a_strict_router_takes_the_request_uri() {
-        let request = plan()
+        let planned = plan()
             .route(uri("sip:192.0.2.10"))
             .route(uri("sip:p2.example.com;lr"))
             .build(&identity(), "sip:alice@192.0.2.1")
             .unwrap();
+        let request = &planned.request;
         let routes: Vec<_> = request
             .headers()
             .get_all(ROUTE)
@@ -381,6 +407,29 @@ mod tests {
             request.headers().get(TO).unwrap(),
             "<sip:bob@biloxi.example.com>"
         );
+        // RFC 3261 section 8.1.2 resolves the Request-URI past a strict
+        // router, though the top Route value is a loose router.
+        assert_eq!(&*planned.next_hop, "sip:192.0.2.10");
+        assert!(!planned.secure);
+    }
+
+    /// A SIPS target behind a strict router that is a SIP URI keeps its
+    /// need for TLS, though strict routing leaves a SIP Request-URI and next
+    /// hop (RFC 3261 section 26.2.2).
+    #[test]
+    fn a_sips_target_behind_a_strict_router_stays_secure() {
+        let planned = InvitePlan::new(
+            uri("sips:bob@biloxi.example.com"),
+            uri("sips:alice@atlanta.example.com"),
+            plan().offer,
+        )
+        .route(uri("sip:192.0.2.10"))
+        .build(&identity(), "sip:alice@192.0.2.1")
+        .unwrap();
+
+        assert_eq!(planned.request.uri().as_str(), "sip:192.0.2.10");
+        assert_eq!(&*planned.next_hop, "sip:192.0.2.10");
+        assert!(planned.secure);
     }
 
     /// A To taken from the Request-URI leaves out what Table 1 of RFC 3261
@@ -393,7 +442,8 @@ mod tests {
             plan().offer,
         )
         .build(&identity(), "sip:alice@192.0.2.1")
-        .unwrap();
+        .unwrap()
+        .request;
 
         assert_eq!(
             request.uri().as_str(),

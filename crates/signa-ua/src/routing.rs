@@ -27,13 +27,13 @@ use std::{
 use signa_core::{
     HeaderMap,
     message::{
-        header::{RECORD_ROUTE, ROUTE},
+        header::RECORD_ROUTE,
         uri::{Scheme, SipUri},
     },
     transport::Transport,
 };
 
-use crate::protocol::{Field, Malformed, addresses};
+use crate::protocol::addresses;
 
 /// One URI of a route set.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -238,8 +238,15 @@ pub(crate) fn request_target(
     };
 
     // RFC 3261 section 8.1.2 has the UAC treat the next hop as SIPS whenever
-    // the Request-URI is a SIPS URI, whatever URI it resolves.
-    let secure = secure_dialog || is_sips(&request_uri) || is_sips(&next_hop);
+    // the Request-URI is a SIPS URI, whatever URI it resolves. Section
+    // 26.2.2 has a SIPS URI ask for TLS on the whole path to it, in a Route
+    // as in the Request-URI. So the hop is secure if the remote target or
+    // any route is a SIPS URI, before strict routing moves the target into
+    // Route and leaves a SIP URI in the Request-URI. Without TLS, that
+    // refuses the request rather than send a SIPS one in the clear.
+    let secure = secure_dialog
+        || is_sips(&target.uri)
+        || routes.0.iter().any(|route| is_sips(&route.uri));
     RequestTarget {
         request_uri,
         route,
@@ -367,41 +374,6 @@ fn address_end(uri: &SipUri<'_>) -> usize {
             if src[end..].starts_with(']') { end + 1 } else { end }
         }
     }
-}
-
-/// Returns the URI to resolve for a request outside a dialog, and whether
-/// its first hop must be secured.
-///
-/// RFC 3261 section 8.1.2 resolves the top Route value, or the Request-URI
-/// without one. When the top Route value is a strict router, the request was
-/// built as section 12.2.1.1 builds it, and the Request-URI is resolved. A
-/// SIPS Request-URI makes the hop secure whatever is resolved.
-pub(crate) fn initial_next_hop(
-    request_uri: &str,
-    headers: &HeaderMap,
-) -> Result<(Box<str>, bool), Malformed> {
-    let malformed = Malformed(Field::Route);
-    let top = match headers.get(ROUTE) {
-        Some(value) => addresses(value.as_str())
-            .next()
-            .transpose()
-            .map_err(|_| malformed)?,
-        None => None,
-    };
-
-    let next_hop = match top {
-        // `route-param = name-addr *( SEMI rr-param )` (RFC 3261 section
-        // 25.1), so a bare `addr-spec` does not belong here either.
-        Some(route) if !route.bracketed => return Err(malformed),
-        Some(route) => {
-            let uri = SipUri::parse(route.uri).map_err(|_| malformed)?;
-            let loose = uri.parameter("lr").map_err(|_| malformed)?.is_some();
-            if loose { route.uri } else { request_uri }
-        }
-        None => request_uri,
-    };
-    let secure = is_sips(request_uri) || is_sips(next_hop);
-    Ok((next_hop.into(), secure))
 }
 
 /// Where the first hop of a request goes.
@@ -755,6 +727,17 @@ mod tests {
                 false,
             ),
             (routes(&["<sip:p1.example.com;lr>"]), "sip:bob@192.0.2.4", true),
+            // A strict router moves the SIPS target into Route, and leaves
+            // a SIP Request-URI and next hop.
+            (routes(&["<sip:p1.example.com>"]), "sips:bob@192.0.2.4", false),
+            (
+                routes(&[
+                    "<sip:p1.example.com;lr>",
+                    "<sips:p2.example.com;lr>",
+                ]),
+                "sip:bob@192.0.2.4",
+                false,
+            ),
         ] {
             let request =
                 request_target(&routes, &self::target(target), secure_dialog);
@@ -846,45 +829,5 @@ mod tests {
             resolver.resolve(&request, 100).unwrap().address,
             "192.0.2.4:5060".parse().unwrap()
         );
-    }
-
-    /// RFC 3261 section 8.1.2 sends a request outside a dialog to its top
-    /// Route, or to its Request-URI without one or past a strict router.
-    #[test]
-    fn the_first_hop_of_an_initial_request() {
-        let route = |value: &'static str| {
-            let mut headers = HeaderMap::new();
-            headers.append(ROUTE, HeaderValue::from_static(value));
-            headers
-        };
-        let uri = "sip:bob@192.0.2.4";
-
-        assert_eq!(
-            initial_next_hop(uri, &HeaderMap::new()),
-            Ok((uri.into(), false)),
-        );
-        assert_eq!(
-            initial_next_hop(uri, &route("<sip:p1.example.com;lr>, <sip:p2>")),
-            Ok(("sip:p1.example.com;lr".into(), false)),
-        );
-        assert_eq!(
-            initial_next_hop(uri, &route("<sip:p1.example.com>")),
-            Ok((uri.into(), false)),
-        );
-        assert_eq!(
-            initial_next_hop(uri, &route("<sips:p1.example.com;lr>")),
-            Ok(("sips:p1.example.com;lr".into(), true)),
-        );
-        assert_eq!(
-            initial_next_hop("sips:bob@192.0.2.4", &HeaderMap::new()),
-            Ok(("sips:bob@192.0.2.4".into(), true)),
-        );
-        for malformed in ["sip:p1.example.com;lr", "<tel:+15551234>"] {
-            assert_eq!(
-                initial_next_hop(uri, &route(malformed)),
-                Err(Malformed(Field::Route)),
-                "{malformed}",
-            );
-        }
     }
 }

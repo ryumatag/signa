@@ -27,14 +27,14 @@ response collection.
 
 use std::time::Instant;
 
-use bytes::Bytes;
-use signa_core::{Request, StatusCode};
+use signa_core::StatusCode;
 
 use crate::{
     dialog::{Dialog, DialogKey, Origin},
     error::Error,
     negotiation::{Description, Negotiation},
     operation::OperationId,
+    plan::PlannedInvite,
     slot::Key,
 };
 
@@ -67,8 +67,8 @@ pub(crate) struct InviteAttempt {
     /// negotiation from it.
     pub(crate) offer_in_request: bool,
     pub(crate) exchange: ExchangeKey,
-    /// The INVITE until the runtime takes it to send.
-    pub(crate) request: Option<Box<Request<Bytes>>>,
+    /// The INVITE and its first hop, until the runtime takes them to send.
+    pub(crate) request: Option<Box<PlannedInvite>>,
     /// The operation that sent the INVITE, until it is in the core.
     pub(crate) operation: Option<OperationId>,
     /// What the INVITE came to, once its first final response or failure

@@ -824,6 +824,12 @@ pub enum Event {
         /// no room even to end the dialog, beyond [`Config::max_cleanups`].
         /// The peer then gives up on the ACK, and ends the dialog itself.
         degraded: bool,
+        /// The session of each dialog the responses formed that is still up,
+        /// in the order they formed, as [`AttemptSnapshot::sessions`] listed
+        /// them. The early ones no 2xx confirmed have ended by now. This event
+        /// is never dropped, so a session whose [`Event::Confirmed`] was lost
+        /// to a full queue is found here once the attempt's snapshot is gone.
+        sessions: Vec<Session>,
     },
     /// Notifications were dropped because the queue was full.
     #[non_exhaustive]

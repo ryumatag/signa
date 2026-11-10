@@ -1457,6 +1457,7 @@ struct Ending {
     result: AttemptResult,
     complete: bool,
     degraded: bool,
+    sessions: Vec<Session>,
 }
 
 /// Receives events until the attempt ends, keeping the sessions the 2xx
@@ -1466,8 +1467,20 @@ async fn ending(events: &mut UaEvents) -> Ending {
     loop {
         match timeout(WAIT, events.recv()).await.unwrap().unwrap() {
             Event::Confirmed { session, .. } => confirmed.push(session),
-            Event::AttemptEnded { result, complete, degraded, .. } => {
-                return Ending { confirmed, result, complete, degraded };
+            Event::AttemptEnded {
+                result,
+                complete,
+                degraded,
+                sessions,
+                ..
+            } => {
+                return Ending {
+                    confirmed,
+                    result,
+                    complete,
+                    degraded,
+                    sessions,
+                };
             }
             _ => {}
         }
@@ -1511,6 +1524,7 @@ async fn two_forks_on_the_wire_get_an_ack_each() {
     assert_eq!(snapshot.sessions.len(), 2);
     let ending = ending(&mut ua.events).await;
     assert_eq!(ending.confirmed, snapshot.sessions);
+    assert_eq!(ending.sessions, snapshot.sessions);
     assert_eq!(ending.result, AttemptResult::Answered);
     assert!(ending.complete && !ending.degraded);
 }
@@ -1594,4 +1608,80 @@ async fn a_fork_flood_on_the_wire_stays_within_its_limits() {
     let ending = ending(&mut ua.events).await;
     assert_eq!(ending.confirmed.len(), 1);
     assert!(!ending.complete && ending.degraded);
+}
+
+/// The notifications of a fork can be lost to a full event queue, and the
+/// attempt can end before the application asks for its snapshot. Its end,
+/// which is never dropped, still lists every session it formed, so none is
+/// lost to the application.
+#[tokio::test]
+async fn forks_whose_notifications_were_lost_are_listed_at_the_end() {
+    let config = config().event_capacity(1).max_attempts(1);
+    let (mut ua, _, _) = start_fast_with(config);
+    tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+    let to = peer.address().to_string();
+    let contact = format!("sip:peer@{to}");
+
+    ua.handle.try_invite(plan_to(&to, "lost")).unwrap().await.unwrap();
+    let (request, from) = peer.recv_starting("INVITE").await;
+    for tag in ["first", "second"] {
+        peer.send(&answer(&request, "200", tag, &contact), from).await;
+        peer.recv_starting("ACK").await;
+    }
+    // Timer M, 64 T1 after the first 2xx, ends the attempt meanwhile.
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+
+    let ending = ending(&mut ua.events).await;
+    assert!(ending.confirmed.len() < 2, "a notification was dropped");
+    assert_eq!(ending.sessions.len(), 2);
+    for session in &ending.sessions {
+        let snapshot = ua.handle.snapshot(session).await.unwrap();
+        assert!(snapshot.is_some(), "{session:?} is still up");
+    }
+}
+
+/// With a strict router first and a loose one after it, the INVITE goes to
+/// the strict router, whose URI is its Request-URI. The top Route value is
+/// then the loose router, but RFC 3261 section 8.1.2 picks the hop from the
+/// route set, not from what is left in Route.
+#[tokio::test]
+async fn a_strict_first_proxy_gets_the_invite() {
+    let (ua, _, _) = start_fast();
+    tokio::spawn(ua.driver);
+    let strict = Peer::new().await;
+    let loose = Peer::new().await;
+    let callee = Peer::new().await;
+    let strict_uri = format!("sip:{}", strict.address());
+    let plan = plan_to(&callee.address().to_string(), "strict")
+        .route(strict_uri.parse().unwrap())
+        .route(format!("sip:{};lr", loose.address()).parse().unwrap());
+
+    ua.handle.try_invite(plan).unwrap().await.unwrap();
+    let (request, _) = strict.recv_starting("INVITE").await;
+
+    assert!(request.starts_with(&format!("INVITE {strict_uri} SIP/2.0")));
+    loose.quiet("INVITE", Duration::from_millis(200)).await;
+    callee.quiet("INVITE", Duration::from_millis(1)).await;
+}
+
+/// A SIPS target behind a strict router with a SIP URI still needs TLS on
+/// the way (RFC 3261 section 26.2.2), though strict routing leaves a SIP
+/// Request-URI. With no TLS, the INVITE does not go out.
+#[tokio::test]
+async fn a_sips_target_behind_a_strict_router_is_not_sent() {
+    let (ua, _, _) = start_fast();
+    tokio::spawn(ua.driver);
+    let strict = Peer::new().await;
+    let plan = InvitePlan::new(
+        format!("sips:peer@{}", strict.address()).parse().unwrap(),
+        "sip:ua@127.0.0.1".parse().unwrap(),
+        sdp(),
+    )
+    .route(format!("sip:{}", strict.address()).parse().unwrap());
+
+    let result = ua.handle.try_invite(plan).unwrap().await;
+
+    assert_eq!(result.unwrap_err(), Error::Unroutable);
+    strict.quiet("INVITE", Duration::from_millis(200)).await;
 }
