@@ -163,8 +163,18 @@ impl Operations {
         Some(outcome)
     }
 
+    /// Says whether no operation runs or keeps an outcome.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.records.len() == 0
+    }
+
+    /// Returns how many operations run or keep an outcome.
+    #[cfg(debug_assertions)]
+    pub(crate) fn len(&self) -> usize {
+        self.records.len()
+    }
+
     /// Returns the operations that have no outcome yet.
-    #[cfg(test)]
     pub(crate) fn running(&self) -> impl Iterator<Item = OperationId> {
         self.records
             .iter()

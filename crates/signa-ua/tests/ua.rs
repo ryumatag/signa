@@ -12,7 +12,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -26,7 +26,8 @@ use signa_ua::{
     AttachError, AttemptResult, CancelResult, Config, Description, EndReason,
     Error, Event, IncomingInvite, InvitePlan, Negotiate, NegotiationState,
     Offer, Query, ReinvitePlan, Resolve, ResolveError, Session, SessionPhase,
-    StaticResolver, Ua, UaEvents, attach,
+    ShutdownMode, ShutdownOutcome, ShutdownReport, StaticResolver, Ua,
+    UaEvents, attach,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -3575,4 +3576,929 @@ async fn an_answer_timeout_past_the_clock_sets_no_deadline() {
         _ => None,
     })
     .await;
+}
+
+/// Timers as [`fast`], with a T4 as short, so that a UDP transaction ends
+/// soon after its final response and a drain of the endpoint takes about
+/// 64 T1, 1.28 s.
+fn brisk() -> Timers {
+    Timers::builder()
+        .t1(Duration::from_millis(20))
+        .t2(Duration::from_millis(80))
+        .t4(Duration::from_millis(80))
+        .build()
+        .unwrap()
+}
+
+/// A UA on UDP and TCP whose endpoint and configuration run on [`brisk`]
+/// timers, its addresses, and another handle to its endpoint.
+fn brisk_with<R: Resolve, N: Negotiate>(
+    config: Config<R, N>,
+) -> (Ua, SocketAddr, SocketAddr, Endpoint) {
+    let local = "127.0.0.1:0".parse().unwrap();
+    let (endpoint, incoming) = Endpoint::builder()
+        .udp(local)
+        .tcp(local)
+        .timers(brisk())
+        .bind()
+        .unwrap();
+    let (udp, tcp) =
+        (endpoint.udp_addr().unwrap(), endpoint.tcp_addr().unwrap());
+    let other = endpoint.clone();
+    let ua = attach(endpoint, incoming, config.timers(brisk())).unwrap();
+    (ua, udp, tcp, other)
+}
+
+/// [`ua_on`] with `timers`, for both its endpoint and its configuration.
+fn ua_timed(transport: &str, timers: Timers) -> (Ua, SocketAddr) {
+    let local = "127.0.0.1:0".parse().unwrap();
+    let builder = Endpoint::builder().timers(timers);
+    let builder = if transport == "tcp" {
+        builder.tcp(local)
+    } else {
+        builder.udp(local)
+    };
+    let (endpoint, incoming) = builder.bind().unwrap();
+    let address = if transport == "tcp" {
+        endpoint.tcp_addr().unwrap()
+    } else {
+        endpoint.udp_addr().unwrap()
+    };
+    let contact = format!("sip:ua@{address};transport={transport}");
+    let config = Config::new(&contact).unwrap().timers(timers);
+    (attach(endpoint, incoming, config).unwrap(), address)
+}
+
+/// Has the `caller` UA call the UA at `address` over `transport`, whose
+/// application accepts, and returns the caller's session and the callee's,
+/// once the ACK is in.
+async fn two_ua_call(
+    caller: &signa_ua::UaHandle,
+    caller_events: &mut UaEvents,
+    callee_events: &mut UaEvents,
+    address: SocketAddr,
+    transport: &str,
+) -> (Session, Session) {
+    let plan = InvitePlan::new(
+        format!("sip:ua@{address};transport={transport}").parse().unwrap(),
+        "sip:caller@127.0.0.1".parse().unwrap(),
+        sdp(),
+    );
+    caller.try_invite(plan).unwrap().await.unwrap();
+    let answered =
+        invite(callee_events).await.try_accept(sdp()).unwrap().await.unwrap();
+    let calling = event(caller_events, |event| match event {
+        Event::Confirmed { session, .. } => Some(session),
+        _ => None,
+    })
+    .await;
+    // The ACK goes at once, and stops the 2xx.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    (calling, answered)
+}
+
+/// Waits for the report of a shutdown, which must come within `wait`.
+async fn report_within(
+    shutdown: signa_ua::UaShutdown,
+    wait: Duration,
+) -> ShutdownReport {
+    timeout(wait, shutdown).await.expect("a report in time").unwrap()
+}
+
+/// A UA that drains keeps its endpoint taking requests, so a BYE of the
+/// peer gets the UA's 200 rather than the 503 of an endpoint that shut down
+/// too early. So does the peer's re-INVITE, which the application takes, over
+/// UDP and over TCP. Only a new INVITE gets a 503, and once the session has
+/// ended the UA and its endpoint drain.
+#[tokio::test]
+async fn peer_bye_during_ua_drain_is_not_rejected_by_premature_core_shutdown()
+{
+    for transport in ["UDP", "TCP"] {
+        let (mut ua, udp, tcp, _) = brisk_with(config());
+        let handle = ua.handle.clone();
+        tokio::spawn(ua.driver);
+        let mut peer = Wire::connect(transport, udp, tcp).await;
+        let me = peer.address();
+        peer.send(&invite_over(transport, me, "draining")).await;
+        let incoming = invite(&mut ua.events).await;
+        incoming.try_accept(sdp()).unwrap().await.unwrap();
+        let ok = peer.recv_answer("SIP/2.0 200", "1 INVITE").await;
+        peer.acknowledge(&ok, "draining", 1).await;
+
+        let shutdown = handle
+            .shutdown(ShutdownMode::DrainExisting, Duration::from_secs(10));
+        peer.send(&invite_over(transport, me, "late")).await;
+        peer.recv_answer("SIP/2.0 503", "1 INVITE").await;
+        let reinvite = reinvite_of(&ok, me, "draining", 2, me, "v=0")
+            .replace("SIP/2.0/UDP", &format!("SIP/2.0/{transport}"));
+        peer.send(&reinvite).await;
+        let accepting = reinvite_event(&mut ua.events).await.try_accept(sdp());
+        accepting.unwrap().await.unwrap();
+        let reok = peer.recv_answer("SIP/2.0 200", "2 INVITE").await;
+        peer.acknowledge(&reok, "draining", 2).await;
+        let bye = in_dialog("BYE", transport, &ok, me, "draining", 3);
+        peer.send(&bye).await;
+        let answered = peer.recv_answer("SIP/2.0 ", "3 BYE").await;
+
+        assert!(
+            answered.starts_with("SIP/2.0 200"),
+            "{transport}: {answered}"
+        );
+        let report = report_within(shutdown, Duration::from_secs(5)).await;
+        assert_eq!(report.outcome, ShutdownOutcome::Drained, "{transport}");
+        assert_eq!((report.ended, report.terminated), (1, 0), "{transport}");
+        assert_eq!(report.sessions_left, 0, "{transport}");
+    }
+}
+
+/// Two UAs over UDP and over TCP, and either one drains, the caller or the
+/// callee. The other's re-INVITE reaches the draining one's application,
+/// which takes it, and the other's BYE gets its 200, so both operations
+/// succeed. Then the draining UA stops.
+#[tokio::test]
+async fn a_draining_ua_takes_its_peers_reinvite_and_bye_either_way() {
+    for transport in ["udp", "tcp"] {
+        for draining in ["caller", "callee"] {
+            let (Ua { handle: caller, events: mut caller_events, driver }, _) =
+                ua_timed(transport, brisk());
+            tokio::spawn(driver);
+            let (
+                Ua { handle: callee, events: mut callee_events, driver },
+                address,
+            ) = ua_timed(transport, brisk());
+            tokio::spawn(driver);
+            let (calling, answered) = two_ua_call(
+                &caller,
+                &mut caller_events,
+                &mut callee_events,
+                address,
+                transport,
+            )
+            .await;
+            let (stopping, mut stopping_events, other, session) =
+                if draining == "caller" {
+                    (caller, caller_events, callee, answered)
+                } else {
+                    (callee, callee_events, caller, calling)
+                };
+
+            let shutdown = stopping.shutdown(
+                ShutdownMode::DrainExisting,
+                Duration::from_secs(10),
+            );
+            let reinviting = other
+                .try_reinvite(&session, ReinvitePlan::new(sdp()))
+                .unwrap();
+            let incoming = reinvite(&mut stopping_events).await;
+            incoming.try_accept(sdp()).unwrap().await.unwrap();
+            assert_eq!(reinviting.await, Ok(()), "{transport} {draining}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let bye = other.try_terminate(&session).unwrap().await;
+
+            assert_eq!(bye, Ok(()), "{transport} {draining}");
+            let report = report_within(shutdown, Duration::from_secs(5)).await;
+            assert_eq!(
+                report.outcome,
+                ShutdownOutcome::Drained,
+                "{transport} {draining}"
+            );
+            assert_eq!(report.ended, 1, "{transport} {draining}");
+        }
+    }
+}
+
+/// Two UAs over UDP and over TCP, and either one terminates. The caller
+/// with an answered call and one the callee holds undecided: the call gets
+/// a BYE, and the INVITE a CANCEL, whose 487 the callee's application learns
+/// of. The callee with an answered call and an INVITE it holds: the call
+/// gets a BYE, and the INVITE a 503. Each side sees the end of the call as
+/// the peer's BYE, and none is left.
+#[tokio::test]
+async fn a_terminating_ua_ends_its_calls_either_way() {
+    for transport in ["udp", "tcp"] {
+        for terminating in ["caller", "callee"] {
+            let (Ua { handle: caller, events: mut caller_events, driver }, _) =
+                ua_timed(transport, brisk());
+            tokio::spawn(driver);
+            let (
+                Ua { handle: callee, events: mut callee_events, driver },
+                address,
+            ) = ua_timed(transport, brisk());
+            tokio::spawn(driver);
+            let (calling, answered) = two_ua_call(
+                &caller,
+                &mut caller_events,
+                &mut callee_events,
+                address,
+                transport,
+            )
+            .await;
+            let plan = InvitePlan::new(
+                format!("sip:ua@{address};transport={transport}")
+                    .parse()
+                    .unwrap(),
+                "sip:caller@127.0.0.1".parse().unwrap(),
+                sdp(),
+            );
+            let pending = caller.try_invite(plan).unwrap().await.unwrap();
+            let held = invite(&mut callee_events).await;
+            // The callee rings, so that the CANCEL may go.
+            held.try_provisional(StatusCode::from_u16(180).unwrap())
+                .unwrap()
+                .await
+                .unwrap();
+            event(&mut caller_events, |event| match event {
+                Event::Early { .. } => Some(()),
+                _ => None,
+            })
+            .await;
+
+            let (stopping, other_events, other_session) =
+                if terminating == "caller" {
+                    (&caller, &mut callee_events, &answered)
+                } else {
+                    (&callee, &mut caller_events, &calling)
+                };
+            let shutdown = stopping
+                .shutdown(ShutdownMode::Terminate, Duration::from_secs(3));
+            // The other side's events come in either order, so each is
+            // taken as it comes: the end of the call, and for the INVITE
+            // that rang, its 487 at the callee or its 503 at the caller.
+            let (mut ended, mut refused) = (None, false);
+            while ended.is_none() || !refused {
+                match timeout(WAIT, other_events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                {
+                    Event::Ended { session, reason, .. }
+                        if &session == other_session =>
+                    {
+                        ended = Some(reason);
+                    }
+                    Event::Cancelled { .. } => refused = true,
+                    Event::Failed { attempt, error, .. } => {
+                        assert_eq!(attempt, pending.id());
+                        let unavailable = StatusCode::from_u16(503).unwrap();
+                        assert_eq!(error, Error::RemoteFailure(unavailable));
+                        refused = true;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(
+                matches!(ended, Some(EndReason::RemoteBye { .. })),
+                "{transport} {terminating}"
+            );
+            drop(held);
+
+            // Over UDP the caller's INVITE that got its 487 keeps Timer D,
+            // at least 32 s (RFC 3261 section 17.1.1.2), which holds the
+            // UA's attempt and the endpoint's drain alike.
+            let report = report_within(shutdown, Duration::from_secs(5)).await;
+            let outcome = if (transport, terminating) == ("udp", "caller") {
+                ShutdownOutcome::DeadlineExpired
+            } else {
+                ShutdownOutcome::Drained
+            };
+            assert_eq!(report.outcome, outcome, "{transport} {terminating}");
+            assert_eq!(report.sessions_left, 0, "{transport} {terminating}");
+            assert_eq!(report.terminated, 1, "{transport} {terminating}");
+            assert_eq!(report.failed_byes, 0, "{transport} {terminating}");
+        }
+    }
+}
+
+/// A UA that terminates while its INVITE rings sends the CANCEL. A 2xx that
+/// crosses the CANCEL gets its ACK, and only then a BYE (RFC 3261 sections
+/// 13.2.2.4 and 15), and the UA drains once the BYE is answered and Timer M
+/// is over.
+#[tokio::test]
+async fn terminate_cancel_late_2xx_ack_bye_sequence() {
+    let (ua, _, _, _) = brisk_with(config());
+    let Ua { handle, mut events, driver } = ua;
+    tokio::spawn(driver);
+    let peer = Peer::new().await;
+    let to = peer.address().to_string();
+    let contact = format!("sip:peer@{to}");
+    handle.try_invite(plan_to(&to, "hangup")).unwrap().await.unwrap();
+    let (request, from) = peer.recv_starting("INVITE").await;
+    peer.send(&answer(&request, "180", "callee", &contact), from).await;
+    event(&mut events, |event| match event {
+        Event::Early { .. } => Some(()),
+        _ => None,
+    })
+    .await;
+
+    let shutdown =
+        handle.shutdown(ShutdownMode::Terminate, Duration::from_secs(10));
+    let (cancel, cancel_from) = peer.recv_starting("CANCEL").await;
+    peer.send(&answer(&request, "200", "callee", &contact), from).await;
+    peer.send(&reply_with(&cancel, 200, "callee"), cancel_from).await;
+    let mut seen = Vec::new();
+    let bye = loop {
+        let (message, from) = peer.recv().await;
+        let method = message.split(' ').next().unwrap().to_owned();
+        seen.push(method.clone());
+        if method == "BYE" {
+            break (message, from);
+        }
+    };
+    peer.send(&reply_with(&bye.0, 200, "callee"), bye.1).await;
+
+    let ack = seen.iter().position(|method| method == "ACK");
+    assert!(ack.is_some_and(|ack| ack < seen.len() - 1), "{seen:?}");
+    assert!(!seen.contains(&"INVITE".to_owned()), "{seen:?}");
+    let report = report_within(shutdown, Duration::from_secs(5)).await;
+    assert_eq!(report.outcome, ShutdownOutcome::Drained);
+    assert_eq!((report.ended, report.terminated), (1, 1));
+    assert_eq!(report.invites_left, 0);
+}
+
+/// Dropping the future of a shutdown leaves the shutdown going: the UA
+/// sends its BYE, stops once that is answered, and its driver returns. A
+/// later call gets the same report.
+#[tokio::test]
+async fn shutdown_future_drop_does_not_cancel_shutdown() {
+    let (mut ua, udp, _, _) = brisk_with(config());
+    let handle = ua.handle.clone();
+    let driver = tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+    call_from(&peer, udp, &mut ua.events, "dropped").await;
+
+    drop(handle.shutdown(ShutdownMode::Terminate, Duration::from_secs(10)));
+    let (bye, from) = peer.recv_starting("BYE").await;
+    peer.send(&reply_with(&bye, 200, "x"), from).await;
+
+    timeout(Duration::from_secs(5), driver).await.unwrap().unwrap();
+    let report = handle
+        .shutdown(ShutdownMode::DrainExisting, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(report.outcome, ShutdownOutcome::Drained);
+    assert_eq!(report.terminated, 1);
+}
+
+/// A second call cannot move the deadline of the first. A drain with 400 ms,
+/// which the driver takes first, becomes a termination with a minute, so the
+/// UA sends its BYE, but the peer never answers it, and the UA stops at
+/// 400 ms all the same.
+#[tokio::test]
+async fn second_shutdown_call_does_not_extend_deadline() {
+    let (mut ua, udp, _, _) = brisk_with(config());
+    let handle = ua.handle.clone();
+    tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+    call_from(&peer, udp, &mut ua.events, "deadline").await;
+
+    let started = Instant::now();
+    let first = handle
+        .shutdown(ShutdownMode::DrainExisting, Duration::from_millis(400));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    peer.quiet("BYE", Duration::from_millis(50)).await;
+    let second =
+        handle.shutdown(ShutdownMode::Terminate, Duration::from_secs(60));
+    peer.recv_starting("BYE").await;
+    let report = report_within(second, Duration::from_secs(2)).await;
+
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_millis(400), "{elapsed:?}");
+    assert!(elapsed < Duration::from_millis(1200), "{elapsed:?}");
+    assert_eq!(report.outcome, ShutdownOutcome::DeadlineExpired);
+    // The BYE reached the endpoint, which ended the session, though no
+    // answer came.
+    assert_eq!((report.ended, report.terminated), (1, 1));
+    assert_eq!(first.await.unwrap(), report);
+}
+
+/// Once the peer's BYE leaves the UA nothing to do, it lets go of its work
+/// guard before it shuts the endpoint down, so the endpoint drains as soon
+/// as its own transactions end, not at the deadline.
+#[tokio::test]
+async fn work_guard_is_released_before_waiting_for_core_drain() {
+    let (mut ua, udp, _, _) = brisk_with(config());
+    let handle = ua.handle.clone();
+    tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+    let (ok, _) = call_from(&peer, udp, &mut ua.events, "guarded").await;
+
+    let shutdown =
+        handle.shutdown(ShutdownMode::DrainExisting, Duration::from_secs(10));
+    let bye = in_dialog("BYE", "UDP", &ok, peer.address(), "guarded", 2);
+    peer.send(&bye, udp).await;
+    peer.recv_starting("SIP/2.0 200").await;
+    let report = report_within(shutdown, Duration::from_secs(4)).await;
+
+    assert_eq!(report.outcome, ShutdownOutcome::Drained);
+}
+
+/// The two Accepted states hold a shutdown each in their own way (RFC 6026
+/// sections 8.4 and 8.7). The endpoint keeps the callee's INVITE until
+/// Timer L, absorbing a copy of the INVITE, and its drain waits for that.
+/// The UA keeps the caller's INVITE until Timer M, since a fork's 2xx can
+/// still come, and needs an ACK and a BYE, a new transaction the endpoint
+/// would refuse once shut down. So the UA waits before it shuts the endpoint
+/// down.
+#[tokio::test]
+async fn timer_l_m_retention_is_accounted_for() {
+    let accepted_states = 64 * brisk().t1();
+
+    // Over TCP, which keeps no non-INVITE transaction after its final, so
+    // that only Timer L holds the drain.
+    let (mut ua, udp, tcp, _) = brisk_with(config());
+    let handle = ua.handle.clone();
+    tokio::spawn(ua.driver);
+    let mut peer = Wire::connect("TCP", udp, tcp).await;
+    let me = peer.address();
+    let invite_request = invite_over("TCP", me, "timer-l");
+    peer.send(&invite_request).await;
+    invite(&mut ua.events).await.try_accept(sdp()).unwrap().await.unwrap();
+    let ok = peer.recv_answer("SIP/2.0 200", "1 INVITE").await;
+    let first_2xx = Instant::now();
+    peer.acknowledge(&ok, "timer-l", 1).await;
+    let bye = in_dialog("BYE", "TCP", &ok, me, "timer-l", 2);
+    peer.send(&bye).await;
+    peer.recv_answer("SIP/2.0 200", "2 BYE").await;
+    let shutdown =
+        handle.shutdown(ShutdownMode::DrainExisting, Duration::from_secs(10));
+    peer.send(&invite_request).await;
+    let absorbed = timeout(
+        Duration::from_millis(200),
+        peer.recv_answer("SIP/2.0 ", "1 INVITE"),
+    )
+    .await;
+    assert!(absorbed.is_err(), "{absorbed:?}");
+    let report = report_within(shutdown, Duration::from_secs(5)).await;
+    assert_eq!(report.outcome, ShutdownOutcome::Drained);
+    assert!(
+        first_2xx.elapsed() >= accepted_states,
+        "{:?}",
+        first_2xx.elapsed()
+    );
+
+    let (ua, _, _, _) = brisk_with(config());
+    let Ua { handle, driver, .. } = ua;
+    tokio::spawn(driver);
+    let peer = Peer::new().await;
+    let to = peer.address().to_string();
+    let contact = format!("sip:peer@{to}");
+    handle.try_invite(plan_to(&to, "timer-m")).unwrap().await.unwrap();
+    let (request, from) = peer.recv_starting("INVITE").await;
+    peer.send(&answer(&request, "200", "first", &contact), from).await;
+    let first_2xx = Instant::now();
+    peer.recv_starting("ACK").await;
+    let shutdown =
+        handle.shutdown(ShutdownMode::Terminate, Duration::from_secs(10));
+    let (bye, bye_from) = peer.recv_starting("BYE").await;
+    peer.send(&reply_with(&bye, 200, "first"), bye_from).await;
+    tokio::time::sleep(accepted_states / 2).await;
+    peer.send(&answer(&request, "200", "fork", &contact), from).await;
+    let (fork_ack, _) = peer.recv_starting("ACK").await;
+    let (fork_bye, fork_from) = peer.recv_starting("BYE").await;
+    peer.send(&reply_with(&fork_bye, 200, "fork"), fork_from).await;
+
+    assert!(header(&fork_ack, "To")[0].ends_with(";tag=fork"));
+    assert!(header(&fork_bye, "To")[0].ends_with(";tag=fork"));
+    let report = report_within(shutdown, Duration::from_secs(5)).await;
+    assert_eq!(report.outcome, ShutdownOutcome::Drained);
+    assert!(
+        first_2xx.elapsed() >= accepted_states,
+        "{:?}",
+        first_2xx.elapsed()
+    );
+}
+
+/// A [`Negotiate`] that never answers, and counts the answers it holds.
+#[derive(Clone, Default)]
+struct Stalled(Arc<()>);
+
+impl Negotiate for Stalled {
+    fn answer(
+        &self,
+        _offer: &Offer,
+    ) -> impl Future<Output = Option<Description>> + Send {
+        let held = self.0.clone();
+        async move {
+            let _held = held;
+            std::future::pending().await
+        }
+    }
+}
+
+/// A negotiator that never answers holds the ACK of a 2xx with an offer for
+/// good when its answers have no deadline. The shutdown still ends at its
+/// own, with the session and the attempt counted as left, and the stalled
+/// answer is dropped.
+#[tokio::test]
+async fn provider_stall_hits_shared_deadline() {
+    let stalled = Stalled::default();
+    let config =
+        config().negotiator(stalled.clone()).answer_timeout(Duration::MAX);
+    let (ua, _, _, _) = brisk_with(config);
+    let Ua { handle, driver, .. } = ua;
+    let driver = tokio::spawn(driver);
+    let peer = Peer::new().await;
+    let to = peer.address().to_string();
+    let plan = InvitePlan::without_offer(
+        format!("sip:peer@{to}").parse().unwrap(),
+        "sip:ua@127.0.0.1".parse().unwrap(),
+    );
+    handle.try_invite(plan).unwrap().await.unwrap();
+    let (request, from) = peer.recv_starting("INVITE").await;
+    let contact = format!("sip:peer@{to}");
+    let ok = ok_offering(&request, "stall", &contact, &offer_named("call"));
+    peer.send(&ok, from).await;
+    while Arc::strong_count(&stalled.0) < 3 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let started = Instant::now();
+    let shutdown =
+        handle.shutdown(ShutdownMode::Terminate, Duration::from_millis(300));
+    let report = report_within(shutdown, Duration::from_secs(2)).await;
+
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_millis(300), "{elapsed:?}");
+    assert_eq!(report.outcome, ShutdownOutcome::DeadlineExpired);
+    assert_eq!((report.sessions_left, report.invites_left), (1, 1));
+    // The answer in preparation is gone by the report. The driver may
+    // still hold its negotiator, until it returns.
+    assert!(Arc::strong_count(&stalled.0) <= 2);
+    peer.quiet("ACK", Duration::from_millis(100)).await;
+    timeout(WAIT, driver).await.unwrap().unwrap();
+    assert_eq!(Arc::strong_count(&stalled.0), 1);
+}
+
+/// A [`Resolve`] that never resolves, and counts the resolutions it holds.
+#[derive(Clone, Default)]
+struct Hung(Arc<()>);
+
+impl Resolve for Hung {
+    async fn resolve(&self, _query: &Query) -> Result<Target, ResolveError> {
+        let _held = self.0.clone();
+        std::future::pending().await
+    }
+}
+
+/// A resolver that hangs without a timeout holds the BYE of a termination
+/// for good. The shutdown still ends at its deadline, with the session
+/// counted as left, and the resolution is dropped.
+#[tokio::test]
+async fn a_hung_resolver_hits_the_shared_deadline() {
+    let hung = Hung::default();
+    let config =
+        config().resolver(hung.clone()).resolve_timeout(Duration::MAX);
+    let (mut ua, udp, _, _) = brisk_with(config);
+    let handle = ua.handle.clone();
+    let driver = tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+    call_from(&peer, udp, &mut ua.events, "hung").await;
+
+    let shutdown =
+        handle.shutdown(ShutdownMode::Terminate, Duration::from_millis(300));
+    let report = report_within(shutdown, Duration::from_secs(2)).await;
+
+    assert_eq!(report.outcome, ShutdownOutcome::DeadlineExpired);
+    assert_eq!(report.sessions_left, 1);
+    // The resolution is gone by the report. The driver may still hold its
+    // resolver, until it returns.
+    assert!(Arc::strong_count(&hung.0) <= 2);
+    timeout(WAIT, driver).await.unwrap().unwrap();
+    assert_eq!(Arc::strong_count(&hung.0), 1);
+}
+
+/// Every operation still running at the deadline ends, with
+/// [`Error::DriverStopped`]: a BYE the peer never answers, and a CANCEL that
+/// waits for a provisional response that never comes. The report counts
+/// them.
+#[tokio::test]
+async fn all_operation_waiters_get_terminal_result() {
+    let (mut ua, udp, _, _) = brisk_with(config());
+    let handle = ua.handle.clone();
+    tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+    let (_, session) = call_from(&peer, udp, &mut ua.events, "waiters").await;
+    let silent = Peer::new().await;
+    let to = silent.address().to_string();
+    let attempt =
+        handle.try_invite(plan_to(&to, "silent")).unwrap().await.unwrap();
+    silent.recv_starting("INVITE").await;
+
+    let bye = handle.try_terminate(&session).unwrap();
+    let cancel = handle.try_cancel(&attempt).unwrap();
+    peer.recv_starting("BYE").await;
+    let shutdown = handle
+        .shutdown(ShutdownMode::DrainExisting, Duration::from_millis(300));
+    let report = report_within(shutdown, Duration::from_secs(2)).await;
+
+    assert_eq!(report.outcome, ShutdownOutcome::DeadlineExpired);
+    assert_eq!(timeout(WAIT, bye).await.unwrap(), Err(Error::DriverStopped));
+    assert_eq!(
+        timeout(WAIT, cancel).await.unwrap(),
+        Err(Error::DriverStopped)
+    );
+    assert_eq!(report.operations_failed, 2);
+    assert_eq!(report.invites_left, 1);
+}
+
+/// A [`Resolve`] of the peer's literal addresses that counts the
+/// resolutions it holds.
+#[derive(Clone, Default)]
+struct Counted(Arc<()>);
+
+impl Resolve for Counted {
+    async fn resolve(&self, query: &Query) -> Result<Target, ResolveError> {
+        let _held = self.0.clone();
+        StaticResolver::new().resolve(query).await
+    }
+}
+
+/// Once the UA has drained, nothing of it is left: its driver has returned
+/// with every task, the resolver goes with it, and nothing more goes on the
+/// wire. The callee's 2xx, never acknowledged, went again every 80 ms until
+/// its ACK deadline let the BYE of the termination go. The handles refuse
+/// what they are asked.
+#[tokio::test]
+async fn drained_has_no_live_tasks_timers_or_post_return_writes() {
+    let counted = Counted::default();
+    let (mut ua, udp, _, _) = brisk_with(config().resolver(counted.clone()));
+    let handle = ua.handle.clone();
+    let driver = tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+    peer.send(&direct_invite(peer.address(), "clean"), udp).await;
+    let incoming = invite(&mut ua.events).await;
+    let session = incoming.try_accept(sdp()).unwrap().await.unwrap();
+    peer.recv_starting("SIP/2.0 200").await;
+
+    let shutdown =
+        handle.shutdown(ShutdownMode::Terminate, Duration::from_secs(10));
+    peer.recv_starting("SIP/2.0 200").await;
+    let (bye, from) = peer.recv_starting("BYE").await;
+    peer.send(&reply_with(&bye, 200, "x"), from).await;
+    let report = report_within(shutdown, Duration::from_secs(5)).await;
+
+    assert_eq!(report.outcome, ShutdownOutcome::Drained);
+    assert_eq!(report.terminated, 1);
+    timeout(Duration::from_millis(100), driver).await.unwrap().unwrap();
+    assert_eq!(Arc::strong_count(&counted.0), 1);
+    peer.quiet("", Duration::from_millis(500)).await;
+    let refused = handle.try_invite(plan_to("127.0.0.1:9", "after"));
+    assert_eq!(refused.unwrap_err().error(), Error::Closed);
+    assert_eq!(handle.snapshot(&session).await, Err(Error::Closed));
+    // The events still queued arrive, and then none.
+    while timeout(WAIT, ua.events.recv()).await.unwrap().is_some() {}
+}
+
+/// A deadline that comes first is not a drain, whether the UA or the
+/// endpoint still had work: a session the application never ends and an
+/// INVITE it never decides, or the INVITE transaction the endpoint keeps
+/// until Timer L. Nothing goes out for what the deadline cuts short.
+#[tokio::test]
+async fn deadline_expired_is_not_reported_as_drained() {
+    let (mut ua, udp, _, _) = brisk_with(config());
+    let handle = ua.handle.clone();
+    tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+    call_from(&peer, udp, &mut ua.events, "kept").await;
+    peer.send(&direct_invite(peer.address(), "undecided"), udp).await;
+    let held = invite(&mut ua.events).await;
+    let shutdown = handle
+        .shutdown(ShutdownMode::DrainExisting, Duration::from_millis(300));
+    let report = report_within(shutdown, Duration::from_secs(2)).await;
+    assert_eq!(report.outcome, ShutdownOutcome::DeadlineExpired);
+    assert_eq!((report.sessions_left, report.invites_left), (1, 1));
+    // The endpoint stopped before the UA let go of the INVITE, so it got no
+    // 500 for it, and the decision finds the UA gone.
+    peer.quiet("SIP/2.0 500", Duration::from_millis(300)).await;
+    let late = held.try_reject(StatusCode::from_u16(486).unwrap());
+    assert_eq!(late.unwrap_err().error(), Error::Closed);
+
+    let (mut ua, udp, tcp, _) = brisk_with(config());
+    let handle = ua.handle.clone();
+    tokio::spawn(ua.driver);
+    let mut peer = Wire::connect("TCP", udp, tcp).await;
+    let me = peer.address();
+    peer.send(&invite_over("TCP", me, "timer-l")).await;
+    invite(&mut ua.events).await.try_accept(sdp()).unwrap().await.unwrap();
+    let ok = peer.recv_answer("SIP/2.0 200", "1 INVITE").await;
+    peer.send(
+        &ack_for(&ok, me, "timer-l", 1).replace("SIP/2.0/UDP", "SIP/2.0/TCP"),
+    )
+    .await;
+    let bye = in_dialog("BYE", "TCP", &ok, me, "timer-l", 2);
+    peer.send(&bye).await;
+    peer.recv_answer("SIP/2.0 200", "2 BYE").await;
+    let shutdown = handle
+        .shutdown(ShutdownMode::DrainExisting, Duration::from_millis(300));
+    let report = report_within(shutdown, Duration::from_secs(2)).await;
+    assert_eq!(report.outcome, ShutdownOutcome::DeadlineExpired);
+    assert_eq!((report.sessions_left, report.invites_left), (0, 0));
+
+    // The same, with the endpoint's deadline brought closer by another of
+    // its handles once the UA has shut it down.
+    let (mut ua, udp, tcp, endpoint) = brisk_with(config());
+    let handle = ua.handle.clone();
+    tokio::spawn(ua.driver);
+    let mut peer = Wire::connect("TCP", udp, tcp).await;
+    let me = peer.address();
+    peer.send(&invite_over("TCP", me, "closer")).await;
+    invite(&mut ua.events).await.try_accept(sdp()).unwrap().await.unwrap();
+    let ok = peer.recv_answer("SIP/2.0 200", "1 INVITE").await;
+    peer.send(
+        &ack_for(&ok, me, "closer", 1).replace("SIP/2.0/UDP", "SIP/2.0/TCP"),
+    )
+    .await;
+    let bye = in_dialog("BYE", "TCP", &ok, me, "closer", 2);
+    peer.send(&bye).await;
+    peer.recv_answer("SIP/2.0 200", "2 BYE").await;
+    let shutdown =
+        handle.shutdown(ShutdownMode::DrainExisting, Duration::from_secs(10));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(endpoint.shutdown(Duration::from_millis(100)));
+    let report = report_within(shutdown, Duration::from_secs(1)).await;
+    assert_eq!(report.outcome, ShutdownOutcome::DeadlineExpired);
+}
+
+/// An endpoint that another of its handles stops at once leaves the UA
+/// before it is done, which its report says, with the session it still had.
+#[tokio::test]
+async fn an_endpoint_stopped_elsewhere_is_reported_as_lost() {
+    let (mut ua, udp, _, endpoint) = brisk_with(config());
+    let handle = ua.handle.clone();
+    tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+    call_from(&peer, udp, &mut ua.events, "lost").await;
+
+    let shutdown =
+        handle.shutdown(ShutdownMode::DrainExisting, Duration::from_secs(10));
+    endpoint.shutdown(Duration::ZERO).await;
+    let report = report_within(shutdown, Duration::from_secs(2)).await;
+
+    assert_eq!(report.outcome, ShutdownOutcome::EndpointLost);
+    assert_eq!(report.sessions_left, 1);
+}
+
+/// A timeout too long to add to the clock sets no deadline, rather than
+/// panic, and a UA with nothing to do drains at once. An INVITE asked for
+/// once the UA shuts down is refused with nothing sent.
+#[tokio::test]
+async fn a_shutdown_timeout_past_the_clock_sets_no_deadline() {
+    let (ua, _, _, _) = brisk_with(config());
+    let Ua { handle, driver, .. } = ua;
+    tokio::spawn(driver);
+
+    let shutdown = handle.shutdown(ShutdownMode::Terminate, Duration::MAX);
+    let refused = handle.try_invite(plan_to("127.0.0.1:9", "late"));
+    let report = report_within(shutdown, Duration::from_secs(2)).await;
+
+    assert_eq!(refused.unwrap_err().error(), Error::Closed);
+    assert_eq!(report.outcome, ShutdownOutcome::Drained);
+}
+
+/// A UA that terminates under a flood, as in
+/// [`ordinary_queue_full_does_not_starve_ack_cancel_bye`], over UDP and over
+/// TCP, still ends each call with a BYE that the other UA takes, and stops
+/// by its deadline. The endpoint may not drain while the transactions of
+/// the flood's INVITEs wait for the ACK of their 503, so the outcome may be
+/// the deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shutdown_under_flood_ends_its_calls_by_its_deadline() {
+    let _alone = FLOODING.lock().await;
+    for (transport, upper) in [("udp", "UDP"), ("tcp", "TCP")] {
+        let (Ua { handle: caller, events: mut caller_events, driver }, _) =
+            ua_timed(transport, *LOADED);
+        tokio::spawn(driver);
+        let (
+            Ua { handle: callee, events: mut callee_events, driver },
+            address,
+        ) = ua_timed(transport, *LOADED);
+        tokio::spawn(driver);
+        for _ in 0..2 {
+            two_ua_call(
+                &caller,
+                &mut caller_events,
+                &mut callee_events,
+                address,
+                transport,
+            )
+            .await;
+        }
+        let stop = Arc::new(Notify::new());
+        let flooding = flood(upper, address, address, stop.clone());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let started = Instant::now();
+        let deadline = Duration::from_secs(3);
+        let shutdown = callee.shutdown(ShutdownMode::Terminate, deadline);
+        for _ in 0..2 {
+            let reason = event(&mut caller_events, |event| match event {
+                Event::Ended { reason, .. } => Some(reason),
+                _ => None,
+            })
+            .await;
+            assert!(matches!(reason, EndReason::RemoteBye { .. }));
+        }
+        // The flood stops before the endpoint does, which closes its
+        // connection. The 503s it got still hold the endpoint's drain.
+        stop.notify_one();
+        flooding.await.unwrap();
+        let report = report_within(shutdown, deadline * 2).await;
+
+        assert!(started.elapsed() < deadline + Duration::from_secs(1));
+        assert_ne!(
+            report.outcome,
+            ShutdownOutcome::EndpointLost,
+            "{transport}"
+        );
+        assert_eq!(report.terminated, 2, "{transport}");
+        assert_eq!(report.failed_byes, 0, "{transport}");
+        assert_eq!(report.sessions_left, 0, "{transport}");
+    }
+}
+
+/// The BYEs of a termination take no operation of the application's, so
+/// they go while every one is in use, here by a CANCEL that waits for a
+/// provisional response that never comes.
+#[tokio::test]
+async fn terminate_needs_no_operation_of_the_application() {
+    let (mut ua, udp, _, _) = brisk_with(config().max_operations(1));
+    let handle = ua.handle.clone();
+    tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+    let (_, session) = call_from(&peer, udp, &mut ua.events, "busy").await;
+    let silent = Peer::new().await;
+    let to = silent.address().to_string();
+    let attempt =
+        handle.try_invite(plan_to(&to, "silent")).unwrap().await.unwrap();
+    let _cancel = handle.try_cancel(&attempt).unwrap();
+    let full = handle.try_terminate(&session).unwrap_err().error();
+    assert_eq!(full, Error::Busy);
+
+    let shutdown =
+        handle.shutdown(ShutdownMode::Terminate, Duration::from_millis(500));
+    let (bye, from) = peer.recv_starting("BYE").await;
+    peer.send(&reply_with(&bye, 200, "x"), from).await;
+    let report = report_within(shutdown, Duration::from_secs(2)).await;
+
+    assert_eq!(report.terminated, 1);
+    assert_eq!(report.failed_byes, 0);
+}
+
+/// A shutdown whose deadline has passed when the driver first sees it still
+/// drains a UA with nothing to do, as the endpoint does with a zero timeout,
+/// rather than report the deadline. Which input the driver takes first
+/// varies, so it runs many times, on two threads, alone as a flood is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_idle_ua_drains_with_no_time_left() {
+    let _alone = FLOODING.lock().await;
+    for _ in 0..50 {
+        let (ua, _, _, _) = brisk_with(config());
+        let Ua { handle, driver, .. } = ua;
+        tokio::spawn(driver);
+
+        let shutdown =
+            handle.shutdown(ShutdownMode::DrainExisting, Duration::ZERO);
+        let report = report_within(shutdown, Duration::from_secs(2)).await;
+
+        assert_eq!(report.outcome, ShutdownOutcome::Drained);
+    }
+}
+
+/// The UA does not cancel a re-INVITE of its own, so one the peer answers
+/// only with a 180 goes on after a termination ended its session, and holds
+/// the shutdown until its deadline. The report counts it.
+#[tokio::test]
+async fn an_unanswered_reinvite_holds_a_termination_until_its_deadline() {
+    let (ua, _, _, _) = brisk_with(config());
+    let Ua { handle, mut events, driver } = ua;
+    tokio::spawn(driver);
+    let peer = Peer::new().await;
+    let to = peer.address().to_string();
+    let contact = format!("sip:peer@{to}");
+    handle.try_invite(plan_to(&to, "pending")).unwrap().await.unwrap();
+    let (request, from) = peer.recv_starting("INVITE").await;
+    peer.send(&answer(&request, "200", "callee", &contact), from).await;
+    peer.recv_starting("ACK").await;
+    let session = event(&mut events, |event| match event {
+        Event::Confirmed { session, .. } => Some(session),
+        _ => None,
+    })
+    .await;
+    let _reinviting =
+        handle.try_reinvite(&session, ReinvitePlan::new(sdp())).unwrap();
+    let (reinvite, from) = peer.recv_starting("INVITE").await;
+    peer.send(&answer(&reinvite, "180", "callee", &contact), from).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let started = Instant::now();
+    let shutdown =
+        handle.shutdown(ShutdownMode::Terminate, Duration::from_secs(2));
+    let (bye, bye_from) = peer.recv_starting("BYE").await;
+    peer.send(&reply_with(&bye, 200, "callee"), bye_from).await;
+    let report = report_within(shutdown, Duration::from_secs(4)).await;
+
+    assert!(started.elapsed() >= Duration::from_secs(2));
+    assert_eq!(report.outcome, ShutdownOutcome::DeadlineExpired);
+    assert_eq!((report.terminated, report.sessions_left), (1, 0));
+    assert_eq!(report.invites_left, 1);
 }

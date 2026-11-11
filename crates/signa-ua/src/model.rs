@@ -46,6 +46,13 @@ re-INVITE that collides with another gets the 491 or the 500 of section 14.2.
 The session and the remote target change apart, each at its own commit point
 ([RFC 6141 section 4]), and neither changes before the final response.
 
+A shutdown closes admission first, with [`Model::shut_down`]: no INVITE of
+this user agent's starts, and a new initial INVITE gets a 503. What is under
+way goes on, BYE, CANCEL, ACK and re-INVITE in the sessions included. To
+terminate, the model also ends everything itself, in the order RFC 3261
+section 15 asks, and [`Model::is_idle`] says when nothing is left. The
+deadline is the runtime's, which then stops the model with [`Model::stop`].
+
 [RFC 3261 section 14]: https://www.rfc-editor.org/rfc/rfc3261.html#section-14
 [RFC 3261 section 17]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17
 [RFC 6141 section 4]: https://www.rfc-editor.org/rfc/rfc6141.html#section-4
@@ -338,6 +345,10 @@ pub(crate) enum Refusal {
     RouteSetTooLong,
     /// There is no room for it. A 503 (RFC 3261 section 21.5.4).
     Busy,
+    /// It is a new initial INVITE, and the UA is shutting down. A 503, which
+    /// RFC 3261 section 21.5.4 gives a server down for maintenance. It
+    /// carries no Retry-After, since the UA cannot know when it is back.
+    Closed,
     /// Its body is one the UA cannot tell the offer in, such as a multipart
     /// body. A 415 (RFC 3261 section 8.2.3).
     UnsupportedBody,
@@ -389,7 +400,7 @@ impl Refusal {
             | Refusal::OutOfOrder
             | Refusal::Overlapping(_)
             | Refusal::Internal => 500,
-            Refusal::Busy => 503,
+            Refusal::Busy | Refusal::Closed => 503,
         };
         StatusCode::from_u16(code).expect("a final status")
     }
@@ -409,6 +420,46 @@ impl From<DialogError> for Refusal {
             DialogError::Terminated => Refusal::NoDialog,
         }
     }
+}
+
+/// Whether the UA takes new work.
+///
+/// It only moves down the list, so that a second request to shut down can
+/// make a drain a termination, never the other way.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum Admission {
+    /// The UA runs.
+    Open,
+    /// No new INVITE in either direction. What is under way goes on, and the
+    /// application ends its sessions.
+    Draining,
+    /// As `Draining`, and the UA ends every session and attempt itself.
+    Terminating,
+}
+
+/// What a shutdown has done so far, for its report.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Tally {
+    /// Sessions that ended since admission closed, whatever ended them.
+    pub(crate) ended: usize,
+    /// Of those, the sessions the UA ended because it terminates.
+    pub(crate) terminated: usize,
+    /// BYEs of sessions since admission closed that got no 2xx: the core
+    /// never had them, or they got another response or none.
+    pub(crate) failed_byes: usize,
+}
+
+/// What [`Model::stop`] found left.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Left {
+    /// Sessions still up, early or confirmed.
+    pub(crate) sessions: usize,
+    /// Incoming INVITEs without a final response the core took, INVITEs
+    /// this user agent sent whose responses it still collected, and
+    /// re-INVITEs it sent without a final response.
+    pub(crate) invites: usize,
+    /// Operations without an outcome, which failed with `DriverStopped`.
+    pub(crate) operations: usize,
 }
 
 /// What the application is told. Losing one of these loses no protocol
@@ -545,12 +596,22 @@ pub(crate) struct Model<R> {
     operations: Operations,
     commands: VecDeque<(OperationId, Command)>,
     effects: Vec<Effect>,
+    admission: Admission,
+    tally: Tally,
     /// The operations the runtime holds until it reports their outcome, as
     /// for a provisional response on its way to the core. No record of the
     /// model's holds them then. Only the tests' checks read this, to find
     /// an operation nothing can end any more.
     #[cfg(test)]
     handed: std::collections::HashSet<OperationId>,
+    /// The attempts and incoming initial INVITEs there were when admission
+    /// closed. Only the tests' checks read this, to find one that started
+    /// after.
+    #[cfg(test)]
+    admitted: Option<(
+        std::collections::HashSet<AttemptKey>,
+        std::collections::HashSet<ExchangeKey>,
+    )>,
 }
 
 impl<R: Random> Model<R> {
@@ -587,8 +648,12 @@ impl<R: Random> Model<R> {
             operations: Operations::new(limits.operations),
             commands: VecDeque::new(),
             effects: Vec::new(),
+            admission: Admission::Open,
+            tally: Tally::default(),
             #[cfg(test)]
             handed: std::collections::HashSet::new(),
+            #[cfg(test)]
+            admitted: None,
         }
     }
 
@@ -900,6 +965,11 @@ impl<R: Random> Model<R> {
             expires_due,
         );
 
+        // A UA that shuts down refuses new work as it would without room, after
+        // the checks that give other statuses.
+        if self.admission != Admission::Open {
+            return Err(Refusal::Closed);
+        }
         // The merge index holds one entry for each incoming exchange.
         if self.merge_index.len() >= self.limits.incoming {
             return Err(Refusal::Busy);
@@ -1538,6 +1608,11 @@ impl<R: Random> Model<R> {
             .and_then(|exchange| exchange.early_ack.take());
         if let Some(answer) = early_ack {
             self.receive_ack(&replay_dialog, cseq, answer);
+        }
+        // A 2xx that was on its way when the UA began to terminate formed a
+        // session all the same, which ends as the others did.
+        if self.admission == Admission::Terminating {
+            self.end_for_shutdown(usage);
         }
     }
 
@@ -2208,6 +2283,10 @@ impl<R: Random> Model<R> {
     /// Builds the INVITE of a plan, opens an attempt for it, and has the
     /// runtime send it.
     fn invite(&mut self, operation: OperationId, plan: InvitePlan) {
+        if self.admission != Admission::Open {
+            self.complete(operation, Err(Error::Closed));
+            return;
+        }
         let Some(identity) = self.identity() else {
             self.complete(operation, Err(Error::Internal));
             return;
@@ -2400,6 +2479,16 @@ impl<R: Random> Model<R> {
         &mut self,
         attempt: AttemptKey,
     ) -> Result<(), Error> {
+        self.give_up(attempt, EndReason::LocalBye)
+    }
+
+    /// Gives an attempt up as [`Model::abandon_attempt`] does, with `reason`
+    /// for the sessions its BYEs end.
+    fn give_up(
+        &mut self,
+        attempt: AttemptKey,
+        reason: EndReason,
+    ) -> Result<(), Error> {
         let record =
             self.attempts.get_mut(attempt).ok_or(Error::StaleDecision)?;
         record.abandoned = true;
@@ -2411,7 +2500,9 @@ impl<R: Random> Model<R> {
                 continue;
             };
             match record.phase() {
-                UsagePhase::Established => self.bye_when_ready(usage, None),
+                UsagePhase::Established => {
+                    self.bye_when_ready(usage, None, reason);
+                }
                 UsagePhase::Establishing => record.begin_ending(),
                 UsagePhase::Ending | UsagePhase::Ended => {}
             }
@@ -2845,7 +2936,12 @@ impl<R: Random> Model<R> {
         if !room {
             let record = self.dialogs.remove(dialog).expect("indexed");
             self.dialog_index.remove(record.id());
-            self.end_usage(usage, EndReason::LocalBye);
+            let reason = if self.admission == Admission::Terminating {
+                EndReason::Shutdown
+            } else {
+                EndReason::LocalBye
+            };
+            self.end_usage(usage, reason);
             let cleaned = self.clean_up(attempt, record, replay, description);
             debug_assert!(cleaned, "the room was checked above");
             return if abandoned {
@@ -3889,6 +3985,11 @@ impl<R: Random> Model<R> {
             self.reclaim_replay(replay);
         }
 
+        if self.admission != Admission::Open {
+            self.tally.ended += 1;
+            self.tally.terminated +=
+                usize::from(reason == EndReason::Shutdown);
+        }
         if self.ended.len() >= self.limits.usages {
             self.ended.pop_front();
         }
@@ -3929,17 +4030,19 @@ impl<R: Random> Model<R> {
             return;
         }
 
-        self.bye_when_ready(key, operation);
+        self.bye_when_ready(key, operation, EndReason::LocalBye);
     }
 
     /// Has the BYE of a usage that has none go, or wait for an ACK: the
     /// peer's ACK of this user agent's 2xx, which RFC 3261 section 15 has a
     /// callee wait for, or this user agent's own ACK while it waits for the
-    /// answer it carries, so that the BYE does not overtake it.
+    /// answer it carries, so that the BYE does not overtake it. The usage
+    /// ends with `reason`.
     fn bye_when_ready(
         &mut self,
         key: UsageKey,
         operation: Option<OperationId>,
+        reason: EndReason,
     ) {
         let awaiting_ack = self.awaits_ack(key);
         let Some(usage) = self.usages.get_mut(key) else {
@@ -3947,12 +4050,12 @@ impl<R: Random> Model<R> {
         };
         if awaiting_ack {
             usage.begin_ending();
-            usage.bye =
-                ByeIntent::Deferred { operation, reason: EndReason::LocalBye };
+            usage.bye = ByeIntent::Deferred { operation, reason };
             return;
         }
 
-        self.start_bye(key, operation, EndReason::LocalBye, true);
+        let restore = reason == EndReason::LocalBye;
+        self.start_bye(key, operation, reason, restore);
     }
 
     /// Says whether an ACK holds back the BYE of a usage: the peer's ACK of
@@ -4081,6 +4184,9 @@ impl<R: Random> Model<R> {
                 })
             }
             Err(error) => {
+                if self.admission != Admission::Open {
+                    self.tally.failed_byes += 1;
+                }
                 // A 2xx may have confirmed an early dialog meanwhile, so the
                 // usage takes the phase its dialog says.
                 let early = self.dialogs.get(bye.dialog).map(Dialog::phase)
@@ -4090,7 +4196,12 @@ impl<R: Random> Model<R> {
                 } else {
                     UsagePhase::Established
                 };
-                match (self.usages.get_mut(key), bye.restore) {
+                // A UA that terminates does not take a session back, or it
+                // would wait for the deadline with it. The session ends
+                // without its BYE, which the report counts.
+                let restore =
+                    bye.restore && self.admission != Admission::Terminating;
+                match (self.usages.get_mut(key), restore) {
                     (Some(usage), true) => usage.resume(phase),
                     (Some(_), false) => self.end_usage(key, bye.reason),
                     (None, _) => {}
@@ -4136,6 +4247,9 @@ impl<R: Random> Model<R> {
         result: Result<(), Error>,
     ) {
         self.take_back(bye.operation);
+        if result.is_err() && self.admission != Admission::Open {
+            self.tally.failed_byes += 1;
+        }
         if let Some(operation) = bye.operation {
             if matches!(result, Ok(()) | Err(Error::RemoteFailure(_))) {
                 self.operations.advance(operation, Stage::Answered);
@@ -4220,6 +4334,239 @@ impl<R: Random> Model<R> {
             self.replay_index.remove(&replay.id);
             self.effects.push(Effect::Released(Released::Replay(key)));
         }
+    }
+}
+
+/// Shutdown.
+impl<R> Model<R> {
+    /// Says whether the model holds nothing that is under way: no command,
+    /// operation, attempt, exchange, dialog, session, replay context, BYE on
+    /// its way or timer.
+    ///
+    /// Why sessions ended is kept for their snapshots, and is not work. With
+    /// admission closed, an idle model stays idle, since only an INVITE
+    /// starts a record that nothing else holds, and every other input finds
+    /// nothing to change.
+    pub(crate) fn is_idle(&self) -> bool {
+        self.commands.is_empty()
+            && self.operations.is_empty()
+            && self.attempts.len() == 0
+            && self.exchanges.len() == 0
+            && self.dialogs.len() == 0
+            && self.usages.len() == 0
+            && self.replays.len() == 0
+            && self.byes.is_empty()
+            && self.timers.next().is_none()
+    }
+
+    /// Says whether an exchange is still kept, for the runtime's checks.
+    #[cfg(debug_assertions)]
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    pub(crate) fn holds_exchange(&self, key: ExchangeKey) -> bool {
+        self.exchanges.get(key).is_some()
+    }
+
+    /// Says whether a replay context is still kept, for the runtime's
+    /// checks.
+    #[cfg(debug_assertions)]
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    pub(crate) fn holds_replay(&self, key: ReplayKey) -> bool {
+        self.replays.get(key).is_some()
+    }
+
+    /// Says whether an attempt is still kept, for the runtime's checks.
+    #[cfg(debug_assertions)]
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    pub(crate) fn holds_attempt(&self, key: AttemptKey) -> bool {
+        self.attempts.get(key).is_some()
+    }
+
+    /// Returns how many operations run or keep an outcome, for the
+    /// runtime's checks.
+    #[cfg(debug_assertions)]
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    pub(crate) fn operation_count(&self) -> usize {
+        self.operations.len()
+    }
+}
+
+impl<R: Random> Model<R> {
+    /// Closes admission, and if `terminate`, ends what is under way.
+    ///
+    /// From now on no INVITE of this user agent's starts, and a new initial
+    /// INVITE gets a 503. The rest goes on: ACKs, CANCELs, BYEs and
+    /// re-INVITEs in the sessions, copies of 2xx responses, answers and
+    /// replays. A later call can make a drain a termination, never the other
+    /// way, and a second termination does no more than the first.
+    ///
+    /// To terminate, the model ends everything as a user who hangs up would,
+    /// in the order RFC 3261 section 15 gives:
+    ///
+    /// * An incoming INVITE without a final response gets a 503 (section
+    ///   21.5.4), as one that arrives now does. One whose final is under way
+    ///   keeps it. If that is a 2xx, its session ends as the others.
+    /// * An INVITE this user agent sent is given up, as
+    ///   [`Model::abandon_attempt`] does: a CANCEL while it has no final, a
+    ///   BYE in each confirmed dialog, and an ACK and a BYE for each 2xx that
+    ///   comes later (section 13.2.2.4).
+    /// * Every other session gets its BYE, after the ACK of this user agent's
+    ///   2xx if that is still to come (section 15). A re-INVITE the peer sent
+    ///   in it gets a 487 once the BYE goes. Section 15.1.2 recommends that
+    ///   of a UAS that receives a BYE, and I answer so when the BYE is this
+    ///   user agent's too.
+    ///
+    /// A re-INVITE this user agent sent goes on, since the UA does not cancel
+    /// its own. One the peer never answers holds the drain until the
+    /// deadline.
+    ///
+    /// None of these takes an operation, so a UA whose operations are all in
+    /// use still ends its sessions. Each session ends with
+    /// [`EndReason::Shutdown`], also when its BYE cannot reach the core,
+    /// since the UA would otherwise keep it until its deadline.
+    pub(crate) fn shut_down(&mut self, terminate: bool) {
+        let admission = if terminate {
+            Admission::Terminating
+        } else {
+            Admission::Draining
+        };
+        if admission <= self.admission {
+            return;
+        }
+        #[cfg(test)]
+        if self.admitted.is_none() {
+            let initial = self
+                .exchanges
+                .iter()
+                .filter(|(_, exchange)| {
+                    matches!(
+                        exchange.scope,
+                        Scope::Incoming { kind: Received::Initial { .. }, .. }
+                    )
+                })
+                .map(|(key, _)| key)
+                .collect();
+            let attempts = self.attempts.iter().map(|(key, _)| key).collect();
+            self.admitted = Some((attempts, initial));
+        }
+        self.admission = admission;
+        if !terminate {
+            return;
+        }
+
+        let pending: Vec<ExchangeKey> = self
+            .exchanges
+            .iter()
+            .filter(|(_, exchange)| {
+                exchange.state() == ExchangeState::Pending
+                    && matches!(
+                        exchange.scope,
+                        Scope::Incoming { kind: Received::Initial { .. }, .. }
+                    )
+            })
+            .map(|(key, _)| key)
+            .collect();
+        let unavailable = StatusCode::from_u16(503).expect("a status");
+        for exchange in pending {
+            self.reject(exchange, unavailable);
+        }
+        let attempts: Vec<AttemptKey> =
+            self.attempts.iter().map(|(key, _)| key).collect();
+        for attempt in attempts {
+            let _ = self.give_up(attempt, EndReason::Shutdown);
+        }
+        let usages: Vec<UsageKey> =
+            self.usages.iter().map(|(key, _)| key).collect();
+        for usage in usages {
+            self.end_for_shutdown(usage);
+        }
+    }
+
+    /// Ends a session for a UA that terminates, unless it is already ending
+    /// or still early. An early one is the caller's, which the CANCEL of its
+    /// INVITE ends.
+    fn end_for_shutdown(&mut self, key: UsageKey) {
+        let Some(usage) = self.usages.get(key) else {
+            return;
+        };
+        if usage.phase() == UsagePhase::Established
+            && usage.bye == ByeIntent::None
+        {
+            self.bye_when_ready(key, None, EndReason::Shutdown);
+        }
+    }
+
+    /// Says whether the BYE on its way for a usage is one the shutdown
+    /// sends, which the runtime starts behind its other sends.
+    // Only the runtime asks.
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    pub(crate) fn is_teardown(&self, usage: UsageKey) -> bool {
+        self.byes
+            .get(&usage)
+            .is_some_and(|bye| bye.reason == EndReason::Shutdown)
+    }
+
+    /// Returns what the shutdown has done so far.
+    pub(crate) fn tally(&self) -> Tally {
+        self.tally
+    }
+
+    /// Stops the model, as at the deadline of a shutdown, and returns what
+    /// was left.
+    ///
+    /// Every operation without an outcome fails with
+    /// [`Error::DriverStopped`], and every record goes, with nothing sent for
+    /// it. The runtime has stopped the core by then, so nothing could go.
+    /// Only the [`Effect::OperationEnded`] of those operations is left to
+    /// carry out. The model takes no input afterwards.
+    pub(crate) fn stop(&mut self) -> Left {
+        let invites = self.attempts.len()
+            + self
+                .exchanges
+                .iter()
+                .filter(|(_, exchange)| match exchange.scope {
+                    Scope::Incoming { .. } => matches!(
+                        exchange.state(),
+                        ExchangeState::Pending
+                            | ExchangeState::FinalSubmissionPending { .. }
+                    ),
+                    Scope::Reinvite(_) => {
+                        exchange.state() == ExchangeState::Pending
+                    }
+                    Scope::Outgoing => false,
+                })
+                .count();
+        let left = Left {
+            sessions: self.usages.len(),
+            invites,
+            operations: self.operations.running().count(),
+        };
+
+        self.admission = Admission::Terminating;
+        self.effects
+            .retain(|effect| matches!(effect, Effect::OperationEnded { .. }));
+        self.commands.clear();
+        for operation in self.operations.running().collect::<Vec<_>>() {
+            self.complete(operation, Err(Error::DriverStopped));
+        }
+        self.attempts = Slots::new(0);
+        self.exchanges = Slots::new(0);
+        self.dialogs = Slots::new(0);
+        self.usages = Slots::new(0);
+        self.replays = Slots::new(0);
+        self.cleanups = 0;
+        self.dialog_index.clear();
+        self.replay_index.clear();
+        self.merge_index.clear();
+        self.early_index.clear();
+        self.byes.clear();
+        self.reinvites = 0;
+        self.timers = TimerQueue::default();
+        #[cfg(test)]
+        {
+            self.handed.clear();
+            self.admitted.get_or_insert_with(Default::default);
+        }
+        left
     }
 }
 
@@ -4336,6 +4683,7 @@ mod tests {
             self.check_reservations();
             self.check_timers();
             self.check_acks();
+            self.check_shutdown();
 
             let mut cleanups = 0;
             for (key, replay) in self.replays.iter() {
@@ -4692,6 +5040,48 @@ mod tests {
                         "{sent:?} may get a 2xx it cannot acknowledge",
                     );
                 }
+            }
+        }
+
+        /// Once admission closed, no attempt or incoming initial INVITE
+        /// starts. Once the UA terminates, every session is ending, every
+        /// attempt given up, and no initial INVITE waits for a decision, so
+        /// that nothing waits on the application. An idle model holds no
+        /// reservation and leaves the runtime no operation to report.
+        fn check_shutdown(&self) {
+            let Some((attempts, initial)) = &self.admitted else {
+                assert_eq!(self.admission, Admission::Open);
+                return;
+            };
+            assert_ne!(self.admission, Admission::Open);
+            for (key, attempt) in self.attempts.iter() {
+                assert!(attempts.contains(&key), "{key:?} started late");
+                if self.admission == Admission::Terminating {
+                    assert!(attempt.abandoned, "{key:?} goes on");
+                }
+            }
+            for (key, exchange) in self.exchanges.iter() {
+                if !matches!(
+                    exchange.scope,
+                    Scope::Incoming { kind: Received::Initial { .. }, .. }
+                ) {
+                    continue;
+                }
+                assert!(initial.contains(&key), "{key:?} arrived late");
+                if self.admission == Admission::Terminating {
+                    assert_ne!(exchange.state(), ExchangeState::Pending);
+                }
+            }
+            if self.admission == Admission::Terminating {
+                for (key, usage) in self.usages.iter() {
+                    assert_eq!(usage.phase(), UsagePhase::Ending, "{key:?}");
+                }
+            }
+            if self.is_idle() {
+                assert_eq!(self.dialogs.reserved(), 0);
+                assert_eq!(self.usages.reserved(), 0);
+                assert_eq!(self.replays.reserved(), 0);
+                assert!(self.handed.is_empty());
             }
         }
 
@@ -10265,6 +10655,154 @@ Contact: <sip:alice@192.0.2.1>
         assert_eq!(ringing.exchange, exchange);
     }
 
+    /// Returns the status of the final response each effect submits for
+    /// `exchange`.
+    fn finals_for(effects: &[Effect], exchange: ExchangeKey) -> Vec<u16> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::SubmitFinal { exchange: key, status, .. }
+                    if *key == exchange =>
+                {
+                    Some(status.as_u16())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A UA that terminates ends each kind of work in the order RFC 3261
+    /// section 15 gives it: a 503 for the INVITE nobody decided, a CANCEL
+    /// for the INVITE without a final, a BYE at once in the caller's
+    /// session, and in the callee's only after the ACK of its 2xx. New work
+    /// is refused, a re-INVITE in an ending session gets a 491, and a BYE
+    /// that cannot reach the core ends its session anyway.
+    #[test]
+    fn termination_ends_each_kind_of_work_in_its_order() {
+        let clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let (_, _, callee) = accepted(&mut model, &clock);
+        let undecided = model
+            .receive_invite(
+                &invite("undecided@example.com"),
+                offer(),
+                clock.now(),
+            )
+            .unwrap()
+            .exchange;
+        let (_, caller, _) = caller_session(&mut model);
+        let pending =
+            model.start_attempt(&invite("pending@example.com"), true).unwrap();
+        model.take_effects();
+
+        model.shut_down(true);
+        let effects = model.take_effects();
+
+        assert_eq!(finals_for(&effects, undecided), [503]);
+        assert!(
+            effects.contains(&Effect::CancelInvite {
+                attempt: pending,
+                operation: None
+            }),
+            "{effects:?}",
+        );
+        assert_eq!(session_byes(&effects, caller), 1);
+        assert_eq!(session_byes(&effects, callee), 0, "no BYE before the ACK");
+        assert_eq!(
+            model.usage_state(callee).unwrap().phase,
+            UsagePhase::Ending
+        );
+        assert!(model.is_teardown(caller));
+        let reinvite = reinvite_from_caller(314_160, "sip:alice@192.0.2.1");
+        assert_eq!(
+            model.receive_invite(&reinvite, offer(), clock.now()).unwrap_err(),
+            Refusal::RequestPending,
+        );
+        model.receive_ack(&uas_dialog(), 314159, None);
+        assert_eq!(session_byes(&model.take_effects(), callee), 1);
+
+        let late = invite("late@example.com");
+        assert_eq!(
+            model.receive_invite(&late, offer(), clock.now()).unwrap_err(),
+            Refusal::Closed,
+        );
+        assert_eq!(Refusal::Closed.status().as_u16(), 503);
+        let refused = run(&mut model, Command::Invite { plan: plan() });
+        assert_eq!(model.take_outcome(refused), Some(Err(Error::Closed)));
+
+        model.bye_started(caller, Err(Error::Unroutable));
+        model.bye_started(callee, Ok(())).unwrap();
+        assert_eq!(
+            notices(&model.take_effects()),
+            [
+                Event::UsageEnded {
+                    usage: caller,
+                    reason: EndReason::Shutdown
+                },
+                Event::UsageEnded {
+                    usage: callee,
+                    reason: EndReason::Shutdown
+                },
+            ],
+        );
+        assert_eq!(
+            model.tally(),
+            Tally { ended: 2, terminated: 2, failed_byes: 1 }
+        );
+    }
+
+    /// A drain refuses only new INVITEs. The peer's re-INVITE is taken and
+    /// the application may still accept an INVITE it holds. A later request
+    /// to terminate ends the session, whose re-INVITE gets a 487 (RFC 3261
+    /// section 15.1.2), and the session the accepted INVITE forms after it.
+    /// A drain after that changes nothing back.
+    #[test]
+    fn a_drain_keeps_what_is_under_way_until_it_becomes_a_termination() {
+        let clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let (_, _, usage) = accepted(&mut model, &clock);
+        model.receive_ack(&uas_dialog(), 314159, None);
+        let held = model
+            .receive_invite(&invite("held@example.com"), offer(), clock.now())
+            .unwrap();
+        let exchange = held.exchange;
+        model.take_effects();
+
+        model.shut_down(false);
+        assert!(model.take_effects().is_empty());
+        let reinvite = model
+            .receive_invite(
+                &reinvite_from_caller(314_160, "sip:alice@192.0.2.1"),
+                offer(),
+                clock.now(),
+            )
+            .unwrap()
+            .exchange;
+        let accept = run(
+            &mut model,
+            Command::Accept { authority: held, answer: answer() },
+        );
+        assert_eq!(finals_for(&model.take_effects(), exchange), [200]);
+
+        model.shut_down(true);
+        assert_eq!(session_byes(&model.take_effects(), usage), 1);
+        model.bye_started(usage, Ok(())).unwrap();
+        assert_eq!(finals_for(&model.take_effects(), reinvite), [487]);
+        model.final_committed(exchange, clock.now());
+        let Some(Ok(Completion::Session(formed))) = model.take_outcome(accept)
+        else {
+            panic!("the accept formed no session");
+        };
+        model.take_effects();
+        assert_eq!(
+            model.usage_state(formed).unwrap().phase,
+            UsagePhase::Ending
+        );
+
+        model.shut_down(false);
+        assert_eq!(model.admission, Admission::Terminating);
+    }
+
     /// A header value that is malformed, extreme or repeated, a route set
     /// longer than the limit, or an extension the UA does not know is
     /// refused or taken, never a panic. What the UA takes stays within its
@@ -10680,7 +11218,7 @@ Contact: <sip:{host}@192.0.2.9>
         /// `a` and `b` choosing among what the tables hold.
         fn step(&mut self, kind: u8, a: u8, b: u8) {
             let now = self.now;
-            match kind % 16 {
+            match kind % 18 {
                 // A new INVITE, with an offer or without.
                 0 => {
                     self.calls += 1;
@@ -10943,6 +11481,10 @@ Contact: <sip:{host}@192.0.2.9>
                 13 | 14 => {
                     self.resolve(usize::from(a), b % 4 != 0, b);
                 }
+                // The application shuts the UA down, to drain or to
+                // terminate, maybe after a drain began.
+                16 => self.model.shut_down(false),
+                17 => self.model.shut_down(true),
                 // Time passes.
                 _ => {
                     let seconds = [0.05, 0.5, 2.0, 5.0, 33.0, 200.0];
@@ -10984,6 +11526,104 @@ Contact: <sip:{host}@192.0.2.9>
             }
             panic!("the model never settled: {:?}", self.owed);
         }
+
+        /// Settles everything as [`Simulation::quiesce`] does, with an
+        /// application that ends each session the UA still has, as one that
+        /// drains does, until the model is idle.
+        fn drain(&mut self) {
+            for _ in 0..32 {
+                let usages: Vec<UsageKey> =
+                    self.model.usages.iter().map(|(key, _)| key).collect();
+                for usage in usages {
+                    self.command(Command::Terminate { usage });
+                    self.settle();
+                }
+                self.quiesce();
+                if self.model.is_idle() {
+                    return;
+                }
+            }
+            panic!("the model never drained");
+        }
+    }
+
+    /// Settles a script as [`run_script`] does, then shuts the UA down,
+    /// to drain or to terminate by `preset`, and settles again. Whatever the
+    /// inputs before, the model then holds nothing: no operation without an
+    /// outcome, no timer, no reservation and nothing handed to the runtime.
+    /// A drain needs the application to end its sessions, and a termination
+    /// does not.
+    fn drain_script(preset: u8, script: Vec<(u8, u8, u8)>) -> bool {
+        let mut simulation = Simulation::new(limits());
+        for (kind, a, b) in script {
+            simulation.step(kind, a, b);
+            simulation.settle();
+        }
+
+        let terminate = preset % 2 == 0;
+        simulation.model.shut_down(terminate);
+        simulation.settle();
+        if terminate {
+            simulation.quiesce();
+        } else {
+            simulation.drain();
+        }
+
+        let model = &simulation.model;
+        assert!(model.is_idle(), "{:?}", simulation.owed);
+        assert_eq!(model.operations.running().count(), 0);
+        assert_eq!(model.timers.len(), 0);
+        assert!(model.handed.is_empty());
+        true
+    }
+
+    #[test]
+    fn any_shutdown_drains_once_everything_settles() {
+        let mut checker =
+            quickcheck::QuickCheck::new().rng(quickcheck::Gen::new(200));
+        if std::env::var_os("QUICKCHECK_TESTS").is_none() {
+            checker = checker.tests(400);
+        }
+        checker.quickcheck(drain_script as fn(u8, Vec<(u8, u8, u8)>) -> bool);
+    }
+
+    /// Stops the model in the middle of a script, as the deadline of a
+    /// shutdown does, with whatever the runtime still owes it. Every
+    /// operation that had no outcome gets one, and nothing is left.
+    fn stop_script(script: Vec<(u8, u8, u8)>) -> bool {
+        let mut simulation = Simulation::new(limits());
+        for (kind, a, b) in script {
+            simulation.step(kind, a, b);
+            simulation.settle();
+        }
+        let running = simulation.model.operations.running().count();
+
+        let left = simulation.model.stop();
+        let effects = simulation.model.take_effects();
+
+        assert_eq!(left.operations, running);
+        assert_eq!(effects.len(), running);
+        for effect in effects {
+            let Effect::OperationEnded { operation } = effect else {
+                panic!("{effect:?} after the stop");
+            };
+            assert_eq!(
+                simulation.model.take_outcome(operation),
+                Some(Err(Error::DriverStopped)),
+            );
+        }
+        assert!(simulation.model.is_idle());
+        true
+    }
+
+    #[test]
+    fn the_deadline_leaves_no_operation_without_an_outcome() {
+        let mut checker =
+            quickcheck::QuickCheck::new().rng(quickcheck::Gen::new(200));
+        if std::env::var_os("QUICKCHECK_TESTS").is_none() {
+            checker = checker.tests(400);
+        }
+        checker.quickcheck(stop_script as fn(Vec<(u8, u8, u8)>) -> bool);
     }
 
     /// Runs a script of steps on a model with small tables, so that every

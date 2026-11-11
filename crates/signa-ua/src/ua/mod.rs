@@ -23,7 +23,10 @@ use signa_core::{
     transaction::Timers,
     transport::Flow,
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
+    time::Instant,
+};
 
 pub use crate::{
     error::{Error, WireEffect},
@@ -38,6 +41,7 @@ use crate::{
     negotiation::Negotiation,
     operation::Completion,
     routing::{Place, allowed_in},
+    timer,
 };
 
 mod driver;
@@ -590,6 +594,21 @@ pub struct Ua {
 /// is lost with it. The outcome of an operation comes through its
 /// [`Operation`], and the state of a session through [`UaHandle::snapshot`].
 ///
+/// # Shutting down
+///
+/// [`UaHandle::shutdown`] stops the UA in two phases. The UA stops taking new
+/// work and ends what is under way, or lets the application end it, while
+/// its endpoint keeps taking the requests that needs. Then it shuts the
+/// endpoint down, and the driver returns once both have stopped or the
+/// deadline came. Dropping the driver instead is a forced stop.
+///
+/// Shut the endpoint down through the UA, not through another handle of it.
+/// While the UA has work, a session up included, it holds a work guard of
+/// the endpoint, so a shutdown of the endpoint alone waits for its deadline.
+/// And once the endpoint shuts down, it refuses the BYE that ends a session,
+/// which is a new transaction. The driver then returns once the endpoint
+/// stops, with [`ShutdownOutcome::EndpointLost`].
+///
 /// # Dropping
 ///
 /// Dropping a handle sends nothing. A [`Session`] or [`InviteAttempt`] going
@@ -616,11 +635,15 @@ pub fn attach<R: Resolve, N: Negotiate>(
     // The places of the attempts' last events come on top of the others.
     let capacity = bounded(config.events.saturating_add(config.attempts));
     let (events, event_receiver) = mpsc::channel(capacity);
+    let (shutdown, requests) = watch::channel(ShutdownRequest::default());
+    let (reports, report_receiver) = watch::channel(None);
     let shared = Arc::new(Shared {
         id: UaId(NEXT_UA.fetch_add(1, Ordering::Relaxed)),
         late_offer: config.negotiator.is_some(),
         commands,
         operations: Arc::new(Semaphore::new(config.operations)),
+        shutdown,
+        reports: report_receiver,
     });
     let driver = driver::Driver::new(
         endpoint,
@@ -629,6 +652,7 @@ pub fn attach<R: Resolve, N: Negotiate>(
         shared.clone(),
         command_receiver,
         events,
+        (requests, reports),
     );
 
     Ok(Ua {
@@ -660,6 +684,21 @@ struct Shared {
     /// One permit per operation that runs or keeps its outcome. A submission
     /// takes one, so that the driver always has room for what it admitted.
     operations: Arc<Semaphore>,
+    /// The shutdown asked for so far, which every call to
+    /// [`UaHandle::shutdown`] merges into.
+    shutdown: watch::Sender<ShutdownRequest>,
+    /// The report of the stop, once the driver has made it.
+    reports: watch::Receiver<Option<ShutdownReport>>,
+}
+
+/// The shutdown asked for so far: the strongest mode and the earliest
+/// deadline of every call.
+#[derive(Clone, Copy, Debug, Default)]
+struct ShutdownRequest {
+    mode: Option<ShutdownMode>,
+    /// `None` once asked for is no deadline, from a timeout too long to add
+    /// to the clock.
+    deadline: Option<Instant>,
 }
 
 /// What a handle asks of the driver.
@@ -788,8 +827,9 @@ impl UaHandle {
     /// Returns `plan` with [`Error::InvalidInput`] when the UA cannot send
     /// it, as [`InvitePlan`] says, or when it has no offer and the UA no
     /// [`Negotiate`], with [`Error::Busy`] when the command queue or the
-    /// operations are full, and with [`Error::Closed`] once the driver has
-    /// stopped.
+    /// operations are full, and with [`Error::Closed`] once the UA shuts
+    /// down or the driver has stopped. An INVITE submitted just before a
+    /// shutdown fails with [`Error::Closed`] too, with nothing sent.
     pub fn try_invite(
         &self,
         plan: InvitePlan,
@@ -797,6 +837,12 @@ impl UaHandle {
         if !plan.is_valid() || (!plan.has_offer() && !self.shared.late_offer) {
             return Err(SubmitError {
                 error: Error::InvalidInput,
+                value: Box::new(plan),
+            });
+        }
+        if self.shared.shutdown.borrow().mode.is_some() {
+            return Err(SubmitError {
+                error: Error::Closed,
                 value: Box::new(plan),
             });
         }
@@ -1070,6 +1116,215 @@ impl UaHandle {
         slot.send(Command::Snapshot { usage, reply });
 
         receiver.await.map_err(|_| Error::DriverStopped)
+    }
+
+    /// Shuts the UA down, and then its endpoint, within `timeout`, and
+    /// returns a future of the report.
+    ///
+    /// The UA stops taking new work at once. [`UaHandle::try_invite`] fails
+    /// with [`Error::Closed`], and a new initial INVITE gets a 503, which RFC
+    /// 3261 section 21.5.4 gives a server down for maintenance. The endpoint
+    /// keeps taking requests meanwhile, so that what is under way goes on: a
+    /// BYE or a re-INVITE in a session, a CANCEL, the ACK of a 2xx, copies of
+    /// a 2xx, and the answers [`Negotiate`] prepares. What happens to the
+    /// work under way depends on `mode`, see [`ShutdownMode`].
+    ///
+    /// Once the UA has nothing left to do, it lets go of what held the
+    /// endpoint's drain for it, and shuts the endpoint down with the time
+    /// that is left. The endpoint then refuses new requests with a 503, and
+    /// drains what it holds, such as an INVITE transaction that took a 2xx,
+    /// until Timer L. The driver keeps answering what the endpoint still
+    /// delivers until it has stopped, then ends every task of the UA and
+    /// returns. [`ShutdownReport`] says how it went.
+    ///
+    /// The UA does not wait for the endpoint before its own work is done,
+    /// since a session it ends needs a BYE, a new transaction the endpoint
+    /// refuses once it shuts down. An INVITE this UA sent can get the 2xx of
+    /// another fork until Timer M, 64 T1 after its first 2xx, which needs an
+    /// ACK and may need a BYE, so the UA waits for that too.
+    ///
+    /// # Deadline
+    ///
+    /// `timeout` counts from this call, for the UA and the endpoint
+    /// together. The phases share it, and no phase starts it again. A
+    /// `timeout` too long to add to the clock, such as [`Duration::MAX`],
+    /// sets no deadline. At the deadline the endpoint stops at once and
+    /// sends nothing more, and the UA lets go of what it had left. Each
+    /// operation still running fails with [`Error::DriverStopped`].
+    ///
+    /// Calling this again, on any handle of the UA, joins the same shutdown.
+    /// The earliest deadline holds, and a later call cannot extend it. A
+    /// call with [`ShutdownMode::Terminate`] makes a drain a termination,
+    /// and a call with [`ShutdownMode::DrainExisting`] changes nothing back.
+    ///
+    /// # Cancellation
+    ///
+    /// The shutdown starts when this is called. Dropping the future gives up
+    /// the wait, not the shutdown, and does not move the deadline. Nothing
+    /// happens unless the [`UaDriver`] runs, though.
+    pub fn shutdown(
+        &self,
+        mode: ShutdownMode,
+        timeout: Duration,
+    ) -> UaShutdown {
+        // A deadline past the clock is none. One that only far exceeds any
+        // deadline the UA means falls back to the far future, as its timers
+        // do.
+        let now = Instant::now();
+        let deadline =
+            now.checked_add(timeout).or_else(|| now.checked_add(timer::FAR));
+        self.shared.shutdown.send_modify(|request| {
+            request.mode = request.mode.max(Some(mode));
+            request.deadline = match (request.deadline, deadline) {
+                (Some(earlier), Some(later)) => Some(earlier.min(later)),
+                (earlier, later) => earlier.or(later),
+            };
+        });
+
+        UaShutdown::new(self.shared.reports.clone())
+    }
+}
+
+/// How [`UaHandle::shutdown`] treats the work under way.
+///
+/// Both modes stop new work at once, and neither stops what RFC 3261 asks to
+/// finish, such as the ACK of a 2xx or a 200 to a BYE. They differ in who
+/// ends the sessions. A later call can turn a drain into a termination,
+/// never the other way.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[non_exhaustive]
+pub enum ShutdownMode {
+    /// Lets the application end the work under way. Sessions stay up, and
+    /// the application may still decide the INVITEs it holds, end sessions,
+    /// and send or take re-INVITEs in them. An INVITE this UA sent goes on
+    /// collecting responses, and a 2xx of another fork forms a session as
+    /// before. The shutdown completes once all of it has ended, or at the
+    /// deadline.
+    DrainExisting,
+    /// Ends the work under way, as a user who hangs up would (RFC 3261
+    /// section 15):
+    ///
+    /// * An INVITE the application has not decided gets a 503. A decision
+    ///   the application submits then finds the final taken.
+    /// * An INVITE this UA sent is given up, as with
+    ///   [`UaHandle::try_abandon`]: a CANCEL while it has no final response,
+    ///   and an ACK and a BYE for each 2xx that comes later.
+    /// * Every session gets a BYE, a callee's after the ACK of its 2xx, and
+    ///   ends with [`EndReason::Shutdown`]. A re-INVITE the peer sent in it
+    ///   gets a 487, as RFC 3261 section 15.1.2 recommends when the peer's
+    ///   BYE leaves one pending. A re-INVITE this UA sent goes on, since the
+    ///   UA does not cancel its own, and one the peer never answers holds
+    ///   the shutdown until its deadline.
+    ///
+    /// None of this takes an operation of the application's, so it goes
+    /// whatever the limit of [`Config::max_operations`]. The BYEs start
+    /// behind the UA's other requests, such as the ACK of a 2xx, though
+    /// never more than eight of those in a row while one waits.
+    Terminate,
+}
+
+/// How a UA stopped, as [`ShutdownReport::outcome`] says.
+///
+/// This is signa-ua's lifecycle contract, not something an RFC defines.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum ShutdownOutcome {
+    /// Everything the UA had taken on ended before the deadline, and then
+    /// the endpoint drained too. No transaction, timer, task or write of
+    /// either is left, and nothing goes out after the report.
+    ///
+    /// It does not say that the peers received anything, nor that each call
+    /// ended well. A BYE may have got a 481 or no answer, which
+    /// [`ShutdownReport::failed_byes`] counts.
+    Drained,
+    /// The deadline came first, for the UA or for the endpoint. The endpoint
+    /// stopped at once, and the UA let go of what it had left, which the
+    /// report counts.
+    DeadlineExpired,
+    /// The endpoint stopped before the UA was done, as when another of its
+    /// handles shut it down. The UA let go of what it had left, which the
+    /// report counts.
+    EndpointLost,
+}
+
+/// What a UA's stop came to, as [`UaShutdown`] reports it.
+///
+/// The counts of sessions that ended cover the time from the first call of
+/// [`UaHandle::shutdown`] to the stop. What was left counts at the stop, and
+/// is nothing when the UA drained.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct ShutdownReport {
+    /// How the UA stopped.
+    pub outcome: ShutdownOutcome,
+    /// The sessions that ended during the shutdown, whatever ended them.
+    pub ended: usize,
+    /// Of those, the sessions the UA ended for [`ShutdownMode::Terminate`].
+    pub terminated: usize,
+    /// The BYEs of sessions during the shutdown that got no 2xx: those the
+    /// endpoint never took, and those that got another final response or
+    /// none. The peer may still have such a session.
+    pub failed_byes: usize,
+    /// The sessions still up when the UA stopped. The peers still have
+    /// them.
+    pub sessions_left: usize,
+    /// The INVITEs the UA still held when it stopped: those it received
+    /// without a final response the endpoint took, those it sent whose
+    /// responses it still collected, and the re-INVITEs it sent without a
+    /// final response.
+    pub invites_left: usize,
+    /// The operations still running when the UA stopped, which failed with
+    /// [`Error::DriverStopped`].
+    pub operations_failed: usize,
+}
+
+/// Resolves with the report of a UA's stop.
+///
+/// [`UaHandle::shutdown`] returns it. Every caller gets the same report.
+/// Dropping it before it resolves gives up the wait, not the shutdown.
+///
+/// It resolves with [`Error::DriverStopped`] if the [`UaDriver`] is dropped
+/// before it stops, which is a forced stop without a report.
+pub struct UaShutdown {
+    done: Pin<
+        Box<dyn Future<Output = Result<ShutdownReport, Error>> + Send + Sync>,
+    >,
+}
+
+impl UaShutdown {
+    fn new(
+        mut reports: watch::Receiver<Option<ShutdownReport>>,
+    ) -> UaShutdown {
+        UaShutdown {
+            done: Box::pin(async move {
+                loop {
+                    if let Some(report) = *reports.borrow_and_update() {
+                        return Ok(report);
+                    }
+                    if reports.changed().await.is_err() {
+                        return (*reports.borrow())
+                            .ok_or(Error::DriverStopped);
+                    }
+                }
+            }),
+        }
+    }
+}
+
+impl Future for UaShutdown {
+    type Output = Result<ShutdownReport, Error>;
+
+    fn poll(
+        mut self: Pin<&mut UaShutdown>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<ShutdownReport, Error>> {
+        self.done.as_mut().poll(cx)
+    }
+}
+
+impl fmt::Debug for UaShutdown {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("UaShutdown")
     }
 }
 
@@ -1832,12 +2087,14 @@ impl SessionSnapshot {
 /// The future that runs a UA.
 ///
 /// Spawn it, or poll it in a task of the application's. It returns once the
-/// endpoint has stopped.
+/// UA has stopped, after [`UaHandle::shutdown`] or once the endpoint stopped
+/// on its own, and it has ended every task of the UA by then.
 ///
 /// Dropping it stops the UA at once. This is a forced stop, not a graceful
 /// shutdown. The endpoint's receiver goes with the driver, which shuts the
-/// endpoint down. Every task of the UA is aborted, and every [`Operation`]
-/// still running fails with [`Error::DriverStopped`].
+/// endpoint down. Every task of the UA is aborted, every [`Operation`] still
+/// running fails with [`Error::DriverStopped`], and so does a [`UaShutdown`]
+/// waiting for its report.
 #[must_use = "the UA does nothing until its driver is polled"]
 pub struct UaDriver {
     future: Pin<Box<dyn Future<Output = ()> + Send>>,

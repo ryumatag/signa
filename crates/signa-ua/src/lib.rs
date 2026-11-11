@@ -39,7 +39,6 @@ This is an early stage of the crate, and much of a UA core is missing:
   answer. A re-INVITE asked for while the last 2xx of the session waits for
   its ACK is refused rather than held until then. A re-INVITE that gets a 491
   goes once more, and no more.
-* There is no graceful shutdown of the UA.
 * There is no TLS, so a request that asks for SIPS is refused, and the UA
   sends none.
 * The UA neither answers a challenge nor sends credentials.
@@ -66,7 +65,8 @@ pub use self::ua::{
     InvalidContact, InviteAttempt, InviteId, InvitePlan, Negotiate,
     NegotiationState, NoNegotiator, Offer, Operation, Query, ReinvitePlan,
     Resolve, ResolveError, Session, SessionId, SessionPhase, SessionSnapshot,
-    StaticResolver, SubmitError, Ua, UaDriver, UaEvents, UaHandle, WireEffect,
+    ShutdownMode, ShutdownOutcome, ShutdownReport, StaticResolver,
+    SubmitError, Ua, UaDriver, UaEvents, UaHandle, UaShutdown, WireEffect,
     attach,
 };
 

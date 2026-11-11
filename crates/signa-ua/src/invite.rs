@@ -173,6 +173,15 @@ pub enum EndReason {
     /// or [`Error::Timeout`] when no response came, the UA ended it with a
     /// BYE.
     ReinviteFailed(Error),
+    /// The UA ended it because it shut down with
+    /// [`ShutdownMode::Terminate`]: with a BYE that reached the endpoint, or
+    /// without one if the BYE could not reach it. In the second case the peer
+    /// may still have the session, and [`ShutdownReport::failed_byes`]
+    /// counts it.
+    ///
+    /// [`ShutdownMode::Terminate`]: crate::ShutdownMode::Terminate
+    /// [`ShutdownReport::failed_byes`]: crate::ShutdownReport::failed_byes
+    Shutdown,
 }
 
 impl InviteAttempt {

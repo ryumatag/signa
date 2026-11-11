@@ -20,9 +20,9 @@ limit and deadline. A slow SDP component therefore holds up only the ACKs that
 wait for its answers, not the other jobs, and its backlog is bounded by the
 replay contexts, each of which asks for one answer at most.
 
-Every task belongs to one of five [`JoinSet`]s, so that dropping the driver
-aborts all of them. Jobs come in two kinds, each with as many at once as the
-configuration allows:
+Every task belongs to one of six [`JoinSet`]s, so that dropping the driver
+aborts all of them, and a shutdown ends all of them before it reports. Jobs
+come in two kinds, each with as many at once as the configuration allows:
 
 * A send resolves a next hop and hands a request to the endpoint, which takes
   as long as a resolution or a connection does.
@@ -31,7 +31,8 @@ configuration allows:
   wait for room.
 
 A resolver that hangs therefore holds up sends only, never the answer to a
-BYE or a CANCEL. More jobs wait in a backlog of their kind, which the model's
+BYE or a CANCEL. The BYEs a shutdown sends to every session wait behind the
+other sends, see [`Sends`]. More jobs wait in a backlog of their kind, which the model's
 own tables bound, since each job is for one of their records, and a record
 has at most one copy of its 2xx or its ACK on the way at a time, and one BYE
 ever. The answers to requests the UA keeps no record for wait apart, in two
@@ -54,6 +55,15 @@ the core for what can take long and writes nothing itself: the CANCEL of an
 attempt, which waits for a provisional response (RFC 3261 section 9.1), one per
 attempt at most, and the response to the BYE of a session, one per Mortal
 dialog, which the dialog table bounds.
+
+A shutdown closes the model's admission and leaves the endpoint as it is,
+until the UA has nothing left to do ([`Driver::is_drained`]). Only then does
+the driver let go of the work guard it holds while it has work, and shut the
+endpoint down, since a BYE the UA still owes is a new transaction the endpoint
+refuses once it shuts down. The answers to requests the UA keeps nothing for
+run in a [`JoinSet`] of their own and do not hold the UA's drain. The
+endpoint's drain waits for their transactions, and the driver keeps running
+them until the endpoint stops.
 */
 
 use std::{
@@ -69,7 +79,8 @@ use signa_core::{
         Branch, CancelError, CancelOutcome, ClientControl, ClientTransaction,
         Endpoint, Error as CoreError, Incoming, IncomingCancel, IncomingEvent,
         ReceivedRequest, ReplyRoute, Responder, Responses, ServerRequest,
-        ServerTransactionId, SubmitError, Target, ViaMode,
+        ServerTransactionId, Shutdown, ShutdownOutcome as CoreOutcome,
+        SubmitError, Target, ViaMode, WorkGuard,
     },
     message::{
         header::{
@@ -82,7 +93,7 @@ use signa_core::{
     },
 };
 use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
     task::{self, JoinSet},
     time::{Instant, sleep_until},
 };
@@ -90,7 +101,8 @@ use tokio::{
 use super::{
     AttemptId, AttemptSnapshot, Command, Config, Event, IncomingInvite,
     InviteId, Negotiate, Offer, Query, Resolve, ResolveError, Session,
-    SessionSnapshot, Shared,
+    SessionSnapshot, Shared, ShutdownMode, ShutdownOutcome, ShutdownReport,
+    ShutdownRequest,
 };
 use crate::{
     error::Error,
@@ -167,6 +179,9 @@ pub(super) struct Driver<R, N> {
     lagged: u64,
     /// The sends that run.
     jobs: JoinSet<Done>,
+    /// The answers that run to requests the UA keeps nothing for, apart from
+    /// `replies`, since no record waits for them.
+    answering: JoinSet<Done>,
     /// What each running job reports if it panics, such as in a resolver,
     /// so that the record it was for does not wait for it for good.
     fallbacks: HashMap<task::Id, Done>,
@@ -179,7 +194,7 @@ pub(super) struct Driver<R, N> {
     /// longest interval before the next copy is due anyway.
     resend_timeout: Duration,
     /// The sends that wait for one of `jobs`.
-    backlog: VecDeque<Job>,
+    sends: Sends<Job>,
     /// The replies that run.
     replies: JoinSet<Done>,
     /// The replies that wait for one of `replies`.
@@ -214,6 +229,22 @@ pub(super) struct Driver<R, N> {
     /// The place in the event queue set aside for the last event of each
     /// attempt, [`Event::AttemptEnded`].
     endings: HashMap<AttemptKey, mpsc::OwnedPermit<Event>>,
+    /// Calls of [`super::UaHandle::shutdown`], merged.
+    requests: watch::Receiver<ShutdownRequest>,
+    /// Where the report of the stop goes.
+    reports: watch::Sender<Option<ShutdownReport>>,
+    /// The mode of the shutdown, once one is asked for.
+    mode: Option<ShutdownMode>,
+    /// The deadline of the shutdown, if it has one.
+    deadline: Option<Instant>,
+    /// The endpoint's shutdown, once the UA has nothing left to do.
+    core: Option<Shutdown>,
+    /// Whether the endpoint still delivers events.
+    receiving: bool,
+    /// Holds the endpoint's drain while the UA has work, so that a shutdown
+    /// of the endpoint from another of its handles waits for it. The UA
+    /// lets go of it before it shuts the endpoint down itself.
+    guard: Option<WorkGuard>,
 }
 
 struct Server {
@@ -394,6 +425,11 @@ impl<T> Waiting<T> {
         self.records.push_back(reply);
     }
 
+    /// Says whether a reply of the model's records waits.
+    fn has_records(&self) -> bool {
+        !self.records.is_empty()
+    }
+
     /// Takes the reply to start next, if any waits.
     fn next(&mut self) -> Option<T> {
         let others = !self.control.is_empty() || !self.records.is_empty();
@@ -414,6 +450,53 @@ impl<T> Waiting<T> {
         };
         self.ordinary_streak += usize::from(!self.ordinary.is_empty());
         reply
+    }
+}
+
+/// The sends that wait for a job, in two backlogs: the requests the UA
+/// sends in its course, such as the ACK of a 2xx, and the BYEs a shutdown
+/// that terminates sends to every session.
+///
+/// The BYEs start behind the others, since they are many at once and none of
+/// them is urgent, while the peer of a 2xx waits for its ACK. They still
+/// start one in every [`BATCH`] + 1 while others wait, so that they end in a
+/// bounded time even under a steady stream of other sends.
+#[derive(Debug)]
+struct Sends<T> {
+    others: VecDeque<T>,
+    teardown: VecDeque<T>,
+    /// How many others started in a row while a BYE of the teardown waited.
+    streak: usize,
+}
+
+impl<T> Sends<T> {
+    fn new() -> Sends<T> {
+        Sends { others: VecDeque::new(), teardown: VecDeque::new(), streak: 0 }
+    }
+
+    fn push(&mut self, send: T) {
+        self.others.push_back(send);
+    }
+
+    /// Queues a BYE of the teardown.
+    fn teardown(&mut self, send: T) {
+        self.teardown.push_back(send);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.others.is_empty() && self.teardown.is_empty()
+    }
+
+    /// Takes the send to start next, if any waits.
+    fn next(&mut self) -> Option<T> {
+        if !self.teardown.is_empty()
+            && (self.others.is_empty() || self.streak >= BATCH)
+        {
+            self.streak = 0;
+            return self.teardown.pop_front();
+        }
+        self.streak += usize::from(!self.teardown.is_empty());
+        self.others.pop_front()
     }
 }
 
@@ -487,6 +570,10 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         shared: Arc<Shared>,
         commands: mpsc::Receiver<Command>,
         events: mpsc::Sender<Event>,
+        (requests, reports): (
+            watch::Receiver<ShutdownRequest>,
+            watch::Sender<Option<ShutdownReport>>,
+        ),
     ) -> Driver<R, N> {
         let (abandon_sender, abandons) = mpsc::channel(config.pending_invites);
         let (response_sender, responses) = mpsc::channel(RESPONSE_QUEUE);
@@ -519,8 +606,9 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             events,
             lagged: 0,
             jobs: JoinSet::new(),
+            answering: JoinSet::new(),
             fallbacks: HashMap::new(),
-            backlog: VecDeque::new(),
+            sends: Sends::new(),
             replies: JoinSet::new(),
             waiting: Waiting::new(config.jobs),
             readers: JoinSet::new(),
@@ -535,25 +623,44 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             acks: HashMap::new(),
             waiters: HashMap::new(),
             endings: HashMap::new(),
+            requests,
+            reports,
+            mode: None,
+            deadline: None,
+            core: None,
+            receiving: true,
+            guard: None,
         }
     }
 
-    /// Runs the UA until the endpoint stops.
+    /// Runs the UA until it stops: after a shutdown, at the deadline of one,
+    /// or once the endpoint stops on its own.
     ///
-    /// TODO: Take a two-phase shutdown, which ends the UA's own work before
-    /// it shuts the endpoint down. Until then the UA runs until the endpoint
-    /// stops on its own.
+    /// A shutdown has two phases, which the loop goes through as its inputs
+    /// come. First the UA drains, with the endpoint as it was, so that the
+    /// requests its work needs, such as a BYE, still go. Once it has nothing
+    /// left ([`Driver::is_drained`]), it lets go of its work guard and shuts
+    /// the endpoint down, then keeps answering what the endpoint delivers
+    /// until the endpoint stops. The deadline is one for both.
     pub(super) async fn run(mut self) {
-        loop {
+        let outcome = loop {
             let deadline = self.model.next_deadline().map(Instant::from_std);
             let answer_due =
                 self.answer_backlog.front().map(|answer| answer.due);
             let room = self.room();
+            let stop_at = self.deadline;
 
             tokio::select! {
-                event = self.incoming.recv() => match event {
+                event = self.incoming.recv(), if self.receiving => match event {
                     Some(event) => self.on_incoming(event),
-                    None => break,
+                    // The endpoint stopped. Once the UA shut it down that is
+                    // the end its shutdown waits for. Before, the UA lost it.
+                    None => {
+                        self.receiving = false;
+                        if self.core.is_none() {
+                            break ShutdownOutcome::EndpointLost;
+                        }
+                    }
                 },
                 Some(command) = self.commands.recv() => {
                     self.on_command(command);
@@ -572,6 +679,8 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
                 {
                     self.on_joined(done);
                 }
+                Some(_) = self.answering.join_next(),
+                    if !self.answering.is_empty() => {}
                 Some(done) = self.watchers.join_next_with_id(),
                     if !self.watchers.is_empty() =>
                 {
@@ -610,10 +719,226 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
                     self.model.fire_timers(now());
                     self.settle(None);
                 }
+                // The handles hold the sender, as the driver does through
+                // `shared`, so this never ends.
+                Ok(()) = self.requests.changed() => self.on_shutdown(),
+                () = sleep_until(stop_at.unwrap_or_else(Instant::now)),
+                    if stop_at.is_some() =>
+                {
+                    break ShutdownOutcome::DeadlineExpired;
+                }
+                outcome = stopped(&mut self.core), if self.core.is_some() => {
+                    break if outcome.is_drained() {
+                        ShutdownOutcome::Drained
+                    } else {
+                        ShutdownOutcome::DeadlineExpired
+                    };
+                }
             }
 
             self.start_jobs();
+            self.advance();
+        };
+
+        self.stop(outcome).await;
+    }
+
+    /// Takes a call of [`super::UaHandle::shutdown`], which may make a drain
+    /// a termination or bring the deadline closer.
+    fn on_shutdown(&mut self) {
+        let ShutdownRequest { mode, deadline } =
+            *self.requests.borrow_and_update();
+        let Some(mode) = mode else {
+            return;
+        };
+
+        self.deadline = deadline;
+        if self.mode < Some(mode) {
+            self.mode = Some(mode);
+            self.model.shut_down(mode == ShutdownMode::Terminate);
+            self.settle(None);
         }
+        // The endpoint keeps the earliest deadline it was given.
+        if self.core.is_some() {
+            drop(self.endpoint.clone().shutdown(remaining(self.deadline)));
+        }
+    }
+
+    /// Holds the endpoint's drain while the UA has work, and shuts the
+    /// endpoint down once a shutdown has left the UA nothing to do.
+    ///
+    /// The guard goes first. The endpoint's drain waits for every guard, and
+    /// this UA waits for that drain, so a guard it kept would hold both until
+    /// the deadline.
+    fn advance(&mut self) {
+        let drained = self.is_drained();
+        if drained {
+            self.guard = None;
+        } else if self.guard.is_none() && self.core.is_none() && self.receiving
+        {
+            // An endpoint that stopped has no guard to give, and nothing to
+            // hold.
+            self.guard = self.endpoint.work_guard().ok();
+        }
+
+        if self.mode.is_none() {
+            return;
+        }
+        #[cfg(debug_assertions)]
+        self.check();
+        if drained && self.core.is_none() && self.receiving {
+            debug_assert!(self.guard.is_none());
+            let timeout = remaining(self.deadline);
+            self.core = Some(self.endpoint.clone().shutdown(timeout));
+        }
+    }
+
+    /// Says whether the UA has nothing left to do, which is the one test of
+    /// its drain. Each of these holds what a record or a job of the UA may
+    /// still act on:
+    ///
+    /// * the model's records, timers and operations,
+    /// * the jobs that send and those that reply for a record, the answers
+    ///   in preparation, the watchers of a CANCEL or a BYE, and the readers
+    ///   of responses,
+    /// * the sends, the replies of records and the answers that wait for a
+    ///   job, and the responses that wait for the driver,
+    /// * the INVITEs and responders, ACKs, client controls, places for the
+    ///   end of an attempt, waiters and fallbacks of the records.
+    ///
+    /// The answers to requests the UA keeps nothing for do not count. The
+    /// endpoint's drain waits for their transactions, and the driver goes on
+    /// running them until the endpoint stops. The 481 to a CANCEL that
+    /// matched no transaction has none, so a drain may cut it short. The
+    /// peer then sends the CANCEL again, as it would for a lost one. Nor do
+    /// these count, since none of them is work the UA owes: the count of
+    /// lost notifications, the events nobody received, and the commands not
+    /// taken yet, which [`Driver::stop`] ends.
+    fn is_drained(&self) -> bool {
+        self.model.is_idle()
+            && self.jobs.is_empty()
+            && self.replies.is_empty()
+            && self.answers.is_empty()
+            && self.watchers.is_empty()
+            && self.readers.is_empty()
+            && self.sends.is_empty()
+            && !self.waiting.has_records()
+            && self.answer_backlog.is_empty()
+            && self.responses.is_empty()
+            && self.servers.is_empty()
+            && self.server_ids.is_empty()
+            && self.acks.is_empty()
+            && self.clients.is_empty()
+            && self.endings.is_empty()
+            && self.waiters.is_empty()
+            && self.fallbacks.is_empty()
+    }
+
+    /// Stops the UA with `outcome`, ends every task it started, and reports.
+    ///
+    /// Short of a drain, the endpoint stops at once first, so that nothing
+    /// goes out for what the UA lets go of, such as the 500 of a responder it
+    /// drops. After the drain the endpoint has stopped already.
+    ///
+    /// A deadline that comes as the drain ends, within a turn of the loop, as
+    /// a timeout of zero does for a UA with nothing to do, is no deadline.
+    /// The endpoint takes a zero timeout as a drain when nothing is left, and
+    /// so does the UA, whichever input the loop happened to take first.
+    async fn stop(mut self, mut outcome: ShutdownOutcome) {
+        if outcome != ShutdownOutcome::Drained {
+            self.core = None;
+            let core = self.endpoint.clone().shutdown(Duration::ZERO).await;
+            if outcome == ShutdownOutcome::DeadlineExpired
+                && core.is_drained()
+                && self.is_drained()
+            {
+                outcome = ShutdownOutcome::Drained;
+            }
+        }
+        self.guard = None;
+        self.jobs.shutdown().await;
+        self.replies.shutdown().await;
+        self.answering.shutdown().await;
+        self.answers.shutdown().await;
+        self.watchers.shutdown().await;
+        self.readers.shutdown().await;
+        #[cfg(debug_assertions)]
+        assert!(
+            self.jobs.is_empty()
+                && self.replies.is_empty()
+                && self.answering.is_empty()
+                && self.answers.is_empty()
+                && self.watchers.is_empty()
+                && self.readers.is_empty(),
+            "a task outlives the stop",
+        );
+        self.fallbacks.clear();
+
+        // A command still queued after a drain finds the UA closed and idle,
+        // so it ends as it would have in the loop, with nothing sent. Short
+        // of a drain it fails as one the UA had taken.
+        self.commands.close();
+        let mut untaken = 0;
+        while let Ok(command) = self.commands.try_recv() {
+            match command {
+                command if outcome == ShutdownOutcome::Drained => {
+                    self.on_command(command);
+                }
+                Command::Operation { reply, .. } => {
+                    let _ = reply.send(Err(Error::DriverStopped));
+                    untaken += 1;
+                }
+                Command::Snapshot { .. } | Command::AttemptSnapshot { .. } => {
+                }
+            }
+        }
+        let left = self.model.stop();
+        for effect in self.model.take_effects() {
+            if let Effect::OperationEnded { operation } = effect {
+                self.deliver(operation);
+            }
+        }
+        #[cfg(debug_assertions)]
+        if outcome == ShutdownOutcome::Drained {
+            assert_eq!(left, model::Left::default());
+            assert_eq!(untaken, 0);
+            assert!(self.is_drained(), "a drain left work behind");
+        }
+        let tally = self.model.tally();
+        let report = ShutdownReport {
+            outcome,
+            ended: tally.ended,
+            terminated: tally.terminated,
+            failed_byes: tally.failed_byes,
+            sessions_left: left.sessions,
+            invites_left: left.invites,
+            operations_failed: left.operations + untaken,
+        };
+        self.reports.send_replace(Some(report));
+    }
+
+    /// Checks that each map of the driver holds only what the model's
+    /// records still need, and that each task has its fallback, so that
+    /// once the model is idle and the tasks are done, the maps are empty.
+    /// It runs while the UA shuts down, in builds with debug assertions.
+    #[cfg(debug_assertions)]
+    fn check(&self) {
+        for &exchange in self.servers.keys() {
+            assert!(self.model.holds_exchange(exchange), "{exchange:?}");
+        }
+        assert_eq!(self.server_ids.len(), self.servers.len());
+        for &replay in self.acks.keys() {
+            assert!(self.model.holds_replay(replay), "{replay:?}");
+        }
+        for &attempt in self.clients.keys().chain(self.endings.keys()) {
+            assert!(self.model.holds_attempt(attempt), "{attempt:?}");
+        }
+        assert_eq!(self.waiters.len(), self.model.operation_count());
+        let tasks = self.jobs.len()
+            + self.replies.len()
+            + self.answers.len()
+            + self.watchers.len();
+        assert_eq!(self.fallbacks.len(), tasks);
     }
 
     /// Takes what a job or watcher reported, or what it would have if it
@@ -1476,7 +1801,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         }
         let request = planned.request;
         let query = query(planned.next_hop, &request);
-        self.backlog.push_back(Job::Start { attempt, request, query });
+        self.sends.push(Job::Start { attempt, request, query });
     }
 
     /// Sends a re-INVITE, built from its dialog (RFC 3261 section 14.1),
@@ -1511,7 +1836,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             *request.body_mut() = offer.body().clone();
         }
         let query = query(outgoing.target.next_hop, &request);
-        self.backlog.push_back(Job::Reinvite { exchange, request, query });
+        self.sends.push(Job::Reinvite { exchange, request, query });
     }
 
     /// Builds the ACK of a 2xx from its dialog and sends it. The ACK is kept
@@ -1540,7 +1865,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             *request.body_mut() = answer.body().clone();
         }
         let next_hop = outgoing.target.next_hop;
-        self.backlog.push_back(Job::Ack {
+        self.sends.push(Job::Ack {
             replay,
             request: request.clone(),
             route: AckRoute::Resolve(query(next_hop.clone(), &request)),
@@ -1575,7 +1900,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             }
         };
         ack.sending = true;
-        self.backlog.push_back(Job::Ack {
+        self.sends.push(Job::Ack {
             replay,
             request: ack.request.clone(),
             route,
@@ -1644,7 +1969,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
 
         let request = outgoing.request.map(|()| Bytes::new());
         let query = query(outgoing.target.next_hop, &request);
-        self.backlog.push_back(Job::Bye { replay, request, query });
+        self.sends.push(Job::Bye { replay, request, query });
     }
 
     /// Sends the BYE that ends a session, in a client transaction of its own
@@ -1665,7 +1990,12 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
 
         let request = outgoing.request.map(|()| Bytes::new());
         let query = query(outgoing.target.next_hop, &request);
-        self.backlog.push_back(Job::SessionBye { usage, request, query });
+        let job = Job::SessionBye { usage, request, query };
+        if self.model.is_teardown(usage) {
+            self.sends.teardown(job);
+        } else {
+            self.sends.push(job);
+        }
     }
 
     /// Reads the response to the BYE of a session, until its final or the
@@ -1864,13 +2194,13 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         }
 
         while self.jobs.len() < self.max_jobs {
-            let Some(job) = self.backlog.pop_front() else {
+            let Some(job) = self.sends.next() else {
                 break;
             };
             self.spawn(job, false);
         }
 
-        while self.replies.len() < self.max_jobs {
+        while self.replies.len() + self.answering.len() < self.max_jobs {
             let Some(job) = self.waiting.next() else {
                 break;
             };
@@ -1879,10 +2209,21 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
     }
 
     /// Runs a job as a send, or as a reply if `reply`.
+    ///
+    /// The answer to a request the UA keeps nothing for runs apart from the
+    /// replies of records, though in their pool. Nothing waits for its
+    /// result, so it has no fallback, and the UA's drain does not wait for
+    /// it. The endpoint's does, since the request's transaction waits for
+    /// its answer.
     fn spawn(&mut self, job: Job, reply: bool) {
         let endpoint = self.endpoint.clone();
         let resolver = self.resolver.clone();
         let timeout = self.resolve_timeout;
+        if matches!(job, Job::Refuse { .. } | Job::Reply { .. }) {
+            self.answering.spawn(job.run(endpoint, resolver, timeout));
+            return;
+        }
+
         let fallback = job.fallback();
         let run = job.run(endpoint, resolver, timeout);
         let handle =
@@ -2197,6 +2538,22 @@ async fn resolve<R: Resolve>(
         .unwrap_or(Err(ResolveError::Unresolved))
 }
 
+/// Resolves once the endpoint's shutdown does, or never without one.
+async fn stopped(core: &mut Option<Shutdown>) -> CoreOutcome {
+    match core {
+        Some(core) => core.await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Returns the time left until `deadline`, or a time the endpoint takes for
+/// no deadline.
+fn remaining(deadline: Option<Instant>) -> Duration {
+    deadline.map_or(Duration::MAX, |deadline| {
+        deadline.saturating_duration_since(Instant::now())
+    })
+}
+
 /// Sends the count of dropped notifications once the event queue has
 /// `room` places free, as [`Driver::room`] counts them.
 async fn report_lag(events: mpsc::Sender<Event>, room: usize, missed: u64) {
@@ -2373,6 +2730,30 @@ mod tests {
             .map(|(at, _)| at)
             .collect();
         assert_eq!(turns, [BATCH, 2 * BATCH + 1, 3 * BATCH + 2]);
+    }
+
+    /// The BYEs of a teardown start behind the other sends, such as the ACK
+    /// of a 2xx, one in every `BATCH + 1` while others wait, and all at once
+    /// when nothing else does.
+    #[test]
+    fn teardown_byes_wait_behind_other_sends_but_not_for_good() {
+        let mut sends = Sends::new();
+        for _ in 0..3 {
+            sends.teardown("bye");
+        }
+        for _ in 0..20 {
+            sends.push("ack");
+        }
+
+        let started: Vec<&str> = std::iter::from_fn(|| sends.next()).collect();
+        let byes: Vec<usize> = started
+            .iter()
+            .enumerate()
+            .filter(|&(_, &send)| send == "bye")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(byes, [BATCH, 2 * BATCH + 1, 22]);
+        assert!(sends.is_empty());
     }
 
     /// Each lane of answers holds as many as the limit, apart from the
