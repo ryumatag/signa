@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
-# Each has a `[workspace]` of its own, so that the benchmark and example
-# dependencies do not pile up on the crates. `tmp/` holds scratch copies of
-# older trees, such as those `scripts/tables` measures.
-exclude = ["bench", "examples", "tmp"]
+# Each has a `[workspace]` of its own, so that the benchmark, example and
+# fuzz dependencies do not pile up on the crates. `tmp/` holds scratch copies
+# of older trees, such as those `scripts/tables` measures.
+exclude = ["bench", "examples", "fuzz", "tmp"]
 
 [workspace.package]
 authors = ["Ryuma Taguchi <ryumatag@gmail.com>"]

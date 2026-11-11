@@ -1,0 +1,28 @@
+[package]
+name = "signa-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+signa-ua = { path = "../crates/signa-ua", default-features = false, features = ["__fuzz"] }
+
+[[bin]]
+name = "headers"
+path = "fuzz_targets/headers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "messages"
+path = "fuzz_targets/messages.rs"
+test = false
+doc = false
+bench = false

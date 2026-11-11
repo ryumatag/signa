@@ -1,0 +1,11 @@
+OPTIONS sip:bob@192.0.2.4 SIP/2.0
+Via: SIP/2.0/UDP 192.0.2.1;branch=z9hG4bK-options-314161
+Max-Forwards: 70
+To: Bob <sip:bob@biloxi.example.com>;tag=0000000000000001
+From: "Alice, A." <sip:alice@atlanta.example.com>;tag=1928301774
+Call-ID: a84b4c76e66710@pc33.atlanta.example.com
+CSeq: 314161 OPTIONS
+Contact: <sip:alice@192.0.2.1>
+Require: 100rel, timer
+Content-Length: 0
+

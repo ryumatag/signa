@@ -1,0 +1,33 @@
+¹INVITE sip:bob@biloxi.example.com SIP/2.0
+Via: SIP/2.0/UDP 192.0.2.1;branch=z9hG4bK776asdhds
+Max-Forwards: 70
+To: Bob <sip:bob@biloxi.example.com>
+From: "Alice, A." <sip:alice@atlanta.example.com>;tag=1928301774
+Call-ID: a84b4c76e66710@pc33.atlanta.example.com
+CSeq: 314159 INVITE
+Contact: <sip:alice@192.0.2.1>
+Record-Route: <sip:p1.example.com;lr>, <sip:p2.example.com;lr>
+Content-Type: application/sdp
+Content-Length: 5
+
+v=0
+iOPTIONS sip:bob@192.0.2.4 SIP/2.0
+Via: SIP/2.0/UDP 192.0.2.1;branch=z9hG4bK-options-314160
+Max-Forwards: 70
+To: Bob <sip:bob@biloxi.example.com>;tag=0000000000000001
+From: "Alice, A." <sip:alice@atlanta.example.com>;tag=1928301774
+Call-ID: a84b4c76e66710@pc33.atlanta.example.com
+CSeq: 314160 OPTIONS
+Contact: <sip:alice@192.0.2.1>
+Content-Length: 0
+
+]ACK sip:bob@192.0.2.4 SIP/2.0
+Via: SIP/2.0/UDP 192.0.2.1;branch=z9hG4bK-ack-314159
+Max-Forwards: 70
+To: Bob <sip:bob@biloxi.example.com>;tag=0000000000000001
+From: "Alice, A." <sip:alice@atlanta.example.com>;tag=1928301774
+Call-ID: a84b4c76e66710@pc33.atlanta.example.com
+CSeq: 314159 ACK
+Contact: <sip:alice@192.0.2.1>
+Content-Length: 0
+

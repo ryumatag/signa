@@ -90,6 +90,12 @@ mod timer;
 #[cfg(feature = "tokio")]
 mod ua;
 
+// Entry points for the fuzz targets in `fuzz/`. Unstable and not part of
+// the public API.
+#[cfg(feature = "__fuzz")]
+#[doc(hidden)]
+pub mod fuzz;
+
 /// Messages and records the tests of several modules share.
 #[cfg(test)]
 mod tests {

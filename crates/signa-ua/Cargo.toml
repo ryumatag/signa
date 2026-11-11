@@ -28,6 +28,9 @@ default = ["tokio"]
 # The runtime that drives the UA on a signa-core endpoint. Without it, only the
 # state model builds, which has no public API.
 tokio = ["dep:tokio", "signa-core/tokio"]
+# Exposes entry points for the fuzz targets in `fuzz/`. Unstable, with no
+# semver guarantee. Not for use outside this repository.
+__fuzz = []
 
 [dependencies]
 bytes = { version = "1.12.1", default-features = false, features = ["std"] }
