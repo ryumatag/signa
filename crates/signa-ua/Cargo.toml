@@ -10,6 +10,9 @@ Dialogs and INVITE usage on signa-core, for SIP user agents.
 '''
 keywords = ["sip", "rfc3261", "voip", "telephony"]
 categories = ["network-programming"]
+# The integration tests are one binary of modules, `tests/lib.rs`, so a new
+# file under `tests/` runs only once a module declares it.
+autotests = false
 authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -39,9 +42,12 @@ tokio = { version = "1.54", default-features = false, features = ["macros", "rt"
 quickcheck = { version = "1", default-features = false }
 tokio = { version = "1.54", features = ["macros", "net", "rt-multi-thread", "test-util"] }
 
-# The runtime through the public API, against raw UDP peers.
+# The runtime through the public API, against raw UDP and TCP peers and other
+# UAs. One binary links once, shares its fixtures, and lets a lock such as
+# `FLOODING` cover every test that takes it.
 [[test]]
-name = "ua"
+name = "integration"
+path = "tests/lib.rs"
 required-features = ["tokio"]
 
 # What the UA keeps of received messages, by a counting allocator, which needs
