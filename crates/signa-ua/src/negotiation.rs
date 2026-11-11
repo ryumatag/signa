@@ -137,6 +137,8 @@ impl Body {
 
     /// Reads a body for the session description it may be, where nothing
     /// is answered for a body the UA cannot use, as in a response or an ACK.
+    // Only the runtime reads responses and ACKs.
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
     pub(crate) fn description(
         headers: &HeaderMap,
         body: &[u8],

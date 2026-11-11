@@ -67,6 +67,10 @@ pub enum Error {
     /// The driver stopped while the operation ran. This includes the core's
     /// `Closed`, after which nobody knows whether the core took the message.
     DriverStopped,
+    /// The session ended while the operation ran, such as a re-INVITE whose
+    /// session a BYE ended before its final response. The request may have
+    /// reached the peer.
+    SessionEnded,
 }
 
 /// What a failure says about the wire.
@@ -101,7 +105,8 @@ impl Error {
             | Error::Timeout
             | Error::NegotiationFailure
             | Error::ObservationIncomplete
-            | Error::DriverStopped => WireEffect::Unknown,
+            | Error::DriverStopped
+            | Error::SessionEnded => WireEffect::Unknown,
             Error::RemoteFailure(_) => WireEffect::Delivered,
         }
     }
@@ -140,6 +145,9 @@ impl fmt::Display for Error {
             }
             Error::Closed => f.write_str("the UA admits no new work"),
             Error::DriverStopped => f.write_str("the UA's driver stopped"),
+            Error::SessionEnded => {
+                f.write_str("the session ended while the operation ran")
+            }
         }
     }
 }

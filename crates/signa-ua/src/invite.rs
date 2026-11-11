@@ -11,7 +11,10 @@ apart:
   session the application sees. It can end long before the INVITE's
   retransmissions stop.
 * An [`InviteExchange`] is one INVITE transaction and its final response, seen
-  from this user agent.
+  from this user agent: an initial INVITE, or a re-INVITE in the dialog of a
+  usage ([RFC 3261 section 14]). A re-INVITE shares the machinery of the
+  initial INVITE, the 2xx and its ACK, but not its lifecycle. Its failure
+  leaves the session as it was, and its 2xx forms no dialog.
 
 The ACK of each 2xx and the retransmissions around it belong to neither. They
 live in a [`ReplayContext`](crate::retention::ReplayContext), which outlives
@@ -23,6 +26,7 @@ to what the core reports, such as a final submission it took or the end of a
 response collection.
 
 [RFC 5057]: https://www.rfc-editor.org/rfc/rfc5057.html
+[RFC 3261 section 14]: https://www.rfc-editor.org/rfc/rfc3261.html#section-14
 */
 
 use std::time::Instant;
@@ -30,7 +34,7 @@ use std::time::Instant;
 use signa_core::{StatusCode, transport::Flow};
 
 use crate::{
-    dialog::{Dialog, DialogId, DialogKey, Origin},
+    dialog::{Dialog, DialogId, DialogKey, Origin, Outgoing},
     error::Error,
     negotiation::{Description, Negotiation},
     operation::OperationId,
@@ -162,6 +166,13 @@ pub enum EndReason {
     ///
     /// [`Event::NegotiationFailed`]: crate::Event::NegotiationFailed
     NegotiationFailed,
+    /// A re-INVITE of this UA's failed in a way that ends the session (RFC
+    /// 3261 sections 12.2.1.2 and 14.1). With
+    /// [`Error::RemoteFailure`] and a 481, the peer has no such dialog, so
+    /// the session ended without a BYE (RFC 5057 section 5.1). With a 408,
+    /// or [`Error::Timeout`] when no response came, the UA ended it with a
+    /// BYE.
+    ReinviteFailed(Error),
 }
 
 impl InviteAttempt {
@@ -245,6 +256,33 @@ pub(crate) struct InviteUsage {
     pub(crate) remote: Option<Description>,
     /// The BYE that is to end the usage, once asked for.
     pub(crate) bye: ByeIntent,
+    /// The INVITE transaction of the usage's dialog that has no final
+    /// response yet, in either direction. RFC 3261 section 14.1 lets no new
+    /// INVITE start in a dialog while there is one, and section 14.2 answers
+    /// one that comes anyway with a 491 or a 500. It is let go at the final
+    /// response, not when the core stops keeping the transaction, so a copy
+    /// of an old 2xx holds up no new exchange.
+    pub(crate) exchange: Option<ExchangeKey>,
+    /// A re-INVITE that got a 491 and waits to go once more.
+    pub(crate) retry: Option<Box<Retry>>,
+    /// How many offer/answer exchanges of the usage completed, the session
+    /// revision. It moves apart from the dialog's target revision.
+    pub(crate) revision: u32,
+}
+
+/// A re-INVITE that waits to go once more after a 491 (RFC 3261 section
+/// 14.1).
+#[derive(Debug)]
+pub(crate) struct Retry {
+    /// The application's, if it waits for the outcome.
+    pub(crate) operation: Option<OperationId>,
+    /// What the re-INVITE offered, which the next one offers again.
+    pub(crate) offer: Option<Description>,
+    pub(crate) due: Instant,
+    /// The session revision when the 491 came. Another exchange that
+    /// completed meanwhile changed what the offer was made against, so the
+    /// re-INVITE does not go again then.
+    pub(crate) revision: u32,
 }
 
 /// Where the BYE that ends a usage stands.
@@ -278,6 +316,9 @@ impl InviteUsage {
             negotiation,
             remote: None,
             bye: ByeIntent::None,
+            exchange: None,
+            retry: None,
+            revision: 0,
         }
     }
 
@@ -293,6 +334,9 @@ impl InviteUsage {
             negotiation,
             remote: None,
             bye: ByeIntent::None,
+            exchange: None,
+            retry: None,
+            revision: 0,
         }
     }
 
@@ -335,18 +379,13 @@ impl InviteUsage {
 pub(crate) enum Scope {
     /// The initial INVITE of the attempt that holds this exchange's key.
     Outgoing,
-    /// An initial INVITE this user agent received.
+    /// An INVITE this user agent received.
     Incoming {
-        /// The dialog a 2xx would form, read from the request when it
-        /// arrived, so that a request that cannot form one is refused before
-        /// the application sees it. The local tag in it is chosen then too,
-        /// so every response of the exchange carries the same To tag. It
-        /// moves to the dialog table when the 2xx is committed.
-        dialog: Option<Box<Dialog>>,
-        /// The INVITE's offer. It moves to the usage the 2xx forms.
+        /// Whether it is an initial INVITE or a re-INVITE.
+        kind: Received,
+        /// The INVITE's offer. It moves to the usage the 2xx forms or
+        /// updates.
         offer: Option<Description>,
-        /// What finds a merged copy of the INVITE while the exchange lives.
-        merge: MergeKey,
         /// When the application's decision is due, while it is.
         decision_due: Option<Instant>,
         /// When the INVITE expires, if its Expires gave a time, while no
@@ -360,6 +399,63 @@ pub(crate) enum Scope {
         /// if it did. It is rare, and a BYE's flow is large, so it is boxed.
         withdrawn: Option<Box<Withdrawal>>,
     },
+    /// A re-INVITE this user agent sent.
+    Reinvite(Box<SentReinvite>),
+}
+
+/// What kind of INVITE an incoming exchange is for.
+#[derive(Debug)]
+pub(crate) enum Received {
+    /// An initial INVITE.
+    Initial {
+        /// The dialog a 2xx would form, read from the request when it
+        /// arrived, so that a request that cannot form one is refused before
+        /// the application sees it. The local tag in it is chosen then too,
+        /// so every response of the exchange carries the same To tag. It
+        /// moves to the dialog table when the 2xx is committed.
+        dialog: Option<Box<Dialog>>,
+        /// What finds a merged copy of the INVITE while the exchange lives.
+        merge: MergeKey,
+    },
+    /// A re-INVITE in the dialog of `usage`, whose identity is `dialog`. Its
+    /// responses carry the dialog's local tag. The identity stays here, so
+    /// that a 2xx committed after the usage ended still gets its ACK.
+    Reinvite {
+        usage: UsageKey,
+        dialog: DialogId,
+        /// The URI of the re-INVITE's Contact, the new remote target, which
+        /// its 2xx commits (RFC 6141 section 4.6).
+        contact: Option<Box<str>>,
+    },
+}
+
+/// A re-INVITE this user agent sent in the dialog of a usage (RFC 3261
+/// section 14.1).
+///
+/// The record lives until the core finishes collecting the re-INVITE's
+/// responses, so that a copy of its 2xx finds its ACK. The usage lets go of
+/// it at the final response, so that the next re-INVITE need not wait for
+/// that.
+#[derive(Debug)]
+pub(crate) struct SentReinvite {
+    pub(crate) usage: UsageKey,
+    /// The dialog's identity, for the replay context of the 2xx.
+    pub(crate) dialog: DialogId,
+    /// The application's, until it has its outcome.
+    pub(crate) operation: Option<OperationId>,
+    /// The offer, kept for a second try after a 491.
+    pub(crate) offer: Option<Description>,
+    /// The request and where it goes, until the runtime takes it to send.
+    pub(crate) request: Option<Box<Outgoing>>,
+    /// Whether this is the try after a 491, which gets no other.
+    pub(crate) retried: bool,
+    /// Whether the slot of the 2xx's replay context is still set aside.
+    pub(crate) reserved: bool,
+    /// Whether the core dropped responses to it for want of room.
+    pub(crate) incomplete: bool,
+    /// The dialog, once its usage ended and no table keeps it, so that a 2xx
+    /// that comes late can still be acknowledged (RFC 5407 section 3.2.3).
+    pub(crate) kept: Option<Box<Dialog>>,
 }
 
 /// A provisional response the UA sends again until a final is under way
@@ -388,6 +484,11 @@ pub(crate) enum Withdrawal {
     Bye {
         flow: Flow,
     },
+    /// The session of a re-INVITE ended, by a BYE in either direction. RFC
+    /// 3261 section 15.1.2 recommends a 487 for each request the dialog
+    /// leaves pending, and I answer one of this user agent's own BYE the
+    /// same way.
+    Ended,
 }
 
 /// What RFC 3261 section 8.2.2.2 compares to tell a merged request: the From
@@ -449,19 +550,41 @@ impl InviteExchange {
         }
     }
 
+    pub(crate) fn reinvite(
+        cseq: u32,
+        reinvite: SentReinvite,
+    ) -> InviteExchange {
+        InviteExchange {
+            scope: Scope::Reinvite(Box::new(reinvite)),
+            cseq,
+            state: ExchangeState::Pending,
+            early_ack: None,
+        }
+    }
+
+    /// Returns the usage of a re-INVITE, in either direction, or `None` for
+    /// an initial INVITE.
+    pub(crate) fn reinvite_usage(&self) -> Option<UsageKey> {
+        match &self.scope {
+            Scope::Incoming {
+                kind: Received::Reinvite { usage, .. }, ..
+            } => Some(*usage),
+            Scope::Reinvite(reinvite) => Some(reinvite.usage),
+            Scope::Incoming { .. } | Scope::Outgoing => None,
+        }
+    }
+
     pub(crate) fn incoming(
-        dialog: Dialog,
-        merge: MergeKey,
+        kind: Received,
+        cseq: u32,
         offer: Option<Description>,
         decision_due: Option<Instant>,
         expires_due: Option<Instant>,
     ) -> InviteExchange {
-        let cseq = merge.cseq;
         InviteExchange {
             scope: Scope::Incoming {
-                dialog: Some(Box::new(dialog)),
+                kind,
                 offer,
-                merge,
                 decision_due,
                 expires_due,
                 provisional: None,

@@ -34,6 +34,7 @@ use crate::{
     dialog::{Dialog, DialogId},
     invite::{AttemptKey, Direction, ExchangeKey, UsageKey},
     negotiation::Description,
+    operation::OperationId,
     slot::Key,
 };
 
@@ -119,6 +120,9 @@ pub(crate) enum Source {
     /// A 2xx this user agent sent for an exchange. Its retransmissions stop
     /// at the ACK or the ACK deadline.
     Exchange(ExchangeKey),
+    /// A 2xx to a re-INVITE this user agent sent. Duplicates stop when the
+    /// core finishes the re-INVITE's response collection, as for an attempt.
+    Reinvite(ExchangeKey),
 }
 
 /// The retransmission of a 2xx this user agent sent, until its ACK.
@@ -159,6 +163,17 @@ pub(crate) struct ReplayContext {
     pub(crate) dialog: Option<Box<Dialog>>,
     /// Set for a cleanup only. A session's BYE is its usage's.
     pub(crate) bye: Option<Bye>,
+    /// The operation of a re-INVITE without an offer, which ends with the
+    /// answer this context waits for. It is kept here rather than with the
+    /// re-INVITE, whose record may go first, when the core stops collecting
+    /// its responses.
+    pub(crate) operation: Option<OperationId>,
+    /// Set for the 2xx of a re-INVITE this user agent received, once the
+    /// peer sent a re-INVITE with a higher CSeq while the 2xx waited for its
+    /// ACK. RFC 6141 section 5.4 then keeps the dialog when the ACK never
+    /// comes, since the peer most likely lost its old contact and could not
+    /// receive the 2xx, and the newer re-INVITE is how it recovers.
+    pub(crate) superseded: bool,
     usage_ended: bool,
     duplicates_end: bool,
 }
@@ -183,6 +198,8 @@ impl ReplayContext {
             retransmission: None,
             dialog: None,
             bye: None,
+            operation: None,
+            superseded: false,
             usage_ended: false,
             duplicates_end: false,
         }
@@ -206,6 +223,8 @@ impl ReplayContext {
             retransmission: None,
             dialog: Some(Box::new(dialog)),
             bye: Some(Bye::Owed),
+            operation: None,
+            superseded: false,
             usage_ended: true,
             duplicates_end: false,
         }

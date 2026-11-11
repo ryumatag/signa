@@ -37,9 +37,18 @@ says, though what they say is not. An answer the ACK of a 2xx owes comes from
 outside, through [`Effect::PrepareAnswer`] and [`Model::answer_prepared`], so
 that the model never waits for it.
 
-TODO: Re-INVITEs are still to come.
+A re-INVITE is an exchange in the dialog of a usage ([RFC 3261 section 14]).
+It shares the 2xx, ACK and replay machinery of the initial INVITE, not its
+lifecycle. Its failure leaves the session as it was, unless it says that the
+dialog is gone. Only one INVITE transaction without a final response may be
+open in a dialog at a time, which [`InviteUsage::exchange`] tracks, and a
+re-INVITE that collides with another gets the 491 or the 500 of section 14.2.
+The session and the remote target change apart, each at its own commit point
+([RFC 6141 section 4]), and neither changes before the final response.
 
+[RFC 3261 section 14]: https://www.rfc-editor.org/rfc/rfc3261.html#section-14
 [RFC 3261 section 17]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17
+[RFC 6141 section 4]: https://www.rfc-editor.org/rfc/rfc6141.html#section-4
 [RFC 5407 section 2]: https://www.rfc-editor.org/rfc/rfc5407.html#section-2
 [RFC 5407 section 3.2.1]: https://www.rfc-editor.org/rfc/rfc5407.html#section-3.2.1
 [RFC 6026 section 7]: https://www.rfc-editor.org/rfc/rfc6026.html#section-7
@@ -67,8 +76,8 @@ use crate::{
     invite::{
         AttemptKey, AttemptResult, ByeIntent, CancelIntent, CancelResult,
         Direction, EndReason, ExchangeKey, ExchangeState, InviteAttempt,
-        InviteExchange, InviteUsage, MergeKey, Provisional, Scope, UsageKey,
-        UsagePhase, Withdrawal,
+        InviteExchange, InviteUsage, MergeKey, Provisional, Received, Retry,
+        Scope, SentReinvite, UsageKey, UsagePhase, Withdrawal,
     },
     negotiation::{Body, Description, Negotiation},
     operation::{Completion, OperationId, Operations, Stage, SubmitError},
@@ -78,6 +87,7 @@ use crate::{
         AckBody, AckObligation, Bye, ReplayContext, ReplayId, ReplayKey,
         Retention, Retransmission, Source,
     },
+    routing::RemoteTarget,
     slot::Slots,
     timer::{Timer, TimerQueue},
 };
@@ -89,8 +99,8 @@ use crate::{
 /// every minute so that a lost one does not cost the call.
 const PROVISIONAL_INTERVAL: Duration = Duration::from_secs(60);
 
-/// A source of randomness for tags and Call-IDs, and later the retry timer
-/// of a 491.
+/// A source of randomness for tags and Call-IDs, the retry timer of a 491
+/// and the Retry-After of a 500 that refuses an overlapping INVITE.
 ///
 /// RFC 3261 section 19.3 asks for at least 32 bits of cryptographic
 /// randomness in a tag. The runtime's source has to meet that. Tests pass a
@@ -126,6 +136,11 @@ pub(crate) struct Limits {
     pub(crate) operations: usize,
     /// Commands admitted and not yet run.
     pub(crate) commands: usize,
+    /// Exchanges of re-INVITEs, in either direction. Those of incoming
+    /// INVITEs and of attempts come on top, so that re-INVITEs cannot take
+    /// their room. A re-INVITE this user agent sent keeps its record until
+    /// the core stops collecting its responses.
+    pub(crate) reinvites: usize,
     /// T1 and T2 of RFC 3261 section 17, which pace the retransmission of a
     /// 2xx this user agent sends and set its ACK deadline.
     pub(crate) t1: Duration,
@@ -179,6 +194,9 @@ pub(crate) enum Command {
     Abandon { attempt: AttemptKey },
     /// End a session with a BYE.
     Terminate { usage: UsageKey },
+    /// Send a re-INVITE in the dialog of a session, with `offer` or, for a
+    /// late offer, without one.
+    Reinvite { usage: UsageKey, offer: Option<Description> },
 }
 
 /// What the runtime does on the model's behalf.
@@ -214,6 +232,11 @@ pub(crate) enum Effect {
     /// over, then report the outcome with [`Model::invite_started`] or
     /// [`Model::invite_failed`].
     StartInvite { attempt: AttemptKey },
+    /// Send a re-INVITE, which [`Model::take_reinvite`] hands over, then
+    /// report the outcome with [`Model::reinvite_started`], and its
+    /// responses as for an attempt, with
+    /// [`Model::receive_reinvite_response`] and the others for a re-INVITE.
+    StartReinvite { exchange: ExchangeKey },
     /// Have the answer to `offer`, the offer of a received 2xx, prepared for
     /// its ACK, outside the driver and within a deadline, then report it with
     /// [`Model::answer_prepared`]. `usage` is the session the 2xx formed, or
@@ -304,11 +327,20 @@ pub(crate) enum Refusal {
     RouteSetTooLong,
     /// There is no room for it. A 503 (RFC 3261 section 21.5.4).
     Busy,
-    /// It is something this user agent does not take yet. A 500.
-    Unsupported,
     /// Its body is one the UA cannot tell the offer in, such as a multipart
     /// body. A 415 (RFC 3261 section 8.2.3).
     UnsupportedBody,
+    /// It is a re-INVITE that collides with an INVITE this user agent sent in
+    /// the dialog and has no final response for. A 491 (RFC 3261 section
+    /// 14.2). So is one while an offer of this user agent's waits for its
+    /// answer (RFC 5407 section 3.1.5), and, by my policy, one in a session
+    /// this user agent is ending.
+    RequestPending,
+    /// It is an INVITE that arrived before this user agent sent the final
+    /// response to an INVITE with a lower CSeq in the same dialog. A 500 with
+    /// a Retry-After of the given seconds, chosen at random from 0 to 10
+    /// (RFC 3261 section 14.2).
+    Overlapping(u8),
     /// Its CSeq is below the last one in its dialog, which RFC 3261 section
     /// 12.2.2 answers with a 500. So is one with the last number, by my
     /// policy (see `Dialog::remote_request`).
@@ -336,9 +368,10 @@ impl Refusal {
             Refusal::SipsNotAllowed => 480,
             Refusal::NoDialog => 481,
             Refusal::Merged => 482,
+            Refusal::RequestPending => 491,
             Refusal::RouteSetTooLong
-            | Refusal::Unsupported
             | Refusal::OutOfOrder
+            | Refusal::Overlapping(_)
             | Refusal::Internal => 500,
             Refusal::Busy => 503,
         };
@@ -390,8 +423,9 @@ pub(crate) enum Event {
     /// An attempt got a final response other than a 2xx, or its transaction
     /// failed, which ended its early dialogs.
     AttemptFailed { attempt: AttemptKey, error: Error },
-    /// The caller gave an INVITE up before the application decided it, and
-    /// the UA answered it with a 487.
+    /// The caller gave an INVITE up before the application decided it, or
+    /// the session of a re-INVITE ended first, and the UA answered it with a
+    /// 487.
     InviteWithdrawn { exchange: ExchangeKey },
 }
 
@@ -422,6 +456,27 @@ struct SendingBye {
 pub(crate) struct ByeStarted {
     pub(crate) dialog: DialogKey,
     pub(crate) operation: Option<OperationId>,
+}
+
+/// Where a usage stands, as a snapshot shows it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UsageState {
+    pub(crate) phase: UsagePhase,
+    pub(crate) negotiation: Negotiation,
+    pub(crate) remote: Option<Description>,
+    pub(crate) session_revision: u32,
+    pub(crate) target_revision: u32,
+    pub(crate) end_reason: Option<EndReason>,
+}
+
+/// What a usage that ended leaves for its snapshot.
+#[derive(Clone, Copy, Debug)]
+struct Ended {
+    usage: UsageKey,
+    reason: EndReason,
+    negotiation: Negotiation,
+    session_revision: u32,
+    target_revision: u32,
 }
 
 /// What an attempt has come to so far.
@@ -466,7 +521,10 @@ pub(crate) struct Model<R> {
     /// Why each of the last usages to end ended, the oldest first, so that a
     /// snapshot can say it after the notification was lost. At most
     /// `limits.usages` are kept.
-    ended: VecDeque<(UsageKey, EndReason, Negotiation)>,
+    ended: VecDeque<Ended>,
+    /// How many of `exchanges` are for re-INVITEs, within
+    /// `limits.reinvites`.
+    reinvites: usize,
     timers: TimerQueue,
     operations: Operations,
     commands: VecDeque<(OperationId, Command)>,
@@ -485,7 +543,10 @@ impl<R: Random> Model<R> {
             random,
             attempts: Slots::new(limits.attempts),
             exchanges: Slots::new(
-                limits.incoming.saturating_add(limits.attempts),
+                limits
+                    .incoming
+                    .saturating_add(limits.attempts)
+                    .saturating_add(limits.reinvites),
             ),
             dialogs: Slots::new(limits.dialogs),
             usages: Slots::new(limits.usages),
@@ -499,6 +560,7 @@ impl<R: Random> Model<R> {
             early_index: HashMap::new(),
             byes: HashMap::new(),
             ended: VecDeque::new(),
+            reinvites: 0,
             timers: TimerQueue::default(),
             operations: Operations::new(limits.operations),
             commands: VecDeque::new(),
@@ -585,6 +647,13 @@ impl<R: Random> Model<R> {
                 Command::Terminate { usage } => {
                     self.terminate(Some(operation), usage);
                 }
+                Command::Reinvite { usage, offer } => {
+                    if let Err(error) =
+                        self.reinvite(Some(operation), usage, offer, false)
+                    {
+                        self.complete(operation, Err(error));
+                    }
+                }
             }
         }
     }
@@ -616,30 +685,43 @@ impl<R: Random> Model<R> {
                     self.retransmission_due(replay, at, now)
                 }
                 Timer::AckDeadline(replay) => self.ack_overdue(replay),
+                Timer::Retry(usage) => self.retry_due(usage),
             }
         }
     }
 
-    /// Returns where a usage stands, or `None` once it has been reclaimed.
-    pub(crate) fn usage_state(
-        &self,
-        usage: UsageKey,
-    ) -> Option<(UsagePhase, Negotiation, Option<Description>)> {
-        let usage = self.usages.get(usage)?;
-        Some((usage.phase(), usage.negotiation, usage.remote.clone()))
+    /// Returns where a usage stands, or `None` once it has been reclaimed
+    /// and is no longer among the last ones to end. One that ended has no
+    /// session description any more.
+    pub(crate) fn usage_state(&self, key: UsageKey) -> Option<UsageState> {
+        let Some(usage) = self.usages.get(key) else {
+            let ended = self.ended(key)?;
+            return Some(UsageState {
+                phase: UsagePhase::Ended,
+                negotiation: ended.negotiation,
+                remote: None,
+                session_revision: ended.session_revision,
+                target_revision: ended.target_revision,
+                end_reason: Some(ended.reason),
+            });
+        };
+
+        let target_revision =
+            self.dialogs.get(usage.dialog).map_or(0, Dialog::target_revision);
+        Some(UsageState {
+            phase: usage.phase(),
+            negotiation: usage.negotiation,
+            remote: usage.remote.clone(),
+            session_revision: usage.revision,
+            target_revision,
+            end_reason: None,
+        })
     }
 
-    /// Returns why a usage ended, and where its negotiation stood then, as
-    /// long as it is among the last ones to end.
-    pub(crate) fn ended(
-        &self,
-        usage: UsageKey,
-    ) -> Option<(EndReason, Negotiation)> {
-        self.ended
-            .iter()
-            .rev()
-            .find(|(key, ..)| *key == usage)
-            .map(|&(_, reason, negotiation)| (reason, negotiation))
+    /// Returns why a usage ended, and where it stood then, as long as it is
+    /// among the last ones to end.
+    fn ended(&self, usage: UsageKey) -> Option<Ended> {
+        self.ended.iter().rev().find(|ended| ended.usage == usage).copied()
     }
 }
 
@@ -674,25 +756,38 @@ impl<R: Random> Model<R> {
     /// request's body. A session description in it is the offer, and an
     /// INVITE without one gets an offer in its 2xx (section 13.2.1). The
     /// application's decision is due one decision timeout after `now`.
+    ///
+    /// An INVITE with a To tag is a re-INVITE, which
+    /// [`Model::receive_reinvite`] takes. One in the early dialog of an
+    /// INVITE this user agent has not answered yet comes before that answer,
+    /// and gets the 500 of RFC 3261 section 14.2.
     pub(crate) fn receive_invite<B>(
         &mut self,
         request: &Request<B>,
         body: Result<Body, Malformed>,
         now: Instant,
     ) -> Result<Authority, Refusal> {
-        match self.classify(request)? {
-            Incoming::Initial => {}
-            Incoming::NoDialog => return Err(Refusal::NoDialog),
+        let dialog = match self.classify(request)? {
+            Incoming::Initial => None,
+            Incoming::NoDialog => {
+                let id = request_dialog(request)?.expect("tagged");
+                if self.early_index.contains_key(&id) {
+                    return Err(Refusal::Overlapping(self.retry_after()));
+                }
+                return Err(Refusal::NoDialog);
+            }
             // A dialog this user agent sent a BYE in is Mortal, and a
             // re-INVITE in it gets a 481 (RFC 5407 section 3.2.2).
             Incoming::InDialog(dialog) if self.is_mortal(dialog) => {
                 return Err(Refusal::NoDialog);
             }
-            // TODO: Take re-INVITEs into their usage's exchange.
-            Incoming::InDialog(_) => return Err(Refusal::Unsupported),
-        }
+            Incoming::InDialog(dialog) => Some(dialog),
+        };
         if protocol::is_sips(request.uri().as_str()) {
             return Err(Refusal::SipsRequestUri);
+        }
+        if let Some(dialog) = dialog {
+            return self.receive_reinvite(dialog, request, body, now);
         }
 
         let headers = request.headers();
@@ -726,15 +821,14 @@ impl<R: Random> Model<R> {
         };
         let dialog = Dialog::uas(request, local_tag, self.limits.routes)?;
         let early = dialog.id().clone();
-        // A time too far off to add to the clock sets no deadline, rather
-        // than overflow.
-        let decision_due = now.checked_add(self.limits.decision_timeout);
-        let expires_due = expires.and_then(|seconds| {
-            now.checked_add(Duration::from_secs(seconds.into()))
-        });
+        let (decision_due, expires_due) = self.decision_times(expires, now);
+        let cseq = merge.cseq;
         let exchange = InviteExchange::incoming(
-            dialog,
-            merge.clone(),
+            Received::Initial {
+                dialog: Some(Box::new(dialog)),
+                merge: merge.clone(),
+            },
+            cseq,
             offer,
             decision_due,
             expires_due,
@@ -749,13 +843,232 @@ impl<R: Random> Model<R> {
         };
         self.merge_index.insert(merge, exchange);
         self.early_index.insert(early, exchange);
+        self.set_decision_timers(exchange, decision_due, expires_due);
+        Ok(Authority { exchange })
+    }
+
+    /// Takes in a re-INVITE in a live dialog of this user agent's
+    /// ([RFC 3261 section 14.2]).
+    ///
+    /// The checks of section 8.2 come first: Require, then the body. Then
+    /// the CSeq, as for any request in a dialog (section 12.2.2), and then
+    /// whether another INVITE of the dialog is still open:
+    ///
+    /// * One this user agent sent and has no final response for gets the
+    ///   re-INVITE a 491 (section 14.2). So does the early dialog of an
+    ///   initial INVITE this user agent sent, whose transaction is still
+    ///   open.
+    /// * One this user agent received and has not answered gets it a 500
+    ///   with a random Retry-After of 0 to 10 seconds (section 14.2).
+    /// * An offer of this user agent's that waits for its answer, as in the
+    ///   2xx of an INVITE without one before its ACK, gets it a 491, which
+    ///   [RFC 5407 section 3.1.5] recommends. A 2xx that only waits for its
+    ///   ACK holds nothing up, as section 3.1.4 recommends.
+    /// * A session this user agent is ending gets it a 491 too, by my policy,
+    ///   since a re-INVITE there would change nothing. The peer learns of the
+    ///   BYE before it would try again.
+    ///
+    /// Nothing in the dialog changes until the re-INVITE is taken, since
+    /// section 12.2 has a request that is refused change no state. Taken,
+    /// it records its CSeq. The new remote target in its Contact waits for
+    /// the 2xx, as [RFC 6141 section 4.6] has a UAS replace the target only
+    /// when it answers with a 2xx or a reliable provisional response, never
+    /// with an error. A Contact that cannot be a target is refused with a 400
+    /// up front.
+    ///
+    /// [RFC 3261 section 14.2]: https://www.rfc-editor.org/rfc/rfc3261.html#section-14.2
+    /// [RFC 5407 section 3.1.5]: https://www.rfc-editor.org/rfc/rfc5407.html#section-3.1.5
+    /// [RFC 6141 section 4.6]: https://www.rfc-editor.org/rfc/rfc6141.html#section-4.6
+    fn receive_reinvite<B>(
+        &mut self,
+        dialog: DialogKey,
+        request: &Request<B>,
+        body: Result<Body, Malformed>,
+        now: Instant,
+    ) -> Result<Authority, Refusal> {
+        let headers = request.headers();
+        if protocol::requires_extension(headers)? {
+            return Err(Refusal::BadExtension);
+        }
+        let offer = match body? {
+            Body::Session(offer) => Some(offer),
+            Body::Empty | Body::Other => None,
+            Body::Unsupported => return Err(Refusal::UnsupportedBody),
+        };
+        let (cseq, _) = protocol::cseq(headers)?;
+        let record = self.dialogs.get(dialog).expect("indexed");
+        record.check_remote(cseq).map_err(out_of_order)?;
+        let id = record.id().clone();
+        let usage_key = self.usage_of(dialog).ok_or(Refusal::NoDialog)?;
+        self.supersede(usage_key, cseq);
+
+        let usage = self.usages.get(usage_key).expect("found");
+        if let Some(open) = usage.exchange {
+            let received = self.exchanges.get(open).is_some_and(|open| {
+                matches!(open.scope, Scope::Incoming { .. })
+            });
+            return Err(if received {
+                Refusal::Overlapping(self.retry_after())
+            } else {
+                Refusal::RequestPending
+            });
+        }
+        // A re-INVITE of this user agent's that waits to go again after a
+        // 491 holds nothing up. The peer's own second try comes first when
+        // this user agent owns the Call-ID, and has to get through, or the
+        // two would collide again (RFC 3261 section 14.1).
+        if usage.phase() != UsagePhase::Established
+            || usage.negotiation != Negotiation::Stable
+        {
+            return Err(Refusal::RequestPending);
+        }
+        let contact = protocol::contact(headers)?;
+        if contact.is_some_and(|contact| RemoteTarget::new(contact).is_err()) {
+            return Err(Refusal::Malformed(Field::Contact));
+        }
+        let expires = protocol::expires(headers)?;
+
+        if self.reinvites >= self.limits.reinvites {
+            return Err(Refusal::Busy);
+        }
+        let (decision_due, expires_due) = self.decision_times(expires, now);
+        let exchange = InviteExchange::incoming(
+            Received::Reinvite {
+                usage: usage_key,
+                dialog: id,
+                contact: contact.map(Into::into),
+            },
+            cseq,
+            offer,
+            decision_due,
+            expires_due,
+        );
+        let Ok(exchange) = self.exchanges.insert(exchange) else {
+            return Err(Refusal::Busy);
+        };
+
+        self.reinvites += 1;
+        self.dialogs
+            .get_mut(dialog)
+            .expect("indexed")
+            .remote_request(cseq)
+            .expect("checked above");
+        self.usages.get_mut(usage_key).expect("found").exchange =
+            Some(exchange);
+        self.set_decision_timers(exchange, decision_due, expires_due);
+        Ok(Authority { exchange })
+    }
+
+    /// Marks the 2xx responses of earlier re-INVITEs of a usage that still
+    /// wait for their ACK as superseded by the peer's re-INVITE numbered
+    /// `cseq`.
+    ///
+    /// RFC 6141 section 5.4 has a UAS that accepted a re-INVITE, which is a
+    /// target refresh, and never gets its ACK, keep the dialog if it
+    /// received a re-INVITE with a higher CSeq, rather than end it with the
+    /// BYE of RFC 3261 section 14.2. The peer lost its old contact, so it
+    /// never got the 2xx, and the newer re-INVITE carries its new one. The
+    /// section asks only that it was received, so a re-INVITE refused for
+    /// another reason, such as a 491, counts too, once its CSeq shows it is
+    /// newer. The 2xx of the initial INVITE is not marked, since RFC 5407
+    /// section 3.1.4 still ends a dialog whose first ACK never comes.
+    fn supersede(&mut self, usage: UsageKey, cseq: u32) {
+        let older: Vec<ReplayKey> = self
+            .replays
+            .iter()
+            .filter(|(_, replay)| {
+                replay.usage == Some(usage)
+                    && replay.ack == AckObligation::AwaitingPeer
+                    && replay.id.cseq < cseq
+                    && matches!(
+                        replay.source,
+                        Source::Exchange(exchange)
+                            if self.exchanges.get(exchange).is_some_and(
+                                |exchange| exchange.reinvite_usage().is_some(),
+                            )
+                    )
+            })
+            .map(|(replay, _)| replay)
+            .collect();
+
+        for replay in older {
+            self.replays.get_mut(replay).expect("listed").superseded = true;
+        }
+    }
+
+    /// Returns when the application's decision on an INVITE is due, and
+    /// when the INVITE expires, if its Expires says. A time too far off to
+    /// add to the clock sets no deadline, rather than overflow.
+    fn decision_times(
+        &self,
+        expires: Option<u32>,
+        now: Instant,
+    ) -> (Option<Instant>, Option<Instant>) {
+        let decision_due = now.checked_add(self.limits.decision_timeout);
+        let expires_due = expires.and_then(|seconds| {
+            now.checked_add(Duration::from_secs(seconds.into()))
+        });
+        (decision_due, expires_due)
+    }
+
+    fn set_decision_timers(
+        &mut self,
+        exchange: ExchangeKey,
+        decision_due: Option<Instant>,
+        expires_due: Option<Instant>,
+    ) {
         if let Some(due) = decision_due {
             self.timers.set(due, Timer::Decision(exchange));
         }
         if let Some(due) = expires_due {
             self.timers.set(due, Timer::Expires(exchange));
         }
-        Ok(Authority { exchange })
+    }
+
+    /// Picks the Retry-After of a 500 that refuses an overlapping INVITE,
+    /// at random from 0 to 10 seconds, as RFC 3261 section 14.2 asks. A
+    /// source of randomness that fails gives the middle of the range.
+    fn retry_after(&mut self) -> u8 {
+        self.random.next_u64().map_or(5, |random| (random % 11) as u8)
+    }
+
+    /// Returns the usage that holds a live dialog.
+    fn usage_of(&self, dialog: DialogKey) -> Option<UsageKey> {
+        self.usages.iter().find_map(|(usage, record)| {
+            (record.dialog == dialog).then_some(usage)
+        })
+    }
+
+    /// Returns the session a re-INVITE this user agent received is for, or
+    /// `None` for an initial INVITE.
+    pub(crate) fn reinvite_session(
+        &self,
+        exchange: ExchangeKey,
+    ) -> Option<UsageKey> {
+        match &self.exchanges.get(exchange)?.scope {
+            Scope::Incoming {
+                kind: Received::Reinvite { usage, .. }, ..
+            } => Some(*usage),
+            _ => None,
+        }
+    }
+
+    /// Returns the To tag every response of an incoming exchange carries,
+    /// while its dialog is known. That is the tag chosen for an initial
+    /// INVITE until its 2xx forms the dialog, or the local tag of a
+    /// re-INVITE's dialog.
+    fn response_tag(exchange: &InviteExchange) -> Option<Tag> {
+        match &exchange.scope {
+            Scope::Incoming {
+                kind: Received::Initial { dialog: Some(dialog), .. },
+                ..
+            } => Some(dialog.id().local_tag().clone()),
+            Scope::Incoming {
+                kind: Received::Reinvite { dialog, .. },
+                ..
+            } => Some(dialog.local_tag().clone()),
+            _ => None,
+        }
     }
 
     /// Sends the final response of an exchange that has none yet.
@@ -781,16 +1094,21 @@ impl<R: Random> Model<R> {
             }
             return;
         }
-        let Scope::Incoming { dialog: Some(dialog), .. } = &exchange.scope
-        else {
-            unreachable!("a pending incoming exchange keeps its dialog");
-        };
-        let to_tag = dialog.id().local_tag().clone();
+        let to_tag = Model::<R>::response_tag(exchange)
+            .expect("a pending incoming exchange knows its dialog");
+        let reinvite = exchange.reinvite_usage().is_some();
 
         // The dialog, the usage and the replay context of a 2xx are set
-        // aside before it goes out, so it never goes out without them.
-        // `final_committed` uses them, and `final_refused` gives them back.
-        if status.is_success() && !self.reserve_session() {
+        // aside before it goes out, so it never goes out without them. A
+        // re-INVITE's 2xx needs the replay context only. `final_committed`
+        // uses them, and `final_refused` gives them back.
+        let reserved = !status.is_success()
+            || if reinvite {
+                self.reserve_replay()
+            } else {
+                self.reserve_session()
+            };
+        if !reserved {
             if let Some(operation) = operation {
                 self.complete(operation, Err(Error::CapacityExceeded));
             }
@@ -896,10 +1214,8 @@ impl<R: Random> Model<R> {
             self.complete(operation, Err(Error::AlreadyFinalized));
             return;
         }
-        let Scope::Incoming { dialog: Some(dialog), offer, .. } =
-            &exchange.scope
-        else {
-            unreachable!("a pending incoming exchange keeps its dialog");
+        let Scope::Incoming { offer, .. } = &exchange.scope else {
+            unreachable!("only incoming exchanges send responses");
         };
         // A 100 is the core's to send (RFC 3261 section 17.2.1).
         if !(101..=199).contains(&status.as_u16())
@@ -909,7 +1225,8 @@ impl<R: Random> Model<R> {
             return;
         }
 
-        let to_tag = dialog.id().local_tag().clone();
+        let to_tag = Model::<R>::response_tag(exchange)
+            .expect("a pending incoming exchange knows its dialog");
         self.effects.push(Effect::SubmitProvisional {
             exchange: key,
             status,
@@ -975,11 +1292,11 @@ impl<R: Random> Model<R> {
         if exchange.state() != ExchangeState::Pending {
             return;
         }
-        let Scope::Incoming {
-            dialog: Some(dialog),
-            provisional: Some(provisional),
-            ..
-        } = &mut exchange.scope
+        let Some(to_tag) = Model::<R>::response_tag(exchange) else {
+            return;
+        };
+        let Scope::Incoming { provisional: Some(provisional), .. } =
+            &mut exchange.scope
         else {
             return;
         };
@@ -990,7 +1307,7 @@ impl<R: Random> Model<R> {
         self.effects.push(Effect::SubmitProvisional {
             exchange: key,
             status: provisional.status,
-            to_tag: dialog.id().local_tag().clone(),
+            to_tag,
             preview: provisional.preview.clone(),
             operation: None,
         });
@@ -1020,22 +1337,45 @@ impl<R: Random> Model<R> {
     }
 
     /// Removes an incoming exchange with its timers and its place in the
-    /// merge index, and has the runtime let go of its responder.
+    /// merge index, and has the runtime let go of its responder. A
+    /// re-INVITE's usage lets go of it too, if it has not yet.
     fn drop_exchange(&mut self, key: ExchangeKey) {
         self.stop_exchange_timers(key);
         let Some(exchange) = self.exchanges.remove(key) else {
             return;
         };
 
-        if let Scope::Incoming { merge, dialog, .. } = &exchange.scope {
-            if self.merge_index.get(merge) == Some(&key) {
-                self.merge_index.remove(merge);
+        match &exchange.scope {
+            Scope::Incoming {
+                kind: Received::Initial { merge, dialog },
+                ..
+            } => {
+                if self.merge_index.get(merge) == Some(&key) {
+                    self.merge_index.remove(merge);
+                }
+                if let Some(dialog) = dialog {
+                    self.forget_early(dialog.id(), key);
+                }
             }
-            if let Some(dialog) = dialog {
-                self.forget_early(dialog.id(), key);
+            Scope::Incoming {
+                kind: Received::Reinvite { usage, .. }, ..
+            } => {
+                self.reinvites -= 1;
+                self.let_go(*usage, key);
             }
+            Scope::Outgoing | Scope::Reinvite(_) => {}
         }
         self.effects.push(Effect::Released(Released::Exchange(key)));
+    }
+
+    /// Has a usage let go of the INVITE exchange it held open, once that
+    /// exchange has its final response.
+    fn let_go(&mut self, usage: UsageKey, exchange: ExchangeKey) {
+        if let Some(usage) = self.usages.get_mut(usage)
+            && usage.exchange == Some(exchange)
+        {
+            usage.exchange = None;
+        }
     }
 
     /// Takes an incoming exchange's early dialog out of the index, once a
@@ -1072,50 +1412,27 @@ impl<R: Random> Model<R> {
         }
 
         let cseq = exchange.cseq;
-        let Scope::Incoming { dialog, offer, withdrawn, .. } =
-            &mut exchange.scope
-        else {
-            unreachable!("only incoming exchanges submit finals");
+        let usage = match &mut exchange.scope {
+            Scope::Incoming {
+                kind: Received::Reinvite { usage, .. }, ..
+            } => Some(*usage),
+            _ => None,
         };
-        let (offer, withdrawn) = (offer.take(), withdrawn.as_deref().copied());
-        let offer_in_request = offer.is_some();
-        let mut dialog = *dialog.take().expect("a 2xx forms the dialog once");
-        // From here on the dialog is in the dialog table, which finds the
-        // requests the caller sends in it.
-        self.forget_early(dialog.id(), key);
-
-        // The 2xx carries the answer to the INVITE's offer, or an offer of
-        // its own whose answer comes in the ACK (RFC 3261 section 13.2.1).
-        let mut negotiation = Negotiation::Stable;
-        if offer_in_request {
-            negotiation.offer_received(cseq).expect("stable");
-            negotiation.answer_sent(cseq).expect("the offer is outstanding");
-        } else {
-            negotiation.offer_sent(cseq).expect("stable");
-        }
-
-        dialog.confirm().expect("a pending dialog has not ended");
-        let replay_dialog = dialog.id().clone();
-        let replay = ReplayId {
-            dialog: replay_dialog.clone(),
-            cseq,
-            direction: Direction::Incoming,
+        let usage = match usage {
+            Some(usage) => self.commit_reinvite(key, usage, cseq),
+            None => self.commit_initial(key, cseq),
         };
-        let (replay, usage) = self.establish(
-            dialog,
-            Direction::Incoming,
-            negotiation,
-            replay,
-            Source::Exchange(key),
-        );
-        self.usages.get_mut(usage).expect("just made").remote = offer;
-        if offer_in_request {
-            self.effects
-                .push(Effect::Notify(Event::NegotiationCompleted { usage }));
-        }
+        let replay_dialog =
+            self.replays.iter().find_map(|(replay, context)| {
+                (context.source == Source::Exchange(key))
+                    .then(|| (replay, context.id.dialog.clone()))
+            });
+        let (replay, replay_dialog) =
+            replay_dialog.expect("a committed 2xx has its replay context");
 
         // RFC 3261 section 13.3.1.4 has the 2xx go out again T1 later, and
-        // gives up on its ACK 64 T1 after the first.
+        // gives up on its ACK 64 T1 after the first. Section 14.2 asks the
+        // same of the 2xx of a re-INVITE.
         let (t1, deadline) = (self.limits.t1, now + self.limits.t1 * 64);
         let next = (now + t1 < deadline).then_some(now + t1);
         self.replays.get_mut(replay).expect("just made").retransmission =
@@ -1137,6 +1454,56 @@ impl<R: Random> Model<R> {
         if let Some(answer) = early_ack {
             self.receive_ack(&replay_dialog, cseq, answer);
         }
+    }
+
+    /// Forms the dialog and the usage of an initial INVITE whose 2xx the
+    /// core took, with the replay context of that 2xx, and returns the
+    /// usage.
+    fn commit_initial(&mut self, key: ExchangeKey, cseq: u32) -> UsageKey {
+        let exchange = self.exchanges.get_mut(key).expect("checked");
+        let Scope::Incoming {
+            kind: Received::Initial { dialog, .. },
+            offer,
+            withdrawn,
+            ..
+        } = &mut exchange.scope
+        else {
+            unreachable!("only incoming exchanges submit finals");
+        };
+        let (offer, withdrawn) = (offer.take(), withdrawn.as_deref().copied());
+        let offer_in_request = offer.is_some();
+        let mut dialog = *dialog.take().expect("a 2xx forms the dialog once");
+        // From here on the dialog is in the dialog table, which finds the
+        // requests the caller sends in it.
+        self.forget_early(dialog.id(), key);
+
+        // The 2xx carries the answer to the INVITE's offer, or an offer of
+        // its own whose answer comes in the ACK (RFC 3261 section 13.2.1).
+        let mut negotiation = Negotiation::Stable;
+        if offer_in_request {
+            negotiation.offer_received(cseq).expect("stable");
+            negotiation.answer_sent(cseq).expect("the offer is outstanding");
+        } else {
+            negotiation.offer_sent(cseq).expect("stable");
+        }
+
+        dialog.confirm().expect("a pending dialog has not ended");
+        let replay = ReplayId {
+            dialog: dialog.id().clone(),
+            cseq,
+            direction: Direction::Incoming,
+        };
+        let (_, usage) = self.establish(
+            dialog,
+            Direction::Incoming,
+            negotiation,
+            replay,
+            Source::Exchange(key),
+        );
+        self.usages.get_mut(usage).expect("just made").remote = offer;
+        if offer_in_request {
+            self.negotiated(usage);
+        }
 
         // The caller sent a BYE in the early dialog while the 2xx was on its
         // way, and the UA answered it with a 200. The 2xx confirmed the
@@ -1146,6 +1513,90 @@ impl<R: Random> Model<R> {
         // already sent (section 9.2).
         if let Some(Withdrawal::Bye { flow }) = withdrawn {
             self.end_usage(usage, EndReason::RemoteBye { flow });
+        }
+        usage
+    }
+
+    /// Takes in the 2xx of a re-INVITE that the core took, with the replay
+    /// context set aside for it, and returns the usage.
+    ///
+    /// The 2xx commits the new remote target of the re-INVITE's Contact
+    /// ([RFC 6141 section 4.6]), and its offer/answer exchange. With an
+    /// offer in the re-INVITE, the 2xx carried the answer, so the session
+    /// takes its next revision now. Without one, the 2xx carried an offer,
+    /// and the revision waits for the answer in the ACK (RFC 3261 section
+    /// 13.2.1). The target does not wait for it, and stays when the exchange
+    /// fails, since the two are not one atomic change (RFC 6141 section
+    /// 4.3).
+    ///
+    /// The session may have ended while the 2xx was on its way, by a BYE in
+    /// either direction. The 2xx then changes nothing, but still goes out
+    /// again until its ACK (RFC 3261 section 13.3.1.4), which needs its
+    /// replay context.
+    ///
+    /// [RFC 6141 section 4.6]: https://www.rfc-editor.org/rfc/rfc6141.html#section-4.6
+    fn commit_reinvite(
+        &mut self,
+        key: ExchangeKey,
+        usage: UsageKey,
+        cseq: u32,
+    ) -> UsageKey {
+        let exchange = self.exchanges.get_mut(key).expect("checked");
+        let Scope::Incoming {
+            kind: Received::Reinvite { dialog: id, contact, .. },
+            offer,
+            ..
+        } = &mut exchange.scope
+        else {
+            unreachable!("checked by the caller");
+        };
+        let (offer, contact) = (offer.take(), contact.take());
+        let replay = ReplayId {
+            dialog: id.clone(),
+            cseq,
+            direction: Direction::Incoming,
+        };
+
+        let context =
+            ReplayContext::new(replay.clone(), Source::Exchange(key), usage);
+        let context = self.replays.insert_reserved(context);
+        self.replay_index.insert(replay, context);
+        self.let_go(usage, key);
+        let Some(record) = self.usages.get_mut(usage) else {
+            self.replays.get_mut(context).expect("just made").usage_ended();
+            return usage;
+        };
+
+        match offer {
+            Some(offer) => {
+                record.negotiation.offer_received(cseq).expect("stable");
+                record
+                    .negotiation
+                    .answer_sent(cseq)
+                    .expect("the offer is outstanding");
+                record.remote = Some(offer);
+                self.negotiated(usage);
+            }
+            None => {
+                record.negotiation.offer_sent(cseq).expect("stable");
+            }
+        }
+        let dialog = self.usages.get(usage).expect("checked").dialog;
+        if let (Some(contact), Some(dialog)) =
+            (contact, self.dialogs.get_mut(dialog))
+        {
+            dialog.refresh_to(&contact).expect("checked when it arrived");
+        }
+        usage
+    }
+
+    /// Completes the offer/answer exchange of a usage. The session takes its
+    /// next revision, and the application hears of it.
+    fn negotiated(&mut self, usage: UsageKey) {
+        if let Some(record) = self.usages.get_mut(usage) {
+            record.revision = record.revision.wrapping_add(1);
+            self.effects
+                .push(Effect::Notify(Event::NegotiationCompleted { usage }));
         }
     }
 
@@ -1165,11 +1616,17 @@ impl<R: Random> Model<R> {
                     ExchangeState::FinalSubmissionPending { status, .. }
                         if status.is_success()
                 )
-                && matches!(
-                    &exchange.scope,
-                    Scope::Incoming { dialog: Some(pending), .. }
-                        if pending.id() == dialog
-                )
+                && match &exchange.scope {
+                    Scope::Incoming {
+                        kind: Received::Initial { dialog: Some(pending), .. },
+                        ..
+                    } => pending.id() == dialog,
+                    Scope::Incoming {
+                        kind: Received::Reinvite { dialog: pending, .. },
+                        ..
+                    } => pending == dialog,
+                    _ => false,
+                }
         });
 
         if let Some((_, exchange)) = in_flight {
@@ -1198,9 +1655,12 @@ impl<R: Random> Model<R> {
             return;
         };
 
+        let reinvite = exchange.reinvite_usage();
         if status.is_success() {
-            self.dialogs.release();
-            self.usages.release();
+            if reinvite.is_none() {
+                self.dialogs.release();
+                self.usages.release();
+            }
             self.replays.release();
         }
         if let Some(operation) = operation {
@@ -1230,13 +1690,18 @@ impl<R: Random> Model<R> {
             // signa-core sends its 500 for an unanswered one.
             self.drop_exchange(key);
         }
+        // A BYE that waited for the ACK of a re-INVITE's 2xx has none to
+        // wait for now.
+        if let Some(usage) = reinvite {
+            self.release_bye(usage);
+        }
     }
 
     /// Returns how the caller gave up an incoming INVITE, if it did.
     fn withdrawn(&self, key: ExchangeKey) -> Option<Withdrawal> {
         match &self.exchanges.get(key)?.scope {
             Scope::Incoming { withdrawn, .. } => withdrawn.as_deref().copied(),
-            Scope::Outgoing => None,
+            Scope::Outgoing | Scope::Reinvite(_) => None,
         }
     }
 
@@ -1250,15 +1715,17 @@ impl<R: Random> Model<R> {
     pub(crate) fn receive_cancel(&mut self, key: ExchangeKey) -> Option<Tag> {
         let exchange = self.exchanges.get(key)?;
         let tag = match &exchange.scope {
-            Scope::Incoming { dialog: Some(dialog), .. } => {
-                dialog.id().local_tag().clone()
-            }
-            // The 2xx went, and the dialog with it, so the tag is the
-            // dialog's. The CANCEL changes nothing then.
-            Scope::Incoming { dialog: None, .. } => {
+            // The 2xx of an initial INVITE went, and the dialog with it, so
+            // the tag is the dialog's. The CANCEL changes nothing then.
+            Scope::Incoming {
+                kind: Received::Initial { dialog: None, .. },
+                ..
+            } => {
                 return self.committed_tag(key);
             }
-            Scope::Outgoing => return None,
+            // A re-INVITE's CANCEL is taken as an initial INVITE's. One that
+            // gets its 487 leaves the session as it was (section 14.1).
+            _ => Model::<R>::response_tag(exchange)?,
         };
 
         self.withdraw(key, Withdrawal::Cancel);
@@ -1322,7 +1789,11 @@ impl<R: Random> Model<R> {
             return Err(Refusal::NoDialog);
         };
         let Some(InviteExchange {
-            scope: Scope::Incoming { dialog: Some(dialog), .. },
+            scope:
+                Scope::Incoming {
+                    kind: Received::Initial { dialog: Some(dialog), .. },
+                    ..
+                },
             ..
         }) = self.exchanges.get_mut(key)
         else {
@@ -1467,6 +1938,7 @@ impl<R: Random> Model<R> {
                             .answer_received(cseq)
                             .expect("checked to await it");
                         record.remote = Some(answer);
+                        record.revision = record.revision.wrapping_add(1);
                         self.effects.push(Effect::Notify(
                             Event::NegotiationCompleted { usage },
                         ));
@@ -1548,6 +2020,13 @@ impl<R: Random> Model<R> {
     /// without it if it cannot. A BYE the application asked for goes now, as
     /// its own. A late ACK finds nothing afterwards, so it brings back
     /// neither the usage nor the retransmissions.
+    ///
+    /// The 2xx of a re-INVITE that a newer re-INVITE of the peer's
+    /// superseded only stops, and the session goes on, as RFC 6141 section
+    /// 5.4 recommends. A BYE the application asked for goes now all the
+    /// same. That is not so when the 2xx carried an offer whose answer the
+    /// missing ACK owed. The exchange can then never complete, and no later
+    /// one can start, so the session ends as above.
     fn ack_overdue(&mut self, key: ReplayKey) {
         let Some(replay) = self.replays.get_mut(key) else {
             return;
@@ -1558,11 +2037,22 @@ impl<R: Random> Model<R> {
 
         replay.ack = AckObligation::Failed;
         replay.duplicates_ended();
-        let (usage, source) = (replay.usage, replay.source);
+        let (usage, source, cseq) =
+            (replay.usage, replay.source, replay.id.cseq);
+        let superseded = replay.superseded;
 
         self.stop_retransmission(key);
         if let Source::Exchange(exchange) = source {
             self.drop_exchange(exchange);
+        }
+        let moot = superseded
+            && usage
+                .and_then(|usage| self.usages.get(usage))
+                .is_some_and(|usage| !usage.negotiation.awaits_answer(cseq));
+        if let (true, Some(usage)) = (moot, usage) {
+            self.release_bye(usage);
+            self.reclaim_replay(key);
+            return;
         }
         if let Some((usage, bye)) =
             usage.and_then(|usage| Some((usage, self.usages.get(usage)?.bye)))
@@ -2324,6 +2814,7 @@ impl<R: Random> Model<R> {
                     Some(_) => {}
                     None => record.remote = Some(answer),
                 }
+                record.revision = record.revision.wrapping_add(1);
                 self.effects.push(Effect::Notify(
                     Event::NegotiationCompleted { usage },
                 ));
@@ -2449,6 +2940,7 @@ impl<R: Random> Model<R> {
 
         let (usage, source, cseq) =
             (context.usage, context.source, context.id.cseq);
+        let operation = context.operation.take();
         let answered = answer.is_some();
         context.ack_body = match answer {
             Some(answer) => AckBody::Answer(answer),
@@ -2456,25 +2948,32 @@ impl<R: Random> Model<R> {
         };
         let attempt = match source {
             Source::Attempt(attempt) => self.attempts.get_mut(attempt),
-            Source::Exchange(_) => None,
+            Source::Exchange(_) | Source::Reinvite(_) => None,
         };
         if let (false, Some(record)) = (answered, attempt) {
             record.degraded = true;
         }
 
-        if let Some(usage) =
-            usage.filter(|&usage| self.usages.get(usage).is_some())
-        {
+        let alive = usage.filter(|&usage| self.usages.get(usage).is_some());
+        if let Some(usage) = alive {
             if answered {
                 let record = self.usages.get_mut(usage).expect("checked");
                 if record.negotiation.answer_sent(cseq).is_ok() {
-                    self.effects.push(Effect::Notify(
-                        Event::NegotiationCompleted { usage },
-                    ));
+                    self.negotiated(usage);
                 }
             } else {
                 self.fail_negotiation(usage);
             }
+        }
+        // The operation of a re-INVITE without an offer ends with its
+        // answer, or with its session, if that ended first.
+        if let Some(operation) = operation {
+            let outcome = match (alive, answered) {
+                (None, _) => Err(Error::SessionEnded),
+                (Some(_), true) => Ok(Completion::Done),
+                (Some(_), false) => Err(Error::NegotiationFailure),
+            };
+            self.complete(operation, outcome);
         }
         self.effects.push(Effect::SendAck { replay: key });
     }
@@ -2577,6 +3076,634 @@ impl<R: Random> Model<R> {
     }
 }
 
+/// Re-INVITEs this user agent sends.
+impl<R: Random> Model<R> {
+    /// Sends a re-INVITE in the dialog of a session, with `offer`, or
+    /// without one for a late offer, for `operation` if the application
+    /// asked. `retried` marks the second try after a 491, which gets no
+    /// third.
+    ///
+    /// RFC 3261 section 14.1 starts no INVITE in a dialog while another
+    /// INVITE transaction of the dialog is in progress in either direction:
+    /// one this user agent sent without its final response, or one it
+    /// received that is not confirmed, as a 2xx that waits for its ACK. RFC
+    /// 3264 section 4 starts no offer while one is outstanding, and the UA
+    /// starts no re-INVITE without an offer then either. A re-INVITE also
+    /// waits for one that got a 491 and waits to go again. In each case it
+    /// is refused, with nothing sent.
+    ///
+    /// The request is built from the dialog (section 12.2.1.1), with the
+    /// next CSeq number, which it keeps whatever happens to it. The replay
+    /// context of its 2xx is set aside now, so that a 2xx is never left
+    /// without its ACK for want of room. The session itself does not change
+    /// until a 2xx comes.
+    fn reinvite(
+        &mut self,
+        operation: Option<OperationId>,
+        key: UsageKey,
+        offer: Option<Description>,
+        retried: bool,
+    ) -> Result<(), Error> {
+        let Some(usage) = self.usages.get(key) else {
+            return Err(if self.ended(key).is_some() {
+                Error::InvalidTransition
+            } else {
+                Error::StaleDecision
+            });
+        };
+        let unconfirmed = self.replays.iter().any(|(_, replay)| {
+            replay.usage == Some(key)
+                && (replay.ack == AckObligation::AwaitingPeer
+                    || replay.ack_body == AckBody::Preparing)
+        });
+        if usage.phase() != UsagePhase::Established
+            || usage.bye != ByeIntent::None
+            || usage.exchange.is_some()
+            || usage.retry.is_some()
+            || usage.negotiation != Negotiation::Stable
+            || unconfirmed
+        {
+            return Err(Error::InvalidTransition);
+        }
+        let dialog = usage.dialog;
+        if self.reinvites >= self.limits.reinvites || !self.reserve_replay() {
+            return Err(Error::CapacityExceeded);
+        }
+
+        // A UAS that sent nothing in the dialog yet picks its first number
+        // from this.
+        let built =
+            self.random.next_u64().ok_or(Error::Internal).and_then(|seed| {
+                let record = self.dialogs.get_mut(dialog).expect("live");
+                let outgoing = record
+                    .request(Method::INVITE, Sequence::Next { seed })
+                    .map_err(|error| match error {
+                        // Out of numbers, the dialog takes no new request.
+                        RequestError::CSeqExhausted => {
+                            Error::InvalidTransition
+                        }
+                        RequestError::Terminated => Error::StaleDecision,
+                        RequestError::WrongSequence
+                        | RequestError::Cancel
+                        | RequestError::Invalid => Error::Internal,
+                    })?;
+                let cseq = record.local_cseq().expect("just numbered");
+                Ok((outgoing, cseq, record.id().clone()))
+            });
+        let (outgoing, cseq, id) = match built {
+            Ok(built) => built,
+            Err(error) => {
+                self.replays.release();
+                return Err(error);
+            }
+        };
+        let sent = SentReinvite {
+            usage: key,
+            dialog: id,
+            operation,
+            offer,
+            request: Some(Box::new(outgoing)),
+            retried,
+            reserved: true,
+            incomplete: false,
+            kept: None,
+        };
+        let has_offer = sent.offer.is_some();
+        let Ok(exchange) =
+            self.exchanges.insert(InviteExchange::reinvite(cseq, sent))
+        else {
+            self.replays.release();
+            return Err(Error::CapacityExceeded);
+        };
+
+        self.reinvites += 1;
+        let usage = self.usages.get_mut(key).expect("checked above");
+        usage.exchange = Some(exchange);
+        if has_offer {
+            usage.negotiation.offer_sent(cseq).expect("checked stable");
+        }
+        self.effects.push(Effect::StartReinvite { exchange });
+        Ok(())
+    }
+
+    /// Hands the runtime a re-INVITE to send, with where it goes and the
+    /// offer it carries, if any.
+    pub(crate) fn take_reinvite(
+        &mut self,
+        exchange: ExchangeKey,
+    ) -> Option<(Outgoing, Option<Description>)> {
+        let Scope::Reinvite(sent) =
+            &mut self.exchanges.get_mut(exchange)?.scope
+        else {
+            return None;
+        };
+        let request = sent.request.take()?;
+        Some((*request, sent.offer.clone()))
+    }
+
+    /// Records whether the core took a re-INVITE. One it did not take never
+    /// started its transaction, and fails as a re-INVITE that got no 2xx,
+    /// which leaves the session as it was (RFC 3261 section 14.1).
+    pub(crate) fn reinvite_started(
+        &mut self,
+        key: ExchangeKey,
+        result: Result<(), Error>,
+        now: Instant,
+    ) {
+        let Some(InviteExchange { scope: Scope::Reinvite(sent), .. }) =
+            self.exchanges.get(key)
+        else {
+            return;
+        };
+
+        match result {
+            Ok(()) => {
+                if let Some(operation) = sent.operation {
+                    self.operations.advance(operation, Stage::Committed);
+                }
+            }
+            Err(error) => {
+                self.reinvite_failed(key, error, now);
+                self.drop_reinvite(key);
+            }
+        }
+    }
+
+    /// Takes in a response to a re-INVITE this user agent sent.
+    ///
+    /// A provisional response changes nothing. It is unreliable, so it
+    /// commits neither a new remote target ([RFC 6141 section 4.7] says it
+    /// MUST NOT) nor a session description, and the 2xx has to carry the
+    /// answer all the same (RFC 6337 section 3.1.1). A final response other
+    /// than a 2xx fails the re-INVITE, see [`Model::reinvite_failed`].
+    ///
+    /// A 2xx must carry the dialog's identity. One with another To tag comes
+    /// from another UA. It is not a fork, since a re-INVITE forms no dialog,
+    /// and it is dropped without an ACK, which could only be built from a
+    /// dialog. A copy of a 2xx gets the ACK again, as for the initial INVITE
+    /// (section 14.1 makes the rules of the ACK the same).
+    ///
+    /// The first 2xx commits, apart from each other:
+    ///
+    /// * the remote target of its Contact, at once ([RFC 6141 section 4.7]),
+    /// * the offer/answer exchange, at once with the answer to this user
+    ///   agent's offer, or, for a late offer, once the answer to the 2xx's
+    ///   offer is prepared for the ACK.
+    ///
+    /// The operation succeeds with the exchange. A 2xx without the answer or
+    /// offer it owes fails it with [`Error::NegotiationFailure`], and the
+    /// session ends with a BYE after the ACK, the policy of an initial
+    /// INVITE. A 2xx that comes after the session ended still gets its ACK,
+    /// which completes the INVITE transaction ([RFC 5407 section 3.2.3]).
+    ///
+    /// [RFC 6141 section 4.7]: https://www.rfc-editor.org/rfc/rfc6141.html#section-4.7
+    /// [RFC 5407 section 3.2.3]: https://www.rfc-editor.org/rfc/rfc5407.html#section-3.2.3
+    pub(crate) fn receive_reinvite_response<B>(
+        &mut self,
+        key: ExchangeKey,
+        response: &Response<B>,
+        description: Option<Description>,
+        now: Instant,
+    ) {
+        let Some(exchange) = self.exchanges.get_mut(key) else {
+            return;
+        };
+        let (pending, cseq) =
+            (exchange.state() == ExchangeState::Pending, exchange.cseq);
+        let Scope::Reinvite(sent) = &mut exchange.scope else {
+            return;
+        };
+        let status = response.status();
+        if !status.is_final() {
+            return;
+        }
+        // A response without the dialog's identity is not the peer's,
+        // whatever the core matched it to. A 481 or a 408 ends the session,
+        // so that matters for an error response as well.
+        if !sent.dialog.answered_by(cseq, response, status.is_success()) {
+            sent.incomplete = true;
+            return;
+        }
+        if !status.is_success() {
+            if pending {
+                self.reinvite_failed(key, Error::RemoteFailure(status), now);
+            }
+            return;
+        }
+
+        let replay = ReplayId {
+            dialog: sent.dialog.clone(),
+            cseq,
+            direction: Direction::Outgoing,
+        };
+        if let Some(&context) = self.replay_index.get(&replay) {
+            let context_record = self.replays.get(context).expect("indexed");
+            if context_record.ack_body != AckBody::Preparing {
+                self.effects.push(Effect::ResendAck { replay: context });
+            }
+            return;
+        }
+        // A 2xx after a failure of the transaction finds no room set aside.
+        // It cannot come in signa-core, which delivers no response after the
+        // failure it reports.
+        if !std::mem::take(&mut sent.reserved) {
+            return;
+        }
+        let (usage, kept, late) =
+            (sent.usage, sent.kept.take(), sent.offer.is_none());
+        let operation = sent.operation.take();
+        exchange.final_received();
+
+        let alive = self.usages.get(usage).is_some();
+        let mut context =
+            ReplayContext::new(replay.clone(), Source::Reinvite(key), usage);
+        if !alive {
+            context.usage_ended();
+            context.dialog = kept;
+        }
+        let context = self.replays.insert_reserved(context);
+        self.replay_index.insert(replay, context);
+        self.let_go(usage, key);
+        if let Some(operation) = operation {
+            self.operations.advance(operation, Stage::Answered);
+        }
+
+        if !alive {
+            // The session ended before the 2xx, and the operation with it.
+            // The ACK still goes where the 2xx says, since a 2xx to a target
+            // refresh replaces the remote target (RFC 6141 section 4.7), and
+            // the ACK is built from the dialog after it (RFC 3261 section
+            // 13.2.2.4). The dialog that builds it is the one the re-INVITE
+            // kept, or the Mortal one in the table.
+            let headers = response.headers();
+            let replay_dialog =
+                self.replays.get_mut(context).expect("just made");
+            // A Contact that is not a SIP URI leaves the target as it was.
+            let _ = match replay_dialog.dialog.as_deref_mut() {
+                Some(dialog) => dialog.refresh_target(headers),
+                None => match self
+                    .dialog_index
+                    .get(&replay_dialog.id.dialog)
+                    .and_then(|&dialog| self.dialogs.get_mut(dialog))
+                {
+                    Some(dialog) => dialog.refresh_target(headers),
+                    None => Ok(()),
+                },
+            };
+            // An offer in the 2xx still owes its answer in the ACK, one that
+            // rejects it, as for a fork the UA does not keep.
+            match description.filter(|_| late) {
+                Some(offer) => {
+                    let record =
+                        self.replays.get_mut(context).expect("just made");
+                    record.ack_body = AckBody::Preparing;
+                    self.effects.push(Effect::PrepareAnswer {
+                        replay: context,
+                        offer,
+                        usage: None,
+                    });
+                }
+                None => self.effects.push(Effect::SendAck { replay: context }),
+            }
+            return;
+        }
+
+        let dialog = self.usages.get(usage).expect("checked").dialog;
+        if let Some(dialog) = self.dialogs.get_mut(dialog) {
+            // A Contact that is not a SIP URI leaves the target as it was.
+            let _ = dialog.refresh_target(response.headers());
+        }
+        let record = self.usages.get_mut(usage).expect("checked");
+        match (record.negotiation, description) {
+            (Negotiation::LocalOfferOutstanding { .. }, Some(answer))
+                if record.negotiation.awaits_answer(cseq) =>
+            {
+                record
+                    .negotiation
+                    .answer_received(cseq)
+                    .expect("checked to await it");
+                record.remote = Some(answer);
+                self.negotiated(usage);
+                if let Some(operation) = operation {
+                    self.complete(operation, Ok(Completion::Done));
+                }
+                self.effects.push(Effect::SendAck { replay: context });
+            }
+            (Negotiation::Stable, Some(offer)) if late => {
+                record.negotiation.offer_received(cseq).expect("stable");
+                record.remote = Some(offer.clone());
+                // The operation completes with the answer.
+                let replay = self.replays.get_mut(context).expect("just made");
+                replay.operation = operation;
+                replay.ack_body = AckBody::Preparing;
+                self.effects.push(Effect::PrepareAnswer {
+                    replay: context,
+                    offer,
+                    usage: Some(usage),
+                });
+            }
+            _ => {
+                self.fail_negotiation(usage);
+                if let Some(operation) = operation {
+                    self.complete(operation, Err(Error::NegotiationFailure));
+                }
+                self.effects.push(Effect::SendAck { replay: context });
+            }
+        }
+    }
+
+    /// Takes in the failure of a re-INVITE's transaction, such as a timeout
+    /// with no response at all, while it has no final response.
+    pub(crate) fn reinvite_transaction_failed(
+        &mut self,
+        key: ExchangeKey,
+        error: Error,
+        now: Instant,
+    ) {
+        let pending = self.exchanges.get(key).is_some_and(|exchange| {
+            exchange.state() == ExchangeState::Pending
+        });
+
+        if pending {
+            self.reinvite_failed(key, error, now);
+        }
+    }
+
+    /// Records that the core dropped responses to a re-INVITE for want of
+    /// room. If its final response is among them, the re-INVITE ends
+    /// without one, see [`Model::reinvite_collection_finished`].
+    pub(crate) fn reinvite_responses_lost(&mut self, key: ExchangeKey) {
+        if let Some(InviteExchange { scope: Scope::Reinvite(sent), .. }) =
+            self.exchanges.get_mut(key)
+        {
+            sent.incomplete = true;
+        }
+    }
+
+    /// Records that the core finished collecting a re-INVITE's responses.
+    /// Copies of its 2xx can no longer arrive, so the replay context goes.
+    /// One that got no final response at all, as when the endpoint stopped
+    /// or dropped it, fails, and leaves the session as it was.
+    pub(crate) fn reinvite_collection_finished(
+        &mut self,
+        key: ExchangeKey,
+        now: Instant,
+    ) {
+        let Some(InviteExchange { scope: Scope::Reinvite(sent), .. }) =
+            self.exchanges.get(key)
+        else {
+            return;
+        };
+
+        let error = if sent.incomplete {
+            Error::ObservationIncomplete
+        } else {
+            Error::DriverStopped
+        };
+        self.reinvite_transaction_failed(key, error, now);
+        self.drop_reinvite(key);
+    }
+
+    /// Fails a re-INVITE that got a final response other than a 2xx, or
+    /// none, with `error`.
+    ///
+    /// RFC 3261 section 14.1 has the session stay as it was, as if the
+    /// re-INVITE had not been sent, so an offer it carried is withdrawn and
+    /// the dialog has none outstanding. The remote target stays too, since
+    /// only a 2xx or a reliable provisional response commits a new one (RFC
+    /// 6141 section 4.7). Some failures go further:
+    ///
+    /// * A 491 says that the peer has a request of its own pending, and the
+    ///   re-INVITE goes once more after a random wait, as section 14.1
+    ///   recommends, unless it is already that second try.
+    /// * A 481 says that the peer has no such dialog (RFC 5057 section 5.1).
+    ///   The session ends, without a BYE, which would only get another 481.
+    /// * A 408, or no response at all, ends the session with a BYE, as
+    ///   sections 12.2.1.2 and 14.1 have a UAC terminate the dialog then.
+    ///
+    /// Any other failure, such as a 488 or a 500, fails the re-INVITE alone
+    /// (RFC 5057 section 5.1).
+    fn reinvite_failed(
+        &mut self,
+        key: ExchangeKey,
+        error: Error,
+        now: Instant,
+    ) {
+        let Some(exchange) = self.exchanges.get_mut(key) else {
+            return;
+        };
+        exchange.final_received();
+        let cseq = exchange.cseq;
+        let Scope::Reinvite(sent) = &mut exchange.scope else {
+            return;
+        };
+        let (usage, operation, offer, retried) = (
+            sent.usage,
+            sent.operation.take(),
+            sent.offer.take(),
+            sent.retried,
+        );
+        if std::mem::take(&mut sent.reserved) {
+            self.replays.release();
+        }
+        self.let_go(usage, key);
+        let Some(record) = self.usages.get_mut(usage) else {
+            // The session ended first, which failed the operation then.
+            return;
+        };
+        if record.negotiation.awaits_answer(cseq) {
+            record.negotiation = Negotiation::Stable;
+        }
+        // A session that is ending takes no second try, so its operation
+        // need not wait for one.
+        let retry = !retried
+            && record.phase() == UsagePhase::Established
+            && record.bye == ByeIntent::None;
+
+        let complete = |model: &mut Model<R>| {
+            if let Some(operation) = operation {
+                model.complete(operation, Err(error));
+            }
+        };
+        match error {
+            Error::RemoteFailure(status)
+                if status.as_u16() == 491 && retry =>
+            {
+                self.schedule_retry(usage, operation, offer, now);
+            }
+            Error::RemoteFailure(status) if status.as_u16() == 481 => {
+                complete(self);
+                self.end_usage(usage, EndReason::ReinviteFailed(error));
+            }
+            Error::Timeout => self.end_failed_session(usage, error, complete),
+            Error::RemoteFailure(status) if status.as_u16() == 408 => {
+                self.end_failed_session(usage, error, complete);
+            }
+            _ => complete(self),
+        }
+    }
+
+    /// Ends the session of a re-INVITE that timed out with a BYE, unless one
+    /// is already asked for, and fails the operation.
+    fn end_failed_session(
+        &mut self,
+        usage: UsageKey,
+        error: Error,
+        complete: impl FnOnce(&mut Model<R>),
+    ) {
+        complete(self);
+        let bye = self.usages.get(usage).map(|usage| usage.bye);
+        if bye == Some(ByeIntent::None) {
+            let reason = EndReason::ReinviteFailed(error);
+            self.start_bye(usage, None, reason, false);
+        }
+    }
+
+    /// Has a re-INVITE that got a 491 go once more after a random wait
+    /// (RFC 3261 section 14.1). The operation waits for that second try.
+    fn schedule_retry(
+        &mut self,
+        usage: UsageKey,
+        operation: Option<OperationId>,
+        offer: Option<Description>,
+        now: Instant,
+    ) {
+        let Some(random) = self.random.next_u64() else {
+            if let Some(operation) = operation {
+                let glare = StatusCode::from_u16(491).expect("a status");
+                self.complete(operation, Err(Error::RemoteFailure(glare)));
+            }
+            return;
+        };
+        let record =
+            self.usages.get_mut(usage).expect("checked by the caller");
+
+        let owner = record.direction == Direction::Outgoing;
+        let due = now + retry_delay(owner, random);
+        let revision = record.revision;
+        record.retry =
+            Some(Box::new(Retry { operation, offer, due, revision }));
+        self.timers.set(due, Timer::Retry(usage));
+    }
+
+    /// Sends a re-INVITE that got a 491 once more, if its change is still
+    /// wanted, as RFC 3261 section 14.1 asks.
+    ///
+    /// The UA cannot know what the application wants now, so it goes by
+    /// what changed. An offer/answer exchange that completed since the 491,
+    /// such as the peer's re-INVITE that won the race, changed what the
+    /// offer was made against, and a session that is ending or busy with
+    /// another exchange takes none. The 491 then stands, and the operation
+    /// fails with it, for the application to decide again. That is my
+    /// policy.
+    fn retry_due(&mut self, key: UsageKey) {
+        let Some(usage) = self.usages.get_mut(key) else {
+            return;
+        };
+        let Some(retry) = usage.retry.take() else {
+            return;
+        };
+        let Retry { operation, offer, revision, .. } = *retry;
+        let glare = StatusCode::from_u16(491).expect("a status");
+        let glare = Error::RemoteFailure(glare);
+
+        let result = if usage.revision == revision {
+            self.reinvite(operation, key, offer, true)
+        } else {
+            Err(glare)
+        };
+        if let (Err(error), Some(operation)) = (result, operation) {
+            let error = match error {
+                Error::InvalidTransition => glare,
+                error => error,
+            };
+            self.complete(operation, Err(error));
+        }
+    }
+
+    /// Removes the record of a re-INVITE this user agent sent, once no more
+    /// responses can arrive for it, with the replay context of its 2xx.
+    fn drop_reinvite(&mut self, key: ExchangeKey) {
+        let Some(exchange) = self.exchanges.remove(key) else {
+            return;
+        };
+        self.reinvites -= 1;
+        if let Scope::Reinvite(sent) = exchange.scope {
+            if sent.reserved {
+                self.replays.release();
+            }
+            self.let_go(sent.usage, key);
+            debug_assert!(sent.operation.is_none(), "completed before");
+        }
+
+        let replays: Vec<ReplayKey> = self
+            .replays
+            .iter()
+            .filter(|(_, replay)| replay.source == Source::Reinvite(key))
+            .map(|(replay, _)| replay)
+            .collect();
+        for replay in replays {
+            self.replays.get_mut(replay).expect("listed").duplicates_ended();
+            self.reclaim_replay(replay);
+        }
+        self.effects.push(Effect::Released(Released::Exchange(key)));
+    }
+
+    /// Hands a dialog that leaves the dialog table to whatever still needs
+    /// it to build an ACK, or drops it.
+    ///
+    /// An ACK that waits for its answer is owed all the same, and is built
+    /// from the dialog once the answer is in, so the dialog goes to it, as
+    /// to a cleanup. Failing that, a re-INVITE of the dialog without its
+    /// final response may still get a 2xx, whose ACK the dialog builds (RFC
+    /// 5407 section 3.2.3).
+    fn hand_on(&mut self, dialog: Dialog) {
+        let waiting = self.replays.iter_mut().find(|(_, replay)| {
+            replay.id.dialog == *dialog.id()
+                && replay.ack_body == AckBody::Preparing
+                && replay.dialog.is_none()
+        });
+        let Some((_, replay)) = waiting else {
+            self.keep_for_reinvite(dialog);
+            return;
+        };
+
+        replay.dialog = Some(Box::new(dialog));
+    }
+
+    /// Hands a dialog to the re-INVITE it has without a final response, if
+    /// any, so that a 2xx that comes late can still be acknowledged.
+    fn keep_for_reinvite(&mut self, dialog: Dialog) {
+        let pending = self.exchanges.iter_mut().find_map(|(_, exchange)| {
+            let pending = exchange.state() == ExchangeState::Pending;
+            match &mut exchange.scope {
+                Scope::Reinvite(sent)
+                    if pending && sent.dialog == *dialog.id() =>
+                {
+                    Some(sent)
+                }
+                _ => None,
+            }
+        });
+
+        if let Some(sent) = pending {
+            sent.kept = Some(Box::new(dialog));
+        }
+    }
+}
+
+/// Returns how long a re-INVITE that got a 491 waits before it goes once
+/// more, from 64 random bits.
+///
+/// RFC 3261 section 14.1 picks it in units of 10 ms, from 2.1 to 4 seconds
+/// for the UA that owns the dialog's Call-ID, which made it as the caller,
+/// and from 0 to 2 seconds for the other. Their windows do not overlap, so
+/// the two retries cannot collide again.
+fn retry_delay(owner: bool, random: u64) -> Duration {
+    let steps = if owner { 210 + random % 191 } else { random % 201 };
+    Duration::from_millis(steps * 10)
+}
+
 /// Usages.
 impl<R: Random> Model<R> {
     /// Ends a usage, as when the peer's BYE is accepted or its early dialog
@@ -2605,23 +3732,43 @@ impl<R: Random> Model<R> {
             return;
         };
         usage.end();
+        let target_revision =
+            self.dialogs.get(usage.dialog).map_or(0, Dialog::target_revision);
 
         if mortal {
             if let Some(dialog) = self.dialogs.get_mut(usage.dialog) {
                 dialog.terminate();
             }
-        } else if let Some(mut dialog) = self.dialogs.remove(usage.dialog) {
+        } else if let Some(dialog) = self.dialogs.remove(usage.dialog) {
             self.dialog_index.remove(dialog.id());
-            // An ACK that waits for its answer is owed all the same, and is
-            // built from the dialog once the answer is in, so the dialog
-            // goes to it, as to a cleanup.
-            let waiting = self.replays.iter_mut().find(|(_, replay)| {
-                replay.usage == Some(key)
-                    && replay.ack_body == AckBody::Preparing
-            });
-            match waiting {
-                Some((_, replay)) => replay.dialog = Some(Box::new(dialog)),
-                None => dialog.terminate(),
+            self.hand_on(dialog);
+        }
+        // An INVITE exchange the usage held open ends with it. A re-INVITE
+        // the peer sent gets a 487, which RFC 3261 section 15.1.2
+        // recommends for a request a BYE leaves pending. One this user agent
+        // sent fails, though its transaction goes on, and a 2xx it gets
+        // still gets its ACK.
+        if let Some(exchange) = usage.exchange {
+            match self
+                .exchanges
+                .get_mut(exchange)
+                .map(|record| &mut record.scope)
+            {
+                Some(Scope::Incoming { .. }) => {
+                    self.withdraw(exchange, Withdrawal::Ended);
+                }
+                Some(Scope::Reinvite(sent)) => {
+                    if let Some(operation) = sent.operation.take() {
+                        self.complete(operation, Err(Error::SessionEnded));
+                    }
+                }
+                Some(Scope::Outgoing) | None => {}
+            }
+        }
+        if let Some(retry) = usage.retry {
+            self.timers.cancel(retry.due, Timer::Retry(key));
+            if let Some(operation) = retry.operation {
+                self.complete(operation, Err(Error::SessionEnded));
             }
         }
         // A BYE the application asked for, deferred until the ACK, is not
@@ -2646,7 +3793,13 @@ impl<R: Random> Model<R> {
         if self.ended.len() >= self.limits.usages {
             self.ended.pop_front();
         }
-        self.ended.push_back((key, reason, usage.negotiation));
+        self.ended.push_back(Ended {
+            usage: key,
+            reason,
+            negotiation: usage.negotiation,
+            session_revision: usage.revision,
+            target_revision,
+        });
         self.effects
             .push(Effect::Notify(Event::UsageEnded { usage: key, reason }));
     }
@@ -2689,13 +3842,7 @@ impl<R: Random> Model<R> {
         key: UsageKey,
         operation: Option<OperationId>,
     ) {
-        // A UAS keeps a usage only once its 2xx is committed, so only an ACK
-        // still awaited holds the BYE back.
-        let awaiting_ack = self.replays.iter().any(|(_, replay)| {
-            replay.usage == Some(key)
-                && (replay.ack == AckObligation::AwaitingPeer
-                    || replay.ack_body == AckBody::Preparing)
-        });
+        let awaiting_ack = self.awaits_ack(key);
         let Some(usage) = self.usages.get_mut(key) else {
             return;
         };
@@ -2707,6 +3854,50 @@ impl<R: Random> Model<R> {
         }
 
         self.start_bye(key, operation, EndReason::LocalBye, true);
+    }
+
+    /// Says whether an ACK holds back the BYE of a usage: the peer's ACK of
+    /// a 2xx this user agent sent, which RFC 3261 section 15 has a callee
+    /// wait for, or its own while the answer it carries is prepared.
+    ///
+    /// A UAS keeps a usage only once the 2xx of its initial INVITE is
+    /// committed. The 2xx of a re-INVITE that the core has not taken yet
+    /// counts too, since it may yet go out and wait for its ACK.
+    fn awaits_ack(&self, key: UsageKey) -> bool {
+        let pending_2xx = self
+            .usages
+            .get(key)
+            .and_then(|usage| self.exchanges.get(usage.exchange?))
+            .is_some_and(|exchange| {
+                matches!(
+                    exchange.state(),
+                    ExchangeState::FinalSubmissionPending { status, .. }
+                        if status.is_success()
+                )
+            });
+
+        pending_2xx
+            || self.replays.iter().any(|(_, replay)| {
+                replay.usage == Some(key)
+                    && (replay.ack == AckObligation::AwaitingPeer
+                        || replay.ack_body == AckBody::Preparing)
+            })
+    }
+
+    /// Lets a BYE that waited go, once nothing holds it back any more, as
+    /// when the core refused the 2xx of a re-INVITE it waited for.
+    fn release_bye(&mut self, key: UsageKey) {
+        let Some(usage) = self.usages.get(key) else {
+            return;
+        };
+        let ByeIntent::Deferred { operation, reason } = usage.bye else {
+            return;
+        };
+
+        if !self.awaits_ack(key) {
+            let restore = reason == EndReason::LocalBye;
+            self.start_bye(key, operation, reason, restore);
+        }
     }
 
     /// Has the runtime send the BYE of a usage, which ends it once the core
@@ -2856,6 +4047,9 @@ impl<R: Random> Model<R> {
             if self.dialog_index.get(dialog.id()) == Some(&bye.dialog) {
                 self.dialog_index.remove(dialog.id());
             }
+            // An ACK may still need it, as for a re-INVITE that crossed the
+            // BYE (RFC 5407 section 3.2.3).
+            self.hand_on(dialog);
         }
     }
 
@@ -2980,10 +4174,27 @@ mod tests {
             routes: 8,
             operations: 4,
             commands: 4,
+            reinvites: 4,
             t1: T1,
             t2: T2,
             decision_timeout: DECISION,
         }
+    }
+
+    impl UsageState {
+        /// Returns the phase, the negotiation and the session description,
+        /// which most tests compare.
+        fn parts(self) -> (UsagePhase, Negotiation, Option<Description>) {
+            (self.phase, self.negotiation, self.remote)
+        }
+    }
+
+    /// Returns why a usage ended, and where its negotiation stood then.
+    fn end_of(
+        model: &Model<Counter>,
+        usage: UsageKey,
+    ) -> Option<(EndReason, Negotiation)> {
+        model.ended(usage).map(|ended| (ended.reason, ended.negotiation))
     }
 
     /// The body of an INVITE with an offer, which the model passes on
@@ -3025,8 +4236,13 @@ mod tests {
                 match replay.usage {
                     Some(usage) => {
                         assert_eq!(replay.bye, None);
-                        if let Some(usage) = self.usages.get(usage) {
-                            assert_eq!(usage.direction, replay.id.direction);
+                        // A re-INVITE goes either way in a dialog, so only
+                        // the 2xx of an attempt says which way its usage
+                        // went.
+                        if let (Some(usage), Source::Attempt(_)) =
+                            (self.usages.get(usage), replay.source)
+                        {
+                            assert_eq!(usage.direction, Direction::Outgoing);
                         }
                     }
                     None => {
@@ -3073,7 +4289,12 @@ mod tests {
             assert!(self.ended.len() <= self.limits.usages);
             for (id, &key) in &self.early_index {
                 let Some(InviteExchange {
-                    scope: Scope::Incoming { dialog: Some(dialog), .. },
+                    scope:
+                        Scope::Incoming {
+                            kind:
+                                Received::Initial { dialog: Some(dialog), .. },
+                            ..
+                        },
                     ..
                 }) = self.exchanges.get(key)
                 else {
@@ -3086,7 +4307,49 @@ mod tests {
             // instant, so none outlives its record.
             let mut timers = 0;
             let mut incoming = 0;
+            let mut reinvites = 0;
             for (key, exchange) in self.exchanges.iter() {
+                let open = matches!(
+                    exchange.state(),
+                    ExchangeState::Pending
+                        | ExchangeState::FinalSubmissionPending { .. }
+                );
+                match &exchange.scope {
+                    Scope::Incoming {
+                        kind: Received::Initial { merge, .. },
+                        ..
+                    } => {
+                        incoming += 1;
+                        assert_eq!(self.merge_index.get(merge), Some(&key));
+                    }
+                    Scope::Incoming {
+                        kind: Received::Reinvite { usage, .. },
+                        ..
+                    } => {
+                        reinvites += 1;
+                        if let (true, Some(usage)) =
+                            (open, self.usages.get(*usage))
+                        {
+                            assert_eq!(usage.exchange, Some(key));
+                        }
+                    }
+                    Scope::Reinvite(sent) => {
+                        reinvites += 1;
+                        let pending =
+                            exchange.state() == ExchangeState::Pending;
+                        if let (true, Some(usage)) =
+                            (pending, self.usages.get(sent.usage))
+                        {
+                            assert_eq!(usage.exchange, Some(key));
+                        }
+                        if !pending {
+                            assert!(
+                                sent.operation.is_none() || !sent.reserved
+                            );
+                        }
+                    }
+                    Scope::Outgoing => {}
+                }
                 if let ExchangeState::FinalSubmissionPending {
                     operation: Some(operation),
                     ..
@@ -3096,15 +4359,12 @@ mod tests {
                     assert_eq!(snapshot.unwrap().outcome, None);
                 }
                 if let Scope::Incoming {
-                    merge,
                     decision_due,
                     expires_due,
                     provisional,
                     ..
                 } = &exchange.scope
                 {
-                    incoming += 1;
-                    assert_eq!(self.merge_index.get(merge), Some(&key));
                     timers += usize::from(decision_due.is_some());
                     timers += usize::from(expires_due.is_some());
                     timers += usize::from(provisional.is_some());
@@ -3123,7 +4383,16 @@ mod tests {
                     timers += 1 + usize::from(retransmission.next.is_some());
                 }
             }
+            for (key, usage) in self.usages.iter() {
+                timers += usize::from(usage.retry.is_some());
+                if let Some(exchange) = usage.exchange {
+                    let exchange = self.exchanges.get(exchange).unwrap();
+                    assert_eq!(exchange.reinvite_usage(), Some(key));
+                }
+            }
             assert_eq!(self.merge_index.len(), incoming);
+            assert_eq!(self.reinvites, reinvites);
+            assert!(reinvites <= self.limits.reinvites);
             assert_eq!(self.timers.len(), timers);
         }
 
@@ -4084,16 +5353,14 @@ mod tests {
         model.receive_2xx(attempt, &callee(), Some(answer())).unwrap();
         let (_, usage) = confirmed(&model.take_effects());
 
-        assert_eq!(
-            model.usage_state(usage),
-            Some((
-                UsagePhase::Established,
-                Negotiation::Stable,
-                Some(answer())
-            )),
-        );
+        let state = model.usage_state(usage).unwrap();
+        assert_eq!(state.phase, UsagePhase::Established);
+        assert_eq!(state.negotiation, Negotiation::Stable);
+        assert_eq!(state.remote, Some(answer()));
         model.end_usage(usage, EndReason::LocalBye);
-        assert_eq!(model.usage_state(usage), None);
+        let state = model.usage_state(usage).unwrap();
+        assert_eq!(state.phase, UsagePhase::Ended);
+        assert_eq!(state.remote, None, "an ended session keeps no SDP");
     }
 
     /// The ACK can reach the driver before the core's verdict on the 2xx
@@ -4400,7 +5667,7 @@ mod tests {
         model.check();
         assert_eq!(model.dialogs.len(), 0);
         assert_eq!(
-            model.ended(usage),
+            end_of(&model, usage),
             Some((EndReason::AckTimeout, Negotiation::Stable)),
         );
 
@@ -4431,7 +5698,7 @@ mod tests {
         model.check();
 
         assert!(model.take_effects().is_empty());
-        let (phase, _, _) = model.usage_state(usage).unwrap();
+        let phase = model.usage_state(usage).unwrap().phase;
         assert_eq!(phase, UsagePhase::Ending, "its BYE is on its way");
         assert_eq!(model.replays.len(), 0);
         assert_eq!(model.next_deadline(), None);
@@ -4930,14 +6197,13 @@ mod tests {
         );
         assert_eq!(acks(&effects).len(), 1);
         assert_eq!(session_byes(&effects, usage), 0);
+        let state = model.usage_state(usage).unwrap();
+        assert_eq!(state.phase, UsagePhase::Ending);
         assert_eq!(
-            model.usage_state(usage),
-            Some((
-                UsagePhase::Ending,
-                Negotiation::LocalOfferOutstanding { cseq: 314159 },
-                None,
-            )),
+            state.negotiation,
+            Negotiation::LocalOfferOutstanding { cseq: 314159 },
         );
+        assert_eq!(state.remote, None);
 
         model.ack_written(acks(&effects)[0], true);
         let effects = model.take_effects();
@@ -4945,7 +6211,7 @@ mod tests {
         model.bye_started(usage, Ok(())).unwrap();
         model.check();
         assert_eq!(
-            model.ended(usage),
+            end_of(&model, usage),
             Some((
                 EndReason::NegotiationFailed,
                 Negotiation::LocalOfferOutstanding { cseq: 314159 },
@@ -5255,8 +6521,8 @@ mod tests {
             [Event::NegotiationFailed { usage: sessions[1] }],
         );
         let state = |usage| {
-            let (_, negotiation, remote) = model.usage_state(usage).unwrap();
-            (negotiation, remote)
+            let state = model.usage_state(usage).unwrap();
+            (state.negotiation, state.remote)
         };
         assert_eq!(state(sessions[0]), (Negotiation::Stable, Some(bob)));
         assert_eq!(
@@ -5593,7 +6859,7 @@ mod tests {
         model.check();
 
         assert!(model.take_effects().is_empty());
-        let (phase, _, _) = model.usage_state(third).unwrap();
+        let phase = model.usage_state(third).unwrap().phase;
         assert_eq!(phase, UsagePhase::Establishing);
         let state = model.attempt_state(attempt).unwrap();
         assert!(state.degraded && !state.complete);
@@ -5695,6 +6961,7 @@ Contact: <sip:bob@192.0.2.4>
             .receive_invite(&request(INVITE), offer(), clock.now())
             .unwrap();
         let exchange = authority.exchange;
+        assert_eq!(model.reinvite_session(exchange), None, "an initial one");
 
         let tag = model.receive_cancel(exchange).unwrap();
         model.check();
@@ -5823,7 +7090,7 @@ Contact: <sip:bob@192.0.2.4>
         assert!(statuses(&effects).is_empty());
         assert_eq!(model.replays.len(), 1, "the 2xx still awaits its ACK");
         assert!(model.next_deadline().is_some());
-        assert_eq!(model.ended(usage), Some((reason, Negotiation::Stable)));
+        assert_eq!(end_of(&model, usage), Some((reason, Negotiation::Stable)));
     }
 
     /// A BYE from the peer ends its session and its dialog, and gets a 200
@@ -5963,7 +7230,10 @@ Contact: <sip:bob@192.0.2.4>
                 Effect::OperationEnded { operation: abandon },
             ],
         );
-        assert_eq!(model.usage_state(early).unwrap().0, UsagePhase::Ending);
+        assert_eq!(
+            model.usage_state(early).unwrap().phase,
+            UsagePhase::Ending
+        );
 
         model
             .receive_2xx(
@@ -6020,7 +7290,10 @@ Contact: <sip:bob@192.0.2.4>
         let terminate = run(&mut model, Command::Terminate { usage });
         model.check();
         assert!(model.take_effects().is_empty(), "no BYE before the ACK");
-        assert_eq!(model.usage_state(usage).unwrap().0, UsagePhase::Ending);
+        assert_eq!(
+            model.usage_state(usage).unwrap().phase,
+            UsagePhase::Ending
+        );
         assert_eq!(
             model.operations.snapshot(terminate).unwrap().outcome,
             None
@@ -6191,7 +7464,10 @@ Contact: <sip:bob@192.0.2.4>
         let mut model = model(limits());
         let (_, session, _) = caller_session(&mut model);
         let terminate = run(&mut model, Command::Terminate { usage: session });
-        assert_eq!(model.usage_state(session).unwrap().0, UsagePhase::Ending);
+        assert_eq!(
+            model.usage_state(session).unwrap().phase,
+            UsagePhase::Ending
+        );
         model.take_effects();
 
         let started = model.bye_started(session, Ok(())).unwrap();
@@ -6217,7 +7493,8 @@ Contact: <sip:bob@192.0.2.4>
                 outcome: Some(Err(gone))
             }),
         );
-        assert_eq!(model.usage_state(session), None);
+        let state = model.usage_state(session).unwrap();
+        assert_eq!(state.phase, UsagePhase::Ended, "nothing comes back");
 
         let mut model = self::model(limits());
         let (_, session, _) = caller_session(&mut model);
@@ -6227,7 +7504,7 @@ Contact: <sip:bob@192.0.2.4>
         model.check();
         assert_eq!(model.take_outcome(terminate), Some(Err(refused)));
         assert_eq!(
-            model.usage_state(session).unwrap().0,
+            model.usage_state(session).unwrap().phase,
             UsagePhase::Established,
         );
         model.take_effects();
@@ -6274,9 +7551,9 @@ Contact: <sip:bob@192.0.2.4>
         }
         model.check();
 
-        assert_eq!(model.ended(ended[0]), None, "the oldest went");
+        assert_eq!(end_of(&model, ended[0]), None, "the oldest went");
         for &session in &ended[1..] {
-            let (reason, _) = model.ended(session).unwrap();
+            let (reason, _) = end_of(&model, session).unwrap();
             assert_eq!(reason, EndReason::RemoteBye { flow: flow() });
         }
     }
@@ -6368,7 +7645,7 @@ Contact: <sip:bob@192.0.2.4>
         let (_, answered) = model.ack_request(acks(&effects)[0]).unwrap();
         assert_eq!(answered, None);
         assert_eq!(
-            model.usage_state(usage),
+            model.usage_state(usage).map(UsageState::parts),
             Some((
                 UsagePhase::Established,
                 Negotiation::Stable,
@@ -6398,7 +7675,7 @@ Contact: <sip:bob@192.0.2.4>
         assert_eq!((asked_offer, asked_usage), (offer.clone(), Some(usage)));
         assert!(acks(&effects).is_empty() && !negotiated(&effects));
         assert_eq!(
-            model.usage_state(usage),
+            model.usage_state(usage).map(UsageState::parts),
             Some((
                 UsagePhase::Established,
                 Negotiation::RemoteOfferOutstanding { cseq: 314159 },
@@ -6414,7 +7691,10 @@ Contact: <sip:bob@192.0.2.4>
         assert!(negotiated(&effects));
         assert_eq!(acks(&effects), [replay]);
         assert_eq!(model.ack_request(replay).unwrap().1, Some(mine));
-        assert_eq!(model.usage_state(usage).unwrap().1, Negotiation::Stable);
+        assert_eq!(
+            model.usage_state(usage).unwrap().negotiation,
+            Negotiation::Stable
+        );
     }
 
     /// A copy of the 2xx asks for no second answer. While the answer is
@@ -6464,7 +7744,7 @@ Contact: <sip:bob@192.0.2.4>
         };
         assert!(!negotiated(&effects));
         assert_eq!(
-            model.usage_state(usage),
+            model.usage_state(usage).map(UsageState::parts),
             Some((
                 UsagePhase::Establishing,
                 Negotiation::LocalOfferOutstanding { cseq: 314159 },
@@ -6524,15 +7804,19 @@ Contact: <sip:bob@192.0.2.4>
             .collect();
         assert_eq!(changes, [Event::AnswerChanged { usage: sessions[0] }]);
         assert_eq!(
-            model.usage_state(sessions[0]).unwrap().2,
+            model.usage_state(sessions[0]).unwrap().remote,
             Some(preview.clone())
         );
-        assert_eq!(model.usage_state(sessions[1]).unwrap().2, Some(preview));
+        assert_eq!(
+            model.usage_state(sessions[1]).unwrap().remote,
+            Some(preview)
+        );
         assert!(!sessions.iter().any(|&usage| {
-            model.usage_state(usage).unwrap().2 == Some(changed.clone())
+            model.usage_state(usage).unwrap().remote == Some(changed.clone())
         }));
         assert!(sessions.iter().all(|&usage| {
-            model.usage_state(usage).unwrap().1 == Negotiation::Stable
+            model.usage_state(usage).unwrap().negotiation
+                == Negotiation::Stable
         }));
     }
 
@@ -6575,7 +7859,7 @@ Contact: <sip:bob@192.0.2.4>
         assert_eq!(acks(&effects), [replays[0]]);
         assert!(model.ack_request(replays[1]).is_none());
         assert_eq!(
-            model.usage_state(sessions[1]).unwrap().1,
+            model.usage_state(sessions[1]).unwrap().negotiation,
             Negotiation::RemoteOfferOutstanding { cseq: 314159 },
         );
 
@@ -6583,7 +7867,7 @@ Contact: <sip:bob@192.0.2.4>
         model.check();
         let effects = model.take_effects();
         assert_eq!(failures(&effects), [sessions[1]]);
-        assert_eq!(model.usage_state(sessions[0]).unwrap().1, {
+        assert_eq!(model.usage_state(sessions[0]).unwrap().negotiation, {
             Negotiation::Stable
         });
         assert_eq!(model.ack_request(replays[0]).unwrap().1, Some(answer()));
@@ -6702,7 +7986,7 @@ Contact: <sip:bob@192.0.2.4>
         model.bye_started(usage, Ok(())).unwrap();
         model.check();
         assert_eq!(
-            model.ended(usage).unwrap().0,
+            end_of(&model, usage).unwrap().0,
             EndReason::NegotiationFailed
         );
     }
@@ -6723,7 +8007,10 @@ Contact: <sip:bob@192.0.2.4>
         let operation = run(&mut model, Command::Terminate { usage });
         model.check();
         assert_eq!(session_byes(&model.take_effects(), usage), 0);
-        assert_eq!(model.usage_state(usage).unwrap().0, UsagePhase::Ending);
+        assert_eq!(
+            model.usage_state(usage).unwrap().phase,
+            UsagePhase::Ending
+        );
 
         model.answer_prepared(replay, Some(answer()));
         model.ack_written(replay, true);
@@ -6731,7 +8018,7 @@ Contact: <sip:bob@192.0.2.4>
 
         assert_eq!(session_byes(&model.take_effects(), usage), 1);
         model.bye_started(usage, Ok(())).unwrap();
-        assert_eq!(model.ended(usage).unwrap().0, EndReason::LocalBye);
+        assert_eq!(end_of(&model, usage).unwrap().0, EndReason::LocalBye);
         assert_eq!(model.take_outcome(operation), None, "the BYE's response");
     }
 
@@ -6761,7 +8048,7 @@ Contact: <sip:bob@192.0.2.4>
         assert_eq!(model.timers.len(), 0, "no more retransmissions");
         model.bye_started(usage, Ok(())).unwrap();
         assert_eq!(
-            model.ended(usage).unwrap().0,
+            end_of(&model, usage).unwrap().0,
             EndReason::NegotiationFailed
         );
     }
@@ -6874,7 +8161,1511 @@ Contact: <sip:bob@192.0.2.4>
             } else {
                 EndReason::NegotiationFailed
             };
-            assert_eq!(model.ended(usage).unwrap().0, reason);
+            assert_eq!(end_of(&model, usage).unwrap().0, reason);
+        }
+    }
+
+    /// A response of the callee of [`caller_session`] to a re-INVITE
+    /// numbered `cseq`, with `tag` on its To and `contact` as its Contact.
+    fn to_reinvite(
+        status: &str,
+        tag: &str,
+        contact: &str,
+        cseq: u32,
+    ) -> Response<Bytes> {
+        let text = String::from_utf8(
+            reply(status, tag, contact, "").to_bytes().to_vec(),
+        )
+        .unwrap();
+        response(
+            &text
+                .replace("\r\n", "\n")
+                .replace("314159 INVITE", &format!("{cseq} INVITE")),
+        )
+    }
+
+    /// Returns the re-INVITE that `effects` start.
+    fn started(effects: &[Effect]) -> ExchangeKey {
+        effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::StartReinvite { exchange } => Some(*exchange),
+                _ => None,
+            })
+            .expect("a re-INVITE starts")
+    }
+
+    /// Has the caller of [`caller_session`] send a re-INVITE with `offer`,
+    /// which the core takes, and returns the operation, the exchange and
+    /// its CSeq number.
+    fn reinvited(
+        model: &mut Model<Counter>,
+        usage: UsageKey,
+        offer: Option<Description>,
+        now: Instant,
+    ) -> (OperationId, ExchangeKey, u32) {
+        let operation = run(model, Command::Reinvite { usage, offer });
+        let exchange = started(&model.take_effects());
+        let (outgoing, _) = model.take_reinvite(exchange).unwrap();
+        let (cseq, method) =
+            protocol::cseq(outgoing.request.headers()).unwrap();
+        assert_eq!(method, "INVITE");
+        model.reinvite_started(exchange, Ok(()), now);
+        model.check();
+        (operation, exchange, cseq)
+    }
+
+    /// The UAS of [`accepted`] with the ACK of its 2xx in, whose session is
+    /// established and settled.
+    fn acknowledged(model: &mut Model<Counter>, clock: &Clock) -> UsageKey {
+        let (_, _, usage) = accepted(model, clock);
+        model.receive_ack(&uas_dialog(), 314159, None);
+        model.check();
+        model.take_effects();
+        usage
+    }
+
+    /// A re-INVITE the caller sends to the UAS of [`accepted`], numbered
+    /// `cseq`, with `contact` as its Contact.
+    fn reinvite_from_caller(cseq: u32, contact: &str) -> Request<Bytes> {
+        let text =
+            String::from_utf8(from_caller("INVITE", cseq).to_bytes().to_vec())
+                .unwrap();
+        request(
+            &text
+                .replace("\r\n", "\n")
+                .replace("<sip:alice@192.0.2.1>", &format!("<{contact}>")),
+        )
+    }
+
+    fn outcome(
+        model: &Model<Counter>,
+        operation: OperationId,
+    ) -> Option<Result<Completion, Error>> {
+        model.operations.snapshot(operation).unwrap().outcome
+    }
+
+    fn status(code: u16) -> StatusCode {
+        StatusCode::from_u16(code).unwrap()
+    }
+
+    /// A re-INVITE that a 2xx answers moves the session to its next
+    /// revision, with the answer as what the peer sent, and replaces the
+    /// remote target with the 2xx's Contact (RFC 3261 sections 12.2.1.2 and
+    /// 14.1). The ACK takes the re-INVITE's number, and the operation
+    /// succeeds once the exchange is complete.
+    #[test]
+    fn reinvite_success_updates_session_revision() {
+        let clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let (_, usage, _) = caller_session(&mut model);
+        let before = model.usage_state(usage).unwrap();
+        assert_eq!((before.session_revision, before.target_revision), (1, 0));
+
+        let offer = description("v=0 hold");
+        let (operation, exchange, cseq) =
+            reinvited(&mut model, usage, Some(offer), clock.now());
+        assert_eq!(cseq, 314160, "the next number after the INVITE's");
+        let state = model.usage_state(usage).unwrap();
+        assert_eq!(
+            state.negotiation,
+            Negotiation::LocalOfferOutstanding { cseq }
+        );
+        assert_eq!(state.session_revision, 1, "nothing changes before");
+
+        let answer = description("v=0 held");
+        let ok = to_reinvite("200 OK", "callee", "sip:bob@192.0.2.40", cseq);
+        model.receive_reinvite_response(
+            exchange,
+            &ok,
+            Some(answer.clone()),
+            clock.now(),
+        );
+        model.check();
+        let effects = model.take_effects();
+
+        assert_eq!(notices(&effects), [Event::NegotiationCompleted { usage }]);
+        assert_eq!(outcome(&model, operation), Some(Ok(Completion::Done)));
+        let state = model.usage_state(usage).unwrap();
+        assert_eq!(state.negotiation, Negotiation::Stable);
+        assert_eq!(state.remote, Some(answer));
+        assert_eq!((state.session_revision, state.target_revision), (2, 1));
+        let dialog = model.usages.get(usage).unwrap().dialog;
+        let dialog = model.dialogs.get(dialog).unwrap();
+        assert_eq!(dialog.target().uri(), "sip:bob@192.0.2.40");
+        let ack = acks(&effects)[0];
+        let (ack, _) = model.ack_request(ack).unwrap();
+        assert_eq!(
+            protocol::cseq(ack.request.headers()).unwrap(),
+            (cseq, "ACK")
+        );
+        assert_eq!(ack.request.uri().as_str(), "sip:bob@192.0.2.40");
+    }
+
+    /// A non-2xx to a re-INVITE leaves the session as it was, as if the
+    /// re-INVITE had not been sent (RFC 3261 section 14.1). Its offer is
+    /// withdrawn, and neither the description, the revisions nor the target
+    /// change. No BYE goes, and the UA sends no ACK, which is the core's for
+    /// a non-2xx. The same goes for a re-INVITE the application rejects as
+    /// a UAS, which only records its CSeq.
+    #[test]
+    fn reinvite_rejection_preserves_existing_session() {
+        let clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let (_, usage, _) = caller_session(&mut model);
+        let before = model.usage_state(usage).unwrap();
+
+        let video = Some(description("v=0 video"));
+        let (operation, exchange, cseq) =
+            reinvited(&mut model, usage, video, clock.now());
+        let refused = to_reinvite(
+            "488 Not Acceptable Here",
+            "callee",
+            "sip:bob@192.0.2.40",
+            cseq,
+        );
+        model.receive_reinvite_response(exchange, &refused, None, clock.now());
+        model.check();
+
+        assert_eq!(
+            model.take_effects(),
+            [Effect::OperationEnded { operation }],
+        );
+        let rejected = Error::RemoteFailure(status(488));
+        assert_eq!(outcome(&model, operation), Some(Err(rejected)));
+        assert_eq!(model.usage_state(usage).unwrap(), before);
+        assert_eq!(model.usages.get(usage).unwrap().exchange, None);
+        let next = run(
+            &mut model,
+            Command::Reinvite { usage, offer: Some(description("v=0")) },
+        );
+        assert_eq!(outcome(&model, next), None, "a new one may go");
+
+        let mut model = self::model(limits());
+        let usage = acknowledged(&mut model, &clock);
+        let before = model.usage_state(usage).unwrap();
+        let authority = model
+            .receive_invite(
+                &reinvite_from_caller(314160, "sip:alice@192.0.2.9"),
+                offer(),
+                clock.now(),
+            )
+            .unwrap();
+        let exchange = authority.exchange;
+        model
+            .try_submit(Command::Reject { authority, status: status(488) })
+            .unwrap();
+        model.run_commands();
+        assert_eq!(finals(model.take_effects()), [(exchange, 488)]);
+        model.final_committed(exchange, clock.now());
+        model.check();
+
+        let effects = model.take_effects();
+        assert!(
+            effects.contains(&Effect::Released(Released::Exchange(exchange)))
+        );
+        assert!(notices(&effects).is_empty() && statuses(&effects).is_empty());
+        assert_eq!(model.usage_state(usage).unwrap(), before);
+        let dialog = model.usages.get(usage).unwrap().dialog;
+        let dialog = model.dialogs.get(dialog).unwrap();
+        assert_eq!(dialog.target().uri(), "sip:alice@192.0.2.1");
+        assert_eq!(dialog.remote_cseq(), Some(314160), "the CSeq is taken");
+    }
+
+    /// A CANCEL of a re-INVITE that has no final yet gets it a 487, and the
+    /// session goes on as it was (RFC 3261 sections 9.2 and 14.1). The 200 to
+    /// the CANCEL carries the dialog's tag. The application's accept after
+    /// that finds the final taken, and the dialog takes a new re-INVITE.
+    #[test]
+    fn reinvite_cancel_preserves_existing_usage_when_required() {
+        let clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let usage = acknowledged(&mut model, &clock);
+        let before = model.usage_state(usage).unwrap();
+        let authority = model
+            .receive_invite(
+                &reinvite_from_caller(314160, "sip:alice@192.0.2.9"),
+                offer(),
+                clock.now(),
+            )
+            .unwrap();
+        let exchange = authority.exchange;
+        assert_eq!(model.reinvite_session(exchange), Some(usage));
+
+        let tag = model.receive_cancel(exchange).unwrap();
+        assert_eq!(&tag, uas_dialog().local_tag());
+        let effects = model.take_effects();
+        assert_eq!(statuses(&effects), [487]);
+        assert_eq!(notices(&effects), [Event::InviteWithdrawn { exchange }]);
+        let late =
+            run(&mut model, Command::Accept { authority, answer: answer() });
+        assert_eq!(outcome(&model, late), Some(Err(Error::AlreadyFinalized)));
+        model.final_committed(exchange, clock.now());
+        model.check();
+
+        let effects = model.take_effects();
+        assert!(
+            effects.contains(&Effect::Released(Released::Exchange(exchange)))
+        );
+        assert!(notices(&effects).is_empty() && statuses(&effects).is_empty());
+        assert_eq!(model.usage_state(usage).unwrap(), before);
+        assert_eq!(model.replays.len(), 0);
+        assert!(
+            model
+                .receive_invite(
+                    &reinvite_from_caller(314161, "sip:alice@192.0.2.1"),
+                    offer(),
+                    clock.now(),
+                )
+                .is_ok()
+        );
+    }
+
+    /// RFC 3261 section 14.1 waits after a 491 for 2.1 to 4 seconds when
+    /// this user agent owns the Call-ID, and up to 2 seconds when it does
+    /// not, in units of 10 ms.
+    #[test]
+    fn glare_491_uses_correct_owner_dependent_window() {
+        let ms = Duration::from_millis;
+        assert_eq!(retry_delay(true, 0), ms(2100));
+        assert_eq!(retry_delay(true, 190), ms(4000));
+        assert_eq!(retry_delay(true, 191), ms(2100));
+        assert_eq!(
+            retry_delay(true, u64::MAX),
+            ms(2100 + (u64::MAX % 191) * 10)
+        );
+        assert_eq!(retry_delay(false, 0), ms(0));
+        assert_eq!(retry_delay(false, 200), ms(2000));
+        assert_eq!(retry_delay(false, 201), ms(0));
+        for random in 0..1000 {
+            let owner = retry_delay(true, random);
+            let other = retry_delay(false, random);
+            assert!(ms(2100) <= owner && owner <= ms(4000));
+            assert!(other <= ms(2000));
+            assert_eq!(owner.as_millis() % 10, 0);
+            assert_eq!(other.as_millis() % 10, 0);
+        }
+
+        // The caller made the Call-ID, so it owns it.
+        let clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let (_, usage, _) = caller_session(&mut model);
+        let (_, exchange, cseq) =
+            reinvited(&mut model, usage, Some(answer()), clock.now());
+        let glare =
+            to_reinvite("491 Request Pending", "callee", "sip:b@h", cseq);
+        model.receive_reinvite_response(exchange, &glare, None, clock.now());
+        model.check();
+        let wait = model.next_deadline().unwrap() - clock.now();
+        assert!(ms(2100) <= wait && wait <= ms(4000), "{wait:?}");
+
+        // The callee did not.
+        let mut model = self::model(limits());
+        let usage = acknowledged(&mut model, &clock);
+        let operation = run(
+            &mut model,
+            Command::Reinvite { usage, offer: Some(answer()) },
+        );
+        let exchange = started(&model.take_effects());
+        let (outgoing, _) = model.take_reinvite(exchange).unwrap();
+        let (cseq, _) = protocol::cseq(outgoing.request.headers()).unwrap();
+        model.reinvite_started(exchange, Ok(()), clock.now());
+        let glare = response(&format!(
+            "SIP/2.0 491 Request Pending
+Via: SIP/2.0/UDP 192.0.2.4;branch=z9hG4bKreinvite
+To: <sip:alice@atlanta.example.com>;tag=1928301774
+From: <sip:bob@biloxi.example.com>;tag=0000000000000001
+Call-ID: a84b4c76e66710@pc33.atlanta.example.com
+CSeq: {cseq} INVITE
+
+"
+        ));
+        model.receive_reinvite_response(exchange, &glare, None, clock.now());
+        model.check();
+        assert_eq!(outcome(&model, operation), None, "it waits to go again");
+        let wait = model.next_deadline().unwrap() - clock.now();
+        assert!(wait <= ms(2000), "{wait:?}");
+    }
+
+    /// A re-INVITE that arrives while this user agent has not answered the
+    /// last one gets a 500 with a Retry-After of 0 to 10 seconds, and one
+    /// while this user agent's own re-INVITE waits for its final a 491 (RFC
+    /// 3261 section 14.2). A re-INVITE in the early dialog of an INVITE not
+    /// yet answered gets the 500 too. None of them changes the dialog.
+    #[test]
+    fn overlapping_incoming_invite_uses_500_retry_after() {
+        let clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let usage = acknowledged(&mut model, &clock);
+        model
+            .receive_invite(
+                &reinvite_from_caller(314160, "sip:alice@192.0.2.1"),
+                offer(),
+                clock.now(),
+            )
+            .unwrap();
+        let second = model.receive_invite(
+            &reinvite_from_caller(314161, "sip:alice@192.0.2.1"),
+            offer(),
+            clock.now(),
+        );
+        model.check();
+
+        let Err(refusal @ Refusal::Overlapping(seconds)) = second else {
+            panic!("not refused as overlapping: {second:?}");
+        };
+        assert!(seconds <= 10);
+        assert_eq!(refusal.status().as_u16(), 500);
+        let dialog = model.usages.get(usage).unwrap().dialog;
+        assert_eq!(
+            model.dialogs.get(dialog).unwrap().remote_cseq(),
+            Some(314160),
+            "a refused request records nothing",
+        );
+
+        let mut model = self::model(limits());
+        model.receive_invite(&request(INVITE), offer(), clock.now()).unwrap();
+        assert!(matches!(
+            model.receive_invite(
+                &reinvite_from_caller(314160, "sip:alice@192.0.2.1"),
+                offer(),
+                clock.now(),
+            ),
+            Err(Refusal::Overlapping(_)),
+        ));
+
+        let mut model = self::model(limits());
+        let (_, usage, _) = caller_session(&mut model);
+        reinvited(&mut model, usage, Some(answer()), clock.now());
+        let crossing = from_callee("INVITE", "callee", 1);
+        let refusal =
+            model.receive_invite(&crossing, offer(), clock.now()).unwrap_err();
+        assert_eq!(refusal, Refusal::RequestPending);
+        assert_eq!(refusal.status().as_u16(), 491);
+        model.check();
+    }
+
+    /// The re-INVITE that goes again after a 491 is a new request, with the
+    /// next CSeq number and a transaction of its own (RFC 3261 section
+    /// 14.1). It goes once. A 491 to it fails the operation. So does an
+    /// exchange that completed meanwhile, such as the peer's re-INVITE that
+    /// won, since the offer was made against the session before it.
+    #[test]
+    fn glare_retry_allocates_new_cseq_and_transaction() {
+        let mut clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let (_, usage, _) = caller_session(&mut model);
+        let hold = description("v=0 hold");
+        let (operation, first, cseq) =
+            reinvited(&mut model, usage, Some(hold.clone()), clock.now());
+        let glare = |cseq| {
+            to_reinvite("491 Request Pending", "callee", "sip:b@h", cseq)
+        };
+        model.receive_reinvite_response(
+            first,
+            &glare(cseq),
+            None,
+            clock.now(),
+        );
+        assert_eq!(
+            model.usage_state(usage).unwrap().negotiation,
+            Negotiation::Stable,
+            "the offer is withdrawn meanwhile",
+        );
+
+        let due = model.next_deadline().unwrap();
+        let effects = advance_to(&mut model, &mut clock, due);
+        let second = started(&effects);
+        assert_ne!(second, first);
+        let (outgoing, carried) = model.take_reinvite(second).unwrap();
+        assert_eq!(
+            protocol::cseq(outgoing.request.headers()).unwrap(),
+            (cseq + 1, "INVITE"),
+        );
+        assert_eq!(carried, Some(hold));
+        model.reinvite_started(second, Ok(()), clock.now());
+        model.receive_reinvite_response(
+            second,
+            &glare(cseq + 1),
+            None,
+            clock.now(),
+        );
+        model.check();
+        let glare_error = Error::RemoteFailure(status(491));
+        assert_eq!(outcome(&model, operation), Some(Err(glare_error)));
+        assert_eq!(model.next_deadline(), None, "no third try");
+        model.reinvite_collection_finished(first, clock.now());
+        model.reinvite_collection_finished(second, clock.now());
+        model.check();
+        assert_eq!(model.reinvites, 0);
+
+        // The callee's re-INVITE completes before the retry is due.
+        let mut model = self::model(limits());
+        let (_, usage, _) = caller_session(&mut model);
+        let (operation, first, cseq) =
+            reinvited(&mut model, usage, Some(answer()), clock.now());
+        model.receive_reinvite_response(
+            first,
+            &glare(cseq),
+            None,
+            clock.now(),
+        );
+        let authority = model
+            .receive_invite(
+                &from_callee("INVITE", "callee", 2),
+                offer(),
+                clock.now(),
+            )
+            .unwrap();
+        let exchange = authority.exchange;
+        run(&mut model, Command::Accept { authority, answer: answer() });
+        model.final_committed(exchange, clock.now());
+        let id = model.replays.iter().next().map(|(_, r)| r.id.clone());
+        let id = id.unwrap();
+        model.receive_ack(&id.dialog, 2, None);
+        model.take_effects();
+        let due = model.next_deadline().unwrap();
+        let effects = advance_to(&mut model, &mut clock, due);
+
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::StartReinvite { .. }))
+        );
+        assert_eq!(outcome(&model, operation), Some(Err(glare_error)));
+    }
+
+    /// The 2xx of a re-INVITE commits its new remote target at once, apart
+    /// from the session description (RFC 6141 sections 4.3 and 4.6). A
+    /// re-INVITE without an offer gets the UAS's offer in the 2xx and the
+    /// answer in the ACK, so the target moves at the 2xx and the session at
+    /// the ACK. An ACK without the answer fails the exchange and ends the
+    /// session, and the target stays where the 2xx moved it.
+    #[test]
+    fn target_refresh_commit_is_separate_from_media_commit() {
+        let clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let usage = acknowledged(&mut model, &clock);
+        let authority = model
+            .receive_invite(
+                &reinvite_from_caller(314160, "sip:alice@192.0.2.9"),
+                Ok(Body::Empty),
+                clock.now(),
+            )
+            .unwrap();
+        let exchange = authority.exchange;
+        let dialog = model.usages.get(usage).unwrap().dialog;
+        let target = |model: &Model<Counter>| {
+            model.dialogs.get(dialog).unwrap().target().uri().to_owned()
+        };
+        assert_eq!(
+            target(&model),
+            "sip:alice@192.0.2.1",
+            "not before the 2xx"
+        );
+
+        let accept =
+            run(&mut model, Command::Accept { authority, answer: answer() });
+        model.final_committed(exchange, clock.now());
+        model.check();
+        let effects = model.take_effects();
+        assert!(notices(&effects).is_empty());
+        assert_eq!(
+            outcome(&model, accept),
+            Some(Ok(Completion::Session(usage)))
+        );
+        let state = model.usage_state(usage).unwrap();
+        assert_eq!(target(&model), "sip:alice@192.0.2.9");
+        assert_eq!((state.session_revision, state.target_revision), (1, 1));
+        assert_eq!(
+            state.negotiation,
+            Negotiation::LocalOfferOutstanding { cseq: 314160 },
+        );
+
+        model.receive_ack(&uas_dialog(), 314160, Some(description("v=0 ok")));
+        model.check();
+        assert_eq!(
+            notices(&model.take_effects()),
+            [Event::NegotiationCompleted { usage }],
+        );
+        let state = model.usage_state(usage).unwrap();
+        assert_eq!((state.session_revision, state.target_revision), (2, 1));
+
+        // An ACK without the answer.
+        let authority = model
+            .receive_invite(
+                &reinvite_from_caller(314161, "sip:alice@192.0.2.10"),
+                Ok(Body::Empty),
+                clock.now(),
+            )
+            .unwrap();
+        let exchange = authority.exchange;
+        run(&mut model, Command::Accept { authority, answer: answer() });
+        model.final_committed(exchange, clock.now());
+        model.take_effects();
+        model.receive_ack(&uas_dialog(), 314161, None);
+        model.check();
+        let effects = model.take_effects();
+        assert!(
+            notices(&effects).contains(&Event::NegotiationFailed { usage })
+        );
+        assert_eq!(session_byes(&effects, usage), 1);
+        assert_eq!(target(&model), "sip:alice@192.0.2.10", "the target stays");
+        assert_eq!(model.usage_state(usage).unwrap().session_revision, 2);
+    }
+
+    /// An unreliable provisional response to a re-INVITE refreshes nothing,
+    /// whatever its Contact says (RFC 6141 section 4.7), and an error
+    /// response that follows it refreshes nothing either.
+    #[test]
+    fn unreliable_provisional_cannot_commit_remote_target_refresh() {
+        let clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let (_, usage, _) = caller_session(&mut model);
+        let (operation, exchange, cseq) =
+            reinvited(&mut model, usage, Some(answer()), clock.now());
+        let dialog = model.usages.get(usage).unwrap().dialog;
+
+        for status in ["180 Ringing", "183 Session Progress"] {
+            let ringing =
+                to_reinvite(status, "callee", "sip:bob@192.0.2.77", cseq);
+            model.receive_reinvite_response(
+                exchange,
+                &ringing,
+                Some(description("v=0 early")),
+                clock.now(),
+            );
+        }
+        model.check();
+        assert!(model.take_effects().is_empty());
+        assert_eq!(
+            model.dialogs.get(dialog).unwrap().target().uri(),
+            "sip:bob@192.0.2.4"
+        );
+        assert_eq!(outcome(&model, operation), None);
+        assert_eq!(model.usage_state(usage).unwrap().remote, Some(answer()));
+
+        let busy =
+            to_reinvite("486 Busy Here", "callee", "sip:bob@192.0.2.77", cseq);
+        model.receive_reinvite_response(exchange, &busy, None, clock.now());
+        let state = model.usage_state(usage).unwrap();
+        assert_eq!(
+            model.dialogs.get(dialog).unwrap().target().uri(),
+            "sip:bob@192.0.2.4"
+        );
+        assert_eq!(state.target_revision, 0);
+    }
+
+    /// A new re-INVITE may go as soon as the last one has its final response
+    /// and its ACK. The replay contexts of earlier 2xx responses, which stay
+    /// until the core stops collecting their responses (Timer M) or keeps
+    /// the transaction in Accepted (Timer L), hold nothing up, on either
+    /// side.
+    #[test]
+    fn new_reinvite_after_ack_does_not_wait_for_timer_m_or_l_cleanup() {
+        let clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let (_, usage, initial) = caller_session(&mut model);
+        assert!(model.has_replay(initial), "the INVITE's 2xx may come again");
+
+        let (first_op, first, cseq) =
+            reinvited(&mut model, usage, Some(answer()), clock.now());
+        let ok = to_reinvite("200 OK", "callee", "sip:bob@192.0.2.4", cseq);
+        model.receive_reinvite_response(
+            first,
+            &ok,
+            Some(answer()),
+            clock.now(),
+        );
+        let ack = acks(&model.take_effects())[0];
+        model.ack_written(ack, true);
+        assert_eq!(outcome(&model, first_op), Some(Ok(Completion::Done)));
+        assert!(model.has_replay(ack), "the re-INVITE's 2xx may come again");
+
+        let (second_op, second, cseq) =
+            reinvited(&mut model, usage, Some(answer()), clock.now());
+        assert_eq!(cseq, 314161);
+        let ok = to_reinvite("200 OK", "callee", "sip:bob@192.0.2.4", cseq);
+        model.receive_reinvite_response(
+            second,
+            &ok,
+            Some(answer()),
+            clock.now(),
+        );
+        model.check();
+        assert_eq!(outcome(&model, second_op), Some(Ok(Completion::Done)));
+
+        // As a UAS, the next re-INVITE may come once the ACK came, while
+        // the core still keeps the last one in Accepted.
+        let mut model = self::model(limits());
+        acknowledged(&mut model, &clock);
+        let authority = model
+            .receive_invite(
+                &reinvite_from_caller(314160, "sip:alice@192.0.2.1"),
+                offer(),
+                clock.now(),
+            )
+            .unwrap();
+        let exchange = authority.exchange;
+        run(&mut model, Command::Accept { authority, answer: answer() });
+        model.final_committed(exchange, clock.now());
+        let early = model.receive_invite(
+            &reinvite_from_caller(314161, "sip:alice@192.0.2.1"),
+            offer(),
+            clock.now(),
+        );
+        assert!(early.is_ok(), "a 2xx that awaits its ACK holds none up");
+        model.check();
+    }
+
+    /// A copy of the 2xx of an older re-INVITE gets that re-INVITE's ACK,
+    /// with the answer it carried, after a newer re-INVITE settled the
+    /// session again (RFC 3261 sections 13.2.2.4 and 14.1).
+    #[test]
+    fn old_reinvite_duplicate_2xx_uses_old_ack_body() {
+        let clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let (_, usage, _) = caller_session(&mut model);
+
+        let (late_op, late, late_cseq) =
+            reinvited(&mut model, usage, None, clock.now());
+        let offer = description("v=0 their offer");
+        let ok =
+            to_reinvite("200 OK", "callee", "sip:bob@192.0.2.4", late_cseq);
+        model.receive_reinvite_response(
+            late,
+            &ok,
+            Some(offer.clone()),
+            clock.now(),
+        );
+        let effects = model.take_effects();
+        let replay = match &effects[..] {
+            [
+                Effect::PrepareAnswer {
+                    replay,
+                    offer: asked,
+                    usage: Some(of),
+                },
+            ] if *asked == offer && *of == usage => *replay,
+            other => panic!("no answer asked for: {other:?}"),
+        };
+        assert_eq!(outcome(&model, late_op), None, "it waits for the answer");
+        let first_answer = description("v=0 first answer");
+        model.answer_prepared(replay, Some(first_answer.clone()));
+        let effects = model.take_effects();
+        assert_eq!(acks(&effects), [replay]);
+        model.ack_written(replay, true);
+        assert_eq!(outcome(&model, late_op), Some(Ok(Completion::Done)));
+        assert_eq!(model.usage_state(usage).unwrap().session_revision, 2);
+
+        let (_, early, cseq) = reinvited(
+            &mut model,
+            usage,
+            Some(description("v=0 next")),
+            clock.now(),
+        );
+        let next = to_reinvite("200 OK", "callee", "sip:bob@192.0.2.4", cseq);
+        model.receive_reinvite_response(
+            early,
+            &next,
+            Some(answer()),
+            clock.now(),
+        );
+        model.take_effects();
+        model.receive_reinvite_response(late, &ok, Some(offer), clock.now());
+        model.check();
+
+        assert_eq!(model.take_effects(), [Effect::ResendAck { replay }]);
+        let (ack, body) = model.ack_request(replay).unwrap();
+        assert_eq!(body, Some(first_answer));
+        assert_eq!(
+            protocol::cseq(ack.request.headers()).unwrap(),
+            (late_cseq, "ACK"),
+        );
+        assert_eq!(model.usage_state(usage).unwrap().session_revision, 3);
+    }
+
+    /// A 2xx to a re-INVITE with another To tag is not a fork. A re-INVITE
+    /// forms no dialog, so it confirms nothing, gets no ACK, and settles
+    /// nothing. The 2xx of the dialog's own peer does.
+    #[test]
+    fn unexpected_reinvite_to_tag_is_not_a_new_fork() {
+        let clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let (_, usage, _) = caller_session(&mut model);
+        let (operation, exchange, cseq) =
+            reinvited(&mut model, usage, Some(answer()), clock.now());
+        let dialogs = model.dialogs.len();
+
+        let stranger =
+            to_reinvite("200 OK", "stranger", "sip:eve@192.0.2.66", cseq);
+        model.receive_reinvite_response(
+            exchange,
+            &stranger,
+            Some(answer()),
+            clock.now(),
+        );
+        model.check();
+        assert!(model.take_effects().is_empty());
+        assert_eq!(model.dialogs.len(), dialogs);
+        assert_eq!(outcome(&model, operation), None);
+
+        let ok = to_reinvite("200 OK", "callee", "sip:bob@192.0.2.4", cseq);
+        model.receive_reinvite_response(
+            exchange,
+            &ok,
+            Some(answer()),
+            clock.now(),
+        );
+        let effects = model.take_effects();
+        assert!(confirmations(&effects).is_empty());
+        assert_eq!(acks(&effects).len(), 1);
+        assert_eq!(outcome(&model, operation), Some(Ok(Completion::Done)));
+    }
+
+    /// A BYE that ends a session while a re-INVITE is open ends it once,
+    /// whichever side sent either.
+    ///
+    /// * The peer's BYE during its own re-INVITE that the application has
+    ///   not decided gets that re-INVITE a 487 (RFC 3261 section 15.1.2).
+    /// * This user agent's BYE during its own re-INVITE fails the
+    ///   operation, and a 2xx that comes after it still gets its ACK, built
+    ///   from the Mortal dialog (RFC 5407 section 3.2.3), and changes
+    ///   nothing.
+    /// * After the peer's BYE ends a session whose re-INVITE this user agent
+    ///   sent, a late 2xx gets its ACK from the dialog the re-INVITE kept.
+    #[test]
+    fn bye_during_reinvite_has_single_terminal_usage_result() {
+        let clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let usage = acknowledged(&mut model, &clock);
+        let authority = model
+            .receive_invite(
+                &reinvite_from_caller(314160, "sip:alice@192.0.2.1"),
+                offer(),
+                clock.now(),
+            )
+            .unwrap();
+        let exchange = authority.exchange;
+        let taken = model.receive_request(&from_caller("BYE", 314161), flow());
+        model.check();
+
+        assert_eq!(taken, Ok(InDialog::Bye));
+        let effects = model.take_effects();
+        assert_eq!(statuses(&effects), [487]);
+        let ended: Vec<_> = notices(&effects)
+            .into_iter()
+            .filter(|event| matches!(event, Event::UsageEnded { .. }))
+            .collect();
+        assert_eq!(
+            ended,
+            [Event::UsageEnded {
+                usage,
+                reason: EndReason::RemoteBye { flow: flow() }
+            }],
+        );
+        let late =
+            run(&mut model, Command::Accept { authority, answer: answer() });
+        assert_eq!(outcome(&model, late), Some(Err(Error::AlreadyFinalized)));
+        model.final_committed(exchange, clock.now());
+        model.check();
+        assert_eq!(model.exchanges.len(), 0);
+
+        // This user agent's BYE crosses its re-INVITE.
+        let mut model = self::model(limits());
+        let (_, usage, _) = caller_session(&mut model);
+        let (operation, exchange, cseq) =
+            reinvited(&mut model, usage, Some(answer()), clock.now());
+        let terminate = run(&mut model, Command::Terminate { usage });
+        assert_eq!(session_byes(&model.take_effects(), usage), 1);
+        let bye = model.bye_started(usage, Ok(())).unwrap();
+        model.check();
+        let effects = model.take_effects();
+        assert_eq!(
+            notices(&effects),
+            [Event::UsageEnded { usage, reason: EndReason::LocalBye }],
+        );
+        assert_eq!(outcome(&model, operation), Some(Err(Error::SessionEnded)));
+
+        let ok = to_reinvite("200 OK", "callee", "sip:bob@192.0.2.4", cseq);
+        model.receive_reinvite_response(
+            exchange,
+            &ok,
+            Some(answer()),
+            clock.now(),
+        );
+        model.check();
+        let effects = model.take_effects();
+        assert!(notices(&effects).is_empty());
+        let ack = acks(&effects)[0];
+        let (ack_request, _) = model.ack_request(ack).unwrap();
+        assert_eq!(
+            protocol::cseq(ack_request.request.headers()).unwrap(),
+            (cseq, "ACK")
+        );
+        model.bye_answered(bye, Ok(()));
+        model.reinvite_collection_finished(exchange, clock.now());
+        model.check();
+        assert!(
+            model
+                .take_effects()
+                .iter()
+                .all(|effect| !matches!(effect, Effect::Notify(_)))
+        );
+        assert_eq!(outcome(&model, terminate), Some(Ok(Completion::Done)));
+
+        // The peer's BYE ends the session while this user agent's re-INVITE
+        // waits, and its dialog goes at once.
+        let mut model = self::model(limits());
+        let (_, usage, _) = caller_session(&mut model);
+        let (operation, exchange, cseq) =
+            reinvited(&mut model, usage, Some(answer()), clock.now());
+        let bye = from_callee("BYE", "callee", 1);
+        assert_eq!(model.receive_request(&bye, flow()), Ok(InDialog::Bye));
+        model.check();
+        assert_eq!(model.dialogs.len(), 0);
+        assert_eq!(outcome(&model, operation), Some(Err(Error::SessionEnded)));
+        model.take_effects();
+
+        model.receive_reinvite_response(
+            exchange,
+            &ok_for(cseq),
+            Some(answer()),
+            clock.now(),
+        );
+        model.check();
+        let ack = acks(&model.take_effects())[0];
+        let (ack_request, _) = model.ack_request(ack).unwrap();
+        assert_eq!(
+            protocol::cseq(ack_request.request.headers()).unwrap(),
+            (cseq, "ACK")
+        );
+    }
+
+    fn ok_for(cseq: u32) -> Response<Bytes> {
+        to_reinvite("200 OK", "callee", "sip:bob@192.0.2.4", cseq)
+    }
+
+    /// A 481 to a re-INVITE says the peer has no such dialog, and ends the
+    /// session without a BYE (RFC 5057 section 5.1). A 408, or no response
+    /// at all, ends it with a BYE (RFC 3261 sections 12.2.1.2 and 14.1).
+    /// Neither is tried again.
+    #[test]
+    fn a_failed_reinvite_ends_the_session_when_the_dialog_is_gone() {
+        let clock = Clock(Instant::now());
+        for (code, bye) in [(Some(481), 0), (Some(408), 1), (None, 1)] {
+            let mut model = model(limits());
+            let (_, usage, _) = caller_session(&mut model);
+            let (operation, exchange, cseq) =
+                reinvited(&mut model, usage, Some(answer()), clock.now());
+            let error = match code {
+                Some(code) => {
+                    let failure = to_reinvite(
+                        &format!("{code} Failed"),
+                        "callee",
+                        "sip:bob@192.0.2.4",
+                        cseq,
+                    );
+                    model.receive_reinvite_response(
+                        exchange,
+                        &failure,
+                        None,
+                        clock.now(),
+                    );
+                    Error::RemoteFailure(status(code))
+                }
+                None => {
+                    model.reinvite_transaction_failed(
+                        exchange,
+                        Error::Timeout,
+                        clock.now(),
+                    );
+                    Error::Timeout
+                }
+            };
+            model.check();
+            let effects = model.take_effects();
+
+            assert_eq!(outcome(&model, operation), Some(Err(error)));
+            assert_eq!(session_byes(&effects, usage), bye);
+            if bye == 1 {
+                model.bye_started(usage, Ok(())).unwrap();
+            }
+            assert_eq!(
+                end_of(&model, usage).map(|(reason, _)| reason),
+                Some(EndReason::ReinviteFailed(error)),
+            );
+            assert_eq!(model.next_deadline(), None, "nothing goes again");
+        }
+    }
+
+    /// A re-INVITE waits while one is open in the dialog either way, while
+    /// the 2xx of this user agent waits for its ACK, and while an offer
+    /// waits for its answer (RFC 3261 section 14.1, RFC 3264 section 4).
+    /// Each is refused with nothing sent.
+    #[test]
+    fn a_reinvite_waits_for_the_open_exchange() {
+        let clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let (_, _, usage) = accepted(&mut model, &clock);
+        let unacknowledged = run(
+            &mut model,
+            Command::Reinvite { usage, offer: Some(answer()) },
+        );
+        assert_eq!(
+            outcome(&model, unacknowledged),
+            Some(Err(Error::InvalidTransition)),
+        );
+        model.receive_ack(&uas_dialog(), 314159, None);
+        model
+            .receive_invite(
+                &reinvite_from_caller(314160, "sip:alice@192.0.2.1"),
+                offer(),
+                clock.now(),
+            )
+            .unwrap();
+        model.take_effects();
+        let crossing = run(
+            &mut model,
+            Command::Reinvite { usage, offer: Some(answer()) },
+        );
+        assert_eq!(
+            outcome(&model, crossing),
+            Some(Err(Error::InvalidTransition))
+        );
+        model.check();
+        assert!(
+            model
+                .take_effects()
+                .iter()
+                .all(|effect| !matches!(effect, Effect::StartReinvite { .. }))
+        );
+
+        let mut model = self::model(limits());
+        let (_, usage, _) = caller_session(&mut model);
+        reinvited(&mut model, usage, Some(answer()), clock.now());
+        let second = run(&mut model, Command::Reinvite { usage, offer: None });
+        assert_eq!(
+            outcome(&model, second),
+            Some(Err(Error::InvalidTransition))
+        );
+        model.check();
+    }
+
+    /// A re-INVITE whose responses the core dropped, the final among them,
+    /// fails once the core stops collecting them, as an observation that is
+    /// not complete, and leaves the session as it was. One the endpoint
+    /// never took fails at once, with its offer withdrawn.
+    #[test]
+    fn a_reinvite_without_its_final_fails_and_changes_nothing() {
+        let clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let (_, usage, _) = caller_session(&mut model);
+        let before = model.usage_state(usage).unwrap();
+        let (operation, exchange, _) =
+            reinvited(&mut model, usage, Some(answer()), clock.now());
+
+        model.reinvite_responses_lost(exchange);
+        model.reinvite_collection_finished(exchange, clock.now());
+        model.check();
+
+        assert_eq!(
+            outcome(&model, operation),
+            Some(Err(Error::ObservationIncomplete)),
+        );
+        assert_eq!(model.usage_state(usage).unwrap(), before);
+        assert_eq!(model.reinvites, 0);
+
+        let operation = run(
+            &mut model,
+            Command::Reinvite { usage, offer: Some(answer()) },
+        );
+        let exchange = started(&model.take_effects());
+        model.take_reinvite(exchange).unwrap();
+        model.reinvite_started(exchange, Err(Error::Unroutable), clock.now());
+        model.check();
+        assert_eq!(outcome(&model, operation), Some(Err(Error::Unroutable)));
+        assert_eq!(model.usage_state(usage).unwrap(), before);
+        assert_eq!(model.reinvites, 0);
+    }
+
+    /// A re-INVITE that comes while the offer in this user agent's 2xx
+    /// waits for its answer in the ACK gets a 491, as RFC 5407 section
+    /// 3.1.5 recommends, since no new offer can start before that answer
+    /// (RFC 3264 section 4). Once the ACK brings it, a re-INVITE is taken.
+    #[test]
+    fn a_reinvite_while_an_offer_waits_gets_a_491() {
+        let clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let authority = model
+            .receive_invite(&request(INVITE), Ok(Body::Empty), clock.now())
+            .unwrap();
+        let exchange = authority.exchange;
+        run(&mut model, Command::Accept { authority, answer: answer() });
+        model.final_committed(exchange, clock.now());
+        model.take_effects();
+
+        let early = model.receive_invite(
+            &reinvite_from_caller(314160, "sip:alice@192.0.2.1"),
+            offer(),
+            clock.now(),
+        );
+        assert_eq!(early.unwrap_err(), Refusal::RequestPending);
+        model.check();
+
+        model.receive_ack(&uas_dialog(), 314159, Some(description("v=0")));
+        let later = model.receive_invite(
+            &reinvite_from_caller(314160, "sip:alice@192.0.2.1"),
+            offer(),
+            clock.now(),
+        );
+        assert!(later.is_ok());
+        model.check();
+    }
+
+    /// The dialog of [`caller_session`], as the caller sees it.
+    fn uac_dialog() -> DialogId {
+        DialogId::new(
+            "a84b4c76e66710@pc33.atlanta.example.com".into(),
+            "1928301774".parse().unwrap(),
+            Some("callee".parse().unwrap()),
+        )
+    }
+
+    /// A response of the caller to a re-INVITE numbered `cseq` that the UAS
+    /// of [`accepted`] sent.
+    fn to_uas_reinvite(status: &str, cseq: u32) -> Response<Bytes> {
+        response(&format!(
+            "SIP/2.0 {status}
+Via: SIP/2.0/UDP 192.0.2.4;branch=z9hG4bKreinvite
+To: <sip:alice@atlanta.example.com>;tag=1928301774
+From: <sip:bob@biloxi.example.com>;tag=0000000000000001
+Call-ID: a84b4c76e66710@pc33.atlanta.example.com
+CSeq: {cseq} INVITE
+Contact: <sip:alice@192.0.2.1>
+
+"
+        ))
+    }
+
+    /// A re-INVITE goes either way, whoever sent the initial INVITE. The
+    /// callee's re-INVITE gets its 2xx and ACK, and the caller takes the
+    /// callee's re-INVITE and gets its ACK, each a session revision on.
+    /// The peer's BYE while the caller's 2xx is on its way ends the session
+    /// once, and the 2xx still waits for its ACK.
+    #[test]
+    fn a_reinvite_goes_either_way() {
+        let clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let usage = acknowledged(&mut model, &clock);
+        let operation = run(
+            &mut model,
+            Command::Reinvite { usage, offer: Some(answer()) },
+        );
+        let exchange = started(&model.take_effects());
+        let (outgoing, _) = model.take_reinvite(exchange).unwrap();
+        let (cseq, _) = protocol::cseq(outgoing.request.headers()).unwrap();
+        model.reinvite_started(exchange, Ok(()), clock.now());
+        model.receive_reinvite_response(
+            exchange,
+            &to_uas_reinvite("200 OK", cseq),
+            Some(answer()),
+            clock.now(),
+        );
+        model.check();
+        let ack = acks(&model.take_effects())[0];
+        model.ack_written(ack, true);
+        model.check();
+        assert_eq!(outcome(&model, operation), Some(Ok(Completion::Done)));
+        assert_eq!(model.usage_state(usage).unwrap().session_revision, 2);
+
+        let mut model = self::model(limits());
+        let (_, usage, _) = caller_session(&mut model);
+        let authority = model
+            .receive_invite(
+                &from_callee("INVITE", "callee", 2),
+                offer(),
+                clock.now(),
+            )
+            .unwrap();
+        let exchange = authority.exchange;
+        assert_eq!(model.reinvite_session(exchange), Some(usage));
+        run(&mut model, Command::Accept { authority, answer: answer() });
+        model.final_committed(exchange, clock.now());
+        model.check();
+        model.receive_ack(&uac_dialog(), 2, None);
+        model.check();
+        assert_eq!(model.usage_state(usage).unwrap().session_revision, 2);
+
+        let authority = model
+            .receive_invite(
+                &from_callee("INVITE", "callee", 3),
+                offer(),
+                clock.now(),
+            )
+            .unwrap();
+        let exchange = authority.exchange;
+        run(&mut model, Command::Accept { authority, answer: answer() });
+        model.take_effects();
+        let bye = from_callee("BYE", "callee", 4);
+        assert_eq!(model.receive_request(&bye, flow()), Ok(InDialog::Bye));
+        model.final_committed(exchange, clock.now());
+        model.check();
+        let effects = model.take_effects();
+        let ended = notices(&effects)
+            .into_iter()
+            .filter(|event| matches!(event, Event::UsageEnded { .. }))
+            .count();
+        assert_eq!(ended, 1);
+        // The INVITE's own replay context stays until Timer M, beside the
+        // one of the 2xx that waits for its ACK.
+        assert_eq!(model.replays.len(), 2, "the 2xx waits for its ACK");
+        model.receive_ack(&uac_dialog(), 3, None);
+        model.check();
+        assert_eq!(model.replays.len(), 1);
+    }
+
+    /// A late-offer re-INVITE whose response collection ends before the
+    /// answer is ready still ends its operation with that answer. One whose
+    /// session ended meanwhile fails with `SessionEnded`, and its ACK, which
+    /// has to reject the offer, is still built from the dialog.
+    #[test]
+    fn a_late_offer_reinvite_ends_with_its_answer() {
+        let clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let (_, usage, _) = caller_session(&mut model);
+        let (operation, exchange, cseq) =
+            reinvited(&mut model, usage, None, clock.now());
+        model.receive_reinvite_response(
+            exchange,
+            &ok_for(cseq),
+            Some(description("v=0 their offer")),
+            clock.now(),
+        );
+        let replay = match model.take_effects()[..] {
+            [Effect::PrepareAnswer { replay, .. }] => replay,
+            ref other => panic!("{other:?}"),
+        };
+        model.reinvite_collection_finished(exchange, clock.now());
+        model.check();
+        assert_eq!(outcome(&model, operation), None);
+
+        model.answer_prepared(replay, Some(answer()));
+        model.check();
+        assert_eq!(outcome(&model, operation), Some(Ok(Completion::Done)));
+
+        // This user agent's BYE crosses the 2xx, and the BYE's transaction
+        // ends before the answer is in.
+        let mut model = self::model(limits());
+        let (_, usage, _) = caller_session(&mut model);
+        let (operation, exchange, cseq) =
+            reinvited(&mut model, usage, None, clock.now());
+        run(&mut model, Command::Terminate { usage });
+        let bye = model.bye_started(usage, Ok(())).unwrap();
+        assert_eq!(outcome(&model, operation), Some(Err(Error::SessionEnded)));
+        model.receive_reinvite_response(
+            exchange,
+            &ok_for(cseq),
+            Some(description("v=0 their offer")),
+            clock.now(),
+        );
+        let replay = model
+            .take_effects()
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::PrepareAnswer { replay, usage: None, .. } => {
+                    Some(replay)
+                }
+                _ => None,
+            })
+            .unwrap();
+        model.bye_answered(bye, Ok(()));
+        model.check();
+        assert_eq!(model.dialogs.len(), 0);
+
+        model.answer_prepared(replay, Some(description("v=0 rejected")));
+        model.check();
+        assert_eq!(acks(&model.take_effects()), [replay]);
+        let (ack, body) = model.ack_request(replay).unwrap();
+        assert_eq!(
+            protocol::cseq(ack.request.headers()).unwrap(),
+            (cseq, "ACK")
+        );
+        assert_eq!(body, Some(description("v=0 rejected")));
+    }
+
+    /// The callee asks to end a session while the 2xx of the caller's
+    /// re-INVITE is on its way to the core. The BYE waits for the ACK of
+    /// that 2xx, as for any 2xx of the callee's (RFC 3261 section 15), and
+    /// goes once the ACK is in. If the core refuses the 2xx instead, the BYE
+    /// goes at once.
+    #[test]
+    fn a_bye_waits_for_the_ack_of_a_reinvite_2xx_on_its_way() {
+        let clock = Clock(Instant::now());
+        for refused in [false, true] {
+            let mut model = model(limits());
+            let usage = acknowledged(&mut model, &clock);
+            let authority = model
+                .receive_invite(
+                    &reinvite_from_caller(314160, "sip:alice@192.0.2.1"),
+                    offer(),
+                    clock.now(),
+                )
+                .unwrap();
+            let exchange = authority.exchange;
+            run(&mut model, Command::Accept { authority, answer: answer() });
+            model.take_effects();
+
+            let terminate = run(&mut model, Command::Terminate { usage });
+            model.check();
+            assert_eq!(session_byes(&model.take_effects(), usage), 0);
+            assert_eq!(
+                model.usage_state(usage).unwrap().phase,
+                UsagePhase::Ending
+            );
+
+            if refused {
+                model.final_refused(exchange, false);
+                model.check();
+                let effects = model.take_effects();
+                assert_eq!(statuses(&effects), [500]);
+                assert_eq!(session_byes(&effects, usage), 1);
+            } else {
+                model.final_committed(exchange, clock.now());
+                model.check();
+                assert_eq!(session_byes(&model.take_effects(), usage), 0);
+                model.receive_ack(&uas_dialog(), 314160, None);
+                model.check();
+                assert_eq!(session_byes(&model.take_effects(), usage), 1);
+            }
+            model.bye_started(usage, Ok(())).unwrap();
+            assert_eq!(
+                outcome(&model, terminate),
+                None,
+                "it waits for the 200"
+            );
+        }
+    }
+
+    /// An error response without the dialog's identity is not the peer's,
+    /// so a 481 with another Call-ID ends nothing. A 491 while the session
+    /// is ending fails the operation at once, with no second try.
+    #[test]
+    fn a_reinvite_failure_is_taken_only_from_its_peer() {
+        let clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let (_, usage, _) = caller_session(&mut model);
+        let (operation, exchange, cseq) =
+            reinvited(&mut model, usage, Some(answer()), clock.now());
+        let stranger = to_reinvite("481 Gone", "callee", "sip:bob@h", cseq);
+        let text = String::from_utf8(stranger.to_bytes().to_vec()).unwrap();
+        let stranger = response(
+            &text.replace("\r\n", "\n").replace("a84b4c76e66710", "elsewhere"),
+        );
+        model.receive_reinvite_response(
+            exchange,
+            &stranger,
+            None,
+            clock.now(),
+        );
+        model.check();
+        assert_eq!(outcome(&model, operation), None);
+        assert_eq!(
+            model.usage_state(usage).unwrap().phase,
+            UsagePhase::Established,
+        );
+
+        // An error response from a proxy may carry a To tag of its own.
+        let proxy =
+            to_reinvite("491 Request Pending", "proxy", "sip:p@h", cseq);
+        model.usages.get_mut(usage).unwrap().begin_ending();
+        model.usages.get_mut(usage).unwrap().bye = ByeIntent::Deferred {
+            operation: None,
+            reason: EndReason::LocalBye,
+        };
+        model.receive_reinvite_response(exchange, &proxy, None, clock.now());
+        model.check();
+        let glare = Error::RemoteFailure(status(491));
+        assert_eq!(outcome(&model, operation), Some(Err(glare)));
+        assert_eq!(model.next_deadline(), None, "no second try");
+    }
+
+    /// The peer lost its old contact and never got the 2xx of its
+    /// re-INVITE, so it sends a newer re-INVITE with its new one, which is
+    /// accepted and acknowledged. The older 2xx's ACK deadline then stops
+    /// its retransmissions but ends nothing, as RFC 6141 section 5.4
+    /// recommends. Without the newer re-INVITE, the deadline ends the
+    /// session with a BYE, as RFC 3261 section 14.2 asks. So it does when
+    /// the older 2xx carried an offer whose answer the missing ACK owed,
+    /// since that exchange can never complete.
+    #[test]
+    fn a_newer_reinvite_keeps_the_session_past_an_older_ack_deadline() {
+        for (newer, offered) in [(true, true), (false, true), (true, false)] {
+            let mut clock = Clock(Instant::now());
+            let mut model = model(limits());
+            let usage = acknowledged(&mut model, &clock);
+            let body = if offered { offer() } else { Ok(Body::Empty) };
+            let first = model
+                .receive_invite(
+                    &reinvite_from_caller(314160, "sip:alice@192.0.2.1"),
+                    body,
+                    clock.now(),
+                )
+                .unwrap();
+            let exchange = first.exchange;
+            run(
+                &mut model,
+                Command::Accept { authority: first, answer: answer() },
+            );
+            model.final_committed(exchange, clock.now());
+            model.take_effects();
+            let deadline = clock.now() + T1 * 64;
+
+            if newer {
+                clock.advance(T1);
+                let recovery = model.receive_invite(
+                    &reinvite_from_caller(314161, "sip:alice@192.0.2.77"),
+                    offer(),
+                    clock.now(),
+                );
+                // While the older 2xx's offer waits for its answer, the newer
+                // re-INVITE is refused, but it was received all the same.
+                if let Ok(second) = recovery {
+                    let exchange = second.exchange;
+                    run(
+                        &mut model,
+                        Command::Accept {
+                            authority: second,
+                            answer: answer(),
+                        },
+                    );
+                    model.final_committed(exchange, clock.now());
+                    model.receive_ack(&uas_dialog(), 314161, None);
+                } else {
+                    assert!(!offered);
+                }
+                model.check();
+                model.take_effects();
+            }
+
+            let mut effects = Vec::new();
+            while let Some(next) =
+                model.next_deadline().filter(|at| *at <= deadline)
+            {
+                effects.extend(advance_to(&mut model, &mut clock, next));
+            }
+
+            let kept = newer && offered;
+            assert_eq!(
+                session_byes(&effects, usage),
+                usize::from(!kept),
+                "newer {newer}, offered {offered}",
+            );
+            assert_eq!(
+                notices(&effects).contains(&Event::AckTimeout { usage }),
+                !kept,
+            );
+            assert_eq!(model.next_deadline(), None, "no 2xx goes out again");
+            if kept {
+                let state = model.usage_state(usage).unwrap();
+                assert_eq!(state.phase, UsagePhase::Established);
+                assert_eq!(state.session_revision, 3);
+                assert_eq!(model.replays.len(), 0);
+                assert_eq!(model.exchanges.len(), 0);
+            }
+        }
+    }
+
+    /// A BYE the application asked for while the superseded 2xx waited for
+    /// its ACK goes at that 2xx's deadline, though the deadline itself ends
+    /// nothing.
+    #[test]
+    fn a_superseded_ack_deadline_still_lets_a_waiting_bye_go() {
+        let mut clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let usage = acknowledged(&mut model, &clock);
+        let first = model
+            .receive_invite(
+                &reinvite_from_caller(314160, "sip:alice@192.0.2.1"),
+                offer(),
+                clock.now(),
+            )
+            .unwrap();
+        let exchange = first.exchange;
+        run(
+            &mut model,
+            Command::Accept { authority: first, answer: answer() },
+        );
+        model.final_committed(exchange, clock.now());
+        let deadline = clock.now() + T1 * 64;
+        let newer = model.receive_invite(
+            &reinvite_from_caller(314161, "sip:alice@192.0.2.77"),
+            offer(),
+            clock.now(),
+        );
+        // The newer re-INVITE is cancelled, which makes it no less received.
+        model.receive_cancel(newer.unwrap().exchange);
+        let terminate = run(&mut model, Command::Terminate { usage });
+        model.take_effects();
+
+        let effects = advance_to(&mut model, &mut clock, deadline);
+        model.check();
+        assert_eq!(session_byes(&effects, usage), 1);
+        assert!(!notices(&effects).contains(&Event::AckTimeout { usage }));
+        model.bye_started(usage, Ok(())).unwrap();
+        assert_eq!(
+            end_of(&model, usage).map(|(reason, _)| reason),
+            Some(EndReason::LocalBye),
+        );
+        assert_eq!(outcome(&model, terminate), None, "it waits for the 200");
+    }
+
+    /// A 2xx to this user agent's re-INVITE that comes after the session
+    /// ended still moves the target its ACK goes to (RFC 6141 section 4.7),
+    /// whether the ACK is built from the Mortal dialog of this user agent's
+    /// BYE or from the dialog the re-INVITE kept after the peer's BYE.
+    #[test]
+    fn a_late_2xx_is_acknowledged_at_its_new_contact() {
+        let clock = Clock(Instant::now());
+        for ours in [true, false] {
+            let mut model = model(limits());
+            let (_, usage, _) = caller_session(&mut model);
+            let (_, exchange, cseq) =
+                reinvited(&mut model, usage, Some(answer()), clock.now());
+            if ours {
+                run(&mut model, Command::Terminate { usage });
+                model.bye_started(usage, Ok(())).unwrap();
+            } else {
+                let bye = from_callee("BYE", "callee", 1);
+                assert_eq!(
+                    model.receive_request(&bye, flow()),
+                    Ok(InDialog::Bye)
+                );
+            }
+            model.take_effects();
+
+            let moved =
+                to_reinvite("200 OK", "callee", "sip:bob@192.0.2.99", cseq);
+            model.receive_reinvite_response(
+                exchange,
+                &moved,
+                Some(answer()),
+                clock.now(),
+            );
+            model.check();
+            let ack = acks(&model.take_effects())[0];
+            let (outgoing, _) = model.ack_request(ack).unwrap();
+
+            assert_eq!(
+                outgoing.request.uri().as_str(),
+                "sip:bob@192.0.2.99",
+                "ours {ours}"
+            );
+            assert_eq!(&*outgoing.target.next_hop, "sip:bob@192.0.2.99");
+            assert_eq!(
+                protocol::cseq(outgoing.request.headers()).unwrap(),
+                (cseq, "ACK"),
+            );
         }
     }
 }

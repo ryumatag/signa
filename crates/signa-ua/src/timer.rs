@@ -9,7 +9,9 @@ of my own policy:
 * the provisional response a UAS sends again every minute while it rings
   ([RFC 3261 section 13.3.1.1]),
 * the retransmission of a 2xx this user agent sent, and the deadline for its
-  ACK ([RFC 3261 section 13.3.1.4]).
+  ACK ([RFC 3261 section 13.3.1.4]),
+* the wait before a re-INVITE that got a 491 goes once more
+  ([RFC 3261 section 14.1]).
 
 The queue keeps one entry per timer that is set, sorted by when it is due. The
 record a timer is for holds that instant, so cancelling it finds the entry, and
@@ -18,11 +20,15 @@ the records it serves.
 
 [RFC 3261 section 13.3.1.1]: https://www.rfc-editor.org/rfc/rfc3261.html#section-13.3.1.1
 [RFC 3261 section 13.3.1.4]: https://www.rfc-editor.org/rfc/rfc3261.html#section-13.3.1.4
+[RFC 3261 section 14.1]: https://www.rfc-editor.org/rfc/rfc3261.html#section-14.1
 */
 
 use std::{collections::BTreeSet, time::Instant};
 
-use crate::{invite::ExchangeKey, retention::ReplayKey};
+use crate::{
+    invite::{ExchangeKey, UsageKey},
+    retention::ReplayKey,
+};
 
 /// What a timer is for.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -37,6 +43,8 @@ pub(crate) enum Timer {
     Retransmit(ReplayKey),
     /// The ACK of a 2xx this user agent sent is overdue.
     AckDeadline(ReplayKey),
+    /// The re-INVITE of a session that got a 491 may go once more.
+    Retry(UsageKey),
 }
 
 /// The timers that are set, by when they are due.

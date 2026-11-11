@@ -85,6 +85,37 @@ impl DialogId {
     pub(crate) fn remote_tag(&self) -> Option<&Tag> {
         self.remote_tag.as_ref()
     }
+
+    /// Says whether a response answers the INVITE numbered `cseq` that this
+    /// user agent sent in this dialog, by the Call-ID, the From tag and the
+    /// CSeq it carries, and the To tag too if `check_to` says so. The core matched
+    /// it to the transaction by its Via alone (RFC 3261 section 17.1.3), so a
+    /// 2xx with another To tag comes from another UA, and is not a fork of
+    /// this dialog. An error response may come from a proxy with a tag of
+    /// its own, so its To tag is not checked.
+    pub(crate) fn answered_by<B>(
+        &self,
+        cseq: u32,
+        response: &Response<B>,
+        check_to: bool,
+    ) -> bool {
+        let headers = response.headers();
+        let (Ok(call_id), Ok(from), Ok(to), Ok((number, method))) = (
+            protocol::call_id(headers),
+            protocol::from(headers),
+            protocol::to(headers),
+            protocol::cseq(headers),
+        ) else {
+            return false;
+        };
+
+        call_id == &*self.call_id
+            && from.tag == Some(self.local_tag.as_str())
+            && (!check_to
+                || to.tag == self.remote_tag.as_ref().map(Tag::as_str))
+            && number == cseq
+            && method == "INVITE"
+    }
 }
 
 impl fmt::Debug for DialogId {
@@ -306,6 +337,11 @@ pub(crate) struct Dialog {
     /// section 12.1). There is no TLS yet, so it stays `false`, and a SIPS
     /// URI alone still makes each request ask for a secure hop.
     secure: bool,
+    /// How many times a target refresh replaced the remote target since the
+    /// dialog formed. It moves apart from the session's revision, since RFC
+    /// 6141 section 4 commits a new target at other points than a new
+    /// session description.
+    target_revision: u32,
 }
 
 impl Dialog {
@@ -342,6 +378,7 @@ impl Dialog {
             local_cseq: None,
             remote_cseq: Some(protocol::cseq(headers)?.0),
             secure: false,
+            target_revision: 0,
         })
     }
 
@@ -378,6 +415,7 @@ impl Dialog {
             local_cseq: Some(origin.cseq),
             remote_cseq: None,
             secure: false,
+            target_revision: 0,
         })
     }
 
@@ -403,6 +441,10 @@ impl Dialog {
 
     pub(crate) fn remote_cseq(&self) -> Option<u32> {
         self.remote_cseq
+    }
+
+    pub(crate) fn target_revision(&self) -> u32 {
+        self.target_revision
     }
 
     /// Moves an early dialog to confirmed, as a UAS does when the core takes
@@ -440,7 +482,8 @@ impl Dialog {
             route_limit,
         )?;
         let mut target = self.target.clone();
-        if let Some(contact) = protocol::contact(headers)? {
+        let contact = protocol::contact(headers)?;
+        if let Some(contact) = contact {
             target
                 .refresh(contact)
                 .map_err(|_| DialogError::Malformed(Field::Contact))?;
@@ -449,6 +492,9 @@ impl Dialog {
         self.routes = routes;
         self.target = target;
         self.phase = DialogPhase::Confirmed;
+        if contact.is_some() {
+            self.target_revision = self.target_revision.wrapping_add(1);
+        }
         Ok(())
     }
 
@@ -468,17 +514,31 @@ impl Dialog {
     /// Replaces the remote target with the Contact of a target refresh,
     /// request or 2xx, if it has one (RFC 3261 sections 12.2.1.2 and 12.2.2).
     /// The route set stays, as RFC 3261 section 12.2 requires.
+    ///
+    /// When to call it is the caller's to decide. RFC 6141 sections 4.6 and
+    /// 4.7 commit a new target with a 2xx or a reliable provisional
+    /// response, and never with an unreliable one or an error response.
     pub(crate) fn refresh_target(
         &mut self,
         headers: &HeaderMap,
     ) -> Result<(), DialogError> {
         match protocol::contact(headers)? {
-            Some(contact) => self
-                .target
-                .refresh(contact)
-                .map_err(|_| DialogError::Malformed(Field::Contact)),
+            Some(contact) => self.refresh_to(contact),
             None => Ok(()),
         }
+    }
+
+    /// Replaces the remote target with `contact`, the Contact URI of a
+    /// target refresh read before, as [`Dialog::refresh_target`] does.
+    pub(crate) fn refresh_to(
+        &mut self,
+        contact: &str,
+    ) -> Result<(), DialogError> {
+        self.target
+            .refresh(contact)
+            .map_err(|_| DialogError::Malformed(Field::Contact))?;
+        self.target_revision = self.target_revision.wrapping_add(1);
+        Ok(())
     }
 
     /// Checks the CSeq of a request the peer sent in the dialog, and records
@@ -495,13 +555,22 @@ impl Dialog {
         &mut self,
         cseq: u32,
     ) -> Result<(), OutOfOrder> {
+        self.check_remote(cseq)?;
+
+        self.remote_cseq = Some(cseq);
+        Ok(())
+    }
+
+    /// Checks the CSeq of a request the peer sent in the dialog, as
+    /// [`Dialog::remote_request`] does, without recording it. RFC 3261
+    /// section 12.2 has a rejected request change no dialog state, so a
+    /// request that may still be refused for other reasons is checked first
+    /// and recorded once it is taken.
+    pub(crate) fn check_remote(&self, cseq: u32) -> Result<(), OutOfOrder> {
         match self.remote_cseq {
             Some(last) if cseq < last => Err(OutOfOrder::Lower),
             Some(last) if cseq == last => Err(OutOfOrder::Repeated),
-            _ => {
-                self.remote_cseq = Some(cseq);
-                Ok(())
-            }
+            _ => Ok(()),
         }
     }
 
@@ -513,12 +582,17 @@ impl Dialog {
     /// even if the request is never sent. A number that may have reached the
     /// peer is never given out again. CANCEL is refused, see
     /// [`RequestError::Cancel`].
+    ///
+    /// A dialog that ended builds no new request, but it still builds the
+    /// ACK of a 2xx that comes late, as for a re-INVITE that crossed this
+    /// user agent's BYE. RFC 5407 section 3.2.3 has that 2xx acknowledged
+    /// in the Mortal state, which completes its INVITE transaction.
     pub(crate) fn request(
         &mut self,
         method: Method,
         sequence: Sequence,
     ) -> Result<Outgoing, RequestError> {
-        if self.phase == DialogPhase::Terminated {
+        if self.phase == DialogPhase::Terminated && method != Method::ACK {
             return Err(RequestError::Terminated);
         }
         if method == Method::CANCEL {

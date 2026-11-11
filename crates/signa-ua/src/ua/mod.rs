@@ -29,12 +29,12 @@ pub use crate::{
     error::{Error, WireEffect},
     invite::{AttemptResult, CancelResult, EndReason},
     negotiation::Description,
-    plan::InvitePlan,
+    plan::{InvitePlan, ReinvitePlan},
     routing::{ResolveError, StaticResolver},
 };
 use crate::{
     invite::{AttemptKey, ExchangeKey, UsageKey, UsagePhase},
-    model::{self, Authority, Limits},
+    model::{self, Authority, Limits, UsageState},
     negotiation::Negotiation,
     operation::Completion,
     routing::{Place, allowed_in},
@@ -45,9 +45,10 @@ mod driver;
 /// Resolves the next hop of a request to a transport and socket address.
 ///
 /// The UA calls it for each request it sends outside a transaction's reply
-/// path: an INVITE, the ACK of each 2xx, and each BYE. Each call runs as a
-/// task of its own, so a slow resolution holds up only its own request. The
-/// UA never asks to resolve a hop that must be secured, since it has no TLS.
+/// path: an INVITE or re-INVITE, the ACK of each 2xx, and each BYE. Each
+/// call runs as a task of its own, so a slow resolution holds up only its own
+/// request. The UA never asks to resolve a hop that must be secured, since it
+/// has no TLS.
 /// A CANCEL goes where its INVITE went, without a resolution (RFC 3261
 /// section 9.1).
 pub trait Resolve: Send + Sync + 'static {
@@ -61,11 +62,11 @@ pub trait Resolve: Send + Sync + 'static {
 /// Prepares the answer that the ACK of a 2xx owes when the 2xx carried an
 /// offer.
 ///
-/// An INVITE sent without an offer, from [`InvitePlan::without_offer`], gets
-/// an offer in the 2xx of each fork, and its ACK has to carry the answer (RFC
-/// 3261 section 13.2.1). The UA does not read session descriptions, so it
-/// cannot make one. It asks for it here, and the ACK waits for it. This is
-/// the contract:
+/// An INVITE sent without an offer, from [`InvitePlan::without_offer`] or
+/// [`ReinvitePlan::without_offer`], gets an offer in the 2xx of each fork,
+/// and its ACK has to carry the answer (RFC 3261 section 13.2.1). The UA
+/// does not read session descriptions, so it cannot make one. It asks for it
+/// here, and the ACK waits for it. This is the contract:
 ///
 /// * The answer is a valid answer to the offer, by the rules of RFC 3264.
 ///   The UA puts it in the ACK as it is, and the same one in every copy of
@@ -108,8 +109,9 @@ impl Offer {
         &self.description
     }
 
-    /// The session the 2xx formed, or `None` for a dialog the UA ends with a
-    /// BYE after the ACK, whose answer should reject the offer.
+    /// The session the 2xx formed or, for a re-INVITE, renegotiates, or
+    /// `None` for a dialog the UA ends with a BYE after the ACK, whose answer
+    /// should reject the offer.
     pub fn session(&self) -> Option<&Session> {
         self.session.as_ref()
     }
@@ -457,14 +459,19 @@ impl<R, N> Config<R, N> {
             dialogs: self.dialogs,
             usages: self.dialogs,
             // A replay context outlives its dialog while copies of its 2xx
-            // can arrive, so a dialog can leave one behind.
-            replays: self.dialogs.saturating_mul(2),
+            // can arrive, so a dialog can leave one behind. Each re-INVITE
+            // has one on top, until copies of its 2xx stop.
+            replays: self.dialogs.saturating_mul(4),
             forks: self.forks,
             cleanups: self.cleanups,
             routes: self.routes,
             operations: self.operations,
             // The driver runs each command as it arrives.
             commands: 1,
+            // A dialog has one re-INVITE open at a time, either way, and
+            // the record of one this UA sent outlives its final response
+            // while copies of its 2xx can come, so twice as many.
+            reinvites: self.dialogs.saturating_mul(2),
             t1: self.timers.t1(),
             t2: self.timers.t2(),
             decision_timeout: self.decision_timeout,
@@ -869,6 +876,94 @@ impl UaHandle {
         submit_on(&self.shared, ua, model::Command::Terminate { usage })
     }
 
+    /// Sends a re-INVITE in the dialog of a session, to change it with the
+    /// offer of `plan`, or without one for a UA with a [`Negotiate`] (RFC
+    /// 3261 section 14).
+    ///
+    /// The UA builds the re-INVITE from the dialog, with the next CSeq
+    /// number, and sends it through the route set. A session takes one
+    /// re-INVITE at a time, and none while an INVITE of either side waits
+    /// for its final response or its ACK, or an offer waits for its answer
+    /// (section 14.1).
+    ///
+    /// Nothing about the session changes until a 2xx comes, and then the
+    /// operation completes once the new offer/answer exchange is complete:
+    /// the 2xx brought the answer, or, without an offer, the [`Negotiate`]
+    /// prepared the answer to the 2xx's offer for the ACK. The session's
+    /// snapshot then has what the peer sent, and a higher
+    /// [`SessionSnapshot::session_revision`]. This is the point to apply the
+    /// new session, and not before. An offer that was only prepared can be
+    /// dropped on any failure, since the session stays as it was then (RFC
+    /// 3261 section 14.1, RFC 6141 section 3). The 2xx also replaces the
+    /// remote target with its Contact, which
+    /// [`SessionSnapshot::target_revision`] counts. That happens at the 2xx,
+    /// apart from the session, and stays if the exchange then fails (RFC
+    /// 6141 section 4).
+    ///
+    /// If the peer has a re-INVITE of its own pending, it answers with a
+    /// 491, and the UA sends the re-INVITE once more after a random wait of
+    /// 2.1 to 4 seconds if this UA made the call, or up to 2 seconds if it
+    /// took it, as section 14.1 has it. The second try gets a new CSeq
+    /// number and transaction. It does not go if the session changed in
+    /// between, is ending, or is busy with another exchange, and a 491 to it
+    /// is final. The operation then fails with the 491, for the application
+    /// to decide again.
+    ///
+    /// The operation fails, with the session as it was unless the error
+    /// says otherwise:
+    ///
+    /// * with [`Error::RemoteFailure`] for a final response other than a
+    ///   2xx, such as a 488 for an offer the peer does not take. A 481 ends
+    ///   the session, since the peer has no such dialog, and a 408 ends it
+    ///   with a BYE ([`EndReason::ReinviteFailed`]),
+    /// * with [`Error::Timeout`] when no response came, which ends the
+    ///   session with a BYE too (sections 12.2.1.2 and 14.1),
+    /// * with [`Error::NegotiationFailure`] when the 2xx lacked the answer or
+    ///   offer it owed, or no answer could be had for its offer. The UA then
+    ///   ends the session with a BYE after the ACK, as for an initial INVITE,
+    /// * with [`Error::SessionEnded`] when the session ended first, by a BYE
+    ///   either way. A 2xx that comes later still gets its ACK,
+    /// * with [`Error::InvalidTransition`], with nothing sent, when the
+    ///   session is not established, is ending, or is busy as said above,
+    ///   or its dialog has run out of CSeq numbers,
+    /// * with [`Error::StaleDecision`] for a session the UA has let go of,
+    /// * with [`Error::CapacityExceeded`] when the UA has no room for the
+    ///   re-INVITE, and
+    /// * as [`UaHandle::try_invite`] fails when the re-INVITE never reaches
+    ///   the endpoint, or with [`Error::TransportFailure`] when its
+    ///   transaction failed to write.
+    ///
+    /// The UA does not cancel a re-INVITE of its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns `plan` with [`Error::InvalidInput`] for a session of another
+    /// UA, an offer without a body, or no offer for a UA without a
+    /// [`Negotiate`], with [`Error::Busy`] when the command queue or the
+    /// operations are full, and with [`Error::Closed`] once the driver has
+    /// stopped.
+    pub fn try_reinvite(
+        &self,
+        session: &Session,
+        plan: ReinvitePlan,
+    ) -> Result<Operation<()>, SubmitError<ReinvitePlan>> {
+        let SessionId { ua, usage } = session.id;
+        if ua != self.shared.id
+            || !plan.is_valid()
+            || (!plan.has_offer() && !self.shared.late_offer)
+        {
+            return Err(SubmitError {
+                error: Error::InvalidInput,
+                value: Box::new(plan),
+            });
+        }
+
+        self.shared.submit(plan, |plan| model::Command::Reinvite {
+            usage,
+            offer: plan.into_offer(),
+        })
+    }
+
     /// Returns what an INVITE this UA sent has come to so far, or `None` once
     /// it has ended and [`Event::AttemptEnded`] has said what it came to.
     ///
@@ -1077,6 +1172,9 @@ impl UaEvents {
 pub enum Event {
     /// An initial INVITE waits for a decision.
     Invite(IncomingInvite),
+    /// A re-INVITE in the dialog of a session waits for a decision, as an
+    /// initial INVITE does. [`IncomingInvite::session`] names the session.
+    Reinvite(IncomingInvite),
     /// A provisional response to an INVITE this UA sent formed an early
     /// dialog.
     #[non_exhaustive]
@@ -1129,6 +1227,11 @@ pub enum Event {
     /// No ACK came for the 2xx of an incoming INVITE within 64 T1 of the
     /// endpoint taking it, which is a little after its first transmission.
     /// The session ends next, with [`Event::Ended`].
+    ///
+    /// It does not come for the 2xx of a re-INVITE once the peer sent a
+    /// newer re-INVITE. The peer most likely lost the contact the 2xx went
+    /// to, and the session goes on, as RFC 6141 section 5.4 recommends,
+    /// unless that 2xx carried an offer whose answer the ACK owed.
     #[non_exhaustive]
     AckTimeout {
         /// The session.
@@ -1145,7 +1248,9 @@ pub enum Event {
     },
     /// The caller gave up an INVITE the application had not decided, with a
     /// CANCEL or with a BYE in its early dialog, and the UA answered it with
-    /// a 487 (RFC 3261 sections 9.2 and 15.1.2). A decision the application
+    /// a 487 (RFC 3261 sections 9.2 and 15.1.2). So did a re-INVITE, with a
+    /// CANCEL, or whose session ended by a BYE either way. The session of a
+    /// re-INVITE cancelled so stays as it was. A decision the application
     /// submits now fails with [`Error::AlreadyFinalized`] or
     /// [`Error::StaleDecision`]. A final that was under way when the caller
     /// gave up goes on, and this does not come.
@@ -1199,7 +1304,7 @@ pub enum Event {
     },
 }
 
-/// An initial INVITE and the authority to decide it.
+/// An INVITE, initial or a re-INVITE, and the authority to decide it.
 ///
 /// The authority is this value, which cannot be cloned. Submitting a
 /// decision consumes it, and a refused submission hands it back. Dropping it
@@ -1217,9 +1322,33 @@ pub enum Event {
 /// early dialog, the UA answers it with a 487 and reports
 /// [`Event::Cancelled`]. A final the application submitted before that goes
 /// on and decides.
+///
+/// # Re-INVITE
+///
+/// A re-INVITE, from [`Event::Reinvite`], asks to change the session that
+/// [`IncomingInvite::session`] names (RFC 3261 section 14.2). Deciding it
+/// works as for an initial INVITE. A rejection, such as a 488 for an offer
+/// the application does not take, leaves the session as it was, and so does
+/// the UA's own 500 when the decision is dropped or late.
+///
+/// Prepare the answer without applying it, and apply it once
+/// [`IncomingInvite::try_accept`] completes, when the endpoint has the 2xx.
+/// Before that, the 2xx may lose to a CANCEL, and a session already changed
+/// could not take the error response then (RFC 6141 section 3.3). With an
+/// offer of the application's, for a re-INVITE without one, the answer comes
+/// in the ACK, with [`Event::Negotiated`]. The 2xx commits the new remote
+/// target of the re-INVITE's Contact, and an error response commits none
+/// (RFC 6141 section 4.6).
+///
+/// The UA answers a re-INVITE that collides with another INVITE of the
+/// dialog itself, without asking: a 491 if this UA's re-INVITE is pending,
+/// and a 500 with a Retry-After if the peer's last one is undecided (RFC
+/// 3261 section 14.2).
 pub struct IncomingInvite {
     request: Request<Bytes>,
     flow: Flow,
+    /// The session of a re-INVITE.
+    session: Option<Session>,
     /// The offer and the preview are boxed, so that an INVITE without them
     /// makes [`Event`] no larger.
     offer: Option<Box<Description>>,
@@ -1243,6 +1372,12 @@ impl IncomingInvite {
     /// Returns the INVITE as received.
     pub fn request(&self) -> &Request<Bytes> {
         &self.request
+    }
+
+    /// Returns the session a re-INVITE is to change, or `None` for an
+    /// initial INVITE.
+    pub fn session(&self) -> Option<&Session> {
+        self.session.as_ref()
     }
 
     /// Returns where the INVITE arrived: the transport, the local address
@@ -1367,6 +1502,10 @@ impl IncomingInvite {
     /// Accepts the INVITE with a 200 that carries `answer`, the answer to its
     /// offer, or an offer of the application's when it had none.
     ///
+    /// For a re-INVITE, the operation completes with the session it changed,
+    /// which takes its next [`SessionSnapshot::session_revision`] with the
+    /// answer, as the type documentation says.
+    ///
     /// With an offer of its own, the session's exchange completes once the
     /// ACK brings the answer, with [`Event::Negotiated`], and the session's
     /// snapshot has that answer. An ACK without one fails the exchange, and
@@ -1376,7 +1515,8 @@ impl IncomingInvite {
     /// The 200 copies the INVITE's Record-Route and carries the UA's Contact.
     /// The UA sends it again until the ACK arrives, on every transport
     /// (RFC 3261 section 13.3.1.4). If none arrives within 64 T1, the session
-    /// ends with [`Event::AckTimeout`].
+    /// ends with [`Event::AckTimeout`], except as that event says for a
+    /// re-INVITE.
     ///
     /// The operation completes once the endpoint has the 200, with the
     /// [`Session`] it established. That is neither the ACK nor delivery to
@@ -1543,6 +1683,14 @@ pub struct SessionSnapshot {
     pub remote_description: Option<Description>,
     /// Why the session ended, once it has.
     pub end_reason: Option<EndReason>,
+    /// How many offer/answer exchanges of the session completed, the
+    /// initial one and each re-INVITE's. It goes up when the session takes
+    /// a new session description, and not before.
+    pub session_revision: u32,
+    /// How many times a target refresh replaced the peer's remote target
+    /// since the dialog formed, as the 2xx of a re-INVITE does. It moves
+    /// apart from the session revision (RFC 6141 section 4).
+    pub target_revision: u32,
 }
 
 /// What an INVITE this UA sent has come to so far.
@@ -1595,15 +1743,20 @@ pub enum NegotiationState {
 }
 
 impl SessionSnapshot {
-    fn new(
-        phase: UsagePhase,
-        negotiation: Negotiation,
-        remote_description: Option<Description>,
-        end_reason: Option<EndReason>,
-    ) -> SessionSnapshot {
-        SessionSnapshot {
-            remote_description,
+    fn new(state: UsageState) -> SessionSnapshot {
+        let UsageState {
+            phase,
+            negotiation,
+            remote,
+            session_revision,
+            target_revision,
             end_reason,
+        } = state;
+        SessionSnapshot {
+            remote_description: remote,
+            end_reason,
+            session_revision,
+            target_revision,
             phase: match phase {
                 UsagePhase::Establishing => SessionPhase::Early,
                 UsagePhase::Established => SessionPhase::Established,

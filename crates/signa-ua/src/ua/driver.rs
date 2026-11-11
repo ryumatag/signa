@@ -51,8 +51,8 @@ use signa_core::{
     message::{
         header::{
             ACCEPT, ACCEPT_ENCODING, ALLOW, CONTACT, CONTENT_DISPOSITION,
-            CONTENT_TYPE, HeaderMap, RECORD_ROUTE, REQUIRE, Tag, UNSUPPORTED,
-            WARNING,
+            CONTENT_TYPE, HeaderMap, RECORD_ROUTE, REQUIRE, RETRY_AFTER, Tag,
+            UNSUPPORTED, WARNING,
         },
         response,
         uri::SipUri,
@@ -71,7 +71,7 @@ use super::{
 };
 use crate::{
     error::Error,
-    invite::{AttemptKey, CancelResult, ExchangeKey, UsageKey, UsagePhase},
+    invite::{AttemptKey, CancelResult, ExchangeKey, UsageKey},
     model::{
         self, ByeStarted, Effect, InDialog, Model, Random, Refusal, Released,
     },
@@ -94,6 +94,13 @@ impl Random for OsRandom {
 
 /// A response read from a client transaction, or `None` at its end.
 type ResponseItem = Option<Result<Response<Bytes>, CoreError>>;
+
+/// The INVITE whose client transaction a reader reads.
+#[derive(Clone, Copy, Debug)]
+enum Client {
+    Attempt(AttemptKey),
+    Reinvite(ExchangeKey),
+}
 
 /// How many responses may wait between the readers and the driver. A reader
 /// whose response does not fit waits, and the endpoint holds the rest under
@@ -148,8 +155,8 @@ pub(super) struct Driver<R, N> {
     resend_timeout: Duration,
     backlog: VecDeque<Job>,
     readers: JoinSet<()>,
-    response_sender: mpsc::Sender<(AttemptKey, ResponseItem)>,
-    responses: mpsc::Receiver<(AttemptKey, ResponseItem)>,
+    response_sender: mpsc::Sender<(Client, ResponseItem)>,
+    responses: mpsc::Receiver<(Client, ResponseItem)>,
     /// The INVITE and responder of each incoming exchange, until its final
     /// response is done with.
     servers: HashMap<ExchangeKey, Server>,
@@ -246,6 +253,8 @@ enum Job {
     Refuse { responder: Arc<Responder>, response: Response<Bytes> },
     /// Resolve and send the INVITE of an attempt.
     Start { attempt: AttemptKey, request: Request<Bytes>, query: Query },
+    /// Resolve and send a re-INVITE.
+    Reinvite { exchange: ExchangeKey, request: Request<Bytes>, query: Query },
     /// Resolve and send the BYE of a cleanup.
     Bye { replay: ReplayKey, request: Request<Bytes>, query: Query },
     /// Resolve and send the BYE that ends a session.
@@ -296,6 +305,11 @@ enum Done {
     Nothing,
     Started {
         attempt: AttemptKey,
+        result: Result<ClientTransaction, Error>,
+    },
+    /// A re-INVITE went to the endpoint, or could not.
+    Reinvited {
+        exchange: ExchangeKey,
         result: Result<ClientTransaction, Error>,
     },
     /// The BYE of a cleanup went to the endpoint, or could not.
@@ -427,9 +441,12 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
                 {
                     self.expire_answers();
                 }
-                Some((attempt, item)) = self.responses.recv() => {
-                    self.on_response(attempt, item);
-                }
+                Some((client, item)) = self.responses.recv() => match client {
+                    Client::Attempt(attempt) => self.on_response(attempt, item),
+                    Client::Reinvite(exchange) => {
+                        self.on_reinvite_response(exchange, item);
+                    }
+                },
                 Some(_) = self.readers.join_next(), if !self.readers.is_empty() => {}
                 // Notifications were dropped, and the count waits for room,
                 // so that the application learns of the loss even if nothing
@@ -576,6 +593,10 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             }
         };
         let exchange = authority.exchange();
+        let session = self
+            .model
+            .reinvite_session(exchange)
+            .map(|usage| Session::new(self.shared.id, usage));
         let id = responder.id();
         self.server_ids.insert(id, exchange);
         self.servers.insert(
@@ -601,15 +622,22 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         ) {
             (Ok(mut places), Ok(abandon)) => {
                 let place = places.next().expect("room for one at least");
-                place.send(Event::Invite(IncomingInvite {
+                let reinvite = session.is_some();
+                let invite = IncomingInvite {
                     request,
                     flow,
+                    session,
                     offer,
                     preview: None,
                     authority: Some(authority),
                     abandon: Some(abandon),
                     shared: self.shared.clone(),
-                }));
+                };
+                place.send(if reinvite {
+                    Event::Reinvite(invite)
+                } else {
+                    Event::Invite(invite)
+                });
             }
             _ => {
                 let unavailable = StatusCode::from_u16(503).expect("a status");
@@ -740,6 +768,12 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             let warning = format!("380 {} \"SIPS Not Allowed\"", self.agent);
             response = response.header(WARNING, warning.as_str());
         }
+        // RFC 3261 section 14.2 has the 500 of an INVITE that overlaps
+        // another say when to try again.
+        if let Refusal::Overlapping(seconds) = refusal {
+            response =
+                response.header(RETRY_AFTER, seconds.to_string().as_str());
+        }
         self.answer_alone(responder, response);
     }
 
@@ -802,25 +836,11 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
                     }
                 }
             }
+            // A session that ended keeps why for a while, so that a lost
+            // notification does not leave the application guessing.
             Command::Snapshot { usage, reply } => {
-                let snapshot = match self.model.usage_state(usage) {
-                    Some((phase, negotiation, remote)) => Some(
-                        SessionSnapshot::new(phase, negotiation, remote, None),
-                    ),
-                    // A session that ended keeps why for a while, so that a
-                    // lost notification does not leave the application
-                    // guessing.
-                    None => {
-                        self.model.ended(usage).map(|(reason, negotiation)| {
-                            SessionSnapshot::new(
-                                UsagePhase::Ended,
-                                negotiation,
-                                None,
-                                Some(reason),
-                            )
-                        })
-                    }
-                };
+                let snapshot =
+                    self.model.usage_state(usage).map(SessionSnapshot::new);
                 let _ = reply.send(snapshot);
             }
             Command::AttemptSnapshot { attempt, reply } => {
@@ -889,12 +909,24 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
                     Ok(transaction) => {
                         let (control, responses) = transaction.into_parts();
                         self.clients.insert(key, Arc::new(control));
-                        self.read(key, responses);
+                        self.read(Client::Attempt(key), responses);
                         self.model.invite_started(key);
                     }
                     Err(error) => self.model.invite_failed(key, error),
                 }
             }
+            Done::Reinvited { exchange, result } => match result {
+                Ok(transaction) => {
+                    // The UA does not cancel its re-INVITEs, so the control
+                    // goes. Dropping it ends nothing in the endpoint.
+                    let (_control, responses) = transaction.into_parts();
+                    self.read(Client::Reinvite(exchange), responses);
+                    self.model.reinvite_started(exchange, Ok(()), now());
+                }
+                Err(error) => {
+                    self.model.reinvite_started(exchange, Err(error), now());
+                }
+            },
             Done::Byed { replay } => self.model.bye_done(replay),
             Done::SessionByeStarted { usage, result } => {
                 let (responses, result) = match result {
@@ -928,22 +960,47 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         self.settle(attempt);
     }
 
-    /// Reads an attempt's responses in a task of their own, until the
-    /// endpoint stops delivering them.
-    fn read(
-        &mut self,
-        attempt: AttemptKey,
-        mut responses: signa_core::endpoint::Responses,
-    ) {
+    /// Reads the responses of an attempt or a re-INVITE in a task of their
+    /// own, until the endpoint stops delivering them.
+    fn read(&mut self, client: Client, mut responses: Responses) {
         let sender = self.response_sender.clone();
         self.readers.spawn(async move {
             while let Some(response) = responses.next().await {
-                if sender.send((attempt, Some(response))).await.is_err() {
+                if sender.send((client, Some(response))).await.is_err() {
                     return;
                 }
             }
-            let _ = sender.send((attempt, None)).await;
+            let _ = sender.send((client, None)).await;
         });
+    }
+
+    /// Takes a response to a re-INVITE, or the end of its responses.
+    fn on_reinvite_response(
+        &mut self,
+        exchange: ExchangeKey,
+        item: ResponseItem,
+    ) {
+        match item {
+            Some(Ok(response)) => {
+                let description =
+                    Body::description(response.headers(), response.body());
+                self.model.receive_reinvite_response(
+                    exchange,
+                    &response,
+                    description,
+                    now(),
+                );
+            }
+            Some(Err(error)) if error.is_delivery_overflow() => {
+                self.model.reinvite_responses_lost(exchange);
+            }
+            Some(Err(error)) => {
+                let error = transaction_error(&error);
+                self.model.reinvite_transaction_failed(exchange, error, now());
+            }
+            None => self.model.reinvite_collection_finished(exchange, now()),
+        }
+        self.settle(None);
     }
 
     fn on_response(&mut self, attempt: AttemptKey, item: ResponseItem) {
@@ -1041,6 +1098,9 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             }
             Effect::Resend2xx { exchange } => self.resend_2xx(exchange),
             Effect::StartInvite { attempt } => self.start_invite(attempt),
+            Effect::StartReinvite { exchange } => {
+                self.start_reinvite(exchange)
+            }
             Effect::SendAck { replay } => self.send_ack(replay),
             Effect::ResendAck { replay } => self.resend_ack(replay),
             Effect::SendBye { replay } => self.send_bye(replay),
@@ -1214,6 +1274,41 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         let request = planned.request;
         let query = query(planned.next_hop, &request);
         self.backlog.push_back(Job::Start { attempt, request, query });
+    }
+
+    /// Sends a re-INVITE, built from its dialog (RFC 3261 section 14.1),
+    /// with the UA's Contact, which RFC 3261 section 12.2.1.1 asks of a
+    /// target refresh request, its Allow, and the offer, if any.
+    fn start_reinvite(&mut self, exchange: ExchangeKey) {
+        let Some((outgoing, offer)) = self.model.take_reinvite(exchange)
+        else {
+            return;
+        };
+        // A secure hop needs TLS, which this UA does not have.
+        if outgoing.target.secure {
+            self.model.reinvite_started(
+                exchange,
+                Err(Error::Unroutable),
+                now(),
+            );
+            return;
+        }
+
+        let mut request = outgoing.request.map(|()| Bytes::new());
+        let headers = request.headers_mut();
+        let contact = format!("<{}>", self.contact);
+        headers.append(
+            CONTACT,
+            signa_core::HeaderValue::from_bytes(contact.as_bytes())
+                .expect("the configuration checked the Contact URI"),
+        );
+        headers.append(ALLOW, signa_core::HeaderValue::from_static(ALLOWED));
+        if let Some(offer) = offer {
+            describe(request.headers_mut(), &offer);
+            *request.body_mut() = offer.body().clone();
+        }
+        let query = query(outgoing.target.next_hop, &request);
+        self.backlog.push_back(Job::Reinvite { exchange, request, query });
     }
 
     /// Builds the ACK of a 2xx from its dialog and sends it. The ACK is kept
@@ -1583,7 +1678,8 @@ impl Job {
     /// * A final response counts as one the endpoint may or may not have
     ///   taken, so nothing more goes out for it. Dropping its responder has
     ///   signa-core send its 500 if the final did not get out.
-    /// * An INVITE that never started fails its attempt.
+    /// * An INVITE that never started fails its attempt, and a re-INVITE
+    ///   fails as one that got no 2xx.
     /// * An ACK counts as not written, and the next copy of its 2xx tries
     ///   again.
     /// * A BYE counts as sent, since a BYE is never sent twice.
@@ -1613,6 +1709,10 @@ impl Job {
             Job::Refuse { .. } => Done::Nothing,
             Job::Start { attempt, .. } => Done::Started {
                 attempt: *attempt,
+                result: Err(Error::Internal),
+            },
+            Job::Reinvite { exchange, .. } => Done::Reinvited {
+                exchange: *exchange,
                 result: Err(Error::Internal),
             },
             Job::Bye { replay, .. } => Done::Byed { replay: *replay },
@@ -1702,6 +1802,16 @@ impl Job {
                     Err(_) => Err(Error::Unroutable),
                 };
                 Done::Started { attempt, result }
+            }
+            Job::Reinvite { exchange, request, query } => {
+                let result = match resolve(&*resolver, &query, timeout).await {
+                    Ok(target) => endpoint
+                        .start(request, target)
+                        .await
+                        .map_err(core_error),
+                    Err(_) => Err(Error::Unroutable),
+                };
+                Done::Reinvited { exchange, result }
             }
             // The UA keeps nothing of the BYE's transaction. Dropping it
             // leaves signa-core to retransmit the BYE and take its response,

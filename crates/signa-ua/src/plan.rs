@@ -249,6 +249,53 @@ impl InvitePlan {
     }
 }
 
+/// A re-INVITE to send in the dialog of a session, with the offer it
+/// carries, if any (RFC 3261 section 14.1).
+///
+/// The UA builds the rest from the dialog: the Request-URI and Route from
+/// the remote target and the route set, To, From and Call-ID, the next CSeq
+/// number, and its Contact and Allow. A re-INVITE carries the whole session
+/// description, not only what changes (section 14.1).
+#[derive(Clone, Debug)]
+#[cfg_attr(not(feature = "tokio"), allow(unreachable_pub))]
+pub struct ReinvitePlan {
+    offer: Option<Description>,
+}
+
+// Only the runtime makes a plan.
+#[cfg_attr(not(feature = "tokio"), allow(dead_code, unreachable_pub))]
+impl ReinvitePlan {
+    /// Plans a re-INVITE with `offer`, the whole new session description.
+    pub fn new(offer: Description) -> ReinvitePlan {
+        ReinvitePlan { offer: Some(offer) }
+    }
+
+    /// Plans a re-INVITE without an offer. The 2xx then carries an offer,
+    /// and the ACK owes the answer (RFC 3261 section 13.2.1), which the UA
+    /// has the [`Negotiate`] of its configuration prepare, as for an initial
+    /// INVITE without one.
+    ///
+    /// [`Negotiate`]: crate::Negotiate
+    pub fn without_offer() -> ReinvitePlan {
+        ReinvitePlan { offer: None }
+    }
+
+    /// Says whether the re-INVITE carries an offer.
+    pub(crate) fn has_offer(&self) -> bool {
+        self.offer.is_some()
+    }
+
+    /// Says whether the UA can send the plan, whose offer, if any, needs a
+    /// body.
+    pub(crate) fn is_valid(&self) -> bool {
+        self.offer.as_ref().is_none_or(|offer| !offer.body().is_empty())
+    }
+
+    pub(crate) fn into_offer(self) -> Option<Description> {
+        self.offer
+    }
+}
+
 /// An INVITE built from a plan, and where its first hop goes.
 ///
 /// The hop comes from the route set, as RFC 3261 section 8.1.2 picks it, and

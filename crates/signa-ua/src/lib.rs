@@ -34,8 +34,12 @@ This is an early stage of the crate, and much of a UA core is missing:
   answered as outside a dialog, without asking the application.
 * Outside a dialog, OPTIONS gets a 200 with the methods the UA takes, without
   asking the application, and other requests but INVITE a 405 or a 501.
-* There is no re-INVITE, and an INVITE in a dialog gets a 500. There is no
-  graceful shutdown of the UA.
+* A re-INVITE of the UA's own cannot be cancelled. A session description in
+  a provisional response to one is not kept, and its 2xx has to carry the
+  answer. A re-INVITE asked for while the last 2xx of the session waits for
+  its ACK is refused rather than held until then. A re-INVITE that gets a 491
+  goes once more, and no more.
+* There is no graceful shutdown of the UA.
 * There is no TLS, so a request that asks for SIPS is refused, and the UA
   sends none.
 * The UA neither answers a challenge nor sends credentials.
@@ -47,8 +51,8 @@ This is an early stage of the crate, and much of a UA core is missing:
 )]
 #![deny(unreachable_pub, rustdoc::broken_intra_doc_links)]
 #![warn(missing_docs, missing_debug_implementations)]
-// TODO: Drive the rest of the state model from the runtime: the target
-// refresh of a re-INVITE, and the stages of an operation for a snapshot.
+// TODO: Drive the rest of the state model from the runtime: the stages of an
+// operation for a snapshot.
 // Until then only the tests use those parts, and without the `tokio` feature
 // only the tests use any.
 #![cfg_attr(not(test), allow(dead_code))]
@@ -58,8 +62,8 @@ pub use self::ua::{
     AttachError, AttemptId, AttemptResult, AttemptSnapshot, CancelResult,
     Config, Description, EndReason, Error, Event, IncomingInvite,
     InvalidContact, InviteAttempt, InviteId, InvitePlan, Negotiate,
-    NegotiationState, NoNegotiator, Offer, Operation, Query, Resolve,
-    ResolveError, Session, SessionId, SessionPhase, SessionSnapshot,
+    NegotiationState, NoNegotiator, Offer, Operation, Query, ReinvitePlan,
+    Resolve, ResolveError, Session, SessionId, SessionPhase, SessionSnapshot,
     StaticResolver, SubmitError, Ua, UaDriver, UaEvents, UaHandle, WireEffect,
     attach,
 };
