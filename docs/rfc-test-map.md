@@ -4,7 +4,11 @@ This maps each requirement signa takes on, and each decision of its API, to
 the tests that show it. A section link names the rule a test checks. It is not
 a claim that signa implements the whole section, and nothing here claims
 conformance to an RFC as a whole. Rows whose basis is signa policy or design
-are decisions of this crate, not RFC rules.
+are decisions of this crate, not RFC rules. Dialogs and INVITE usage, which
+rows here leave to the TU, are signa-ua's, and [signa-ua-rfc-test-map.md] maps
+them.
+
+[signa-ua-rfc-test-map.md]: signa-ua-rfc-test-map.md
 
 Test names are the function names, and the file says where to find them.
 
