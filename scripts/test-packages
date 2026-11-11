@@ -5,14 +5,41 @@
 # `cargo test --workspace` builds every member with the union of their
 # features, so a crate that compiles only because a sibling turns a feature on
 # for it passes there. Here each crate gets only the features it asks for.
+#
+# Usage: scripts/test-packages [--include-ignored]
+#
+# `--include-ignored` also runs the tests marked `#[ignore]`, which take too
+# long for every run, such as signa-ua's measurements of what it keeps.
 
 set -euo pipefail
 
+usage() {
+  echo "usage: $0 [--include-ignored]"
+}
+
+harness=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --include-ignored) harness=(-- --include-ignored) ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
 cd -- "$(dirname -- "$0")/.."
 
+# Expanded this way, an empty array is no argument at all, also under `set -u`
+# in the bash 3.2 that macOS ships.
 for package in signa-core signa-ua signa; do
   echo "===== $package ====="
-  cargo test -p "$package"
+  cargo test -p "$package" ${harness[@]+"${harness[@]}"}
   echo "===== $package, no default features ====="
-  cargo test -p "$package" --no-default-features
+  cargo test -p "$package" --no-default-features ${harness[@]+"${harness[@]}"}
 done
