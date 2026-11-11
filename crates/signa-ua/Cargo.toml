@@ -36,9 +36,16 @@ siparse = "0.4.4"
 tokio = { version = "1.54", default-features = false, features = ["macros", "rt", "sync", "time"], optional = true }
 
 [dev-dependencies]
+quickcheck = { version = "1", default-features = false }
 tokio = { version = "1.54", features = ["macros", "net", "rt-multi-thread", "test-util"] }
 
 # The runtime through the public API, against raw UDP peers.
 [[test]]
 name = "ua"
+required-features = ["tokio"]
+
+# What the UA keeps of received messages, by a counting allocator, which needs
+# a binary to itself.
+[[test]]
+name = "memory"
 required-features = ["tokio"]

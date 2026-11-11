@@ -89,7 +89,7 @@ use crate::{
     },
     routing::RemoteTarget,
     slot::Slots,
-    timer::{Timer, TimerQueue},
+    timer::{self, Timer, TimerQueue},
 };
 
 /// How often a UAS that rings sends its provisional response again.
@@ -98,6 +98,17 @@ use crate::{
 /// minutes without a response, and has the UAS send a non-100 provisional
 /// every minute so that a lost one does not cost the call.
 const PROVISIONAL_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How many 2xx responses of one session may wait for their ACK at once.
+///
+/// RFC 5407 section 3.1.4 recommends taking a re-INVITE that arrives while a
+/// 2xx waits for its ACK, and allows a 491 for it. I take one, and refuse a
+/// re-INVITE with a 491 once two wait, so that a peer that never sends its
+/// ACK cannot have one session take every replay context, each for 64 T1.
+/// A 2xx that a newer re-INVITE superseded counts until its ACK deadline
+/// too. It ends nothing then, but holds its context as long, and not counting
+/// it would let each new re-INVITE free room for the next.
+const UNACKNOWLEDGED: usize = 2;
 
 /// A source of randomness for tags and Call-IDs, the retry timer of a 491
 /// and the Retry-After of a 500 that refuses an overlapping INVITE.
@@ -330,6 +341,10 @@ pub(crate) enum Refusal {
     /// Its body is one the UA cannot tell the offer in, such as a multipart
     /// body. A 415 (RFC 3261 section 8.2.3).
     UnsupportedBody,
+    /// Its offer is larger than the UA keeps of a session description. A
+    /// 413, which RFC 3261 section 21.4.11 gives a body larger than the
+    /// server is willing to process. The limit is my policy.
+    TooLarge,
     /// It is a re-INVITE that collides with an INVITE this user agent sent in
     /// the dialog and has no final response for. A 491 (RFC 3261 section
     /// 14.2). So is one while an offer of this user agent's waits for its
@@ -362,6 +377,7 @@ impl Refusal {
     pub(crate) fn status(self) -> StatusCode {
         let code = match self {
             Refusal::Malformed(_) => 400,
+            Refusal::TooLarge => 413,
             Refusal::UnsupportedBody => 415,
             Refusal::SipsRequestUri => 416,
             Refusal::BadExtension => 420,
@@ -529,6 +545,12 @@ pub(crate) struct Model<R> {
     operations: Operations,
     commands: VecDeque<(OperationId, Command)>,
     effects: Vec<Effect>,
+    /// The operations the runtime holds until it reports their outcome, as
+    /// for a provisional response on its way to the core. No record of the
+    /// model's holds them then. Only the tests' checks read this, to find
+    /// an operation nothing can end any more.
+    #[cfg(test)]
+    handed: std::collections::HashSet<OperationId>,
 }
 
 impl<R: Random> Model<R> {
@@ -565,12 +587,38 @@ impl<R: Random> Model<R> {
             operations: Operations::new(limits.operations),
             commands: VecDeque::new(),
             effects: Vec::new(),
+            #[cfg(test)]
+            handed: std::collections::HashSet::new(),
         }
     }
 
     /// Returns the effects of the inputs so far, in order.
+    ///
+    /// In the tests it checks what must hold between the tables too, so that
+    /// every input a test feeds is checked.
     pub(crate) fn take_effects(&mut self) -> Vec<Effect> {
+        #[cfg(test)]
+        self.check();
         std::mem::take(&mut self.effects)
+    }
+
+    /// Notes that the runtime holds `operation` until it reports the
+    /// outcome, for the tests' checks.
+    fn hand_over(&mut self, operation: Option<OperationId>) {
+        #[cfg(test)]
+        self.handed.extend(operation);
+        #[cfg(not(test))]
+        let _ = operation;
+    }
+
+    /// Notes that the runtime reported the outcome of `operation`.
+    fn take_back(&mut self, operation: Option<OperationId>) {
+        #[cfg(test)]
+        if let Some(operation) = operation {
+            self.handed.remove(&operation);
+        }
+        #[cfg(not(test))]
+        let _ = operation;
     }
 
     /// Makes a tag from 64 random bits, as 16 hexadecimal digits.
@@ -746,6 +794,23 @@ impl<R: Random> Model<R> {
         })
     }
 
+    /// Says whether a request belongs to a dialog this user agent keeps, or
+    /// to the early dialog of an INVITE it has not answered, which tells a
+    /// BYE that ends something from one that ends nothing. A Mortal dialog
+    /// does not count, since a BYE there ends nothing more.
+    // Only the runtime asks.
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    pub(crate) fn knows_dialog<B>(&self, request: &Request<B>) -> bool {
+        matches!(
+            request_dialog(request),
+            Ok(Some(id)) if self
+                .dialog_index
+                .get(&id)
+                .is_some_and(|&dialog| !self.is_mortal(dialog))
+                || self.early_index.contains_key(&id)
+        )
+    }
+
     /// Takes in an INVITE and returns the authority to decide it, or the
     /// reason to refuse it before the application sees it.
     ///
@@ -809,6 +874,7 @@ impl<R: Random> Model<R> {
             Body::Session(offer) => Some(offer),
             Body::Empty | Body::Other => None,
             Body::Unsupported => return Err(Refusal::UnsupportedBody),
+            Body::TooLarge => return Err(Refusal::TooLarge),
         };
 
         if protocol::sips_on_the_way_back(headers)? {
@@ -867,6 +933,9 @@ impl<R: Random> Model<R> {
     /// * A session this user agent is ending gets it a 491 too, by my policy,
     ///   since a re-INVITE there would change nothing. The peer learns of the
     ///   BYE before it would try again.
+    /// * So does a session with two 2xx responses of this user agent's that
+    ///   wait for their ACK, by my policy, which section 3.1.4 allows (see
+    ///   [`UNACKNOWLEDGED`]).
     ///
     /// Nothing in the dialog changes until the re-INVITE is taken, since
     /// section 12.2 has a request that is refused change no state. Taken,
@@ -894,9 +963,13 @@ impl<R: Random> Model<R> {
             Body::Session(offer) => Some(offer),
             Body::Empty | Body::Other => None,
             Body::Unsupported => return Err(Refusal::UnsupportedBody),
+            Body::TooLarge => return Err(Refusal::TooLarge),
         };
         let (cseq, _) = protocol::cseq(headers)?;
-        let record = self.dialogs.get(dialog).expect("indexed");
+        // The index and the table change together, so a dialog the index
+        // names is there. One that were not would be no dialog to take a
+        // re-INVITE in.
+        let record = self.dialogs.get(dialog).ok_or(Refusal::NoDialog)?;
         record.check_remote(cseq).map_err(out_of_order)?;
         let id = record.id().clone();
         let usage_key = self.usage_of(dialog).ok_or(Refusal::NoDialog)?;
@@ -917,8 +990,17 @@ impl<R: Random> Model<R> {
         // 491 holds nothing up. The peer's own second try comes first when
         // this user agent owns the Call-ID, and has to get through, or the
         // two would collide again (RFC 3261 section 14.1).
+        let unacknowledged = self
+            .replays
+            .iter()
+            .filter(|(_, replay)| {
+                replay.usage == Some(usage_key)
+                    && replay.ack == AckObligation::AwaitingPeer
+            })
+            .count();
         if usage.phase() != UsagePhase::Established
             || usage.negotiation != Negotiation::Stable
+            || unacknowledged >= UNACKNOWLEDGED
         {
             return Err(Refusal::RequestPending);
         }
@@ -1227,6 +1309,7 @@ impl<R: Random> Model<R> {
 
         let to_tag = Model::<R>::response_tag(exchange)
             .expect("a pending incoming exchange knows its dialog");
+        self.hand_over(Some(operation));
         self.effects.push(Effect::SubmitProvisional {
             exchange: key,
             status,
@@ -1252,6 +1335,7 @@ impl<R: Random> Model<R> {
         result: Result<(), Error>,
         now: Instant,
     ) {
+        self.take_back(operation);
         let Some(operation) = operation else {
             return;
         };
@@ -1274,7 +1358,7 @@ impl<R: Random> Model<R> {
         if let Some(last) = provisional.take() {
             self.timers.cancel(last.due, Timer::Provisional(key));
         }
-        let due = now + PROVISIONAL_INTERVAL;
+        let due = later(now, PROVISIONAL_INTERVAL);
         *provisional = Some(Box::new(Provisional { status, preview, due }));
         self.timers.set(due, Timer::Provisional(key));
     }
@@ -1371,10 +1455,10 @@ impl<R: Random> Model<R> {
     /// Has a usage let go of the INVITE exchange it held open, once that
     /// exchange has its final response.
     fn let_go(&mut self, usage: UsageKey, exchange: ExchangeKey) {
-        if let Some(usage) = self.usages.get_mut(usage)
-            && usage.exchange == Some(exchange)
-        {
-            usage.exchange = None;
+        if let Some(usage) = self.usages.get_mut(usage) {
+            if usage.exchange == Some(exchange) {
+                usage.exchange = None;
+            }
         }
     }
 
@@ -1433,8 +1517,9 @@ impl<R: Random> Model<R> {
         // RFC 3261 section 13.3.1.4 has the 2xx go out again T1 later, and
         // gives up on its ACK 64 T1 after the first. Section 14.2 asks the
         // same of the 2xx of a re-INVITE.
-        let (t1, deadline) = (self.limits.t1, now + self.limits.t1 * 64);
-        let next = (now + t1 < deadline).then_some(now + t1);
+        // signa-core's `Timers` checked that 64 T1 multiplies.
+        let (t1, deadline) = (self.limits.t1, later(now, self.limits.t1 * 64));
+        let next = Some(later(now, t1)).filter(|&next| next < deadline);
         self.replays.get_mut(replay).expect("just made").retransmission =
             Some(Retransmission { next, interval: t1, deadline });
         if let Some(next) = next {
@@ -1768,19 +1853,21 @@ impl<R: Random> Model<R> {
                     Err(Refusal::NoDialog)
                 };
             }
-            let dialog = self.dialogs.get_mut(key).expect("indexed");
+            // A dialog that is not Mortal is in the table with its usage,
+            // since the index, the table and the usages change together.
+            // Were either missing, the request would find no dialog, and
+            // nothing changes before it is found.
+            let usage = self.usage_of(key);
+            let (Some(dialog), Some(usage)) =
+                (self.dialogs.get_mut(key), usage)
+            else {
+                return Err(Refusal::NoDialog);
+            };
             dialog.remote_request(cseq).map_err(out_of_order)?;
             if !bye {
                 return Ok(InDialog::Other);
             }
 
-            let usage = self
-                .usages
-                .iter()
-                .find_map(|(usage, record)| {
-                    (record.dialog == key).then_some(usage)
-                })
-                .expect("a live dialog has its usage");
             self.end_usage(usage, EndReason::RemoteBye { flow });
             return Ok(InDialog::Bye);
         }
@@ -1797,7 +1884,9 @@ impl<R: Random> Model<R> {
             ..
         }) = self.exchanges.get_mut(key)
         else {
-            unreachable!("an indexed early dialog is its exchange's");
+            // The index lets go of an exchange before its dialog goes, so
+            // this does not happen. Were it to, there is no early dialog.
+            return Err(Refusal::NoDialog);
         };
         dialog.remote_request(cseq).map_err(out_of_order)?;
         if bye {
@@ -2078,12 +2167,20 @@ fn out_of_order(_: OutOfOrder) -> Refusal {
     Refusal::OutOfOrder
 }
 
+/// Returns `by` after `at`, or as late as the clock goes. A timer set from
+/// a configured time too long to add to the clock is then due as late as it
+/// can be, rather than overflow, which only a T1 or a T2 of thousands of years
+/// could ask for.
+fn later(at: Instant, by: Duration) -> Instant {
+    at.checked_add(by).or_else(|| at.checked_add(timer::FAR)).unwrap_or(at)
+}
+
 /// Returns `interval` after `at`, the time a timer was due, or after `now`
 /// when that has passed too, so that a late driver sends one copy rather
 /// than a burst to catch up.
 fn after(at: Instant, interval: Duration, now: Instant) -> Instant {
-    let next = at + interval;
-    if next > now { next } else { now + interval }
+    let next = later(at, interval);
+    if next > now { next } else { later(now, interval) }
 }
 
 /// Initial INVITEs this user agent sends.
@@ -2175,6 +2272,7 @@ impl<R: Random> Model<R> {
 
         if let CancelIntent::Waiting(cancel) = record.cancel {
             record.cancel = CancelIntent::Asked;
+            self.hand_over(cancel);
             self.effects
                 .push(Effect::CancelInvite { attempt, operation: cancel });
         }
@@ -2237,6 +2335,7 @@ impl<R: Random> Model<R> {
 
         if record.started() {
             record.cancel = CancelIntent::Asked;
+            self.hand_over(operation);
             self.effects.push(Effect::CancelInvite { attempt, operation });
         } else {
             record.cancel = CancelIntent::Waiting(operation);
@@ -2249,6 +2348,7 @@ impl<R: Random> Model<R> {
         operation: Option<OperationId>,
         result: Result<CancelResult, Error>,
     ) {
+        self.take_back(operation);
         let Some(operation) = operation else {
             return;
         };
@@ -2719,16 +2819,15 @@ impl<R: Random> Model<R> {
         let record =
             self.attempts.get(attempt).expect("checked by the caller");
         let abandoned = record.abandoned;
-        let usage = record
-            .forks
-            .iter()
-            .copied()
-            .find(|&usage| {
-                self.usages
-                    .get(usage)
-                    .is_some_and(|usage| usage.dialog == dialog)
-            })
-            .expect("an early dialog has its usage");
+        // An early dialog in the table has its usage, since a usage the
+        // UA ends takes its dialog out, or leaves it Mortal, which
+        // `ended_early` covers before this is called. A 2xx for a dialog
+        // without one could not be taken, and leaves the attempt incomplete.
+        let Some(usage) = record.forks.iter().copied().find(|&usage| {
+            self.usages.get(usage).is_some_and(|usage| usage.dialog == dialog)
+        }) else {
+            return Err(Error::InvalidInput);
+        };
         let room = !abandoned && self.reserve_replay();
         if !room && self.cleanups >= self.limits.cleanups {
             let record = self.attempts.get_mut(attempt).expect("checked");
@@ -3579,7 +3678,7 @@ impl<R: Random> Model<R> {
             self.usages.get_mut(usage).expect("checked by the caller");
 
         let owner = record.direction == Direction::Outgoing;
-        let due = now + retry_delay(owner, random);
+        let due = later(now, retry_delay(owner, random));
         let revision = record.revision;
         record.retry =
             Some(Box::new(Retry { operation, offer, due, revision }));
@@ -3975,6 +4074,7 @@ impl<R: Random> Model<R> {
                 }
                 self.remember_ended_early(key, bye.dialog);
                 self.end_usage_mortal(key, bye.reason);
+                self.hand_over(bye.operation);
                 Some(ByeStarted {
                     dialog: bye.dialog,
                     operation: bye.operation,
@@ -4035,6 +4135,7 @@ impl<R: Random> Model<R> {
         bye: ByeStarted,
         result: Result<(), Error>,
     ) {
+        self.take_back(bye.operation);
         if let Some(operation) = bye.operation {
             if matches!(result, Ok(()) | Err(Error::RemoteFailure(_))) {
                 self.operations.advance(operation, Stage::Answered);
@@ -4228,7 +4329,14 @@ mod tests {
 
     impl<R> Model<R> {
         /// Checks what must hold between the tables after every input.
-        fn check(&self) {
+        /// [`Model::take_effects`] calls it, so every test that takes the
+        /// effects of an input checks it.
+        pub(super) fn check(&self) {
+            self.check_operations();
+            self.check_reservations();
+            self.check_timers();
+            self.check_acks();
+
             let mut cleanups = 0;
             for (key, replay) in self.replays.iter() {
                 assert_eq!(self.replay_index.get(&replay.id), Some(&key));
@@ -4394,6 +4502,197 @@ mod tests {
             assert_eq!(self.reinvites, reinvites);
             assert!(reinvites <= self.limits.reinvites);
             assert_eq!(self.timers.len(), timers);
+        }
+
+        /// Each operation without an outcome is held by exactly one record,
+        /// or by the runtime, which reports its outcome. One that nothing
+        /// holds would never end, and its waiter would wait for good. Each
+        /// one a record holds is running, so that no record ends an
+        /// operation twice or one that a reused slot now names.
+        fn check_operations(&self) {
+            let mut held: Vec<OperationId> = Vec::new();
+            held.extend(self.commands.iter().map(|&(operation, _)| operation));
+            for (_, exchange) in self.exchanges.iter() {
+                if let ExchangeState::FinalSubmissionPending {
+                    operation: Some(operation),
+                    ..
+                } = exchange.state()
+                {
+                    held.push(operation);
+                }
+                if let Scope::Reinvite(sent) = &exchange.scope {
+                    held.extend(sent.operation);
+                }
+            }
+            for (_, attempt) in self.attempts.iter() {
+                held.extend(attempt.operation);
+                if let CancelIntent::Waiting(Some(operation)) = attempt.cancel
+                {
+                    held.push(operation);
+                }
+            }
+            for (_, usage) in self.usages.iter() {
+                if let Some(retry) = &usage.retry {
+                    held.extend(retry.operation);
+                }
+                if let ByeIntent::Deferred { operation, .. } = usage.bye {
+                    held.extend(operation);
+                }
+            }
+            held.extend(self.byes.values().filter_map(|bye| bye.operation));
+            for (_, replay) in self.replays.iter() {
+                held.extend(replay.operation);
+            }
+            held.extend(self.handed.iter().copied());
+
+            for &operation in &held {
+                let snapshot = self.operations.snapshot(operation);
+                assert!(
+                    snapshot
+                        .is_some_and(|snapshot| snapshot.outcome.is_none()),
+                    "{operation:?} is held but not running",
+                );
+            }
+            for operation in self.operations.running() {
+                let holders =
+                    held.iter().filter(|&&held| held == operation).count();
+                assert_eq!(holders, 1, "{operation:?} has {holders} holders");
+            }
+        }
+
+        /// The slots set aside in each table are those of the records that
+        /// hold a reservation. A 2xx under way to the core holds a dialog, a
+        /// usage and a replay context for an initial INVITE, and a replay
+        /// context for a re-INVITE. A re-INVITE this user agent sent holds a
+        /// replay context until its first 2xx or its failure.
+        fn check_reservations(&self) {
+            let (mut sessions, mut replays) = (0, 0);
+            for (_, exchange) in self.exchanges.iter() {
+                let pending_2xx = matches!(
+                    exchange.state(),
+                    ExchangeState::FinalSubmissionPending { status, .. }
+                        if status.is_success()
+                );
+                match (pending_2xx, exchange.reinvite_usage()) {
+                    (true, Some(_)) => replays += 1,
+                    (true, None) => sessions += 1,
+                    (false, _) => {}
+                }
+                if matches!(&exchange.scope, Scope::Reinvite(sent) if sent.reserved)
+                {
+                    replays += 1;
+                }
+            }
+
+            assert_eq!(self.dialogs.reserved(), sessions);
+            assert_eq!(self.usages.reserved(), sessions);
+            assert_eq!(self.replays.reserved(), sessions + replays);
+        }
+
+        /// Each timer that is set is due at the instant its record holds for
+        /// it, so a timer outlives neither its record nor a change of the
+        /// record's instant. `check` counts as many timers as the records
+        /// hold instants, and each entry of the queue is a distinct record's,
+        /// so no record holds an instant without its timer either.
+        fn check_timers(&self) {
+            for (at, timer) in self.timers.iter() {
+                let held = match timer {
+                    Timer::Decision(key) => match self.exchanges.get(key) {
+                        Some(InviteExchange {
+                            scope: Scope::Incoming { decision_due, .. },
+                            ..
+                        }) => *decision_due,
+                        _ => None,
+                    },
+                    Timer::Expires(key) => match self.exchanges.get(key) {
+                        Some(InviteExchange {
+                            scope: Scope::Incoming { expires_due, .. },
+                            ..
+                        }) => *expires_due,
+                        _ => None,
+                    },
+                    Timer::Provisional(key) => match self.exchanges.get(key) {
+                        Some(InviteExchange {
+                            scope:
+                                Scope::Incoming {
+                                    provisional: Some(provisional),
+                                    ..
+                                },
+                            ..
+                        }) => Some(provisional.due),
+                        _ => None,
+                    },
+                    Timer::Retransmit(key) => self
+                        .replays
+                        .get(key)
+                        .and_then(|replay| replay.retransmission?.next),
+                    Timer::AckDeadline(key) => self
+                        .replays
+                        .get(key)
+                        .and_then(|replay| replay.retransmission)
+                        .map(|retransmission| retransmission.deadline),
+                    Timer::Retry(key) => self
+                        .usages
+                        .get(key)
+                        .and_then(|usage| Some(usage.retry.as_ref()?.due)),
+                };
+                assert_eq!(held, Some(at), "{timer:?} at {at:?}");
+            }
+        }
+
+        /// Whatever still has to build an ACK or a BYE from a dialog can
+        /// find it. The runtime builds the ACK of a [`Effect::SendAck`] and
+        /// the BYE of a [`Effect::SendBye`] as it takes the effect, so the
+        /// dialog has to be there when the input that made the effect ends.
+        /// An ACK that waits for its answer is built when the answer comes,
+        /// any number of inputs later, so its dialog has to last that long,
+        /// in the table or in the context. So does that of a re-INVITE whose
+        /// 2xx may still come after its session ended.
+        fn check_acks(&self) {
+            let can_build = |id: &DialogId, own: bool| {
+                own || self.dialog_index.contains_key(id)
+            };
+            for effect in &self.effects {
+                let (Effect::SendAck { replay } | Effect::SendBye { replay }) =
+                    *effect
+                else {
+                    continue;
+                };
+                let Some(context) = self.replays.get(replay) else {
+                    continue;
+                };
+                let bye = matches!(effect, Effect::SendBye { .. });
+                assert!(
+                    can_build(&context.id.dialog, context.dialog.is_some())
+                        && (!bye || context.dialog.is_some()),
+                    "{effect:?} for {context:?} cannot be built",
+                );
+            }
+            for (_, replay) in self.replays.iter() {
+                if replay.ack_body == AckBody::Preparing {
+                    assert!(
+                        can_build(&replay.id.dialog, replay.dialog.is_some()),
+                        "{replay:?} waits for an answer to an ACK it cannot \
+                         build",
+                    );
+                }
+                if replay.bye == Some(Bye::Owed) {
+                    assert!(replay.dialog.is_some(), "{replay:?} owes a BYE");
+                }
+            }
+            for (_, exchange) in self.exchanges.iter() {
+                let Scope::Reinvite(sent) = &exchange.scope else {
+                    continue;
+                };
+                if exchange.state() == ExchangeState::Pending
+                    && self.usages.get(sent.usage).is_none()
+                {
+                    assert!(
+                        can_build(&sent.dialog, sent.kept.is_some()),
+                        "{sent:?} may get a 2xx it cannot acknowledge",
+                    );
+                }
+            }
         }
 
         fn replay(&self, effects: &[Effect]) -> &ReplayContext {
@@ -4769,7 +5068,9 @@ mod tests {
             Some(Err(Error::AlreadyFinalized)),
         );
 
-        model.exchanges.remove(exchange);
+        // The endpoint stopped, which leaves nothing of the exchange.
+        model.final_refused(exchange, true);
+        model.take_effects();
         let stale = model
             .try_submit(Command::Accept {
                 authority: Authority { exchange },
@@ -9223,6 +9524,52 @@ CSeq: {cseq} INVITE
         model.check();
     }
 
+    /// A session takes a re-INVITE while one 2xx of its own waits for its
+    /// ACK, and refuses the next with a 491 while two wait, so that a peer
+    /// that never acknowledges cannot take every replay context. Once an ACK
+    /// comes, the next re-INVITE is taken again.
+    #[test]
+    fn a_session_keeps_at_most_two_2xx_without_their_ack() {
+        let clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let (_, _, usage) = accepted(&mut model, &clock);
+
+        let second = model
+            .receive_invite(
+                &reinvite_from_caller(314160, "sip:alice@192.0.2.1"),
+                offer(),
+                clock.now(),
+            )
+            .unwrap();
+        let exchange = second.exchange;
+        run(
+            &mut model,
+            Command::Accept { authority: second, answer: answer() },
+        );
+        model.final_committed(exchange, clock.now());
+        model.take_effects();
+        let third = model.receive_invite(
+            &reinvite_from_caller(314161, "sip:alice@192.0.2.1"),
+            offer(),
+            clock.now(),
+        );
+        assert_eq!(third.unwrap_err(), Refusal::RequestPending);
+        assert_eq!(
+            model.usages.get(usage).unwrap().phase(),
+            UsagePhase::Established
+        );
+
+        model.receive_ack(&uas_dialog(), 314159, None);
+        model.take_effects();
+        let fourth = model.receive_invite(
+            &reinvite_from_caller(314162, "sip:alice@192.0.2.1"),
+            offer(),
+            clock.now(),
+        );
+        assert!(fourth.is_ok());
+        model.take_effects();
+    }
+
     /// The dialog of [`caller_session`], as the caller sees it.
     fn uac_dialog() -> DialogId {
         DialogId::new(
@@ -9667,5 +10014,1041 @@ Contact: <sip:alice@192.0.2.1>
                 (cseq, "ACK"),
             );
         }
+    }
+
+    /// Each table refuses what does not fit, with the outcome its limit
+    /// defines and nothing on the wire that the limit does not call for:
+    ///
+    /// * An INVITE beyond the attempts fails with `CapacityExceeded`, and
+    ///   nothing is sent.
+    /// * A route set longer than the limit forms no dialog. An INVITE with
+    ///   one is refused with a 500, and a 2xx with one gets no ACK and leaves
+    ///   its attempt incomplete.
+    /// * A re-INVITE beyond the limit of re-INVITEs gets a 503, and the
+    ///   application's own fails with `CapacityExceeded`, with nothing sent.
+    #[test]
+    fn each_table_refuses_at_its_limit() {
+        let clock = Clock(Instant::now());
+
+        let mut model = model(Limits { attempts: 1, ..limits() });
+        let first = run(&mut model, Command::Invite { plan: plan() });
+        let second = run(&mut model, Command::Invite { plan: plan() });
+        let effects = model.take_effects();
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, Effect::StartInvite { .. }))
+                .count(),
+            1,
+        );
+        assert_eq!(
+            outcome(&model, second),
+            Some(Err(Error::CapacityExceeded))
+        );
+        assert_eq!(outcome(&model, first), None);
+
+        let mut model = self::model(Limits { routes: 2, ..limits() });
+        let refused =
+            model.receive_invite(&request(INVITE), offer(), clock.now());
+        assert_eq!(refused.unwrap_err().status().as_u16(), 500);
+        let attempt = model.start_attempt(&request(INVITE), true).unwrap();
+        let routed = reply(
+            "200 OK",
+            "callee",
+            "sip:bob@192.0.2.4",
+            "Record-Route: <sip:a.example.com;lr>, <sip:b.example.com;lr>, \
+             <sip:c.example.com;lr>\n",
+        );
+        let taken = model.receive_2xx(attempt, &routed, Some(answer()));
+        assert_eq!(taken, Err(Error::InvalidInput));
+        assert_eq!(acks(&model.take_effects()), []);
+        assert_eq!(
+            progress(&model, attempt),
+            Some((Some(AttemptResult::Answered), false))
+        );
+
+        let mut model = self::model(Limits { reinvites: 1, ..limits() });
+        let (_, caller, _) = caller_session(&mut model);
+        let callee = acknowledged(&mut model, &clock);
+        reinvited(&mut model, caller, Some(answer()), clock.now());
+        let peer = model.receive_invite(
+            &reinvite_from_caller(314160, "sip:alice@192.0.2.1"),
+            offer(),
+            clock.now(),
+        );
+        assert_eq!(peer.unwrap_err(), Refusal::Busy);
+        let own = run(
+            &mut model,
+            Command::Reinvite { usage: callee, offer: Some(answer()) },
+        );
+        assert_eq!(
+            model.take_effects(),
+            [Effect::OperationEnded { operation: own }]
+        );
+        assert_eq!(outcome(&model, own), Some(Err(Error::CapacityExceeded)));
+    }
+
+    /// A set of responses the core could not deliver whole is never
+    /// reported as complete, whatever came of it. An attempt whose 2xx came
+    /// is answered and incomplete. A re-INVITE whose final may be among
+    /// those lost fails with `ObservationIncomplete`, and leaves the session
+    /// as it was, rather than succeed or count as the endpoint stopping.
+    #[test]
+    fn responses_overflow_is_not_reported_as_complete_success() {
+        let clock = Clock(Instant::now());
+        let mut model = model(limits());
+        let (attempt, usage, _) = caller_session(&mut model);
+        model.responses_lost(attempt);
+        model.response_collection_finished(attempt);
+        assert_eq!(
+            ended(&model.take_effects()),
+            (AttemptResult::Answered, false),
+        );
+
+        let (operation, exchange, _) =
+            reinvited(&mut model, usage, Some(answer()), clock.now());
+        model.reinvite_responses_lost(exchange);
+        model.reinvite_collection_finished(exchange, clock.now());
+        model.take_effects();
+        assert_eq!(
+            outcome(&model, operation),
+            Some(Err(Error::ObservationIncomplete)),
+        );
+        let state = model.usage_state(usage).unwrap();
+        assert_eq!(
+            (state.phase, state.negotiation, state.session_revision),
+            (UsagePhase::Established, Negotiation::Stable, 1),
+        );
+    }
+
+    /// With a slot in each table, every record reuses the slot the one
+    /// before it had. Inputs that name the earlier records, as late results
+    /// of jobs or timers do, find nothing. The record in the slot now stays
+    /// as it is, and nothing is sent.
+    #[test]
+    fn generation_reuse_under_load_is_safe() {
+        let clock = Clock(Instant::now());
+        let mut model = model(Limits {
+            incoming: 1,
+            dialogs: 1,
+            usages: 1,
+            replays: 1,
+            reinvites: 1,
+            ..limits()
+        });
+        let mut exchanges = Vec::new();
+        let mut replays = Vec::new();
+        for n in 0..200 {
+            let call = format!("reuse{n}@example.com");
+            let authority =
+                model.receive_invite(&invite(&call), offer(), clock.now());
+            let exchange = authority.as_ref().unwrap().exchange;
+            run(
+                &mut model,
+                Command::Accept {
+                    authority: authority.unwrap(),
+                    answer: answer(),
+                },
+            );
+            model.final_committed(exchange, clock.now());
+            let effects = model.take_effects();
+            let (_, usage) = confirmed(&effects);
+            let replay = model
+                .replays
+                .iter()
+                .find(|(_, replay)| replay.usage == Some(usage))
+                .map(|(key, _)| key)
+                .unwrap();
+            let id = model.replays.get(replay).unwrap().id.dialog.clone();
+            model.receive_ack(&id, 314159, None);
+            model.end_usage(usage, EndReason::LocalBye);
+            model.take_effects();
+            for effect in effects {
+                if let Effect::OperationEnded { operation } = effect {
+                    model.take_outcome(operation);
+                }
+            }
+            exchanges.push(exchange);
+            replays.push(replay);
+        }
+        let authority = model
+            .receive_invite(&invite("live@example.com"), offer(), clock.now())
+            .unwrap();
+        let live = authority.exchange;
+        assert!(!exchanges.contains(&live), "the generation moved on");
+        model.take_effects();
+
+        for (&exchange, &replay) in exchanges.iter().zip(&replays) {
+            model.final_committed(exchange, clock.now());
+            model.final_refused(exchange, false);
+            model.receive_cancel(exchange);
+            model.abandon(exchange);
+            model.provisional_done(
+                exchange,
+                status(180),
+                None,
+                None,
+                Ok(()),
+                clock.now(),
+            );
+            model.answer_prepared(replay, Some(answer()));
+            model.ack_written(replay, true);
+            model.bye_done(replay);
+        }
+
+        assert_eq!(model.take_effects(), []);
+        let record = model.exchanges.get(live).unwrap();
+        assert_eq!(record.state(), ExchangeState::Pending);
+        assert_eq!(authority.exchange, live);
+    }
+
+    /// Every timer is set again only within its bound. The copies of a 2xx
+    /// stop at its ACK deadline, 64 T1 after it went, and the provisional
+    /// sent again every minute stops at the decision deadline. Once both
+    /// passed, no timer is left. A re-INVITE that gets a 491 goes once more,
+    /// and not a third time (see `glare_retry_allocates_new_cseq_and_transaction`).
+    #[test]
+    fn retries_and_timer_entries_remain_bounded() {
+        let mut clock = Clock(Instant::now());
+        let mut model = model(limits());
+        accepted(&mut model, &clock);
+        let ringing = model
+            .receive_invite(
+                &invite("ringing@example.com"),
+                offer(),
+                clock.now(),
+            )
+            .unwrap();
+        let exchange = ringing.exchange;
+        let operation = run(
+            &mut model,
+            Command::Provisional {
+                exchange,
+                status: status(180),
+                preview: None,
+            },
+        );
+        model.take_effects();
+        model.provisional_done(
+            exchange,
+            status(180),
+            None,
+            Some(operation),
+            Ok(()),
+            clock.now(),
+        );
+        model.take_effects();
+
+        let (mut copies, mut provisionals) = (0, 0);
+        while let Some(due) = model.next_deadline() {
+            for effect in advance_to(&mut model, &mut clock, due) {
+                match effect {
+                    Effect::Resend2xx { .. } => copies += 1,
+                    Effect::SubmitProvisional { .. } => provisionals += 1,
+                    Effect::SubmitFinal { exchange, .. } => {
+                        model.final_committed(exchange, clock.now());
+                    }
+                    Effect::SendSessionBye { usage } => {
+                        model.bye_started(usage, Err(Error::TransportFailure));
+                    }
+                    _ => {}
+                }
+            }
+            model.take_effects();
+        }
+
+        // 2xx copies at 0.5, 1.5, 3.5, 7.5 and every 4 s until 32 s.
+        assert_eq!(copies, 10);
+        // A provisional every minute until the 500 at three minutes.
+        assert_eq!(provisionals, 2);
+        assert_eq!(model.timers.len(), 0);
+        assert_eq!(ringing.exchange, exchange);
+    }
+
+    /// A header value that is malformed, extreme or repeated, a route set
+    /// longer than the limit, or an extension the UA does not know is
+    /// refused or taken, never a panic. What the UA takes stays within its
+    /// tables, which the checks after every input confirm, and is gone once
+    /// everything settled.
+    #[test]
+    fn malformed_message_cannot_create_unbounded_state() {
+        fn property(mutations: Vec<(u8, u8, u8)>) -> bool {
+            let mut simulation = Simulation::new(limits());
+            for (n, &(kind, line, value)) in mutations.iter().enumerate() {
+                let text = mutate(n, kind, line, value);
+                let Ok(message) = Request::from_bytes(text.as_bytes()) else {
+                    continue;
+                };
+                simulation.receive(&message, value);
+                simulation.settle();
+            }
+            simulation.quiesce();
+            let model = &simulation.model;
+            assert_eq!(model.exchanges.len(), 0);
+            assert_eq!(model.replays.len(), 0);
+            assert!(model.dialogs.len() <= model.limits.dialogs);
+            true
+        }
+
+        quickcheck::QuickCheck::new()
+            .rng(quickcheck::Gen::new(100))
+            .quickcheck(property as fn(Vec<(u8, u8, u8)>) -> bool);
+    }
+
+    /// Values a peer could put in a header, from the plausible to the
+    /// hostile.
+    const VALUES: [&str; 16] = [
+        "",
+        ";;;",
+        "<sip:",
+        "4294967295 INVITE",
+        "2147483648 INVITE",
+        "-1 INVITE",
+        "1 BYE",
+        "<sip:a@192.0.2.9>;tag=",
+        "<sip:a@192.0.2.9>;tag=x, <sip:b@192.0.2.9>",
+        "\"unterminated <sip:a@192.0.2.9>",
+        "<sips:a@192.0.2.9;lr>",
+        "<sip:a@[2001:db8::1]:5060;lr;maddr=192.0.2.1>",
+        "100rel, x-unknown",
+        "4294967295",
+        "application/sdp; charset=\"",
+        "<sip:a@192.0.2.9;method=BYE?Route=x>",
+    ];
+
+    /// Makes the `n`th message of a script: the INVITE of the fixtures, as
+    /// a new INVITE, a request in a dialog or an ACK by `kind`, with one of
+    /// its lines dropped, repeated or given one of [`VALUES`] by `line` and
+    /// `value`.
+    fn mutate(n: usize, kind: u8, line: u8, value: u8) -> String {
+        let call = format!("call{}@example.com", n % 5);
+        let text =
+            INVITE.replace("a84b4c76e66710@pc33.atlanta.example.com", &call);
+        let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+        lines.retain(|line| !line.is_empty());
+        match kind % 4 {
+            0 => {}
+            1 => {
+                lines[0] = lines[0].replace("INVITE", "BYE");
+                lines[2] = "To: Bob <sip:bob@biloxi.example.com>;tag=0000000000000001".into();
+            }
+            2 => {
+                lines[0] = lines[0].replace("INVITE", "ACK");
+                lines[2] = "To: Bob <sip:bob@biloxi.example.com>;tag=0000000000000001".into();
+            }
+            _ => lines.push("Expires: 4294967295".into()),
+        }
+        let index = 1 + usize::from(line) % (lines.len() - 1);
+        let name = lines[index].split(':').next().unwrap().to_owned();
+        let header = |value: &str| format!("{name}: {value}");
+        match value % 4 {
+            // A Via the core would not have, or a CSeq or Call-ID of another
+            // shape, still parses, so these only drop or change values.
+            0 if name != "Via" => drop(lines.remove(index)),
+            1 => {
+                let repeated = lines[index].clone();
+                let times = usize::from(line % 40);
+                lines.extend(std::iter::repeat_n(repeated, times));
+            }
+            _ => {
+                let value = VALUES[usize::from(value / 4) % VALUES.len()];
+                lines[index] = header(value);
+            }
+        }
+        let mut text = lines.join("\n");
+        text.push_str("\n\n");
+        text.replace('\n', "\r\n")
+    }
+
+    /// What the runtime owes the model once a job or a watcher ends.
+    #[derive(Debug)]
+    enum Owed {
+        Final(ExchangeKey),
+        Provisional {
+            exchange: ExchangeKey,
+            status: StatusCode,
+            preview: Option<Description>,
+            operation: Option<OperationId>,
+        },
+        Invite(AttemptKey),
+        Reinvite(ExchangeKey),
+        Ack(ReplayKey),
+        Bye(ReplayKey),
+        SessionBye(UsageKey),
+        ByeResponse(ByeStarted),
+        Cancel(Option<OperationId>),
+        Answer(ReplayKey),
+    }
+
+    /// The model with a runtime of the test's own. It does with each effect
+    /// what the driver does at once, such as build an ACK, and leaves what
+    /// waits on the core, the network or a negotiator for a script to settle,
+    /// in whatever order the script picks. A script also plays the
+    /// application and the peers, from what the tables hold.
+    struct Simulation {
+        model: Model<Counter>,
+        now: Instant,
+        owed: Vec<Owed>,
+        authorities: Vec<Authority>,
+        /// The re-INVITEs the core took, which the peer may answer.
+        reinvites: Vec<ExchangeKey>,
+        calls: u32,
+        /// The next CSeq number of a request from a peer, above any number the
+        /// UA picks or the fixtures use, so each is new in its dialog.
+        cseq: u32,
+    }
+
+    /// A request a peer sends in the dialog `id` names, as this user agent
+    /// knows the dialog.
+    fn peer_request(id: &DialogId, method: &str, cseq: u32) -> Request<Bytes> {
+        let from =
+            id.remote_tag().map_or(String::new(), |tag| format!(";tag={tag}"));
+        request(&format!(
+            "{method} sip:ua@192.0.2.1 SIP/2.0
+Via: SIP/2.0/UDP 192.0.2.9;branch=z9hG4bK-{method}-{cseq}
+Max-Forwards: 70
+To: <sip:ua@192.0.2.1>;tag={local}
+From: <sip:peer@192.0.2.9>{from}
+Call-ID: {call}
+CSeq: {cseq} {method}
+Contact: <sip:peer@192.0.2.{host}>
+
+",
+            local = id.local_tag(),
+            call = id.call_id(),
+            host = 10 + cseq % 200,
+        ))
+    }
+
+    /// A response of the peer to an INVITE numbered `cseq` that this user
+    /// agent sent in the dialog `id` names.
+    fn peer_response(
+        id: &DialogId,
+        status: &str,
+        cseq: u32,
+    ) -> Response<Bytes> {
+        let (to, host) = match id.remote_tag() {
+            Some(tag) => (format!(";tag={tag}"), tag.as_str()),
+            None => (String::new(), "none"),
+        };
+        response(&format!(
+            "SIP/2.0 {status}
+Via: SIP/2.0/UDP 192.0.2.1;branch=z9hG4bK-sim
+To: <sip:peer@192.0.2.9>{to}
+From: <sip:ua@192.0.2.1>;tag={local}
+Call-ID: {call}
+CSeq: {cseq} INVITE
+Contact: <sip:{host}@192.0.2.9>
+
+",
+            local = id.local_tag(),
+            call = id.call_id(),
+        ))
+    }
+
+    /// Picks the `index`th of `items`, wrapping around, or `None` from none.
+    fn pick<T: Clone>(items: &[T], index: u8) -> Option<T> {
+        (!items.is_empty())
+            .then(|| items[usize::from(index) % items.len()].clone())
+    }
+
+    impl Simulation {
+        fn new(limits: Limits) -> Simulation {
+            Simulation {
+                model: model(limits),
+                now: Instant::now(),
+                owed: Vec::new(),
+                authorities: Vec::new(),
+                reinvites: Vec::new(),
+                calls: 0,
+                cseq: 400_000,
+            }
+        }
+
+        /// Carries out the effects until there are none, as the driver's
+        /// `settle` does. Taking them checks the tables each time.
+        fn settle(&mut self) {
+            loop {
+                let effects = self.model.take_effects();
+                if effects.is_empty() {
+                    return;
+                }
+                for effect in effects {
+                    self.apply(effect);
+                }
+            }
+        }
+
+        fn apply(&mut self, effect: Effect) {
+            let owed = match effect {
+                Effect::SubmitFinal { exchange, .. } => Owed::Final(exchange),
+                Effect::SubmitProvisional {
+                    exchange,
+                    status,
+                    preview,
+                    operation,
+                    ..
+                } => {
+                    Owed::Provisional { exchange, status, preview, operation }
+                }
+                Effect::StartInvite { attempt } => {
+                    if self.model.take_invite(attempt).is_none() {
+                        return;
+                    }
+                    Owed::Invite(attempt)
+                }
+                Effect::StartReinvite { exchange } => {
+                    if self.model.take_reinvite(exchange).is_none() {
+                        return;
+                    }
+                    Owed::Reinvite(exchange)
+                }
+                Effect::PrepareAnswer { replay, .. } => Owed::Answer(replay),
+                Effect::SendAck { replay } => {
+                    if self.model.ack_request(replay).is_none() {
+                        self.model.ack_written(replay, false);
+                        return;
+                    }
+                    Owed::Ack(replay)
+                }
+                Effect::SendBye { replay } => {
+                    if self.model.bye_request(replay).is_none() {
+                        self.model.bye_done(replay);
+                        return;
+                    }
+                    Owed::Bye(replay)
+                }
+                Effect::SendSessionBye { usage } => {
+                    if let Err(error) = self.model.session_bye_request(usage) {
+                        self.model.bye_started(usage, Err(error));
+                        return;
+                    }
+                    Owed::SessionBye(usage)
+                }
+                Effect::CancelInvite { operation, .. } => {
+                    Owed::Cancel(operation)
+                }
+                Effect::OperationEnded { operation } => {
+                    self.model.take_outcome(operation);
+                    return;
+                }
+                Effect::Resend2xx { .. }
+                | Effect::ResendAck { .. }
+                | Effect::AttemptEnded { .. }
+                | Effect::Notify(_)
+                | Effect::Released(_) => return,
+            };
+            self.owed.push(owed);
+        }
+
+        /// Takes in a request a peer sent, as the driver does by its method,
+        /// with the body of an offer or none by `choice`.
+        fn receive(&mut self, request: &Request<Bytes>, choice: u8) {
+            let now = self.now;
+            let method = request.method().clone();
+            if method == Method::ACK {
+                let answer = (choice % 2 == 0).then(answer);
+                self.model.receive_ack_request(request, answer);
+            } else if method == Method::INVITE {
+                let body =
+                    if choice % 2 == 0 { offer() } else { Ok(Body::Empty) };
+                if let Ok(authority) =
+                    self.model.receive_invite(request, body, now)
+                {
+                    self.authorities.push(authority);
+                }
+            } else {
+                let _ = self.model.classify(request);
+                let _ = self.model.knows_dialog(request);
+                let _ = self.model.receive_request(request, flow());
+            }
+        }
+
+        /// Settles one thing the runtime owes, well or badly.        /// Settles one thing the runtime owes, well or badly.
+        fn resolve(&mut self, index: usize, well: bool, choice: u8) {
+            if self.owed.is_empty() {
+                return;
+            }
+            let owed = self.owed.swap_remove(index % self.owed.len());
+            let now = self.now;
+            let model = &mut self.model;
+            match owed {
+                Owed::Final(exchange) if well => {
+                    model.final_committed(exchange, now);
+                }
+                Owed::Final(exchange) => {
+                    model.final_refused(exchange, choice % 2 == 0);
+                }
+                Owed::Provisional { exchange, status, preview, operation } => {
+                    let result = if well {
+                        Ok(())
+                    } else {
+                        Err(Error::AlreadyFinalized)
+                    };
+                    model.provisional_done(
+                        exchange, status, preview, operation, result, now,
+                    );
+                }
+                Owed::Invite(attempt) if well => model.invite_started(attempt),
+                Owed::Invite(attempt) => {
+                    model.invite_failed(attempt, Error::Unroutable);
+                }
+                Owed::Reinvite(exchange) if well => {
+                    model.reinvite_started(exchange, Ok(()), now);
+                    self.reinvites.push(exchange);
+                }
+                Owed::Reinvite(exchange) => {
+                    let error = Error::CoreSubmissionRejected;
+                    model.reinvite_started(exchange, Err(error), now);
+                }
+                Owed::Ack(replay) => model.ack_written(replay, well),
+                Owed::Bye(replay) => model.bye_done(replay),
+                Owed::SessionBye(usage) => {
+                    let result = if well {
+                        Ok(())
+                    } else {
+                        Err(Error::TransportFailure)
+                    };
+                    if let Some(bye) = model.bye_started(usage, result) {
+                        self.owed.push(Owed::ByeResponse(bye));
+                    }
+                }
+                Owed::ByeResponse(bye) => {
+                    let result = match choice % 3 {
+                        _ if well => Ok(()),
+                        0 => Err(Error::RemoteFailure(status(481))),
+                        _ => Err(Error::Timeout),
+                    };
+                    model.bye_answered(bye, result);
+                }
+                Owed::Cancel(operation) => {
+                    let result = if well {
+                        Ok(CancelResult::Sent)
+                    } else {
+                        Err(Error::TransportFailure)
+                    };
+                    model.cancel_done(operation, result);
+                }
+                Owed::Answer(replay) => {
+                    model.answer_prepared(replay, well.then(answer));
+                }
+            }
+        }
+
+        /// Submits a command as the application, and runs it. A command the
+        /// UA refuses comes back, with the authority it carried.
+        fn command(&mut self, command: Command) {
+            match self.model.try_submit(command) {
+                Ok(_) => self.model.run_commands(),
+                Err(refused) => {
+                    if let Command::Accept { authority, .. }
+                    | Command::Reject { authority, .. } = refused.command
+                    {
+                        self.authorities.push(authority);
+                    }
+                }
+            }
+        }
+
+        fn next_cseq(&mut self) -> u32 {
+            self.cseq += 1;
+            self.cseq
+        }
+
+        /// The dialogs a peer can send requests in: those in the table, and
+        /// the early dialogs of INVITEs this user agent has not answered.
+        fn dialogs(&self) -> Vec<DialogId> {
+            let mut dialogs: Vec<DialogId> = self
+                .model
+                .dialogs
+                .iter()
+                .map(|(_, dialog)| dialog.id().clone())
+                .collect();
+            for (_, exchange) in self.model.exchanges.iter() {
+                if let Scope::Incoming {
+                    kind: Received::Initial { dialog: Some(dialog), .. },
+                    ..
+                } = &exchange.scope
+                {
+                    dialogs.push(dialog.id().clone());
+                }
+            }
+            dialogs
+        }
+
+        /// Takes one step of a script, with `kind` choosing what happens and
+        /// `a` and `b` choosing among what the tables hold.
+        fn step(&mut self, kind: u8, a: u8, b: u8) {
+            let now = self.now;
+            match kind % 16 {
+                // A new INVITE, with an offer or without.
+                0 => {
+                    self.calls += 1;
+                    let call = format!("call{}@example.com", self.calls);
+                    let body =
+                        if a % 2 == 0 { offer() } else { Ok(Body::Empty) };
+                    if let Ok(authority) =
+                        self.model.receive_invite(&invite(&call), body, now)
+                    {
+                        self.authorities.push(authority);
+                    }
+                }
+                // The application decides an INVITE, or drops it.
+                1 | 2 => {
+                    if self.authorities.is_empty() {
+                        return;
+                    }
+                    let index = usize::from(a) % self.authorities.len();
+                    let authority = self.authorities.swap_remove(index);
+                    let exchange = authority.exchange;
+                    match b % 5 {
+                        0 | 1 => self.command(Command::Accept {
+                            authority,
+                            answer: answer(),
+                        }),
+                        2 => self.command(Command::Reject {
+                            authority,
+                            status: status(486),
+                        }),
+                        3 => {
+                            self.authorities.push(authority);
+                            self.command(Command::Provisional {
+                                exchange,
+                                status: status(180),
+                                preview: (a % 2 == 0).then(answer),
+                            });
+                        }
+                        _ => self.model.abandon(authority.exchange),
+                    }
+                }
+                // The caller cancels an INVITE this user agent holds.
+                3 => {
+                    let incoming: Vec<ExchangeKey> = self
+                        .model
+                        .exchanges
+                        .iter()
+                        .filter(|(_, exchange)| {
+                            matches!(exchange.scope, Scope::Incoming { .. })
+                        })
+                        .map(|(key, _)| key)
+                        .collect();
+                    if let Some(exchange) = pick(&incoming, a) {
+                        self.model.receive_cancel(exchange);
+                    }
+                }
+                // The peer acknowledges a 2xx this user agent sent or is
+                // sending, with an answer or without.
+                4 => {
+                    let mut acks: Vec<(DialogId, u32)> = self
+                        .model
+                        .replays
+                        .iter()
+                        .filter(|(_, replay)| {
+                            replay.id.direction == Direction::Incoming
+                        })
+                        .map(|(_, replay)| {
+                            (replay.id.dialog.clone(), replay.id.cseq)
+                        })
+                        .collect();
+                    for (_, exchange) in self.model.exchanges.iter() {
+                        let id = match &exchange.scope {
+                            Scope::Incoming {
+                                kind:
+                                    Received::Initial {
+                                        dialog: Some(dialog), ..
+                                    },
+                                ..
+                            } => dialog.id().clone(),
+                            Scope::Incoming {
+                                kind: Received::Reinvite { dialog, .. },
+                                ..
+                            } => dialog.clone(),
+                            _ => continue,
+                        };
+                        acks.push((id, exchange.cseq));
+                    }
+                    if let Some((id, cseq)) = pick(&acks, a) {
+                        let answer = (b % 2 == 0).then(answer);
+                        self.model.receive_ack(&id, cseq, answer);
+                    }
+                }
+                // The peer sends a BYE, an OPTIONS or a re-INVITE in a
+                // dialog.
+                5 | 6 => {
+                    let Some(id) = pick(&self.dialogs(), a) else {
+                        return;
+                    };
+                    let cseq = if b % 7 == 0 { 1 } else { self.next_cseq() };
+                    match b % 3 {
+                        0 => {
+                            let bye = peer_request(&id, "BYE", cseq);
+                            let _ = self.model.receive_request(&bye, flow());
+                        }
+                        1 => {
+                            let options = peer_request(&id, "OPTIONS", cseq);
+                            let _ =
+                                self.model.receive_request(&options, flow());
+                        }
+                        _ => {
+                            let reinvite = peer_request(&id, "INVITE", cseq);
+                            let body = if a % 2 == 0 {
+                                offer()
+                            } else {
+                                Ok(Body::Empty)
+                            };
+                            if let Ok(authority) =
+                                self.model.receive_invite(&reinvite, body, now)
+                            {
+                                self.authorities.push(authority);
+                            }
+                        }
+                    }
+                }
+                // The application sends an INVITE, with an offer or without.
+                7 => {
+                    let mut plan = plan();
+                    if a % 3 == 0 {
+                        let uri = |text: &str| text.parse().unwrap();
+                        *plan = InvitePlan::without_offer(
+                            uri("sip:bob@biloxi.example.com"),
+                            uri("sip:alice@atlanta.example.com"),
+                        );
+                    }
+                    self.command(Command::Invite { plan });
+                }
+                // A peer answers an INVITE the core took for this user agent.
+                8 | 9 => {
+                    let started: Vec<AttemptKey> = self
+                        .model
+                        .attempts
+                        .iter()
+                        .filter(|(_, attempt)| attempt.started())
+                        .map(|(key, _)| key)
+                        .collect();
+                    let Some(attempt) = pick(&started, a) else {
+                        return;
+                    };
+                    let record = self.model.attempts.get(attempt).unwrap();
+                    let tag: Tag = ["a", "b", "c"][usize::from(b / 8) % 3]
+                        .parse()
+                        .unwrap();
+                    let id = record.origin.dialog_id(Some(tag));
+                    let cseq = record.origin.cseq();
+                    let description = (b % 4 != 0).then(answer);
+                    let _ = match b % 8 {
+                        0 | 1 => self.model.receive_provisional(
+                            attempt,
+                            &peer_response(&id, "180 Ringing", cseq),
+                            description,
+                        ),
+                        2..=4 => self.model.receive_2xx(
+                            attempt,
+                            &peer_response(&id, "200 OK", cseq),
+                            description,
+                        ),
+                        5 => {
+                            let error = Error::RemoteFailure(status(486));
+                            self.model.attempt_failed(attempt, error);
+                            Ok(())
+                        }
+                        6 => {
+                            self.model.responses_lost(attempt);
+                            Ok(())
+                        }
+                        _ => {
+                            self.model.response_collection_finished(attempt);
+                            Ok(())
+                        }
+                    };
+                }
+                // The application cancels or gives up an INVITE it sent.
+                10 => {
+                    let attempts: Vec<AttemptKey> = self
+                        .model
+                        .attempts
+                        .iter()
+                        .map(|(key, _)| key)
+                        .collect();
+                    if let Some(attempt) = pick(&attempts, a) {
+                        self.command(if b % 2 == 0 {
+                            Command::Cancel { attempt }
+                        } else {
+                            Command::Abandon { attempt }
+                        });
+                    }
+                }
+                // The application ends a session or sends a re-INVITE.
+                11 => {
+                    let usages: Vec<UsageKey> =
+                        self.model.usages.iter().map(|(key, _)| key).collect();
+                    if let Some(usage) = pick(&usages, a) {
+                        self.command(match b % 3 {
+                            0 => Command::Terminate { usage },
+                            1 => Command::Reinvite {
+                                usage,
+                                offer: Some(answer()),
+                            },
+                            _ => Command::Reinvite { usage, offer: None },
+                        });
+                    }
+                }
+                // The peer answers a re-INVITE this user agent sent.
+                12 => {
+                    self.reinvites.retain(|&exchange| {
+                        self.model.exchanges.get(exchange).is_some()
+                    });
+                    let Some(exchange) = pick(&self.reinvites, a) else {
+                        return;
+                    };
+                    let record = self.model.exchanges.get(exchange).unwrap();
+                    let Scope::Reinvite(sent) = &record.scope else {
+                        return;
+                    };
+                    let (id, cseq) = (sent.dialog.clone(), record.cseq);
+                    let description = (b % 4 != 0).then(answer);
+                    let code = [
+                        "200 OK",
+                        "180 Ringing",
+                        "491 Request Pending",
+                        "481 Call Does Not Exist",
+                        "408 Request Timeout",
+                        "488 Not Acceptable Here",
+                    ];
+                    match b % 9 {
+                        0..=5 => {
+                            let response = peer_response(
+                                &id,
+                                code[usize::from(b % 9)],
+                                cseq,
+                            );
+                            self.model.receive_reinvite_response(
+                                exchange,
+                                &response,
+                                description,
+                                now,
+                            );
+                        }
+                        6 => self.model.reinvite_transaction_failed(
+                            exchange,
+                            Error::Timeout,
+                            now,
+                        ),
+                        7 => self.model.reinvite_responses_lost(exchange),
+                        _ => self
+                            .model
+                            .reinvite_collection_finished(exchange, now),
+                    }
+                }
+                // Something the runtime owes is settled.
+                13 | 14 => {
+                    self.resolve(usize::from(a), b % 4 != 0, b);
+                }
+                // Time passes.
+                _ => {
+                    let seconds = [0.05, 0.5, 2.0, 5.0, 33.0, 200.0];
+                    let by = seconds[usize::from(a) % seconds.len()];
+                    self.now += Duration::from_secs_f64(by);
+                    self.model.fire_timers(self.now);
+                }
+            }
+        }
+
+        /// Settles everything, as a runtime that keeps running and peers that
+        /// stop sending would, until nothing changes.
+        fn quiesce(&mut self) {
+            for _ in 0..32 {
+                for authority in std::mem::take(&mut self.authorities) {
+                    self.model.abandon(authority.exchange);
+                }
+                self.settle();
+                while !self.owed.is_empty() {
+                    self.resolve(0, true, 1);
+                    self.settle();
+                }
+                let attempts: Vec<AttemptKey> =
+                    self.model.attempts.iter().map(|(key, _)| key).collect();
+                for attempt in attempts {
+                    self.model.response_collection_finished(attempt);
+                }
+                for exchange in std::mem::take(&mut self.reinvites) {
+                    self.model
+                        .reinvite_collection_finished(exchange, self.now);
+                }
+                self.settle();
+                if self.owed.is_empty() && self.model.timers.next().is_none() {
+                    return;
+                }
+                self.now += Duration::from_secs(300);
+                self.model.fire_timers(self.now);
+                self.settle();
+            }
+            panic!("the model never settled: {:?}", self.owed);
+        }
+    }
+
+    /// Runs a script of steps on a model with small tables, so that every
+    /// limit is met and slots are reused, then lets everything settle. The
+    /// tables are checked after every input. Once settled, no operation is
+    /// left without an outcome, no timer is set, and nothing is kept but the
+    /// sessions that are still up.
+    fn run_script(preset: u8, script: Vec<(u8, u8, u8)>) -> bool {
+        let limits = match preset % 3 {
+            0 => Limits {
+                attempts: 1,
+                incoming: 1,
+                dialogs: 2,
+                usages: 2,
+                replays: 2,
+                forks: 1,
+                cleanups: 1,
+                operations: 3,
+                commands: 2,
+                reinvites: 1,
+                ..limits()
+            },
+            1 => limits(),
+            _ => Limits {
+                attempts: 8,
+                incoming: 8,
+                dialogs: 16,
+                usages: 16,
+                replays: 32,
+                forks: 4,
+                cleanups: 4,
+                operations: 64,
+                commands: 8,
+                reinvites: 16,
+                ..limits()
+            },
+        };
+        let mut simulation = Simulation::new(limits);
+
+        for (kind, a, b) in script {
+            simulation.step(kind, a, b);
+            simulation.settle();
+        }
+        simulation.quiesce();
+
+        let model = &simulation.model;
+        assert_eq!(model.operations.running().count(), 0, "a stuck operation");
+        assert_eq!(model.timers.len(), 0);
+        assert_eq!(model.attempts.len(), 0);
+        assert_eq!(model.exchanges.len(), 0);
+        assert_eq!(model.replays.len(), 0);
+        assert_eq!(model.dialogs.len(), model.usages.len(), "a Mortal dialog");
+        assert!(model.byes.is_empty());
+        true
+    }
+
+    /// `QUICKCHECK_TESTS` sets how many scripts run, for a longer search
+    /// than the 400 of a test run.
+    #[test]
+    fn any_order_of_inputs_keeps_the_tables_consistent() {
+        let mut checker =
+            quickcheck::QuickCheck::new().rng(quickcheck::Gen::new(200));
+        if std::env::var_os("QUICKCHECK_TESTS").is_none() {
+            checker = checker.tests(400);
+        }
+        checker.quickcheck(run_script as fn(u8, Vec<(u8, u8, u8)>) -> bool);
     }
 }

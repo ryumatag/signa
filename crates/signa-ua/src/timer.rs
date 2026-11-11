@@ -23,12 +23,21 @@ the records it serves.
 [RFC 3261 section 14.1]: https://www.rfc-editor.org/rfc/rfc3261.html#section-14.1
 */
 
-use std::{collections::BTreeSet, time::Instant};
+use std::{
+    collections::BTreeSet,
+    time::{Duration, Instant},
+};
 
 use crate::{
     invite::{ExchangeKey, UsageKey},
     retention::ReplayKey,
 };
+
+/// A time later than any deadline of the UA is meant to be, and early enough
+/// to add to the clock. A timer set from a configured time too long to add is
+/// due this far ahead instead, which is what Tokio takes for the far future
+/// too.
+pub(crate) const FAR: Duration = Duration::from_secs(30 * 365 * 24 * 60 * 60);
 
 /// What a timer is for.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -80,6 +89,12 @@ impl TimerQueue {
             return None;
         }
         self.entries.pop_first()
+    }
+
+    /// Returns each timer that is set, with when it is due.
+    #[cfg(test)]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (Instant, Timer)> {
+        self.entries.iter().copied()
     }
 
     #[cfg(test)]

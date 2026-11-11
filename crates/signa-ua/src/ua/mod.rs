@@ -193,6 +193,8 @@ pub struct Config<R = StaticResolver, N = NoNegotiator> {
     resolve_timeout: Duration,
     timers: Timers,
     decision_timeout: Duration,
+    invite_bytes: usize,
+    description_bytes: usize,
 }
 
 /// The Contact URI given to [`Config::new`] is not a SIP or SIPS URI, or has
@@ -257,6 +259,8 @@ impl Config {
             // final response (RFC 3261 section 16.6, Timer C), so a decision
             // later than that is likely to come too late anyway.
             decision_timeout: Duration::from_secs(180),
+            invite_bytes: 16 * 1024 * 1024,
+            description_bytes: 32 * 1024,
         })
     }
 }
@@ -283,6 +287,8 @@ impl<R, N> Config<R, N> {
             resolve_timeout: self.resolve_timeout,
             timers: self.timers,
             decision_timeout: self.decision_timeout,
+            invite_bytes: self.invite_bytes,
+            description_bytes: self.description_bytes,
         }
     }
 
@@ -310,6 +316,8 @@ impl<R, N> Config<R, N> {
             resolve_timeout: self.resolve_timeout,
             timers: self.timers,
             decision_timeout: self.decision_timeout,
+            invite_bytes: self.invite_bytes,
+            description_bytes: self.description_bytes,
         }
     }
 
@@ -325,7 +333,8 @@ impl<R, N> Config<R, N> {
     /// answers that hang delay no other beyond it. One that takes longer
     /// counts as none, so the ACK goes without it, and the dialog ends. The
     /// default is 2 seconds, well within the 32 seconds a peer with the
-    /// default T1 waits for the ACK.
+    /// default T1 waits for the ACK. A timeout too long to add to the clock,
+    /// such as [`Duration::MAX`], sets no deadline.
     pub fn answer_timeout(mut self, timeout: Duration) -> Config<R, N> {
         self.answer_timeout = timeout;
         self
@@ -415,8 +424,17 @@ impl<R, N> Config<R, N> {
         self
     }
 
-    /// Sets how many sends and resolutions may run at once. More wait their
+    /// Sets how many sends, each with the resolution of its next hop, may
+    /// run at once, and apart from them how many responses. More wait their
     /// turn. The default is 256.
+    ///
+    /// The answers to requests the UA keeps nothing for, such as the 503 of
+    /// an INVITE it has no room for, wait up to this many more. So do the
+    /// answers to a BYE in one of its dialogs or a CANCEL of one of its
+    /// INVITEs, apart from them, and they start first, though never more
+    /// than eight in a row while other responses wait. A request whose
+    /// answer finds no room changes nothing, and the endpoint answers it
+    /// with a 500.
     pub fn max_jobs(mut self, limit: usize) -> Config<R, N> {
         self.jobs = bounded(limit);
         self
@@ -447,6 +465,35 @@ impl<R, N> Config<R, N> {
     /// such as [`Duration::MAX`], sets no deadline. The default is 3 minutes.
     pub fn decision_timeout(mut self, timeout: Duration) -> Config<R, N> {
         self.decision_timeout = timeout;
+        self
+    }
+
+    /// Sets how many bytes the incoming INVITEs the UA keeps may take
+    /// together. The default is 16 MiB.
+    ///
+    /// The UA keeps an INVITE from its arrival until its ACK, or until its
+    /// final response is sent if that is not a 2xx, and so does an
+    /// [`IncomingInvite`] the application keeps. Each INVITE counts its bytes
+    /// on the wire, which it keeps apart from the buffer it arrived in. Its
+    /// parsed header table comes on top, which the parser bounds to 100 rows.
+    /// An INVITE that does not fit gets a 503. Bytes the application copies
+    /// out of the INVITE are its own.
+    pub fn max_invite_bytes(mut self, bytes: usize) -> Config<R, N> {
+        self.invite_bytes = bounded(bytes);
+        self
+    }
+
+    /// Sets how many bytes a session description the UA receives may take.
+    /// The default is 32 KiB.
+    ///
+    /// A session keeps the last description it got for as long as it lasts,
+    /// and its snapshot shows it, so this and [`Config::max_dialogs`] bound
+    /// what the sessions keep. An INVITE whose offer is larger gets a 413
+    /// (RFC 3261 section 21.4.11). A larger description in a response or an
+    /// ACK counts as none, which fails the exchange that needed it, as an
+    /// answer missing from a 2xx or an ACK does.
+    pub fn max_description_bytes(mut self, bytes: usize) -> Config<R, N> {
+        self.description_bytes = bounded(bytes);
         self
     }
 
@@ -1343,9 +1390,15 @@ pub enum Event {
 /// The UA answers a re-INVITE that collides with another INVITE of the
 /// dialog itself, without asking: a 491 if this UA's re-INVITE is pending,
 /// and a 500 with a Retry-After if the peer's last one is undecided (RFC
-/// 3261 section 14.2).
+/// 3261 section 14.2). It answers one with a 491 too while two 2xx of the
+/// session wait for their ACK, so that a peer that never acknowledges cannot
+/// have one session take the room of every other, which RFC 5407 section
+/// 3.1.4 allows.
 pub struct IncomingInvite {
     request: Request<Bytes>,
+    /// The INVITE's share of [`Config::max_invite_bytes`], which goes back
+    /// once neither this nor the UA keeps the INVITE.
+    _bytes: Arc<OwnedSemaphorePermit>,
     flow: Flow,
     /// The session of a re-INVITE.
     session: Option<Session>,

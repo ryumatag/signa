@@ -20,11 +20,34 @@ limit and deadline. A slow SDP component therefore holds up only the ACKs that
 wait for its answers, not the other jobs, and its backlog is bounded by the
 replay contexts, each of which asks for one answer at most.
 
-Every task belongs to one of four [`JoinSet`]s, so that dropping the driver
-aborts all of them. Jobs are bounded by the configuration. More wait in a
-backlog, which the model's own tables bound, since each job is for one of their
-records, and a record has at most one copy of its 2xx or its ACK on the way at
-a time, and one BYE ever. A job that writes to the network gives up after a
+Every task belongs to one of five [`JoinSet`]s, so that dropping the driver
+aborts all of them. Jobs come in two kinds, each with as many at once as the
+configuration allows:
+
+* A send resolves a next hop and hands a request to the endpoint, which takes
+  as long as a resolution or a connection does.
+* A reply hands a response to the endpoint, through a responder or a reply
+  route, which the endpoint takes or refuses at once, or within a bounded
+  wait for room.
+
+A resolver that hangs therefore holds up sends only, never the answer to a
+BYE or a CANCEL. More jobs wait in a backlog of their kind, which the model's
+own tables bound, since each job is for one of their records, and a record
+has at most one copy of its 2xx or its ACK on the way at a time, and one BYE
+ever. The answers to requests the UA keeps no record for wait apart, in two
+lanes with a limit each, so that a flood of new requests takes no room from
+a BYE, and a flood of BYEs no room from anything else:
+
+* The answer to a request that ends or withdraws something the UA keeps, a
+  BYE in one of its dialogs or a CANCEL of one of its INVITEs, goes first.
+* The answer to any other request, such as the refusal of a new INVITE,
+  goes after the replies of records.
+
+A request that finds no room changes nothing. No backlog of replies starts
+more than a few in a row while a later one waits, so that none waits for
+good, see [`Waiting`]. None of this is a guarantee that a request gets
+through. Before the UA sees a request, signa-core may refuse it for limits of
+its own, and a peer's retransmission is what recovers it then. A job that writes to the network gives up after a
 while, so that a peer that does not read holds no job for long. Response
 readers are one per attempt, which the attempt table bounds. Watchers wait on
 the core for what can take long and writes nothing itself: the CANCEL of an
@@ -41,7 +64,7 @@ use std::{
 
 use bytes::Bytes;
 use signa_core::{
-    Method, Request, Response, StatusCode,
+    HeaderValue, Method, Request, Response, StatusCode,
     endpoint::{
         Branch, CancelError, CancelOutcome, ClientControl, ClientTransaction,
         Endpoint, Error as CoreError, Incoming, IncomingCancel, IncomingEvent,
@@ -59,7 +82,7 @@ use signa_core::{
     },
 };
 use tokio::{
-    sync::{OwnedSemaphorePermit, mpsc, oneshot},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
     task::{self, JoinSet},
     time::{Instant, sleep_until},
 };
@@ -80,6 +103,7 @@ use crate::{
     plan::ALLOWED,
     protocol,
     retention::ReplayKey,
+    timer,
 };
 
 /// Randomness from the operating system, which RFC 3261 section 19.3 asks
@@ -141,6 +165,7 @@ pub(super) struct Driver<R, N> {
     events: mpsc::Sender<Event>,
     /// Notifications dropped since the last one that got through.
     lagged: u64,
+    /// The sends that run.
     jobs: JoinSet<Done>,
     /// What each running job reports if it panics, such as in a resolver,
     /// so that the record it was for does not wait for it for good.
@@ -153,13 +178,24 @@ pub(super) struct Driver<R, N> {
     /// How long a copy of a 2xx may wait for the endpoint, which is T2, the
     /// longest interval before the next copy is due anyway.
     resend_timeout: Duration,
+    /// The sends that wait for one of `jobs`.
     backlog: VecDeque<Job>,
+    /// The replies that run.
+    replies: JoinSet<Done>,
+    /// The replies that wait for one of `replies`.
+    waiting: Waiting<Job>,
     readers: JoinSet<()>,
     response_sender: mpsc::Sender<(Client, ResponseItem)>,
     responses: mpsc::Receiver<(Client, ResponseItem)>,
     /// The INVITE and responder of each incoming exchange, until its final
     /// response is done with.
     servers: HashMap<ExchangeKey, Server>,
+    /// The bytes the INVITEs in `servers` may take together, one permit a
+    /// byte. An INVITE holds its permits as long as the UA or the
+    /// application keeps it.
+    invite_bytes: Arc<Semaphore>,
+    /// The most bytes of a session description the UA keeps.
+    max_description: usize,
     /// The exchange of each INVITE transaction in `servers`, which a CANCEL
     /// names by the transaction it matched.
     server_ids: HashMap<ServerTransactionId, ExchangeKey>,
@@ -181,7 +217,12 @@ pub(super) struct Driver<R, N> {
 }
 
 struct Server {
+    /// The INVITE, in an allocation of its own (see [`compact`]).
     request: Request<Bytes>,
+    /// The INVITE's bytes, of [`Driver::invite_bytes`], which its
+    /// [`IncomingInvite`] shares. An INVITE the UA refuses for want of room
+    /// has none, see [`Driver::on_invite`].
+    _bytes: Option<Arc<OwnedSemaphorePermit>>,
     responder: Arc<Responder>,
     id: ServerTransactionId,
     /// The 2xx the core took, as it went out, to send again through the
@@ -276,6 +317,104 @@ enum Job {
 enum AckRoute {
     Resolve(Query),
     Resend(Target),
+}
+
+/// Which backlog the answer to a request goes to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Lane {
+    /// The answer to a request that ends or withdraws something the UA
+    /// keeps, a BYE in one of its dialogs or a CANCEL of one of its INVITEs.
+    Control,
+    /// The answer to any other request.
+    Ordinary,
+}
+
+/// How many replies of one backlog may start in a row while a backlog after
+/// it in [`Waiting`] has one waiting. My policy, so that a burst of one kind,
+/// such as copies of many 2xx due at once or a flood of BYEs, delays the
+/// others without stopping them.
+const BATCH: usize = 8;
+
+/// The replies that wait for a job, in three backlogs, which start in the
+/// order below, though no more than [`BATCH`] in a row from one while a later
+/// one waits:
+///
+/// * The answers to requests that end or withdraw something the UA keeps,
+///   such as the 200 of a BYE in one of its dialogs.
+/// * The replies of the model's records, such as a final response or a copy
+///   of a 2xx, which its tables bound.
+/// * The answers to requests the UA keeps nothing for, such as the refusal of
+///   a new INVITE.
+///
+/// The answers have a limit for each lane, since nothing else bounds them.
+#[derive(Debug)]
+struct Waiting<T> {
+    control: VecDeque<T>,
+    records: VecDeque<T>,
+    ordinary: VecDeque<T>,
+    /// How many control answers started in a row while a record's reply
+    /// waited.
+    control_streak: usize,
+    /// How many others started in a row while an ordinary answer waited.
+    ordinary_streak: usize,
+    limit: usize,
+}
+
+impl<T> Waiting<T> {
+    fn new(limit: usize) -> Waiting<T> {
+        Waiting {
+            control: VecDeque::new(),
+            records: VecDeque::new(),
+            ordinary: VecDeque::new(),
+            control_streak: 0,
+            ordinary_streak: 0,
+            limit,
+        }
+    }
+
+    /// Says whether `lane` takes another answer.
+    fn has_room(&self, lane: Lane) -> bool {
+        match lane {
+            Lane::Control => self.control.len() < self.limit,
+            Lane::Ordinary => self.ordinary.len() < self.limit,
+        }
+    }
+
+    /// Queues an answer in `lane`, whose room the caller checked before the
+    /// request it answers changed anything.
+    fn answer(&mut self, reply: T, lane: Lane) {
+        match lane {
+            Lane::Control => self.control.push_back(reply),
+            Lane::Ordinary => self.ordinary.push_back(reply),
+        }
+    }
+
+    /// Queues a reply of one of the model's records.
+    fn record(&mut self, reply: T) {
+        self.records.push_back(reply);
+    }
+
+    /// Takes the reply to start next, if any waits.
+    fn next(&mut self) -> Option<T> {
+        let others = !self.control.is_empty() || !self.records.is_empty();
+        if !self.ordinary.is_empty()
+            && (!others || self.ordinary_streak >= BATCH)
+        {
+            self.ordinary_streak = 0;
+            return self.ordinary.pop_front();
+        }
+        let reply = if !self.control.is_empty()
+            && (self.records.is_empty() || self.control_streak < BATCH)
+        {
+            self.control_streak += usize::from(!self.records.is_empty());
+            self.control.pop_front()
+        } else {
+            self.control_streak = 0;
+            self.records.pop_front()
+        };
+        self.ordinary_streak += usize::from(!self.ordinary.is_empty());
+        reply
+    }
 }
 
 /// What a finished job reports.
@@ -382,10 +521,14 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             jobs: JoinSet::new(),
             fallbacks: HashMap::new(),
             backlog: VecDeque::new(),
+            replies: JoinSet::new(),
+            waiting: Waiting::new(config.jobs),
             readers: JoinSet::new(),
             response_sender,
             responses,
             servers: HashMap::new(),
+            invite_bytes: Arc::new(Semaphore::new(config.invite_bytes)),
+            max_description: config.description_bytes,
             server_ids: HashMap::new(),
             clients: HashMap::new(),
             watchers: JoinSet::new(),
@@ -421,6 +564,11 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
                 }
                 Some(done) = self.jobs.join_next_with_id(),
                     if !self.jobs.is_empty() =>
+                {
+                    self.on_joined(done);
+                }
+                Some(done) = self.replies.join_next_with_id(),
+                    if !self.replies.is_empty() =>
                 {
                     self.on_joined(done);
                 }
@@ -498,6 +646,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
                 let answer = Body::description(
                     ack.request.headers(),
                     ack.request.body(),
+                    self.max_description,
                 );
                 self.model.receive_ack_request(&ack.request, answer);
                 self.settle(None);
@@ -525,10 +674,17 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
     /// without it, so a CANCEL that finds no room changes nothing. Its
     /// responder is dropped unanswered, and signa-core sends its 500. The
     /// peer then still has its INVITE pending, and may send the CANCEL again.
+    /// The 200 of a CANCEL of an INVITE the UA holds goes first, see
+    /// [`Lane`].
     fn on_cancel(&mut self, cancel: IncomingCancel) {
         let IncomingCancel { request, transaction, target, .. } = cancel;
         let (responder, _events) = transaction.into_parts();
-        if !self.has_room() {
+        let lane = if self.server_ids.contains_key(&target) {
+            Lane::Control
+        } else {
+            Lane::Ordinary
+        };
+        if !self.has_room(lane) {
             return;
         }
 
@@ -541,7 +697,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         if let Some(tag) = tag {
             response = response.to_tag(tag);
         }
-        self.answer_committed(Arc::new(responder), response);
+        self.answer(Arc::new(responder), response, lane);
         self.settle(None);
     }
 
@@ -556,14 +712,14 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             response = response.to_tag(tag);
         }
 
-        // As in `answer_alone`, no table bounds such an answer, so it waits
-        // for the backlog to have room, or does not go. The peer sends its
-        // CANCEL again then.
-        if !self.has_room() {
+        // No table bounds such an answer, so it waits for the backlog to
+        // have room, or does not go. The peer sends its CANCEL again then.
+        if !self.has_room(Lane::Ordinary) {
             return;
         }
         if let Ok(response) = response.body(Bytes::new()) {
-            self.backlog.push_back(Job::Reply { route: reply, response });
+            let job = Job::Reply { route: reply, response };
+            self.waiting.answer(job, Lane::Ordinary);
         }
     }
 
@@ -578,7 +734,11 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         let (responder, _events) = transaction.into_parts();
         let responder = Arc::new(responder);
 
-        let body = Body::read(request.headers(), request.body());
+        let body = Body::read(
+            request.headers(),
+            request.body(),
+            self.max_description,
+        );
         let offer = match &body {
             Ok(Body::Session(offer)) => Some(Box::new(offer.clone())),
             _ => None,
@@ -587,7 +747,9 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         {
             Ok(authority) => authority,
             Err(refusal) => {
-                self.refuse(&request, responder, refusal);
+                if self.has_room(Lane::Ordinary) {
+                    self.refuse(&request, responder, refusal, Lane::Ordinary);
+                }
                 self.settle(None);
                 return;
             }
@@ -599,32 +761,40 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             .map(|usage| Session::new(self.shared.id, usage));
         let id = responder.id();
         self.server_ids.insert(id, exchange);
-        self.servers.insert(
-            exchange,
-            Server {
-                request: request.clone(),
-                responder,
-                id,
-                sent: None,
-                resending: false,
-            },
-        );
+        let (request, size) = compact(request);
+        let size = u32::try_from(size).unwrap_or(u32::MAX);
+        let bytes = self.invite_bytes.clone().try_acquire_many_owned(size);
 
-        // The decision needs a place in the event queue and a slot for its
-        // abandonment. Without them, as when nobody reads the events, the UA
-        // answers with the 503 of a server without room (RFC 3261 section
-        // 21.5.4), which is my policy. The checks above come first, so that
-        // an INVITE the UA refuses anyway gets its own status.
+        // The decision needs a place in the event queue, a slot for its
+        // abandonment, and room for the INVITE's bytes. Without them, as
+        // when nobody reads the events, the UA answers with the 503 of a
+        // server without room (RFC 3261 section 21.5.4), which is my policy.
+        // The checks above come first, so that an INVITE the UA refuses
+        // anyway gets its own status.
         let room = self.room();
         match (
+            bytes,
             self.events.try_reserve_many(room),
             self.abandon_sender.clone().try_reserve_owned(),
         ) {
-            (Ok(mut places), Ok(abandon)) => {
+            (Ok(bytes), Ok(mut places), Ok(abandon)) => {
+                let bytes = Arc::new(bytes);
+                self.servers.insert(
+                    exchange,
+                    Server {
+                        request: request.clone(),
+                        _bytes: Some(bytes.clone()),
+                        responder,
+                        id,
+                        sent: None,
+                        resending: false,
+                    },
+                );
                 let place = places.next().expect("room for one at least");
                 let reinvite = session.is_some();
                 let invite = IncomingInvite {
                     request,
+                    _bytes: bytes,
                     flow,
                     session,
                     offer,
@@ -640,6 +810,20 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
                 });
             }
             _ => {
+                // The 503 is built from the INVITE, which stays until the
+                // endpoint has the 503. Its bytes are not counted for that
+                // while, which the INVITEs of the model bound in number.
+                self.servers.insert(
+                    exchange,
+                    Server {
+                        request,
+                        _bytes: None,
+                        responder,
+                        id,
+                        sent: None,
+                        resending: false,
+                    },
+                );
                 let unavailable = StatusCode::from_u16(503).expect("a status");
                 self.model.reject(exchange, unavailable);
             }
@@ -670,11 +854,20 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
     /// nothing, and its responder is dropped unanswered, so that signa-core
     /// sends its 500. A BYE the UA takes always gets its 200 (section 15.1.2
     /// makes it a MUST), since its room was there before the session ended.
+    /// The answer to a BYE in a dialog the UA keeps goes first, see
+    /// [`Lane`].
     fn on_other(&mut self, request: ServerRequest) {
         let ServerRequest { request, transaction, flow } = request;
         let (responder, _events) = transaction.into_parts();
         let responder = Arc::new(responder);
-        if !self.has_room() {
+        let lane = if *request.method() == Method::BYE
+            && self.model.knows_dialog(&request)
+        {
+            Lane::Control
+        } else {
+            Lane::Ordinary
+        };
+        if !self.has_room(lane) {
             return;
         }
 
@@ -690,7 +883,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             if allow {
                 response = response.header(ALLOW, ALLOWED);
             }
-            self.answer_alone(responder, response);
+            self.answer(responder, response, lane);
             return;
         }
         let headers = request.headers();
@@ -699,12 +892,12 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         });
         let in_dialog = match checked {
             Ok((_, true)) => {
-                self.refuse(&request, responder, Refusal::BadExtension);
+                self.refuse(&request, responder, Refusal::BadExtension, lane);
                 return;
             }
             Ok((in_dialog, false)) => in_dialog,
             Err(malformed) => {
-                self.refuse(&request, responder, malformed.into());
+                self.refuse(&request, responder, malformed.into(), lane);
                 return;
             }
         };
@@ -716,33 +909,34 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
                 Ok(InDialog::Bye) => {
                     let ok =
                         Response::reply_to(&request).status(StatusCode::OK);
-                    self.answer_committed(responder, ok);
+                    self.answer(responder, ok, lane);
                     return;
                 }
                 Ok(InDialog::Other) => {}
                 Err(refusal) => {
-                    self.refuse(&request, responder, refusal);
+                    self.refuse(&request, responder, refusal, lane);
                     return;
                 }
             }
         } else if method == Method::BYE {
-            self.refuse(&request, responder, Refusal::NoDialog);
+            self.refuse(&request, responder, Refusal::NoDialog, lane);
             return;
         }
 
         let response = Response::reply_to(&request)
             .status(StatusCode::OK)
             .header(ALLOW, ALLOWED);
-        self.answer_committed(responder, response);
+        self.answer(responder, response, lane);
     }
 
     /// Answers a request the UA keeps nothing for, with the status of
-    /// `refusal`.
+    /// `refusal`, in `lane`, whose room the caller checked.
     fn refuse(
         &mut self,
         request: &Request<Bytes>,
         responder: Arc<Responder>,
         refusal: Refusal,
+        lane: Lane,
     ) {
         let mut response =
             Response::reply_to(request).status(refusal.status());
@@ -774,48 +968,38 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             response =
                 response.header(RETRY_AFTER, seconds.to_string().as_str());
         }
-        self.answer_alone(responder, response);
+        self.answer(responder, response, lane);
     }
 
-    /// Sends a response outside any record of the model, if the backlog has
-    /// room. The model's tables do not bound such a response. With the
-    /// backlog full, dropping the responder has signa-core send its 500,
-    /// which costs the driver nothing more.
-    fn answer_alone(
-        &mut self,
-        responder: Arc<Responder>,
-        response: response::Builder,
-    ) {
-        if self.has_room() {
-            self.answer_committed(responder, response);
-        }
-    }
-
-    /// Sends a response whatever the backlog holds, since the request it
-    /// answers already changed the UA's state. The caller checked
-    /// [`Driver::has_room`] before that change, so one request adds one job
-    /// at most beyond the limit.
+    /// Sends a response outside any record of the model, in `lane`. The
+    /// caller checked [`Driver::has_room`] before the request changed
+    /// anything, and the request is not answered twice, so a lane holds one
+    /// answer at most beyond its limit.
     ///
     /// Each response but a 100 carries a To tag (RFC 3261 section 8.2.6.2).
     /// A request that had none gets a fresh one, and one in a dialog keeps
     /// its own. A response that cannot be built drops the responder, and
     /// signa-core sends its 500.
-    fn answer_committed(
+    fn answer(
         &mut self,
         responder: Arc<Responder>,
         mut response: response::Builder,
+        lane: Lane,
     ) {
         if let Some(tag) = self.tag() {
             response = response.to_tag(tag);
         }
-        if let Ok(response) = response.body(Bytes::new()) {
-            self.backlog.push_back(Job::Refuse { responder, response });
-        }
+        let Ok(response) = response.body(Bytes::new()) else {
+            return;
+        };
+        self.waiting.answer(Job::Refuse { responder, response }, lane);
     }
 
-    /// Says whether the backlog takes another job.
-    fn has_room(&self) -> bool {
-        self.backlog.len() < self.max_jobs
+    /// Says whether `lane` takes another answer. Each holds up to the job
+    /// limit. With no room, dropping the responder has signa-core send its
+    /// 500, which costs the driver nothing more.
+    fn has_room(&self, lane: Lane) -> bool {
+        self.waiting.has_room(lane)
     }
 
     fn on_command(&mut self, command: Command) {
@@ -982,8 +1166,11 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
     ) {
         match item {
             Some(Ok(response)) => {
-                let description =
-                    Body::description(response.headers(), response.body());
+                let description = Body::description(
+                    response.headers(),
+                    response.body(),
+                    self.max_description,
+                );
                 self.model.receive_reinvite_response(
                     exchange,
                     &response,
@@ -1016,6 +1203,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
                         let preview = Body::description(
                             response.headers(),
                             response.body(),
+                            self.max_description,
                         );
                         self.model
                             .receive_provisional(attempt, &response, preview)
@@ -1024,6 +1212,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
                         let description = Body::description(
                             response.headers(),
                             response.body(),
+                            self.max_description,
                         );
                         self.model.receive_2xx(attempt, &response, description)
                     }
@@ -1152,7 +1341,11 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         to_tag: Tag,
         body: Option<Description>,
     ) {
+        // The server of an exchange goes only when the model releases the
+        // exchange, after its final. Were it gone, the final could not be
+        // built, and the model drops the exchange as for a closed endpoint.
         let Some(server) = self.servers.get(&exchange) else {
+            self.model.final_refused(exchange, true);
             return;
         };
 
@@ -1170,7 +1363,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         let response = with_description(response, body);
 
         match response {
-            Ok(response) => self.backlog.push_back(Job::Final {
+            Ok(response) => self.waiting.record(Job::Final {
                 exchange,
                 responder: server.responder.clone(),
                 response,
@@ -1187,7 +1380,17 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         preview: Option<Description>,
         operation: Option<OperationId>,
     ) {
+        // As in `submit_final`, the server is there until the exchange goes,
+        // and the operation is not left waiting if it were not.
         let Some(server) = self.servers.get(&exchange) else {
+            self.model.provisional_done(
+                exchange,
+                status,
+                preview,
+                operation,
+                Err(Error::StaleDecision),
+                now(),
+            );
             return;
         };
 
@@ -1201,7 +1404,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         );
 
         match response {
-            Ok(response) => self.backlog.push_back(Job::Provisional {
+            Ok(response) => self.waiting.record(Job::Provisional {
                 exchange,
                 operation,
                 preview,
@@ -1234,7 +1437,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         }
 
         server.resending = true;
-        self.backlog.push_back(Job::Resend {
+        self.waiting.record(Job::Resend {
             exchange,
             route: server.responder.reply_route(),
             response: response.clone(),
@@ -1401,7 +1604,11 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         self.answer_backlog.push_back(Answer {
             replay,
             offer: Offer { description: offer, session },
-            due: Instant::now() + self.answer_timeout,
+            // A timeout too long to add to the clock sets an answer no
+            // deadline it could reach.
+            due: Instant::now()
+                .checked_add(self.answer_timeout)
+                .unwrap_or_else(|| Instant::now() + timer::FAR),
         });
     }
 
@@ -1658,15 +1865,29 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
 
         while self.jobs.len() < self.max_jobs {
             let Some(job) = self.backlog.pop_front() else {
-                return;
+                break;
             };
-            let endpoint = self.endpoint.clone();
-            let resolver = self.resolver.clone();
-            let timeout = self.resolve_timeout;
-            let fallback = job.fallback();
-            let handle = self.jobs.spawn(job.run(endpoint, resolver, timeout));
-            self.fallbacks.insert(handle.id(), fallback);
+            self.spawn(job, false);
         }
+
+        while self.replies.len() < self.max_jobs {
+            let Some(job) = self.waiting.next() else {
+                break;
+            };
+            self.spawn(job, true);
+        }
+    }
+
+    /// Runs a job as a send, or as a reply if `reply`.
+    fn spawn(&mut self, job: Job, reply: bool) {
+        let endpoint = self.endpoint.clone();
+        let resolver = self.resolver.clone();
+        let timeout = self.resolve_timeout;
+        let fallback = job.fallback();
+        let run = job.run(endpoint, resolver, timeout);
+        let handle =
+            if reply { self.replies.spawn(run) } else { self.jobs.spawn(run) };
+        self.fallbacks.insert(handle.id(), fallback);
     }
 }
 
@@ -1876,6 +2097,48 @@ impl Job {
     }
 }
 
+/// Copies a received request into one allocation of its exact size, so that
+/// keeping it keeps nothing else alive.
+///
+/// signa-core hands a request over as slices of the buffer it read it into.
+/// Over UDP that buffer is a chunk of 256 KiB that other datagrams share, and
+/// over TCP the read buffer of the connection, which a large message before it
+/// may have grown. The UA keeps an INVITE until its ACK, and the application
+/// may keep it until it decides, so a slice would keep the whole buffer alive
+/// for as long. Encoding the request and parsing the copy costs a few
+/// microseconds once per INVITE.
+///
+/// The copy may not parse, as for an INVITE with as many header rows as the
+/// parser takes and no Content-Length, which the encoding adds. Its URI,
+/// header values and body are then copied one by one, which costs an
+/// allocation each, so that it still keeps nothing else alive.
+///
+/// Returns the request with the bytes it takes on the wire, which the copy
+/// holds.
+fn compact(request: Request<Bytes>) -> (Request<Bytes>, usize) {
+    // `to_bytes` grows its buffer as it writes, so its capacity may be twice
+    // the length. The `Vec` holds the length alone.
+    let exact = Bytes::from(request.to_bytes().to_vec());
+    let size = exact.len();
+    if let Ok(copy) = Request::from_shared(exact) {
+        return (copy, size);
+    }
+
+    let (mut parts, body) = request.into_parts();
+    let mut headers = HeaderMap::with_capacity(parts.headers.len());
+    for (name, value) in parts.headers.iter() {
+        // signa-core checked the value as `from_bytes` does.
+        if let Ok(value) = HeaderValue::from_bytes(value.as_bytes()) {
+            headers.append(name.clone(), value);
+        }
+    }
+    parts.headers = headers;
+    if let Ok(uri) = parts.uri.as_str().parse() {
+        parts.uri = uri;
+    }
+    (Request::from_parts(parts, Bytes::copy_from_slice(&body)), size)
+}
+
 /// Adds what a response that forms a dialog carries: every Record-Route value
 /// of the request, in order, and the UA's Contact (RFC 3261 section 12.1.1).
 fn dialog_headers(
@@ -2010,4 +2273,130 @@ fn transaction_error(error: &CoreError) -> Error {
 
 fn now() -> std::time::Instant {
     Instant::now().into_std()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Takes every reply that waits, in the order they start.
+    fn drain(waiting: &mut Waiting<&'static str>) -> Vec<&'static str> {
+        std::iter::from_fn(|| waiting.next()).collect()
+    }
+
+    /// Says whether nothing of `request` lies in `source`.
+    fn apart(request: &Request<Bytes>, source: &Bytes) -> bool {
+        let range = source.as_ptr_range();
+        let inside = |bytes: &[u8]| range.contains(&bytes.as_ptr());
+        !inside(request.uri().as_str().as_bytes())
+            && !inside(request.body())
+            && request
+                .headers()
+                .iter()
+                .all(|(_, value)| !inside(value.as_bytes()))
+    }
+
+    /// A request keeps nothing of the buffer it arrived in once copied,
+    /// also one whose encoding does not parse again: with the 100 header
+    /// rows the parser takes and no Content-Length, which the encoding adds
+    /// as a 101st.
+    #[test]
+    fn a_compact_request_keeps_nothing_of_its_buffer() {
+        let mut full = String::from("INVITE sip:ua@192.0.2.1 SIP/2.0\r\n");
+        for row in 0..100 {
+            full.push_str(&format!("X-Row-{row}: {row}\r\n"));
+        }
+        full.push_str("\r\n");
+        let usual = "INVITE sip:ua@192.0.2.1 SIP/2.0\r\nCall-ID: a\r\n\
+                     Content-Length: 3\r\n\r\nv=0";
+
+        for text in [full.as_str(), usual] {
+            let source = Bytes::copy_from_slice(text.as_bytes());
+            let request = Request::from_shared(source.clone()).unwrap();
+            let rows = request.headers().len();
+
+            let (copy, size) = compact(request);
+
+            assert!(apart(&copy, &source));
+            assert!(copy.headers().len() >= rows);
+            assert!(size >= text.len());
+        }
+    }
+
+    /// One of each starts in the order of the backlogs: the answer that ends
+    /// something, the reply of a record, then the answer to a new request.
+    #[test]
+    fn replies_start_control_records_then_ordinary() {
+        let mut waiting = Waiting::new(4);
+        waiting.answer("ordinary", Lane::Ordinary);
+        waiting.record("record");
+        waiting.answer("control", Lane::Control);
+
+        assert_eq!(drain(&mut waiting), ["control", "record", "ordinary"]);
+    }
+
+    /// A flood of answers to BYEs delays the copies of a 2xx and the answers
+    /// to new requests, but each gets its turn after `BATCH` of them.
+    #[test]
+    fn no_backlog_starves_another() {
+        let mut waiting = Waiting::new(64);
+        for _ in 0..32 {
+            waiting.answer("control", Lane::Control);
+        }
+        waiting.record("record");
+        waiting.answer("ordinary", Lane::Ordinary);
+
+        let started = drain(&mut waiting);
+        let at = |name| started.iter().position(|&reply| reply == name);
+        assert_eq!(at("ordinary"), Some(BATCH));
+        assert_eq!(at("record"), Some(BATCH + 1));
+        assert_eq!(started.len(), 34);
+    }
+
+    /// A steady stream of the model's replies leaves the answers to new
+    /// requests one start in every `BATCH + 1`.
+    #[test]
+    fn the_answers_to_new_requests_take_their_turn() {
+        let mut waiting = Waiting::new(64);
+        for _ in 0..30 {
+            waiting.record("record");
+        }
+        for _ in 0..3 {
+            waiting.answer("ordinary", Lane::Ordinary);
+        }
+
+        let started = drain(&mut waiting);
+        let turns: Vec<usize> = started
+            .iter()
+            .enumerate()
+            .filter(|&(_, &reply)| reply == "ordinary")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(turns, [BATCH, 2 * BATCH + 1, 3 * BATCH + 2]);
+    }
+
+    /// Each lane of answers holds as many as the limit, apart from the
+    /// other, and the replies of records have no limit here, since the
+    /// model's tables bound them.
+    #[test]
+    fn each_lane_of_answers_has_its_own_room() {
+        let mut waiting = Waiting::new(2);
+        for _ in 0..2 {
+            assert!(waiting.has_room(Lane::Ordinary));
+            waiting.answer("ordinary", Lane::Ordinary);
+        }
+        assert!(!waiting.has_room(Lane::Ordinary));
+        assert!(waiting.has_room(Lane::Control));
+        for _ in 0..2 {
+            waiting.answer("control", Lane::Control);
+        }
+        assert!(!waiting.has_room(Lane::Control));
+        for _ in 0..10 {
+            waiting.record("record");
+        }
+
+        waiting.next();
+        assert!(waiting.has_room(Lane::Control));
+        assert!(!waiting.has_room(Lane::Ordinary));
+    }
 }

@@ -163,6 +163,15 @@ impl Operations {
         Some(outcome)
     }
 
+    /// Returns the operations that have no outcome yet.
+    #[cfg(test)]
+    pub(crate) fn running(&self) -> impl Iterator<Item = OperationId> {
+        self.records
+            .iter()
+            .filter(|(_, record)| record.outcome.is_none())
+            .map(|(id, _)| id)
+    }
+
     pub(crate) fn snapshot(&self, id: OperationId) -> Option<Snapshot> {
         let record = self.records.get(id)?;
         Some(Snapshot { stage: record.stage, outcome: record.outcome })

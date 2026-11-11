@@ -44,6 +44,8 @@ This is an early stage of the crate, and much of a UA core is missing:
   sends none.
 * The UA neither answers a challenge nor sends credentials.
 * Next hops resolve from IP literals and a fixed table, with no DNS.
+* A request without an RFC 3261 branch, as an RFC 2543 element sends, gets
+  no answer, since signa-core keeps no transaction for it.
 */
 #![cfg_attr(
     not(feature = "tokio"),

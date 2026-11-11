@@ -23,6 +23,8 @@ none, as RFC 3261 section 20.11 sets the default, and never by the bytes.
 [RFC 3264 section 4]: https://www.rfc-editor.org/rfc/rfc3264.html#section-4
 */
 
+use std::fmt;
+
 use bytes::Bytes;
 use signa_core::{HeaderMap, HeaderValue, message::header::CONTENT_TYPE};
 
@@ -34,11 +36,28 @@ use crate::protocol::{self, Malformed};
 /// `content_type` as the Content-Type. Whether the bytes are a valid offer or
 /// answer is for the code that made them to decide, such as an SDP
 /// implementation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// Its `Debug` shows the Content-Type and the length of the body, not the
+/// body. A session description can carry secrets: the SRTP keys of an
+/// `a=crypto` line ([RFC 4568]) and the ICE password of `a=ice-pwd`
+/// ([RFC 8839 section 5.4]). Read the body with [`Description::body`].
+///
+/// [RFC 4568]: https://www.rfc-editor.org/rfc/rfc4568.html
+/// [RFC 8839 section 5.4]: https://www.rfc-editor.org/rfc/rfc8839.html#section-5.4
+#[derive(Clone, Eq, PartialEq)]
 #[cfg_attr(not(feature = "tokio"), allow(unreachable_pub))]
 pub struct Description {
     content_type: HeaderValue,
     body: Bytes,
+}
+
+impl fmt::Debug for Description {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Description")
+            .field("content_type", &self.content_type)
+            .field("body_len", &self.body.len())
+            .finish_non_exhaustive()
+    }
 }
 
 // Only the runtime reads a description, to put it on the wire.
@@ -90,6 +109,9 @@ pub(crate) enum Body {
     /// TODO: Take a session description out of a multipart body, as RFC
     /// 5621 describes, for peers such as SIP-I gateways that send one.
     Unsupported,
+    /// A session description larger than the UA keeps. An INVITE with one
+    /// gets a 413 (RFC 3261 section 21.4.11).
+    TooLarge,
 }
 
 impl Body {
@@ -102,10 +124,12 @@ impl Body {
     /// default. A multipart body without a disposition may hold one, so it is
     /// unsupported rather than other. The bytes are copied, so that a
     /// description the UA keeps does not hold on to the buffer the message
-    /// arrived in.
+    /// arrived in. A description of more than `limit` bytes is not copied,
+    /// since a session keeps the last one it got for as long as it lasts.
     pub(crate) fn read(
         headers: &HeaderMap,
         body: &[u8],
+        limit: usize,
     ) -> Result<Body, Malformed> {
         if body.is_empty() {
             return Ok(Body::Empty);
@@ -126,6 +150,9 @@ impl Body {
         if multipart || protocol::encoded(headers)? {
             return Ok(Body::Unsupported);
         }
+        if body.len() > limit {
+            return Ok(Body::TooLarge);
+        }
 
         let content_type = headers.get(CONTENT_TYPE).expect("read above");
         Ok(Body::Session(Description {
@@ -137,13 +164,16 @@ impl Body {
 
     /// Reads a body for the session description it may be, where nothing
     /// is answered for a body the UA cannot use, as in a response or an ACK.
+    /// One larger than `limit` counts as none, which fails an exchange that
+    /// needed it.
     // Only the runtime reads responses and ACKs.
     #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
     pub(crate) fn description(
         headers: &HeaderMap,
         body: &[u8],
+        limit: usize,
     ) -> Option<Description> {
-        match Body::read(headers, body) {
+        match Body::read(headers, body, limit) {
             Ok(Body::Session(description)) => Some(description),
             _ => None,
         }
@@ -289,6 +319,9 @@ mod tests {
         assert_eq!(sent, Negotiation::LocalOfferOutstanding { cseq: 1 });
     }
 
+    /// A limit no body of these tests reaches.
+    const ANY: usize = usize::MAX;
+
     fn headers(rows: &[(signa_core::HeaderName, &'static str)]) -> HeaderMap {
         let mut headers = HeaderMap::new();
         for (name, value) in rows {
@@ -301,9 +334,9 @@ mod tests {
     fn a_description_needs_a_body_and_its_type() {
         let sdp = headers(&[(CONTENT_TYPE, "application/sdp")]);
 
-        assert_eq!(Body::read(&sdp, b""), Ok(Body::Empty));
-        assert!(Body::read(&headers(&[]), b"v=0\r\n").is_err());
-        let Ok(Body::Session(description)) = Body::read(&sdp, b"v=0\r\n")
+        assert_eq!(Body::read(&sdp, b"", ANY), Ok(Body::Empty));
+        assert!(Body::read(&headers(&[]), b"v=0\r\n", ANY).is_err());
+        let Ok(Body::Session(description)) = Body::read(&sdp, b"v=0\r\n", ANY)
         else {
             panic!("an SDP body is a session description");
         };
@@ -353,7 +386,7 @@ mod tests {
 
         for (rows, expected) in cases {
             assert_eq!(
-                Body::read(&headers(rows), bytes),
+                Body::read(&headers(rows), bytes, ANY),
                 Ok(expected),
                 "{rows:?}"
             );
@@ -368,12 +401,44 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    Body::read(&headers(rows), bytes),
+                    Body::read(&headers(rows), bytes, ANY),
                     Ok(Body::Session(_))
                 ),
                 "{rows:?}",
             );
         }
+    }
+
+    /// A session description over the limit is not read, and only it. A
+    /// body that is no description is the application's, whatever its size.
+    #[test]
+    fn a_description_over_the_limit_is_not_kept() {
+        let sdp = headers(&[(CONTENT_TYPE, "application/sdp")]);
+        let text = headers(&[(CONTENT_TYPE, "text/plain")]);
+
+        assert!(matches!(
+            Body::read(&sdp, b"v=0\r\n", 5),
+            Ok(Body::Session(_))
+        ));
+        assert_eq!(Body::read(&sdp, b"v=0\r\n", 4), Ok(Body::TooLarge));
+        assert_eq!(Body::read(&text, b"v=0\r\n", 4), Ok(Body::Other));
+        assert_eq!(Body::description(&sdp, b"v=0\r\n", 4), None);
+    }
+
+    /// The body of a description can hold keys, so its `Debug` shows only
+    /// how long it is.
+    #[test]
+    fn debug_leaves_the_body_out() {
+        let description = Description::new(
+            HeaderValue::from_static("application/sdp"),
+            Bytes::from_static(
+                b"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:key",
+            ),
+        );
+
+        let shown = format!("{description:?}");
+        assert!(!shown.contains("inline:key"), "{shown}");
+        assert!(shown.contains("application/sdp") && shown.contains("45"));
     }
 
     #[test]
