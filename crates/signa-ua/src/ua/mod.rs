@@ -1608,7 +1608,8 @@ pub enum Event {
 
 /// An INVITE, initial or a re-INVITE, and the authority to decide it.
 ///
-/// The authority is this value, which cannot be cloned. Submitting a
+/// The authority is this value, which cannot be cloned, so nothing can hand
+/// the INVITE to a handler twice, as a retry middleware would. Submitting a
 /// decision consumes it, and a refused submission hands it back. Dropping it
 /// without a decision has the UA answer the INVITE with a 500, a policy of
 /// this crate rather than an RFC rule. So does a decision that takes longer
@@ -1915,6 +1916,49 @@ impl Drop for IncomingInvite {
         }
     }
 }
+
+/// A retry middleware cannot send an INVITE to its handler again. It replays
+/// a request from a copy it made before the first call, and
+/// [`IncomingInvite`] has no `Clone`, so a policy that copies its requests
+/// does not apply. Nothing outside the crate can make one either, so a policy
+/// written for it has no copy to give and retries nothing. What SIP asks to
+/// send again stays with the UA: the copies of a 2xx until its ACK, and one
+/// more re-INVITE after a 491.
+///
+/// ```compile_fail,E0277
+/// use std::{convert::Infallible, future::{Ready, ready}};
+///
+/// use signa_ua::IncomingInvite;
+/// use tower::{Service, retry::{Policy, Retry}, service_fn};
+///
+/// // Sends a request again after an error, from a copy of it.
+/// #[derive(Clone)]
+/// struct Again;
+///
+/// impl<Req: Clone, Res, E> Policy<Req, Res, E> for Again {
+///     type Future = Ready<()>;
+///
+///     fn retry(
+///         &mut self,
+///         _: &mut Req,
+///         result: &mut Result<Res, E>,
+///     ) -> Option<Ready<()>> {
+///         result.is_err().then(|| ready(()))
+///     }
+///
+///     fn clone_request(&mut self, request: &Req) -> Option<Req> {
+///         Some(request.clone())
+///     }
+/// }
+///
+/// fn serves_invites<S: Service<IncomingInvite>>(_: S) {}
+///
+/// let handler =
+///     service_fn(|_: IncomingInvite| async { Ok::<(), Infallible>(()) });
+/// serves_invites(Retry::new(Again, handler));
+/// ```
+#[cfg(doctest)]
+fn middleware_cannot_retry_invite_implicitly() {}
 
 /// Identifies an incoming INVITE, also among those of other UAs.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

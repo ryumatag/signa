@@ -12,47 +12,12 @@ mod terminate;
 use std::{net::SocketAddr, time::Duration};
 
 use signa_core::{endpoint::Endpoint, transaction::Timers};
-use signa_ua::{
-    Config, Event, InvitePlan, Negotiate, Resolve, Session, ShutdownReport,
-    Ua, UaEvents, attach,
-};
-use tokio::time::timeout;
+use signa_ua::{Config, Event, InvitePlan, Session, Ua, UaEvents, attach};
 
 use crate::support::{
     events::{event, invite},
     message::sdp,
 };
-
-/// Timers as [`fast`](crate::support::fast), with a T4 as short, so that a
-/// UDP transaction ends soon after its final response and a drain of the
-/// endpoint takes about 64 T1, 1.28 s.
-fn brisk() -> Timers {
-    Timers::builder()
-        .t1(Duration::from_millis(20))
-        .t2(Duration::from_millis(80))
-        .t4(Duration::from_millis(80))
-        .build()
-        .unwrap()
-}
-
-/// A UA on UDP and TCP whose endpoint and configuration run on [`brisk`]
-/// timers, its addresses, and another handle to its endpoint.
-fn brisk_with<R: Resolve, N: Negotiate>(
-    config: Config<R, N>,
-) -> (Ua, SocketAddr, SocketAddr, Endpoint) {
-    let local = "127.0.0.1:0".parse().unwrap();
-    let (endpoint, incoming) = Endpoint::builder()
-        .udp(local)
-        .tcp(local)
-        .timers(brisk())
-        .bind()
-        .unwrap();
-    let (udp, tcp) =
-        (endpoint.udp_addr().unwrap(), endpoint.tcp_addr().unwrap());
-    let other = endpoint.clone();
-    let ua = attach(endpoint, incoming, config.timers(brisk())).unwrap();
-    (ua, udp, tcp, other)
-}
 
 /// [`ua_on`](crate::support::ua_on) with `timers`, for both its endpoint
 /// and its configuration.
@@ -101,12 +66,4 @@ async fn two_ua_call(
     // The ACK goes at once, and stops the 2xx.
     tokio::time::sleep(Duration::from_millis(100)).await;
     (calling, answered)
-}
-
-/// Waits for the report of a shutdown, which must come within `wait`.
-async fn report_within(
-    shutdown: signa_ua::UaShutdown,
-    wait: Duration,
-) -> ShutdownReport {
-    timeout(wait, shutdown).await.expect("a report in time").unwrap()
 }

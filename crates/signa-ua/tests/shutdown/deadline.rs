@@ -17,17 +17,14 @@ use signa_ua::{
 };
 use tokio::time::timeout;
 
-use crate::{
-    shutdown::{brisk_with, report_within},
-    support::{
-        WAIT, call_from, config,
-        events::invite,
-        message::{
-            ack_for, direct_invite, in_dialog, invite_over, offer_named,
-            ok_offering, plan_to, reply_with, sdp,
-        },
-        peer::{Peer, Wire},
+use crate::support::{
+    WAIT, brisk_with, call_from, config,
+    events::{invite, report_within},
+    message::{
+        ack_for, direct_invite, in_dialog, invite_over, offer_named,
+        ok_offering, plan_to, reply_with, sdp,
     },
+    peer::{Peer, Wire},
 };
 
 /// Dropping the future of a shutdown leaves the shutdown going: the UA

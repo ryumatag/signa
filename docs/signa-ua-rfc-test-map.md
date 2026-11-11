@@ -30,6 +30,8 @@ Type is where the evidence runs. Paths are in `crates/signa-ua/`:
   checks, shutdowns among them.
 * unit: a test of one module's functions, inline in that module.
 * build: the compiler checks it on every build.
+* doctest: an example in the rustdoc that `cargo test` compiles, here one
+  that must fail to compile.
 * loopback: a UA through its public API, against raw UDP or TCP peers on
   loopback, or another UA. These tests are one binary, `tests/lib.rs`, with
   a module for each section of this map, which the section names. A loopback
@@ -311,6 +313,28 @@ report.
 | The deadline | design | The endpoint stops at once, then the UA ends every task and lets go of its records, with nothing sent. Each operation still running, or submitted and not yet taken, fails with `DriverStopped`, and the report counts the sessions, INVITEs and operations left. A command still queued after a drain ends as it would have before, with nothing sent. | `all_operation_waiters_get_terminal_result` (`tests/shutdown/deadline.rs`), `deadline_expired_is_not_reported_as_drained` (`tests/shutdown/deadline.rs`), `the_deadline_leaves_no_operation_without_an_outcome` | model, loopback | UDP, TCP | covered |
 | The endpoint stopping first | design | Another handle of the endpoint that stops it ends the UA with `EndpointLost`, as the deadline does. While the UA has work, a session up included, it holds a work guard, so a shutdown of the endpoint alone waits for its deadline. | `an_endpoint_stopped_elsewhere_is_reported_as_lost` (`tests/shutdown/deadline.rs`) | loopback | UDP | covered |
 | The drain is complete | design | The UA counts as drained only once the model holds no record, timer or operation, no job, answer, watcher or reader runs, no send, reply or answer waits, and the driver keeps nothing for a record. That is one test in the driver, which builds with debug assertions check against the model's tables while the UA shuts down. Any order of inputs drains once everything settles. | `any_shutdown_drains_once_everything_settles`, `drained_has_no_live_tasks_timers_or_post_return_writes` (`tests/shutdown/deadline.rs`) | model, loopback | UDP | covered |
+
+## Tower adapter (design)
+
+An adapter from the UA's events to a Tower service, built on the public API
+alone, as a crate on top of signa-ua would be. It is part of the tests, not
+of the crate, and the readiness policy it documents is its own. The
+loopback tests are in `tests/tower/`, and each names its file. None wraps a
+re-INVITE of the UA's in a timeout. The UA cannot cancel one, as the
+Shutdown section says, and a timeout would only drop its operation.
+
+| Requirement | Basis | Expected behavior | Evidence | Type | Scope | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| The decision is the request | design | The adapter hands each `IncomingInvite`, initial or re-INVITE, to a `Service<IncomingInvite, Response = ()>` as it is, with no envelope of its own, and passes the other events on. | `tower_uses_same_service_for_ready_and_call` (`tests/tower/readiness.rs`), `handler_completion_does_not_end_dialog` (`tests/tower/lifetime.rs`) | loopback | UDP | covered |
+| Ready and called on one instance | [tower-service `Service`](https://docs.rs/tower-service/0.3.3/tower_service/trait.Service.html), design | The adapter polls one instance of a service that is not `Clone` ready, again where it is not, and calls that instance. | `tower_uses_same_service_for_ready_and_call` (`tests/tower/readiness.rs`) | loopback | UDP | covered |
+| A service that is not ready | design | The adapter polls the service ready before it takes the next event, so it holds no INVITE the service cannot take. Meanwhile the INVITEs wait in the event queue, and one beyond it gets the UA's 503. The other events wait behind them, and a handler that holds an INVITE learns of its CANCEL from its decision. A readiness error has the adapter drop the service and the events: an INVITE still queued gets the UA's 500, a later one its 503, and the driver goes on. | `readiness_error_is_reported_without_driver_panic` (`tests/tower/readiness.rs`), `handler_concurrency_limit_does_not_block_ack` (`tests/tower/bounds.rs`) | loopback | UDP, TCP | covered |
+| A handler's end is not the dialog's | [3261 §13.3.1.4](https://www.rfc-editor.org/rfc/rfc3261.html#section-13.3.1.4), [§15](https://www.rfc-editor.org/rfc/rfc3261.html#section-15) | The future of a call ending is not the final response, the ACK or the end of the dialog. After it, the 2xx goes again until its ACK, a re-INVITE reaches a handler of its own, and only a BYE ends the session. | `handler_completion_does_not_end_dialog` (`tests/tower/lifetime.rs`) | loopback | UDP | covered |
+| A timeout is not a CANCEL | [3261 §9.1](https://www.rfc-editor.org/rfc/rfc3261.html#section-9.1), design | A Tower timeout that drops a handler holding an undecided INVITE gets it the UA's 500, not a 487. One that drops the operation of the UA's INVITE, or a handler holding its attempt, sends no CANCEL, and the INVITE goes on to its 2xx and ACK. | `handler_timeout_is_not_protocol_cancel` (`tests/tower/lifetime.rs`) | loopback | UDP | covered |
+| A handler that panics | design | Its INVITE drops as it unwinds, which gets the UA's 500. The adapter counts the panic, and it and the UA go on. | `a_panicking_handler_is_a_dropped_decision` (`tests/tower/lifetime.rs`) | loopback | UDP | covered |
+| Bounded handlers apart from the protocol | [3261 §21.5.4](https://www.rfc-editor.org/rfc/rfc3261.html#section-21.5.4), design | While a `ConcurrencyLimit` of one handler, alone or behind a `Buffer`, is full, the UA sends its 2xx again until the ACK and answers a CANCEL and a BYE as the callee, and sends an ACK, a BYE and a CANCEL as the caller. An INVITE beyond the event queue gets the UA's 503. The test checks that the limit was full throughout. | `handler_concurrency_limit_does_not_block_ack` (`tests/tower/bounds.rs`) | loopback | UDP, TCP | covered |
+| No implicit retry | design | `IncomingInvite` has no `Clone`, so a retry policy written for requests it can copy does not apply to a service of INVITEs, and any other policy has no copy to send again. The copies of a 2xx and the retry after a 491 are the UA's. | `middleware_cannot_retry_invite_implicitly` (`src/ua/mod.rs`) | doctest | - | covered |
+| A shutdown and the handlers | design | A drain waits for the decisions the handlers hold. A termination answers them with a 503, and a decision after that is refused and sends nothing. At the deadline the endpoint stops, the UA lets go of the INVITEs, and the adapter aborts its handlers, with nothing on the wire after the report. | `shutdown_waits_for_or_aborts_tracked_adapter_work` (`tests/tower/shutdown.rs`), `a_termination_takes_the_decision_a_handler_holds` (`tests/tower/shutdown.rs`) | loopback | UDP | covered |
+| Tower only in the tests | design | `tower` is a dev-dependency of signa-ua, outside its normal dependencies, and the crate has no adapter. | `crates/signa-ua/Cargo.toml`, `cargo tree -p signa-ua -e normal` | build | - | covered |
 
 ## State model contracts (design)
 

@@ -15,7 +15,7 @@ use signa_core::{
     endpoint::{Endpoint, Incoming},
     transaction::Timers,
 };
-use signa_ua::{Config, Resolve, Session, Ua, UaEvents, attach};
+use signa_ua::{Config, Negotiate, Resolve, Session, Ua, UaEvents, attach};
 
 use crate::support::{
     events::invite,
@@ -55,6 +55,37 @@ pub(crate) static LOADED: std::sync::LazyLock<Timers> =
             .build()
             .unwrap()
     });
+
+/// Timers as [`fast`], with a T4 as short, so that a UDP transaction ends
+/// soon after its final response and a drain of the endpoint takes about
+/// 64 T1, 1.28 s.
+pub(crate) fn brisk() -> Timers {
+    Timers::builder()
+        .t1(Duration::from_millis(20))
+        .t2(Duration::from_millis(80))
+        .t4(Duration::from_millis(80))
+        .build()
+        .unwrap()
+}
+
+/// A UA on UDP and TCP whose endpoint and configuration run on [`brisk`]
+/// timers, its addresses, and another handle to its endpoint.
+pub(crate) fn brisk_with<R: Resolve, N: Negotiate>(
+    config: Config<R, N>,
+) -> (Ua, SocketAddr, SocketAddr, Endpoint) {
+    let local = "127.0.0.1:0".parse().unwrap();
+    let (endpoint, incoming) = Endpoint::builder()
+        .udp(local)
+        .tcp(local)
+        .timers(brisk())
+        .bind()
+        .unwrap();
+    let (udp, tcp) =
+        (endpoint.udp_addr().unwrap(), endpoint.tcp_addr().unwrap());
+    let other = endpoint.clone();
+    let ua = attach(endpoint, incoming, config.timers(brisk())).unwrap();
+    (ua, udp, tcp, other)
+}
 
 /// A UA whose endpoint and configuration both run on [`fast`] timers, on
 /// UDP and TCP.

@@ -4,7 +4,9 @@ Waiting for the events a test expects of a UA.
 
 use std::time::Duration;
 
-use signa_ua::{AttemptResult, Event, IncomingInvite, UaEvents};
+use signa_ua::{
+    AttemptResult, Event, IncomingInvite, ShutdownReport, UaEvents,
+};
 use tokio::time::timeout;
 
 use crate::support::WAIT;
@@ -74,4 +76,12 @@ pub(crate) async fn reinvite_event(events: &mut UaEvents) -> IncomingInvite {
         _ => None,
     })
     .await
+}
+
+/// Waits for the report of a shutdown, which must come within `wait`.
+pub(crate) async fn report_within(
+    shutdown: signa_ua::UaShutdown,
+    wait: Duration,
+) -> ShutdownReport {
+    timeout(wait, shutdown).await.expect("a report in time").unwrap()
 }
