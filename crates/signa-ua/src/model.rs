@@ -10828,8 +10828,7 @@ Contact: <sip:alice@192.0.2.1>
             true
         }
 
-        quickcheck::QuickCheck::new()
-            .rng(quickcheck::Gen::new(100))
+        checker(100, 100)
             .quickcheck(property as fn(Vec<(u8, u8, u8)>) -> bool);
     }
 
@@ -10934,6 +10933,21 @@ Contact: <sip:alice@192.0.2.1>
         /// The next CSeq number of a request from a peer, above any number the
         /// UA picks or the fixtures use, so each is new in its dialog.
         cseq: u32,
+        /// Each usage the application was told ended, and why, as often as
+        /// it was.
+        ended: Vec<(UsageKey, EndReason)>,
+        /// How many dialogs the application was told were confirmed.
+        confirmed: usize,
+        /// The replay context of each ACK of a 2xx that went, a copy of one
+        /// not counted.
+        acked: Vec<ReplayKey>,
+        /// The status of each final response submitted.
+        finals: Vec<u16>,
+        /// The status of each refusal of an INVITE a peer sent.
+        refusals: Vec<u16>,
+        /// How many BYEs of sessions went while a 2xx of the session still
+        /// waited for the peer's ACK.
+        early_byes: usize,
     }
 
     /// A request a peer sends in the dialog `id` names, as this user agent
@@ -11000,6 +11014,12 @@ Contact: <sip:{host}@192.0.2.9>
                 reinvites: Vec::new(),
                 calls: 0,
                 cseq: 400_000,
+                ended: Vec::new(),
+                confirmed: 0,
+                acked: Vec::new(),
+                finals: Vec::new(),
+                refusals: Vec::new(),
+                early_byes: 0,
             }
         }
 
@@ -11018,6 +11038,27 @@ Contact: <sip:{host}@192.0.2.9>
         }
 
         fn apply(&mut self, effect: Effect) {
+            match &effect {
+                Effect::Notify(Event::UsageEnded { usage, reason }) => {
+                    self.ended.push((*usage, *reason));
+                }
+                Effect::Notify(Event::DialogConfirmed { .. }) => {
+                    self.confirmed += 1;
+                }
+                Effect::SendAck { replay } => self.acked.push(*replay),
+                Effect::SubmitFinal { status, .. } => {
+                    self.finals.push(status.as_u16());
+                }
+                Effect::SendSessionBye { usage } => {
+                    let awaited =
+                        self.model.replays.iter().any(|(_, replay)| {
+                            replay.usage == Some(*usage)
+                                && replay.ack == AckObligation::AwaitingPeer
+                        });
+                    self.early_byes += usize::from(awaited);
+                }
+                _ => {}
+            }
             let owed = match effect {
                 Effect::SubmitFinal { exchange, .. } => Owed::Final(exchange),
                 Effect::SubmitProvisional {
@@ -11102,7 +11143,7 @@ Contact: <sip:{host}@192.0.2.9>
             }
         }
 
-        /// Settles one thing the runtime owes, well or badly.        /// Settles one thing the runtime owes, well or badly.
+        /// Settles one thing the runtime owes, well or badly.
         fn resolve(&mut self, index: usize, well: bool, choice: u8) {
             if self.owed.is_empty() {
                 return;
@@ -11188,6 +11229,15 @@ Contact: <sip:{host}@192.0.2.9>
             }
         }
 
+        /// Keeps the authority of an INVITE the UA took, or the status of
+        /// the refusal the runtime would send.
+        fn take(&mut self, received: Result<Authority, Refusal>) {
+            match received {
+                Ok(authority) => self.authorities.push(authority),
+                Err(refusal) => self.refusals.push(refusal.status().as_u16()),
+            }
+        }
+
         fn next_cseq(&mut self) -> u32 {
             self.cseq += 1;
             self.cseq
@@ -11225,11 +11275,9 @@ Contact: <sip:{host}@192.0.2.9>
                     let call = format!("call{}@example.com", self.calls);
                     let body =
                         if a % 2 == 0 { offer() } else { Ok(Body::Empty) };
-                    if let Ok(authority) =
-                        self.model.receive_invite(&invite(&call), body, now)
-                    {
-                        self.authorities.push(authority);
-                    }
+                    let received =
+                        self.model.receive_invite(&invite(&call), body, now);
+                    self.take(received);
                 }
                 // The application decides an INVITE, or drops it.
                 1 | 2 => {
@@ -11334,11 +11382,10 @@ Contact: <sip:{host}@192.0.2.9>
                             } else {
                                 Ok(Body::Empty)
                             };
-                            if let Ok(authority) =
-                                self.model.receive_invite(&reinvite, body, now)
-                            {
-                                self.authorities.push(authority);
-                            }
+                            let received = self
+                                .model
+                                .receive_invite(&reinvite, body, now);
+                            self.take(received);
                         }
                     }
                 }
@@ -11527,6 +11574,40 @@ Contact: <sip:{host}@192.0.2.9>
             panic!("the model never settled: {:?}", self.owed);
         }
 
+        /// Checks what holds once a script settled, after
+        /// [`Simulation::quiesce`]: no operation is left without an outcome,
+        /// no timer is set, nothing is kept but the sessions that are still
+        /// up, and no session ended twice.
+        fn assert_settled(&self) {
+            let model = &self.model;
+            assert_eq!(
+                model.operations.running().count(),
+                0,
+                "a stuck operation"
+            );
+            assert_eq!(model.timers.len(), 0);
+            assert_eq!(model.attempts.len(), 0);
+            assert_eq!(model.exchanges.len(), 0);
+            assert_eq!(model.replays.len(), 0);
+            assert_eq!(
+                model.dialogs.len(),
+                model.usages.len(),
+                "a Mortal dialog"
+            );
+            assert!(model.byes.is_empty());
+            let mut ended: Vec<UsageKey> =
+                self.ended.iter().map(|&(usage, _)| usage).collect();
+            ended.sort();
+            let before = ended.len();
+            ended.dedup();
+            assert_eq!(
+                ended.len(),
+                before,
+                "a session ended twice: {:?}",
+                self.ended
+            );
+        }
+
         /// Settles everything as [`Simulation::quiesce`] does, with an
         /// application that ends each session the UA still has, as one that
         /// drains does, until the model is idle.
@@ -11579,12 +11660,8 @@ Contact: <sip:{host}@192.0.2.9>
 
     #[test]
     fn any_shutdown_drains_once_everything_settles() {
-        let mut checker =
-            quickcheck::QuickCheck::new().rng(quickcheck::Gen::new(200));
-        if std::env::var_os("QUICKCHECK_TESTS").is_none() {
-            checker = checker.tests(400);
-        }
-        checker.quickcheck(drain_script as fn(u8, Vec<(u8, u8, u8)>) -> bool);
+        checker(200, 400)
+            .quickcheck(drain_script as fn(u8, Vec<(u8, u8, u8)>) -> bool);
     }
 
     /// Stops the model in the middle of a script, as the deadline of a
@@ -11618,12 +11695,8 @@ Contact: <sip:{host}@192.0.2.9>
 
     #[test]
     fn the_deadline_leaves_no_operation_without_an_outcome() {
-        let mut checker =
-            quickcheck::QuickCheck::new().rng(quickcheck::Gen::new(200));
-        if std::env::var_os("QUICKCHECK_TESTS").is_none() {
-            checker = checker.tests(400);
-        }
-        checker.quickcheck(stop_script as fn(Vec<(u8, u8, u8)>) -> bool);
+        checker(200, 400)
+            .quickcheck(stop_script as fn(Vec<(u8, u8, u8)>) -> bool);
     }
 
     /// Runs a script of steps on a model with small tables, so that every
@@ -11668,27 +11741,410 @@ Contact: <sip:{host}@192.0.2.9>
             simulation.settle();
         }
         simulation.quiesce();
-
-        let model = &simulation.model;
-        assert_eq!(model.operations.running().count(), 0, "a stuck operation");
-        assert_eq!(model.timers.len(), 0);
-        assert_eq!(model.attempts.len(), 0);
-        assert_eq!(model.exchanges.len(), 0);
-        assert_eq!(model.replays.len(), 0);
-        assert_eq!(model.dialogs.len(), model.usages.len(), "a Mortal dialog");
-        assert!(model.byes.is_empty());
+        simulation.assert_settled();
         true
     }
 
-    /// `QUICKCHECK_TESTS` sets how many scripts run, for a longer search
-    /// than the 400 of a test run.
     #[test]
     fn any_order_of_inputs_keeps_the_tables_consistent() {
-        let mut checker =
-            quickcheck::QuickCheck::new().rng(quickcheck::Gen::new(200));
-        if std::env::var_os("QUICKCHECK_TESTS").is_none() {
-            checker = checker.tests(400);
+        checker(200, 400)
+            .quickcheck(run_script as fn(u8, Vec<(u8, u8, u8)>) -> bool);
+    }
+
+    /// A QuickCheck run of `tests` inputs of up to `size` steps each, unless
+    /// `QUICKCHECK_TESTS` sets how many, for a longer search.
+    ///
+    /// The inputs come from a seed, which `SIGNA_UA_SEED` sets and is random
+    /// otherwise. A failing test prints it, and QuickCheck prints the input
+    /// it shrank the failure to. The model runs on a fake clock and counted
+    /// randomness, so the seed repeats the whole run on the same platform.
+    /// The shrunk input repeats the failing script on its own, as the
+    /// arguments of the property, such as [`run_script`].
+    fn checker(size: usize, tests: u64) -> quickcheck::QuickCheck {
+        let seed = match std::env::var("SIGNA_UA_SEED") {
+            Ok(seed) => seed.parse().expect("SIGNA_UA_SEED is a u64"),
+            Err(std::env::VarError::NotPresent) => {
+                use std::hash::{BuildHasher, Hasher};
+                std::collections::hash_map::RandomState::new()
+                    .build_hasher()
+                    .finish()
+            }
+            Err(error) => panic!("SIGNA_UA_SEED: {error}"),
+        };
+        eprintln!("rerun with SIGNA_UA_SEED={seed}");
+        let checker = quickcheck::QuickCheck::new()
+            .rng(quickcheck::Gen::from_size_and_seed(size, seed));
+        if std::env::var_os("QUICKCHECK_TESTS").is_some() {
+            return checker;
         }
-        checker.quickcheck(run_script as fn(u8, Vec<(u8, u8, u8)>) -> bool);
+        checker.tests(tests)
+    }
+
+    /// One input of a race: a step of [`Simulation::step`], or the runtime
+    /// settling the first thing it owes that a predicate picks, well or
+    /// badly.
+    #[derive(Clone, Copy)]
+    enum Race {
+        Step(&'static str, u8, u8, u8),
+        Settle(&'static str, fn(&Owed) -> bool, bool),
+    }
+
+    impl Race {
+        fn name(self) -> &'static str {
+            match self {
+                Race::Step(name, ..) | Race::Settle(name, ..) => name,
+            }
+        }
+    }
+
+    impl Simulation {
+        /// Takes one input of a race. The `settle` after it takes the
+        /// effects, which checks the tables.
+        fn play(&mut self, input: Race) {
+            match input {
+                Race::Step(_, kind, a, b) => self.step(kind, a, b),
+                Race::Settle(_, owed, well) => {
+                    if let Some(index) = self.owed.iter().position(owed) {
+                        self.resolve(index, well, 1);
+                    }
+                }
+            }
+            self.settle();
+        }
+
+        /// What an input changes, if it changes anything.
+        fn fingerprint(&self) -> [usize; 11] {
+            let model = &self.model;
+            [
+                model.exchanges.len(),
+                model.dialogs.len(),
+                model.usages.len(),
+                model.replays.len(),
+                model.attempts.len(),
+                model.timers.len(),
+                self.owed.len(),
+                self.authorities.len(),
+                self.ended.len() + self.confirmed,
+                self.acked.len() + self.finals.len() + self.refusals.len(),
+                model
+                    .exchanges
+                    .iter()
+                    .filter(|(_, exchange)| {
+                        matches!(
+                            &exchange.scope,
+                            Scope::Incoming { withdrawn: Some(_), .. }
+                        )
+                    })
+                    .count(),
+            ]
+        }
+    }
+
+    /// Every order of `n` inputs, by their indices.
+    fn orders(n: usize) -> Vec<Vec<usize>> {
+        if n == 0 {
+            return vec![Vec::new()];
+        }
+        let mut all = Vec::new();
+        for order in orders(n - 1) {
+            for at in 0..=order.len() {
+                let mut longer = order.clone();
+                longer.insert(at, n - 1);
+                all.push(longer);
+            }
+        }
+        all
+    }
+
+    /// Runs `setup`, then `inputs` in every order, each from a fresh model,
+    /// and settles. The tables are checked after every input, and
+    /// [`Simulation::assert_settled`] and `expect`, which gets the names of
+    /// the inputs in their order, at the end. A failure prints the order.
+    /// Each input has to change something in some order, or the race does
+    /// not race it.
+    fn race(
+        name: &str,
+        setup: &[Race],
+        inputs: &[Race],
+        expect: fn(&Simulation, &[&str]),
+    ) {
+        // Seven inputs would take seven times as long as six, which is the
+        // most a race needs so far.
+        assert!(inputs.len() <= 6, "{name}: {} inputs", inputs.len());
+        let mut acted = vec![false; inputs.len()];
+        for order in orders(inputs.len()) {
+            let names: Vec<&str> =
+                order.iter().map(|&index| inputs[index].name()).collect();
+            let run = || {
+                let mut simulation = Simulation::new(limits());
+                for &input in setup {
+                    simulation.play(input);
+                }
+                for &index in &order {
+                    let before = simulation.fingerprint();
+                    simulation.play(inputs[index]);
+                    acted[index] |= simulation.fingerprint() != before;
+                }
+                simulation.quiesce();
+                simulation.assert_settled();
+                expect(&simulation, &names);
+            };
+            if let Err(panic) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
+            {
+                eprintln!("{name} failed in the order {names:?}");
+                std::panic::resume_unwind(panic);
+            }
+        }
+        for (input, acted) in inputs.iter().zip(acted) {
+            assert!(acted, "{name}: {} never did anything", input.name());
+        }
+    }
+
+    /// Where the input named `name` came in `order`.
+    fn at(order: &[&str], name: Race) -> usize {
+        order.iter().position(|&input| input == name.name()).expect("an input")
+    }
+
+    // The steps the races use. Each picks the first of what the tables hold,
+    // and a race has one of each, so the step names its target.
+    const INVITE_WITH_OFFER: Race =
+        Race::Step("INVITE with an offer", 0, 0, 0);
+    const INVITE_WITHOUT_OFFER: Race =
+        Race::Step("INVITE without an offer", 0, 1, 0);
+    const ACCEPT: Race = Race::Step("accept", 1, 0, 0);
+    const CANCEL: Race = Race::Step("CANCEL", 3, 0, 0);
+    const ACK: Race = Race::Step("ACK", 4, 0, 1);
+    const ACK_WITH_ANSWER: Race = Race::Step("ACK with an answer", 4, 0, 0);
+    const BYE: Race = Race::Step("peer's BYE", 5, 0, 3);
+    const REINVITE: Race = Race::Step("peer's re-INVITE", 5, 0, 2);
+    const SEND_INVITE: Race = Race::Step("INVITE of the UA's", 7, 1, 0);
+    const PROVISIONAL_A: Race = Race::Step("180 of a", 8, 0, 1);
+    const OK_A: Race = Race::Step("2xx of a", 8, 0, 2);
+    const OK_B: Race = Race::Step("2xx of b", 8, 0, 10);
+    const GIVE_UP: Race = Race::Step("CANCEL of the UA's", 10, 0, 0);
+    const TERMINATE: Race = Race::Step("BYE of the UA's", 11, 0, 0);
+    const SEND_REINVITE: Race = Race::Step("re-INVITE of the UA's", 11, 0, 1);
+    const SEND_BARE_REINVITE: Race =
+        Race::Step("re-INVITE of the UA's without an offer", 11, 0, 2);
+    const REINVITE_OK: Race =
+        Race::Step("2xx to the UA's re-INVITE", 12, 0, 9);
+    const REINVITE_491: Race =
+        Race::Step("491 to the UA's re-INVITE", 12, 0, 2);
+    /// Past the ACK deadline of 64 T1, 32 s with the T1 of the fixtures.
+    const LATE: Race = Race::Step("33 seconds", 15, 4, 0);
+    fn final_owed(owed: &Owed) -> bool {
+        matches!(owed, Owed::Final(_))
+    }
+    const COMMIT: Race = Race::Settle("2xx committed", final_owed, true);
+    const REFUSED: Race = Race::Settle("2xx refused", final_owed, false);
+    const STARTED: Race = Race::Settle(
+        "INVITE started",
+        |owed| matches!(owed, Owed::Invite(_) | Owed::Reinvite(_)),
+        true,
+    );
+    const BYE_STARTED: Race = Race::Settle(
+        "BYE started",
+        |owed| matches!(owed, Owed::SessionBye(_)),
+        true,
+    );
+
+    /// The callee's 2xx races its commit and the caller's CANCEL, ACK and
+    /// BYE (RFC 5407 sections 3.1.2, 3.1.3 and 3.1.6). An ACK may reach the
+    /// UA before the core's verdict on the 2xx. In every order the session
+    /// forms and the BYE ends it, once. Without the BYE, the ACK keeps the
+    /// session, unless the ACK deadline passes between the commit and the
+    /// ACK (RFC 3261 section 13.3.1.4). An ACK held from before the commit
+    /// sets no deadline. A CANCEL or a BYE before the verdict makes a 2xx
+    /// the core refuses a 487.
+    #[test]
+    fn the_callees_2xx_races_cancel_ack_and_bye_in_any_order() {
+        // That the application hears of the session and of the BYE that ends
+        // it is signa-ua policy, not an RFC rule.
+        race(
+            "callee's 2xx",
+            &[INVITE_WITH_OFFER, ACCEPT],
+            &[COMMIT, CANCEL, ACK, BYE],
+            |simulation, _| {
+                assert_eq!(simulation.confirmed, 1);
+                assert!(matches!(
+                    simulation.ended[..],
+                    [(_, EndReason::RemoteBye { .. })]
+                ));
+            },
+        );
+        // A 2xx the core refuses leaves the INVITE to the UA's own final: a
+        // 487 if the CANCEL or the BYE came before the verdict (RFC 3261
+        // sections 9.2 and 15.1.2), and a 500 otherwise.
+        race(
+            "callee's 2xx refused",
+            &[INVITE_WITH_OFFER, ACCEPT],
+            &[REFUSED, CANCEL, BYE],
+            |simulation, order| {
+                let refused = at(order, REFUSED);
+                let withdrawn =
+                    at(order, CANCEL) < refused || at(order, BYE) < refused;
+                let status = if withdrawn { 487 } else { 500 };
+                assert_eq!(simulation.finals, [200, status]);
+                assert_eq!(simulation.confirmed, 0);
+                assert_eq!(simulation.ended, []);
+            },
+        );
+        race(
+            "callee's 2xx without a BYE",
+            &[INVITE_WITH_OFFER, ACCEPT],
+            &[COMMIT, CANCEL, ACK, LATE],
+            |simulation, order| {
+                let late = at(order, COMMIT) < at(order, LATE)
+                    && at(order, LATE) < at(order, ACK);
+                assert_eq!(simulation.confirmed, 1);
+                if late {
+                    assert!(matches!(
+                        simulation.ended[..],
+                        [(_, EndReason::AckTimeout)]
+                    ));
+                } else {
+                    assert_eq!(simulation.ended, []);
+                }
+            },
+        );
+    }
+
+    /// Two forked 2xx responses race a provisional and the caller's CANCEL
+    /// (RFC 5407 section 3.1.2, appendices A and E). Each 2xx forms a
+    /// session and gets an ACK of its own, whichever comes first.
+    #[test]
+    fn forked_2xx_responses_race_a_cancel_in_any_order() {
+        race(
+            "forked 2xx",
+            &[SEND_INVITE, STARTED],
+            &[PROVISIONAL_A, OK_A, OK_B, GIVE_UP],
+            |simulation, _| {
+                let mut acked = simulation.acked.clone();
+                acked.sort();
+                acked.dedup();
+                assert_eq!(simulation.confirmed, 2);
+                assert_eq!(acked.len(), 2, "{:?}", simulation.acked);
+            },
+        );
+    }
+
+    /// Both sides end or change an established session at once, with the
+    /// runtime's verdicts on the UA's BYE and re-INVITE among them (RFC
+    /// 5407 sections 3.2.1 to 3.2.3, appendix B). The session ends once:
+    /// by the UA's BYE if the core took it before the peer's BYE came, and
+    /// by the peer's otherwise.
+    #[test]
+    fn byes_and_reinvites_cross_in_any_order() {
+        race(
+            "BYE and re-INVITE",
+            &[INVITE_WITH_OFFER, ACCEPT, COMMIT, ACK],
+            &[TERMINATE, BYE, SEND_REINVITE, REINVITE, STARTED, BYE_STARTED],
+            |simulation, order| {
+                // The UA's BYE ends the session once the core has it.
+                let local = at(order, TERMINATE) < at(order, BYE_STARTED)
+                    && at(order, BYE_STARTED) < at(order, BYE);
+                let reason = if local { "local" } else { "remote" };
+                match simulation.ended[..] {
+                    [(_, EndReason::RemoteBye { .. })] => {
+                        assert_eq!(reason, "remote");
+                    }
+                    [(_, EndReason::LocalBye)] => assert_eq!(reason, "local"),
+                    _ => panic!("{:?}", simulation.ended),
+                }
+            },
+        );
+    }
+
+    /// The UA's re-INVITE crosses the peer's, with the 491 and the 2xx a
+    /// peer may send (RFC 5407 section 3.3.1). Neither ends the session.
+    /// The peer's re-INVITE gets a 491 when it finds the UA's under way,
+    /// sent and not yet answered (RFC 3261 section 14.2). Once a 491 or a
+    /// 2xx answered the UA's, the peer's is the application's to decide,
+    /// and one that comes first makes the UA refuse its own.
+    #[test]
+    fn crossing_reinvites_settle_in_any_order() {
+        /// `sent` is where the UA's re-INVITE came. The first response to
+        /// it after it started is its final, which settles it if it is one
+        /// of `answers`.
+        fn expect(
+            simulation: &Simulation,
+            order: &[&str],
+            sent: usize,
+            answers: &[Race],
+        ) {
+            let started = at(order, STARTED);
+            let arrived = at(order, REINVITE);
+            let answered = [REINVITE_491, REINVITE_OK]
+                .into_iter()
+                .filter(|&answer| {
+                    sent < started && started < at(order, answer)
+                })
+                .min_by_key(|&answer| at(order, answer))
+                .filter(|final_| {
+                    answers.iter().any(|a| a.name() == final_.name())
+                })
+                .map(|first| at(order, first));
+            let pending = sent < arrived
+                && answered.is_none_or(|answered| arrived < answered);
+            assert_eq!(simulation.ended, []);
+            assert_eq!(simulation.refusals.contains(&491), pending);
+        }
+
+        race(
+            "crossing re-INVITEs",
+            &[INVITE_WITH_OFFER, ACCEPT, COMMIT, ACK],
+            &[SEND_REINVITE, REINVITE, STARTED, REINVITE_491, REINVITE_OK],
+            |simulation, order| {
+                let sent = at(order, SEND_REINVITE);
+                expect(simulation, order, sent, &[REINVITE_491, REINVITE_OK]);
+            },
+        );
+        // Without an offer of the UA's, no offer waits for its answer, so
+        // only the open re-INVITE holds the peer's off. Its 2xx brings an
+        // offer, whose answer the ACK owes, so only a 491 settles it here.
+        race(
+            "crossing re-INVITEs without an offer",
+            &[INVITE_WITH_OFFER, ACCEPT, COMMIT, ACK],
+            &[
+                SEND_BARE_REINVITE,
+                REINVITE,
+                STARTED,
+                REINVITE_491,
+                REINVITE_OK,
+            ],
+            |simulation, order| {
+                let sent = at(order, SEND_BARE_REINVITE);
+                expect(simulation, order, sent, &[REINVITE_491]);
+            },
+        );
+    }
+
+    /// The offer in the callee's 2xx races its commit, the ACK that answers
+    /// it, the callee hanging up and the peer's re-INVITE (RFC 5407
+    /// sections 3.1.5 and 3.2.4). The UA's BYE never goes before the ACK,
+    /// which a callee waits for (RFC 3261 section 15), so the two never
+    /// cross. A hang-up after the commit ends the session. One before it
+    /// finds no session and does nothing, as the application has none
+    /// before then.
+    #[test]
+    fn an_offer_in_the_2xx_races_its_answer_in_any_order() {
+        race(
+            "offer in the 2xx",
+            &[INVITE_WITHOUT_OFFER, ACCEPT],
+            &[COMMIT, ACK_WITH_ANSWER, TERMINATE, REINVITE, BYE_STARTED],
+            |simulation, order| {
+                assert_eq!(simulation.confirmed, 1);
+                assert_eq!(simulation.early_byes, 0);
+                if at(order, COMMIT) < at(order, TERMINATE) {
+                    assert!(matches!(
+                        simulation.ended[..],
+                        [(_, EndReason::LocalBye)]
+                    ));
+                } else {
+                    assert_eq!(simulation.ended, []);
+                }
+            },
+        );
     }
 }

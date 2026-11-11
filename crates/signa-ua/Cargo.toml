@@ -39,7 +39,7 @@ siparse = "0.4.4"
 tokio = { version = "1.54", default-features = false, features = ["macros", "rt", "sync", "time"], optional = true }
 
 [dev-dependencies]
-quickcheck = { version = "1", default-features = false }
+quickcheck = { version = "1.1", default-features = false }
 tokio = { version = "1.54", features = ["macros", "net", "rt-multi-thread", "test-util"] }
 # The external Tower adapter in `tests/tower/`, and the doctest that a retry
 # middleware cannot replay an INVITE. Never a dependency of the crate itself.
