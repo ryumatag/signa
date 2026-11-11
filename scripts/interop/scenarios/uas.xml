@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- The callee answers and the caller hangs up: INVITE, 180, 200 with an
+     answer, the ACK the caller owes for the 2xx (RFC 3261 section
+     13.2.2.4), then BYE and its 200. Like SIPp's own uas, but with the ACK
+     required, and sent to the Contact of the 2xx, the dialog's remote
+     target (section 12.2.1.1). -->
+<scenario name="UAS that requires the ACK">
+  <recv request="INVITE" crlf="true"/>
+
+  <send>
+    <![CDATA[
+      SIP/2.0 180 Ringing
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=callee-[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Contact: <sip:callee@[local_ip]:[local_port];transport=[transport]>
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <send retrans="500">
+    <![CDATA[
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=callee-[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Contact: <sip:callee@[local_ip]:[local_port];transport=[transport]>
+      Content-Type: application/sdp
+      Content-Length: [len]
+
+      v=0
+      o=callee 1 1 IN IP[local_ip_type] [local_ip]
+      s=interop
+      c=IN IP[media_ip_type] [media_ip]
+      t=0 0
+      m=audio [media_port] RTP/AVP 0
+
+    ]]>
+  </send>
+
+  <recv request="ACK" crlf="true">
+    <action>
+      <ereg regexp="^ACK sip:callee@" search_in="msg" check_it="true"
+            assign_to="target"/>
+    </action>
+  </recv>
+
+  <recv request="BYE"/>
+
+  <send>
+    <![CDATA[
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      [last_To:]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- Copies of the BYE that cross the 200 over UDP still find the call. -->
+  <pause milliseconds="4000"/>
+
+  <!-- SIPp refuses a variable it sees used only once. -->
+  <Reference variables="target"/>
+</scenario>

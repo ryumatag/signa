@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+
+# Runs signa-ua against SIPp, an independent SIP implementation, in docker.
+#
+# The profile:
+#
+# * The image built from `scripts/interop/Dockerfile`: Rust 1.85 on Debian
+#   bookworm, pinned by digest, with bookworm's `sip-tester` package pinned
+#   at 1:3.6.1-1+b2 (SIPp v3.6.1). The run writes the version it used to
+#   `tmp/interop/profile.txt`. The crates are those of the local
+#   `Cargo.lock`, which the repository does not track.
+# * Over UDP and over TCP, four cases, each `CALLS` calls one at a time:
+#   - `uac`: SIPp's own `uac` scenario calls the UA, which accepts, and
+#     SIPp ends the call with a BYE. SIPp's scenario sends the ACK and the
+#     BYE to the INVITE's Request-URI rather than to the remote target,
+#     which signa-ua takes.
+#   - `uac_cancel`: `scenarios/uac_cancel.xml` calls the UA, which rings,
+#     and cancels.
+#   - `uac_reinvite`: `scenarios/uac_reinvite.xml` calls the UA, sends a
+#     re-INVITE, and ends the call.
+#   - `uas`: the UA calls `scenarios/uas.xml`, which answers like SIPp's
+#     own `uas` but requires the ACK, and the UA ends the call.
+#
+# The UA side is the ignored tests in `crates/signa-ua/tests/interop.rs`,
+# built at the MSRV in the same image. Both run on a docker network of
+# their own, with fixed addresses, so that neither sees the other through
+# the NAT of Docker Desktop. A case passes when SIPp counts no failed call,
+# received no copy of a message, which would mean the UA did not match an
+# ACK or a response, and dropped nothing as belonging to no call, and when
+# the UA's test passes. The logs and SIPp's files go to `tmp/interop/`.
+#
+#   scripts/interop/run                     five calls a case
+#   scripts/interop/run 50                  fifty
+#   scripts/interop/run 5 udp-uac_cancel    one case
+#
+# The first run pulls the base image and Debian's package, copies the
+# host's downloaded crates into a docker volume, and fetches the crates
+# index and whatever crates the host lacks.
+
+set -euo pipefail
+
+cd -- "$(dirname -- "$0")/../.."
+root=$PWD
+calls=${1:-5}
+only=${2:-}
+
+image=signa-interop
+network=signa-interop
+subnet=10.213.0.0/24
+ua_ip=10.213.0.10
+sipp_ip=10.213.0.20
+logs=tmp/interop
+cases=()
+for transport in udp tcp; do
+  for case in uac uac_cancel uac_reinvite uas; do
+    cases+=("$transport-$case")
+  done
+done
+
+if ! [[ $calls =~ ^[1-9][0-9]*$ ]]; then
+  echo "calls must be a positive number, not \`$calls\`" >&2
+  exit 2
+fi
+if [ -n "$only" ] && ! printf '%s\n' "${cases[@]}" | grep -qx -- "$only"; then
+  echo "no case \`$only\`, which is one of: ${cases[*]}" >&2
+  exit 2
+fi
+if [ ! -f Cargo.lock ]; then
+  echo "no Cargo.lock: run \`cargo generate-lockfile\` first" >&2
+  exit 2
+fi
+mkdir -p "$logs"
+
+docker build -q -t "$image" scripts/interop >/dev/null
+if docker network inspect "$network" >/dev/null 2>&1; then
+  existing=$(docker network inspect -f '{{(index .IPAM.Config 0).Subnet}}' \
+    "$network")
+  if [ "$existing" != "$subnet" ]; then
+    echo "network $network has subnet $existing, not $subnet:" \
+      "remove it with \`docker network rm $network\`" >&2
+    exit 2
+  fi
+else
+  docker network create --subnet "$subnet" "$network" >/dev/null
+fi
+docker volume create signa-interop-cargo >/dev/null
+docker volume create signa-interop-target >/dev/null
+
+cargo_mounts=(
+  -v signa-interop-cargo:/usr/local/cargo/registry
+  -v signa-interop-target:/target
+  -e CARGO_TARGET_DIR=/target
+  -v "$root:/src:ro"
+  -w /src
+)
+
+# The host's downloaded crates save fetching them again. The host's cache
+# stays read-only.
+cache="${CARGO_HOME:-$HOME/.cargo}/registry/cache"
+if [ -d "$cache" ]; then
+  docker run --rm -v "$cache:/host-cache:ro" \
+    -v signa-interop-cargo:/usr/local/cargo/registry "$image" \
+    sh -c 'mkdir -p /usr/local/cargo/registry/cache &&
+      cp -rn /host-cache/. /usr/local/cargo/registry/cache/'
+fi
+docker run --rm "${cargo_mounts[@]}" "$image" \
+  cargo test --locked -q -p signa-ua --test integration --no-run
+docker run --rm "$image" sh -c \
+  'sipp -v 2>&1 | grep SIPp; dpkg-query -W sip-tester' | tee "$logs/profile.txt"
+
+cleanup() {
+  docker rm -f signa-interop-ua signa-interop-sipp >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+# Starts the UA's test `test` in the background with the settings given,
+# and waits until it listens, or fails if it stops first.
+start_ua() {
+  local test=$1
+  shift
+  docker run -d --name signa-interop-ua --network "$network" --ip "$ua_ip" \
+    "${cargo_mounts[@]}" -e SIGNA_UA_INTEROP_LOCAL="$ua_ip" "$@" "$image" \
+    cargo test --locked -q -p signa-ua --test integration \
+    "interop::$test" -- --ignored --exact --nocapture >/dev/null || return 1
+  for _ in $(seq 120); do
+    if docker logs signa-interop-ua 2>/dev/null | grep -x ready >/dev/null; then
+      return 0
+    fi
+    if [ "$(docker inspect -f '{{.State.Running}}' signa-interop-ua)" != true ]
+    then
+      return 1
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+# Runs SIPp for the case `name` with `args`, in the foreground or, with
+# `-d` before the name, in the background. The run may take three seconds a
+# call, on top of a minute.
+sipp() {
+  local mode=(--rm)
+  if [ "$1" = -d ]; then
+    mode=(-d)
+    shift
+  fi
+  local name=$1
+  shift
+  docker run "${mode[@]}" --name signa-interop-sipp --network "$network" \
+    --ip "$sipp_ip" --user "$(id -u):$(id -g)" \
+    -v "$root/scripts/interop/scenarios:/scenarios:ro" \
+    -v "$root/$logs:/logs" -w /logs "$image" \
+    sipp -i "$sipp_ip" -p 5060 -m "$calls" -l 1 \
+    -timeout "$((calls * 3 + 60))s" -timeout_error \
+    -trace_err -error_file "$name-errors.log" \
+    -trace_stat -stf "$name.csv" "$@"
+}
+
+# Prints what the last screen of the SIPp log `log` shows that a case must
+# not have: a message SIPp received again, or one it dropped as belonging
+# to no call.
+screen_problems() {
+  awk '
+    /Messages  Retrans/ { screen = ""; inside = 1; next }
+    inside && /<----------/ {
+      for (i = 1; i <= NF; i++) if ($i == "<----------") break
+      while (i < NF && $(i + 1) !~ /^[0-9]+$/) i++
+      if ($(i + 2) != 0) screen = screen "copies of " $1 ": " $(i + 2) "\n"
+      next
+    }
+    inside && /^ *$/ { inside = 0 }
+    # SIPp as a UAS shows no count of out-of-call messages.
+    /dead call msg/ { dead = $1; stray = $6 == "" ? 0 : $6 }
+    END {
+      printf "%s", screen
+      if (dead != 0) print "dead call messages: " dead
+      if (stray != 0) print "out-of-call messages: " stray
+    }
+  ' "$1"
+}
+
+results=()
+failed=0
+
+# Runs one case and records its result.
+run_case() {
+  local transport=$1 case=$2
+  local flag=u1
+  [ "$transport" = tcp ] && flag=t1
+  local name="$transport-$case"
+  local settings=(
+    -e SIGNA_UA_INTEROP_TRANSPORT="$transport"
+    -e SIGNA_UA_INTEROP_CALLS="$calls"
+  )
+  local sipp_status=0 ua_status=0
+
+  cleanup
+  if [ "$case" = uas ]; then
+    sipp -d "$name" -t "$flag" -sf /scenarios/uas.xml >/dev/null
+    sleep 1
+    if start_ua calls_sipp "${settings[@]}" \
+      -e SIGNA_UA_INTEROP_PEER="$sipp_ip:5060"; then
+      ua_status=$(docker wait signa-interop-ua)
+    else
+      ua_status="never ready"
+      docker stop signa-interop-sipp >/dev/null 2>&1 || true
+    fi
+    sipp_status=$(docker wait signa-interop-sipp)
+    docker logs signa-interop-sipp >"$logs/$name-sipp.log" 2>&1 || true
+  else
+    local scenario=(-sn uac -d 1500)
+    [ "$case" != uac ] && scenario=(-sf "/scenarios/$case.xml")
+    if start_ua answers_calls_from_sipp "${settings[@]}" \
+      -e SIGNA_UA_INTEROP_SCENARIO="$case"; then
+      sipp "$name" -t "$flag" "${scenario[@]}" "$ua_ip:5060" \
+        >"$logs/$name-sipp.log" 2>&1 || sipp_status=$?
+      ua_status=$(docker wait signa-interop-ua)
+    else
+      ua_status="never ready"
+      sipp_status="not run"
+    fi
+  fi
+  docker logs signa-interop-ua >"$logs/$name-ua.log" 2>&1 || true
+
+  local problems=""
+  if [ -f "$logs/$name-sipp.log" ]; then
+    problems=$(screen_problems "$logs/$name-sipp.log")
+  fi
+  if [ "$sipp_status" = 0 ] && [ "$ua_status" = 0 ] && [ -z "$problems" ]; then
+    results+=("passed  $name")
+  else
+    results+=("FAILED  $name (SIPp $sipp_status, UA $ua_status)")
+    if [ -n "$problems" ]; then
+      while IFS= read -r problem; do
+        results+=("        $problem")
+      done <<<"$problems"
+    fi
+    failed=1
+  fi
+}
+
+for name in "${cases[@]}"; do
+  if [ -z "$only" ] || [ "$only" = "$name" ]; then
+    run_case "${name%%-*}" "${name#*-}"
+  fi
+done
+
+printf '%s\n' "${results[@]}" | tee "$logs/results.txt"
+exit "$failed"

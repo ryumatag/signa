@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!-- The caller changes the session once it is up: INVITE, 200, ACK, a
+     re-INVITE with a new offer, its 200 and ACK, then BYE and its 200 (RFC
+     3261 section 14). The requests in the dialog go to the remote target,
+     the Contact of the 2xx, through its route set (section 12.2.1.1). The
+     pauses, longer than 2 T1, let a copy of a 2xx show, should the callee
+     not match its ACK. -->
+<scenario name="UAC that sends a re-INVITE">
+  <send retrans="500">
+    <![CDATA[
+      INVITE sip:service@[remote_ip]:[remote_port];transport=[transport] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: <sip:caller@[local_ip]:[local_port]>;tag=caller-[call_number]
+      To: <sip:service@[remote_ip]:[remote_port]>
+      Call-ID: [call_id]
+      CSeq: 1 INVITE
+      Contact: <sip:caller@[local_ip]:[local_port];transport=[transport]>
+      Max-Forwards: 70
+      Content-Type: application/sdp
+      Content-Length: [len]
+
+      v=0
+      o=caller 1 1 IN IP[local_ip_type] [local_ip]
+      s=interop
+      c=IN IP[media_ip_type] [media_ip]
+      t=0 0
+      m=audio [media_port] RTP/AVP 0
+
+    ]]>
+  </send>
+
+  <recv response="100" optional="true"/>
+  <recv response="180" optional="true"/>
+  <recv response="200" rrs="true"/>
+
+  <send>
+    <![CDATA[
+      ACK [next_url] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      [routes]
+      From: <sip:caller@[local_ip]:[local_port]>;tag=caller-[call_number]
+      [last_To:]
+      Call-ID: [call_id]
+      CSeq: 1 ACK
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <pause milliseconds="1500"/>
+
+  <send retrans="500">
+    <![CDATA[
+      INVITE [next_url] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      [routes]
+      From: <sip:caller@[local_ip]:[local_port]>;tag=caller-[call_number]
+      [last_To:]
+      Call-ID: [call_id]
+      CSeq: 2 INVITE
+      Contact: <sip:caller@[local_ip]:[local_port];transport=[transport]>
+      Max-Forwards: 70
+      Content-Type: application/sdp
+      Content-Length: [len]
+
+      v=0
+      o=caller 1 2 IN IP[local_ip_type] [local_ip]
+      s=interop
+      c=IN IP[media_ip_type] [media_ip]
+      t=0 0
+      m=audio [media_port] RTP/AVP 0
+      a=sendonly
+
+    ]]>
+  </send>
+
+  <recv response="100" optional="true"/>
+  <recv response="200"/>
+
+  <send>
+    <![CDATA[
+      ACK [next_url] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      [routes]
+      From: <sip:caller@[local_ip]:[local_port]>;tag=caller-[call_number]
+      [last_To:]
+      Call-ID: [call_id]
+      CSeq: 2 ACK
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <pause milliseconds="1500"/>
+
+  <send retrans="500">
+    <![CDATA[
+      BYE [next_url] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      [routes]
+      From: <sip:caller@[local_ip]:[local_port]>;tag=caller-[call_number]
+      [last_To:]
+      Call-ID: [call_id]
+      CSeq: 3 BYE
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200" crlf="true"/>
+</scenario>

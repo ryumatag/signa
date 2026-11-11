@@ -35,6 +35,9 @@ Type is where the evidence runs. Paths are in `crates/signa-ua/`:
   that must fail to compile.
 * fuzz: a cargo-fuzz target in `fuzz/` at the repository root, on the entry
   points of the unstable `__fuzz` feature. It runs by hand, not in CI.
+* interop: the UA against SIPp, an independent implementation, which
+  `scripts/interop/run` runs in docker by hand, not in CI. The UA's side is
+  the ignored tests in `tests/interop.rs`.
 * loopback: a UA through its public API, against raw UDP or TCP peers on
   loopback, or another UA. These tests are one binary, `tests/lib.rs`, with
   a module for each section of this map, which the section names. A loopback
@@ -355,6 +358,26 @@ Shutdown section says, and a timeout would only drop its operation.
 | No implicit retry | design | `IncomingInvite` has no `Clone`, so a retry policy written for requests it can copy does not apply to a service of INVITEs, and any other policy has no copy to send again. The copies of a 2xx and the retry after a 491 are the UA's. | `middleware_cannot_retry_invite_implicitly` (`src/ua/mod.rs`) | doctest | - | covered |
 | A shutdown and the handlers | design | A drain waits for the decisions the handlers hold. A termination answers them with a 503, and a decision after that is refused and sends nothing. At the deadline the endpoint stops, the UA lets go of the INVITEs, and the adapter aborts its handlers, with nothing on the wire after the report. | `shutdown_waits_for_or_aborts_tracked_adapter_work` (`tests/tower/shutdown.rs`), `a_termination_takes_the_decision_a_handler_holds` (`tests/tower/shutdown.rs`) | loopback | UDP | covered |
 | Tower only in the tests | design | `tower` is a dev-dependency of signa-ua, outside its normal dependencies, and the crate has no adapter. | `crates/signa-ua/Cargo.toml`, `cargo tree -p signa-ua -e normal` | build | - | covered |
+
+## Interoperability (SIPp)
+
+The UA against SIPp v3.6.1, Debian bookworm's `sip-tester` 1:3.6.1-1+b2,
+which `scripts/interop/run` runs in docker on a network of its own, over UDP
+and over TCP. The script pins the image and the package and names the
+scenarios. The crates are those of the local `Cargo.lock`. A case passes
+when SIPp counts no failed call, received no copy of a message, which would
+mean the UA did not match an ACK or a response, and dropped nothing as
+belonging to no call, and when the UA's test, in `tests/interop.rs`,
+passes. Each case ran 50 calls over each transport. The UA's own tests
+against another signa-ua UA are not counted here.
+
+| Requirement | Basis | Expected behavior | Evidence | Type | Scope | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| A call from SIPp | [3261 §13.3](https://www.rfc-editor.org/rfc/rfc3261.html#section-13.3), [§15.1.2](https://www.rfc-editor.org/rfc/rfc3261.html#section-15.1.2) | SIPp's own `uac` scenario calls the UA, which accepts. SIPp acknowledges the 2xx, and the UA sends no copy of it after the ACK. SIPp's BYE gets a 200. SIPp's scenario sends the ACK and the BYE to the INVITE's Request-URI rather than to the remote target, which the UA takes. | `answers_calls_from_sipp` | interop | UDP, TCP | covered |
+| A CANCEL from SIPp | [3261 §9.2](https://www.rfc-editor.org/rfc/rfc3261.html#section-9.2) | SIPp calls, the UA rings, and SIPp cancels. The CANCEL gets a 200 and the INVITE a 487, which SIPp acknowledges, and the UA sends no copy of the 487 after the ACK. SIPp takes the two responses in either order, and every recorded call had the 200 first. | `answers_calls_from_sipp`, `scripts/interop/scenarios/uac_cancel.xml` | interop | UDP, TCP | covered |
+| A re-INVITE from SIPp | [3261 §12.2.1.1](https://www.rfc-editor.org/rfc/rfc3261.html#section-12.2.1.1), [§14.2](https://www.rfc-editor.org/rfc/rfc3261.html#section-14.2) | SIPp calls, then sends a re-INVITE with a new offer to the remote target, which the UA accepts. SIPp acknowledges both 2xx, the UA sends no copy of either after its ACK, and SIPp ends the call. | `answers_calls_from_sipp`, `scripts/interop/scenarios/uac_reinvite.xml` | interop | UDP, TCP | covered |
+| A call to SIPp | [3261 §13.2.2.4](https://www.rfc-editor.org/rfc/rfc3261.html#section-13.2.2.4), [§15.1.1](https://www.rfc-editor.org/rfc/rfc3261.html#section-15.1.1) | The UA calls SIPp, which rings and answers. SIPp requires the UA's ACK of the 2xx, sent to the Contact of the 2xx, which SIPp's own `uas` scenario leaves optional. The UA's BYE ends the call. | `calls_sipp`, `scripts/interop/scenarios/uas.xml` | interop | UDP, TCP | covered |
+| Other implementations | design | pjsua, baresip, Kamailio as a proxy between two UAs, and Asterisk. | none | - | - | not executed: no profile for them yet |
 
 ## State model contracts (design)
 

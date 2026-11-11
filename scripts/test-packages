@@ -9,7 +9,9 @@
 # Usage: scripts/test-packages [--include-ignored]
 #
 # `--include-ignored` also runs the tests marked `#[ignore]`, which take too
-# long for every run, such as signa-ua's measurements of what it keeps.
+# long for every run, such as signa-ua's measurements of what it keeps. It
+# skips signa-ua's interoperability tests, which need SIPp beside them and
+# which `scripts/interop/run` runs.
 
 set -euo pipefail
 
@@ -20,7 +22,7 @@ usage() {
 harness=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    --include-ignored) harness=(-- --include-ignored) ;;
+    --include-ignored) harness=(-- --include-ignored --skip interop::) ;;
     -h | --help)
       usage
       exit 0
