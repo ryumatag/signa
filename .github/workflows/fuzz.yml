@@ -1,0 +1,53 @@
+name: fuzz
+
+on:
+  schedule:
+    - cron: '40 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Every target on both architectures. signa-ua reads its headers through
+  # siparse, whose scans have separate SSE2 and NEON paths.
+  fuzz:
+    name: fuzz (${{ matrix.target }}, ${{ matrix.arch }})
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        target: [headers, messages]
+        include:
+          # A `messages` input is a series of requests.
+          - target: headers
+            max_len: 4096
+          - target: messages
+            max_len: 8192
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version 0.13.2
+      - name: Fuzz signa-ua with AddressSanitizer
+        env:
+          FUZZ_TARGET: ${{ matrix.target }}
+          FUZZ_MAX_LEN: ${{ matrix.max_len }}
+        run: |
+          mkdir -p "tmp/fuzz/$FUZZ_TARGET"
+          cargo fuzz run --sanitizer address "$FUZZ_TARGET" \
+            "tmp/fuzz/$FUZZ_TARGET" "fuzz/corpus/$FUZZ_TARGET" -- \
+            -max_total_time=300 -max_len="$FUZZ_MAX_LEN"
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}-${{ matrix.arch }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
