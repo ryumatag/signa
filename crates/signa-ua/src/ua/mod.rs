@@ -58,6 +58,80 @@ pub trait Resolve: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Target, ResolveError>> + Send;
 }
 
+/// Prepares the answer that the ACK of a 2xx owes when the 2xx carried an
+/// offer.
+///
+/// An INVITE sent without an offer, from [`InvitePlan::without_offer`], gets
+/// an offer in the 2xx of each fork, and its ACK has to carry the answer (RFC
+/// 3261 section 13.2.1). The UA does not read session descriptions, so it
+/// cannot make one. It asks for it here, and the ACK waits for it. This is
+/// the contract:
+///
+/// * The answer is a valid answer to the offer, by the rules of RFC 3264.
+///   The UA puts it in the ACK as it is, and the same one in every copy of
+///   the ACK. It never looks inside.
+/// * An [`Offer`] without a session is that of a dialog the UA ends with a
+///   BYE after the ACK, such as a fork beyond [`Config::max_forks`] or one of
+///   an attempt given up. Its answer should reject every stream, as RFC 3264
+///   section 6 lets an answerer do with a port of zero, so that the ACK
+///   still completes the exchange.
+/// * It runs apart from the UA's other work, as a task of its own, with at
+///   most [`Config::max_answers`] at once. An answer is due
+///   [`Config::answer_timeout`] after the 2xx asked for it, the wait for a
+///   free task included. It is not for anything that waits on the
+///   application or a user, since the peer retransmits its 2xx until the
+///   ACK.
+/// * `None` says that the offer cannot be answered, as one that is not valid
+///   SDP. The ACK then goes without an answer, only to stop the 2xx's
+///   retransmissions, and the dialog ends with a BYE. That ACK breaks RFC
+///   3261 section 13.2.1, so the attempt reports itself degraded, and a
+///   session that ends so says [`EndReason::NegotiationFailed`]. Running out
+///   of time ends the same way.
+pub trait Negotiate: Send + Sync + 'static {
+    /// Prepares the answer to `offer`, or returns `None` if there is none.
+    fn answer(
+        &self,
+        offer: &Offer,
+    ) -> impl Future<Output = Option<Description>> + Send;
+}
+
+/// An offer in a 2xx, which a [`Negotiate`] is asked to answer.
+#[derive(Clone, Debug)]
+pub struct Offer {
+    description: Description,
+    session: Option<Session>,
+}
+
+impl Offer {
+    /// The offer, as the 2xx carried it.
+    pub fn description(&self) -> &Description {
+        &self.description
+    }
+
+    /// The session the 2xx formed, or `None` for a dialog the UA ends with a
+    /// BYE after the ACK, whose answer should reject the offer.
+    pub fn session(&self) -> Option<&Session> {
+        self.session.as_ref()
+    }
+}
+
+/// The [`Negotiate`] of a UA without one, as [`Config::new`] makes it.
+///
+/// It has no values. A UA with it never asks for an answer, and refuses an
+/// [`InvitePlan`] without an offer.
+#[derive(Clone, Copy, Debug)]
+pub enum NoNegotiator {}
+
+impl Negotiate for NoNegotiator {
+    fn answer(
+        &self,
+        _offer: &Offer,
+    ) -> impl Future<Output = Option<Description>> + Send {
+        // A `NoNegotiator` has no values, so this never runs.
+        std::future::ready(None)
+    }
+}
+
 /// What a [`Resolve`] is asked to resolve.
 #[derive(Clone, Debug)]
 pub struct Query {
@@ -98,9 +172,12 @@ impl Resolve for StaticResolver {
 /// beyond the largest capacity Tokio's channels and semaphores take,
 /// [`Semaphore::MAX_PERMITS`], counts as that.
 #[derive(Clone, Debug)]
-pub struct Config<R = StaticResolver> {
+pub struct Config<R = StaticResolver, N = NoNegotiator> {
     contact: Box<str>,
     resolver: R,
+    negotiator: Option<N>,
+    answers: usize,
+    answer_timeout: Duration,
     commands: usize,
     events: usize,
     operations: usize,
@@ -157,6 +234,11 @@ impl Config {
         Ok(Config {
             contact: contact.into(),
             resolver: StaticResolver::new(),
+            negotiator: None,
+            answers: 64,
+            // An answer is local work for an SDP component, and the peer
+            // gives up on the ACK 64 T1 after its 2xx, 32 seconds by default.
+            answer_timeout: Duration::from_secs(2),
             commands: 256,
             events: 256,
             operations: 1024,
@@ -177,12 +259,15 @@ impl Config {
     }
 }
 
-impl<R> Config<R> {
+impl<R, N> Config<R, N> {
     /// Resolves next hops with `resolver`.
-    pub fn resolver<S: Resolve>(self, resolver: S) -> Config<S> {
+    pub fn resolver<S: Resolve>(self, resolver: S) -> Config<S, N> {
         Config {
             contact: self.contact,
             resolver,
+            negotiator: self.negotiator,
+            answers: self.answers,
+            answer_timeout: self.answer_timeout,
             commands: self.commands,
             events: self.events,
             operations: self.operations,
@@ -199,9 +284,54 @@ impl<R> Config<R> {
         }
     }
 
+    /// Has `negotiator` prepare the answer that the ACK of a 2xx owes when
+    /// the 2xx carried an offer, as [`Negotiate`] describes. Only a UA with
+    /// one sends an INVITE without an offer, from
+    /// [`InvitePlan::without_offer`].
+    pub fn negotiator<M: Negotiate>(self, negotiator: M) -> Config<R, M> {
+        Config {
+            contact: self.contact,
+            resolver: self.resolver,
+            negotiator: Some(negotiator),
+            answers: self.answers,
+            answer_timeout: self.answer_timeout,
+            commands: self.commands,
+            events: self.events,
+            operations: self.operations,
+            pending_invites: self.pending_invites,
+            attempts: self.attempts,
+            dialogs: self.dialogs,
+            forks: self.forks,
+            cleanups: self.cleanups,
+            routes: self.routes,
+            jobs: self.jobs,
+            resolve_timeout: self.resolve_timeout,
+            timers: self.timers,
+            decision_timeout: self.decision_timeout,
+        }
+    }
+
+    /// Sets how many answers the [`Negotiate`] may prepare at once. More
+    /// wait their turn. The default is 64.
+    pub fn max_answers(mut self, limit: usize) -> Config<R, N> {
+        self.answers = bounded(limit);
+        self
+    }
+
+    /// Sets how long an answer may take, from the 2xx that asks for it,
+    /// with the wait for one of [`Config::max_answers`] included, so that
+    /// answers that hang delay no other beyond it. One that takes longer
+    /// counts as none, so the ACK goes without it, and the dialog ends. The
+    /// default is 2 seconds, well within the 32 seconds a peer with the
+    /// default T1 waits for the ACK.
+    pub fn answer_timeout(mut self, timeout: Duration) -> Config<R, N> {
+        self.answer_timeout = timeout;
+        self
+    }
+
     /// Sets how many submitted operations may wait for the driver. A
     /// submission beyond it gets [`Error::Busy`]. The default is 256.
-    pub fn command_capacity(mut self, capacity: usize) -> Config<R> {
+    pub fn command_capacity(mut self, capacity: usize) -> Config<R, N> {
         self.commands = bounded(capacity);
         self
     }
@@ -213,14 +343,14 @@ impl<R> Config<R> {
     /// and INVITEs in flight do not crowd out other events. An incoming
     /// INVITE that finds no place gets a 503. Once delivered, each event
     /// holds its place until it is received.
-    pub fn event_capacity(mut self, capacity: usize) -> Config<R> {
+    pub fn event_capacity(mut self, capacity: usize) -> Config<R, N> {
         self.events = bounded(capacity);
         self
     }
 
     /// Sets how many operations may run or keep an outcome at once. A
     /// submission beyond it gets [`Error::Busy`]. The default is 1024.
-    pub fn max_operations(mut self, limit: usize) -> Config<R> {
+    pub fn max_operations(mut self, limit: usize) -> Config<R, N> {
         self.operations = bounded(limit);
         self
     }
@@ -233,21 +363,21 @@ impl<R> Config<R> {
     ///
     /// An accepted INVITE is kept until its ACK, apart from this limit and
     /// [`Config::max_attempts`]. [`Config::max_dialogs`] bounds those.
-    pub fn max_pending_invites(mut self, limit: usize) -> Config<R> {
+    pub fn max_pending_invites(mut self, limit: usize) -> Config<R, N> {
         self.pending_invites = bounded(limit);
         self
     }
 
     /// Sets how many INVITEs this UA may have sent and still collect
     /// responses for. The default is 256.
-    pub fn max_attempts(mut self, limit: usize) -> Config<R> {
+    pub fn max_attempts(mut self, limit: usize) -> Config<R, N> {
         self.attempts = bounded(limit);
         self
     }
 
     /// Sets how many dialogs, early or confirmed, the UA keeps. The default
     /// is 1024.
-    pub fn max_dialogs(mut self, limit: usize) -> Config<R> {
+    pub fn max_dialogs(mut self, limit: usize) -> Config<R, N> {
         self.dialogs = bounded(limit);
         self
     }
@@ -259,7 +389,7 @@ impl<R> Config<R> {
     /// A 2xx beyond it forms no session. The UA acknowledges it and ends its
     /// dialog with a BYE, as RFC 3261 section 13.2.2.4 asks of a dialog the
     /// UAC does not want, and the attempt ends incomplete.
-    pub fn max_forks(mut self, limit: usize) -> Config<R> {
+    pub fn max_forks(mut self, limit: usize) -> Config<R, N> {
         self.forks = bounded(limit);
         self
     }
@@ -271,21 +401,21 @@ impl<R> Config<R> {
     /// They have room of their own, apart from [`Config::max_dialogs`], so
     /// that a fork the UA has no room for still gets its ACK and BYE. Beyond
     /// this limit too, a 2xx gets neither, and the attempt ends degraded.
-    pub fn max_cleanups(mut self, limit: usize) -> Config<R> {
+    pub fn max_cleanups(mut self, limit: usize) -> Config<R, N> {
         self.cleanups = bounded(limit);
         self
     }
 
     /// Sets how many URIs a dialog's route set may have. A request or
     /// response with more cannot form a dialog. The default is 16.
-    pub fn max_routes(mut self, limit: usize) -> Config<R> {
+    pub fn max_routes(mut self, limit: usize) -> Config<R, N> {
         self.routes = bounded(limit);
         self
     }
 
     /// Sets how many sends and resolutions may run at once. More wait their
     /// turn. The default is 256.
-    pub fn max_jobs(mut self, limit: usize) -> Config<R> {
+    pub fn max_jobs(mut self, limit: usize) -> Config<R, N> {
         self.jobs = bounded(limit);
         self
     }
@@ -293,7 +423,7 @@ impl<R> Config<R> {
     /// Sets how long a next hop may take to resolve. A resolution that
     /// takes longer counts as unresolved, so that a resolver that hangs holds
     /// no job for good. The default is 4 seconds.
-    pub fn resolve_timeout(mut self, timeout: Duration) -> Config<R> {
+    pub fn resolve_timeout(mut self, timeout: Duration) -> Config<R, N> {
         self.resolve_timeout = timeout;
         self
     }
@@ -304,7 +434,7 @@ impl<R> Config<R> {
     /// UA and the endpoint agree on them. The default is [`Timers::new`].
     ///
     /// [RFC 3261 section 13.3.1.4]: https://www.rfc-editor.org/rfc/rfc3261.html#section-13.3.1.4
-    pub fn timers(mut self, timers: Timers) -> Config<R> {
+    pub fn timers(mut self, timers: Timers) -> Config<R, N> {
         self.timers = timers;
         self
     }
@@ -313,7 +443,7 @@ impl<R> Config<R> {
     /// The UA answers an INVITE still undecided then with a 500, as one whose
     /// [`IncomingInvite`] was dropped. A timeout too long to add to the clock,
     /// such as [`Duration::MAX`], sets no deadline. The default is 3 minutes.
-    pub fn decision_timeout(mut self, timeout: Duration) -> Config<R> {
+    pub fn decision_timeout(mut self, timeout: Duration) -> Config<R, N> {
         self.decision_timeout = timeout;
         self
     }
@@ -419,10 +549,10 @@ pub struct Ua {
 ///
 /// Returns [`AttachError::Stateless`] for an endpoint with stateless
 /// reception.
-pub fn attach<R: Resolve>(
+pub fn attach<R: Resolve, N: Negotiate>(
     endpoint: Endpoint,
     incoming: Incoming,
-    config: Config<R>,
+    config: Config<R, N>,
 ) -> Result<Ua, AttachError> {
     if endpoint.reception() != Reception::Stateful {
         return Err(AttachError::Stateless);
@@ -434,6 +564,7 @@ pub fn attach<R: Resolve>(
     let (events, event_receiver) = mpsc::channel(capacity);
     let shared = Arc::new(Shared {
         id: UaId(NEXT_UA.fetch_add(1, Ordering::Relaxed)),
+        late_offer: config.negotiator.is_some(),
         commands,
         operations: Arc::new(Semaphore::new(config.operations)),
     });
@@ -468,6 +599,9 @@ static NEXT_UA: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug)]
 struct Shared {
     id: UaId,
+    /// Whether the UA has a [`Negotiate`], and so sends INVITEs without an
+    /// offer.
+    late_offer: bool,
     commands: mpsc::Sender<Command>,
     /// One permit per operation that runs or keeps its outcome. A submission
     /// takes one, so that the driver always has room for what it admitted.
@@ -560,7 +694,7 @@ pub struct UaHandle {
 
 impl UaHandle {
     /// Submits an initial INVITE, built from `plan` with the offer it
-    /// carries.
+    /// carries, or without one for a UA with a [`Negotiate`].
     ///
     /// The UA picks the Call-ID, the From tag and the first CSeq number, adds
     /// its Contact, resolves the next hop from the first route or the
@@ -570,10 +704,12 @@ impl UaHandle {
     ///
     /// Each dialog a response forms comes as an event, and the UA
     /// acknowledges each 2xx itself, whatever the application does with the
-    /// session. No 2xx wins over another. The UA keeps each one as a session
-    /// of its own. [`Event::AttemptEnded`] says what the INVITE came to once
-    /// no more responses can arrive, and [`UaHandle::attempt_snapshot`] says
-    /// it before.
+    /// session. Without an offer, the ACK of each 2xx carries the answer to
+    /// its offer that the [`Negotiate`] prepared. No 2xx wins over another.
+    /// The UA keeps each one as a session of its own.
+    /// [`Event::AttemptEnded`] says what the INVITE came to once no more
+    /// responses can arrive, and [`UaHandle::attempt_snapshot`] says it
+    /// before.
     ///
     /// The operation fails, with nothing sent unless the error says so:
     ///
@@ -596,14 +732,15 @@ impl UaHandle {
     /// # Errors
     ///
     /// Returns `plan` with [`Error::InvalidInput`] when the UA cannot send
-    /// it, as [`InvitePlan`] says, with [`Error::Busy`] when the command
-    /// queue or the operations are full, and with [`Error::Closed`] once the
-    /// driver has stopped.
+    /// it, as [`InvitePlan`] says, or when it has no offer and the UA no
+    /// [`Negotiate`], with [`Error::Busy`] when the command queue or the
+    /// operations are full, and with [`Error::Closed`] once the driver has
+    /// stopped.
     pub fn try_invite(
         &self,
         plan: InvitePlan,
     ) -> Result<Operation<InviteAttempt>, SubmitError<InvitePlan>> {
-        if !plan.is_valid() {
+        if !plan.is_valid() || (!plan.has_offer() && !self.shared.late_offer) {
             return Err(SubmitError {
                 error: Error::InvalidInput,
                 value: Box::new(plan),
@@ -958,9 +1095,34 @@ pub enum Event {
         /// The session of the dialog.
         session: Session,
     },
-    /// The offer/answer exchange of a session completed.
+    /// The offer/answer exchange of a session completed. The answer came,
+    /// in the 2xx or the ACK, or the answer this UA owed in its ACK is fixed.
+    /// The session's snapshot has what the peer sent. Whether that suits is
+    /// for the application's SDP component to judge, since the UA does not
+    /// read it.
     #[non_exhaustive]
     Negotiated {
+        /// The session.
+        session: Session,
+    },
+    /// The offer/answer exchange of a session failed, and the UA ends the
+    /// session with a BYE, after the ACK, with
+    /// [`EndReason::NegotiationFailed`]. The 2xx or the ACK lacked the answer
+    /// or offer it owed (RFC 3261 section 13.2.1), or the [`Negotiate`] had no
+    /// answer for the offer of a 2xx.
+    #[non_exhaustive]
+    NegotiationFailed {
+        /// The session.
+        session: Session,
+    },
+    /// The answer in a 2xx differs from the preview of it that a provisional
+    /// response carried, which RFC 3261 section 13.2.1 does not allow. The
+    /// preview stays the answer, as section 13.2.1 has the first session
+    /// description be, and RFC 6337 section 3.1.1 keeps it even then. The
+    /// session's snapshot has it. The peer is at fault, and the application
+    /// may end the session.
+    #[non_exhaustive]
+    AnswerChanged {
         /// The session.
         session: Session,
     },
@@ -1045,9 +1207,11 @@ pub enum Event {
 /// this crate rather than an RFC rule. So does a decision that takes longer
 /// than [`Config::decision_timeout`].
 ///
-/// The INVITE carries an offer. The UA answers one without an offer itself,
-/// with a 488, since its 2xx would have to carry an offer and its ACK the
-/// answer, which this UA cannot check yet.
+/// The INVITE may carry an offer, which [`IncomingInvite::offer`] returns.
+/// Then the 2xx carries the answer. Without one, the 2xx carries an offer,
+/// and the ACK owes the answer (RFC 3261 section 13.2.1). An INVITE whose body
+/// may hold an offer the UA cannot take out, such as a multipart body, never
+/// gets here. The UA answers it with a 415.
 ///
 /// If the caller gives the INVITE up first, with a CANCEL or a BYE in its
 /// early dialog, the UA answers it with a 487 and reports
@@ -1056,6 +1220,12 @@ pub enum Event {
 pub struct IncomingInvite {
     request: Request<Bytes>,
     flow: Flow,
+    /// The offer and the preview are boxed, so that an INVITE without them
+    /// makes [`Event`] no larger.
+    offer: Option<Box<Description>>,
+    /// The preview of the answer that a provisional response went out
+    /// with, which the 2xx has to repeat.
+    preview: Option<Box<Description>>,
     authority: Option<Authority>,
     /// A slot reserved in the driver's queue of abandoned INVITEs, so that
     /// dropping this always reaches the driver.
@@ -1081,6 +1251,14 @@ impl IncomingInvite {
     /// endpoint can tell them apart by it.
     pub fn flow(&self) -> Flow {
         self.flow
+    }
+
+    /// Returns the offer the INVITE carries: its body, if that is a session
+    /// description by its Content-Disposition, or by its Content-Type
+    /// `application/sdp` without one (RFC 3261 section 20.11). The UA does
+    /// not look inside it.
+    pub fn offer(&self) -> Option<&Description> {
+        self.offer.as_deref()
     }
 
     /// Returns the INVITE's identity, which [`Event::Cancelled`] names.
@@ -1130,11 +1308,70 @@ impl IncomingInvite {
         self.shared.submit(status, |status| model::Command::Provisional {
             exchange,
             status,
+            preview: None,
         })
     }
 
+    /// Sends a provisional response, from 101 to 199, that carries `answer`,
+    /// the answer to the INVITE's offer, ahead of the 2xx. It is a preview,
+    /// as for early media, which RFC 3261 section 13.2.1 allows. The response
+    /// is not reliable, so the 2xx has to carry the same answer, and
+    /// [`IncomingInvite::try_accept`] refuses another one.
+    ///
+    /// Otherwise it is as [`IncomingInvite::try_provisional`]. The UA sends
+    /// the preview again with the provisional response every minute.
+    ///
+    /// # Errors
+    ///
+    /// Returns `status` and `answer` with [`Error::InvalidInput`] for a status
+    /// outside 101 to 199, an empty answer, an INVITE without an offer, whose
+    /// 2xx has to carry an offer instead, or an answer other than one sent
+    /// before, with [`Error::Busy`] when the command queue or the operations
+    /// are full, or with [`Error::Closed`] once the driver has stopped.
+    pub fn try_provisional_with(
+        &mut self,
+        status: StatusCode,
+        answer: Description,
+    ) -> Result<Operation<()>, SubmitError<(StatusCode, Description)>> {
+        let valid = (101..=199).contains(&status.as_u16())
+            && !answer.body().is_empty()
+            && self.offer.is_some()
+            && self
+                .preview
+                .as_deref()
+                .is_none_or(|preview| *preview == answer);
+        if !valid {
+            return Err(SubmitError {
+                error: Error::InvalidInput,
+                value: Box::new((status, answer)),
+            });
+        }
+
+        let exchange = self
+            .authority
+            .as_ref()
+            .expect("a live invite holds its authority")
+            .exchange();
+        let operation = self.shared.submit(
+            (status, answer.clone()),
+            |(status, answer)| model::Command::Provisional {
+                exchange,
+                status,
+                preview: Some(answer),
+            },
+        )?;
+        self.preview = Some(Box::new(answer));
+        Ok(operation)
+    }
+
     /// Accepts the INVITE with a 200 that carries `answer`, the answer to its
-    /// offer.
+    /// offer, or an offer of the application's when it had none.
+    ///
+    /// With an offer of its own, the session's exchange completes once the
+    /// ACK brings the answer, with [`Event::Negotiated`], and the session's
+    /// snapshot has that answer. An ACK without one fails the exchange, and
+    /// the UA ends the session with a BYE, with
+    /// [`Event::NegotiationFailed`].
     ///
     /// The 200 copies the INVITE's Record-Route and carries the UA's Contact.
     /// The UA sends it again until the ACK arrives, on every transport
@@ -1157,15 +1394,18 @@ impl IncomingInvite {
     /// # Errors
     ///
     /// Returns this INVITE and `answer` with [`Error::InvalidInput`] when the
-    /// body of `answer` is empty, with [`Error::Busy`] when the command queue
-    /// or the operations are full, or with [`Error::Closed`] once the driver
-    /// has stopped.
+    /// body of `answer` is empty, or differs from the preview a provisional
+    /// response carried, with [`Error::Busy`] when the command queue or the
+    /// operations are full, or with [`Error::Closed`] once the driver has
+    /// stopped.
     pub fn try_accept(
         self,
         answer: Description,
     ) -> Result<Operation<Session>, SubmitError<(IncomingInvite, Description)>>
     {
-        if answer.body().is_empty() {
+        let previewed =
+            self.preview.as_deref().is_none_or(|preview| *preview == answer);
+        if answer.body().is_empty() || !previewed {
             return Err(SubmitError {
                 error: Error::InvalidInput,
                 value: Box::new((self, answer)),
@@ -1295,8 +1535,11 @@ pub struct SessionSnapshot {
     /// The offer/answer exchange of its dialog.
     pub negotiation: NegotiationState,
     /// The last session description the peer sent: the offer of an INVITE
-    /// this UA took, or the answer in the 2xx of one it sent. The UA does not
-    /// check it. A session that ended no longer has it.
+    /// this UA took, or the answer in its ACK, and for an INVITE this UA
+    /// sent, the answer or offer in the 2xx. A preview of the answer that a
+    /// provisional response gave stays the answer, as the first session
+    /// description (RFC 3261 section 13.2.1). The UA does not check it. A
+    /// session that ended no longer has it.
     pub remote_description: Option<Description>,
     /// Why the session ended, once it has.
     pub end_reason: Option<EndReason>,
@@ -1369,10 +1612,10 @@ impl SessionSnapshot {
             },
             negotiation: match negotiation {
                 Negotiation::Stable => NegotiationState::Settled,
-                Negotiation::LocalOfferOutstanding => {
+                Negotiation::LocalOfferOutstanding { .. } => {
                     NegotiationState::AwaitingAnswer
                 }
-                Negotiation::RemoteOfferOutstanding => {
+                Negotiation::RemoteOfferOutstanding { .. } => {
                     NegotiationState::AnswerOwed
                 }
             },

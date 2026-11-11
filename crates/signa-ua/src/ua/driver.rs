@@ -14,7 +14,13 @@ endpoint, runs as a job on a [`JoinSet`], and its result comes back to the loop
 as another input. A slow resolution therefore holds up only its own request,
 and the loop keeps taking ACKs and CANCELs.
 
-Every task belongs to one of three [`JoinSet`]s, so that dropping the driver
+The answer a [`Negotiate`] prepares for the ACK of a 2xx that carried an offer
+runs as a job too, in a [`JoinSet`] and a backlog of its own, with its own
+limit and deadline. A slow SDP component therefore holds up only the ACKs that
+wait for its answers, not the other jobs, and its backlog is bounded by the
+replay contexts, each of which asks for one answer at most.
+
+Every task belongs to one of four [`JoinSet`]s, so that dropping the driver
 aborts all of them. Jobs are bounded by the configuration. More wait in a
 backlog, which the model's own tables bound, since each job is for one of their
 records, and a record has at most one copy of its 2xx or its ACK on the way at
@@ -44,8 +50,9 @@ use signa_core::{
     },
     message::{
         header::{
-            ALLOW, CONTACT, CONTENT_TYPE, RECORD_ROUTE, REQUIRE, Tag,
-            UNSUPPORTED, WARNING,
+            ACCEPT, ACCEPT_ENCODING, ALLOW, CONTACT, CONTENT_DISPOSITION,
+            CONTENT_TYPE, HeaderMap, RECORD_ROUTE, REQUIRE, Tag, UNSUPPORTED,
+            WARNING,
         },
         response,
         uri::SipUri,
@@ -59,7 +66,8 @@ use tokio::{
 
 use super::{
     AttemptId, AttemptSnapshot, Command, Config, Event, IncomingInvite,
-    InviteId, Query, Resolve, ResolveError, Session, SessionSnapshot, Shared,
+    InviteId, Negotiate, Offer, Query, Resolve, ResolveError, Session,
+    SessionSnapshot, Shared,
 };
 use crate::{
     error::Error,
@@ -67,7 +75,7 @@ use crate::{
     model::{
         self, ByeStarted, Effect, InDialog, Model, Random, Refusal, Released,
     },
-    negotiation::Description,
+    negotiation::{Body, Description},
     operation::{Completion, OperationId},
     plan::ALLOWED,
     protocol,
@@ -101,12 +109,20 @@ const RESPONSE_QUEUE: usize = 64;
 /// the limit to TCP, which RFC 3261 allows of any request.
 const VIA_ALLOWANCE: usize = 160;
 
-pub(super) struct Driver<R> {
+pub(super) struct Driver<R, N> {
     model: Model<OsRandom>,
     random: OsRandom,
     endpoint: Endpoint,
     incoming: Incoming,
     resolver: Arc<R>,
+    negotiator: Option<Arc<N>>,
+    /// The jobs that prepare answers, apart from the others.
+    answers: JoinSet<Done>,
+    /// Answers to prepare once one of `answers` ends. Each waits as long as
+    /// any other, so the first is due first.
+    answer_backlog: VecDeque<Answer>,
+    max_answers: usize,
+    answer_timeout: Duration,
     contact: Box<str>,
     /// The host and port of `contact`, which names the UA in a Warning
     /// (RFC 3261 section 20.43).
@@ -185,6 +201,15 @@ struct Ack {
     sending: bool,
 }
 
+/// An answer for the ACK of a 2xx, to prepare.
+struct Answer {
+    replay: ReplayKey,
+    offer: Offer,
+    /// When the answer is due. It counts from when the 2xx asked for it,
+    /// so that the time in the backlog counts too.
+    due: Instant,
+}
+
 struct Waiter {
     reply: oneshot::Sender<Result<Completion, Error>>,
     /// The operation's place, which the handle took. It is held, not read,
@@ -204,6 +229,7 @@ enum Job {
     Provisional {
         exchange: ExchangeKey,
         operation: Option<OperationId>,
+        preview: Option<Description>,
         responder: Arc<Responder>,
         response: Response<Bytes>,
     },
@@ -255,7 +281,14 @@ enum Done {
         exchange: ExchangeKey,
         operation: Option<OperationId>,
         status: StatusCode,
+        preview: Option<Description>,
         result: Result<(), Error>,
+    },
+    /// The answer prepared for the ACK of a 2xx, or `None` if there was
+    /// none in time.
+    Answered {
+        replay: ReplayKey,
+        answer: Option<Description>,
     },
     Resent {
         exchange: ExchangeKey,
@@ -293,15 +326,15 @@ enum Done {
     },
 }
 
-impl<R: Resolve> Driver<R> {
+impl<R: Resolve, N: Negotiate> Driver<R, N> {
     pub(super) fn new(
         endpoint: Endpoint,
         incoming: Incoming,
-        config: Config<R>,
+        config: Config<R, N>,
         shared: Arc<Shared>,
         commands: mpsc::Receiver<Command>,
         events: mpsc::Sender<Event>,
-    ) -> Driver<R> {
+    ) -> Driver<R, N> {
         let (abandon_sender, abandons) = mpsc::channel(config.pending_invites);
         let (response_sender, responses) = mpsc::channel(RESPONSE_QUEUE);
 
@@ -321,6 +354,11 @@ impl<R: Resolve> Driver<R> {
             agent: warn_agent(&config.contact),
             contact: config.contact,
             resolver: Arc::new(config.resolver),
+            negotiator: config.negotiator.map(Arc::new),
+            answers: JoinSet::new(),
+            answer_backlog: VecDeque::new(),
+            max_answers: config.answers,
+            answer_timeout: config.answer_timeout,
             shared,
             commands,
             abandon_sender,
@@ -351,6 +389,8 @@ impl<R: Resolve> Driver<R> {
     pub(super) async fn run(mut self) {
         loop {
             let deadline = self.model.next_deadline().map(Instant::from_std);
+            let answer_due =
+                self.answer_backlog.front().map(|answer| answer.due);
             let room = self.room();
 
             tokio::select! {
@@ -374,6 +414,18 @@ impl<R: Resolve> Driver<R> {
                     if !self.watchers.is_empty() =>
                 {
                     self.on_joined(done);
+                }
+                Some(done) = self.answers.join_next_with_id(),
+                    if !self.answers.is_empty() =>
+                {
+                    self.on_joined(done);
+                }
+                // Answers that waited for a free job until they were due get
+                // none, even while every job is busy.
+                () = sleep_until(answer_due.unwrap_or_else(Instant::now)),
+                    if answer_due.is_some() =>
+                {
+                    self.expire_answers();
                 }
                 Some((attempt, item)) = self.responses.recv() => {
                     self.on_response(attempt, item);
@@ -426,7 +478,10 @@ impl<R: Resolve> Driver<R> {
             }
             IncomingEvent::Request(request) => self.on_other(request),
             IncomingEvent::Ack(ack) => {
-                let answer = !ack.request.body().is_empty();
+                let answer = Body::description(
+                    ack.request.headers(),
+                    ack.request.body(),
+                );
                 self.model.receive_ack_request(&ack.request, answer);
                 self.settle(None);
             }
@@ -506,10 +561,12 @@ impl<R: Resolve> Driver<R> {
         let (responder, _events) = transaction.into_parts();
         let responder = Arc::new(responder);
 
-        let offer =
-            Description::from_message(request.headers(), request.body());
-        let offered = offer.is_some();
-        let authority = match self.model.receive_invite(&request, offer, now())
+        let body = Body::read(request.headers(), request.body());
+        let offer = match &body {
+            Ok(Body::Session(offer)) => Some(Box::new(offer.clone())),
+            _ => None,
+        };
+        let authority = match self.model.receive_invite(&request, body, now())
         {
             Ok(authority) => authority,
             Err(refusal) => {
@@ -532,18 +589,6 @@ impl<R: Resolve> Driver<R> {
             },
         );
 
-        // An INVITE without an offer would need an offer in the 2xx and the
-        // answer checked in the ACK, which this UA cannot do yet. It is
-        // answered with a 488 rather than let through to be accepted with
-        // nothing to check the answer against. The status is my policy (RFC
-        // 3261 section 21.4.26).
-        if !offered {
-            let not_acceptable = StatusCode::from_u16(488).expect("a status");
-            self.model.reject(exchange, not_acceptable);
-            self.settle(None);
-            return;
-        }
-
         // The decision needs a place in the event queue and a slot for its
         // abandonment. Without them, as when nobody reads the events, the UA
         // answers with the 503 of a server without room (RFC 3261 section
@@ -559,6 +604,8 @@ impl<R: Resolve> Driver<R> {
                 place.send(Event::Invite(IncomingInvite {
                     request,
                     flow,
+                    offer,
+                    preview: None,
                     authority: Some(authority),
                     abandon: Some(abandon),
                     shared: self.shared.clone(),
@@ -678,6 +725,14 @@ impl<R: Resolve> Driver<R> {
             for value in request.headers().get_all(REQUIRE) {
                 response = response.header(UNSUPPORTED, value.clone());
             }
+        }
+        // A 415 lists what the UA takes (RFC 3261 section 21.4.13). That is a
+        // session description of the one type with a default disposition,
+        // and no content coding.
+        if refusal == Refusal::UnsupportedBody {
+            response = response
+                .header(ACCEPT, "application/sdp")
+                .header(ACCEPT_ENCODING, "identity");
         }
         // RFC 5630 section 5.1.2 has a UAS that is not reached over SIPS say
         // so with the warning 380.
@@ -803,14 +858,24 @@ impl<R: Resolve> Driver<R> {
                     .model
                     .final_refused(exchange, error == SubmitError::Closed),
             },
-            Done::Provisional { exchange, operation, status, result } => {
+            Done::Provisional {
+                exchange,
+                operation,
+                status,
+                preview,
+                result,
+            } => {
                 self.model.provisional_done(
                     exchange,
                     status,
+                    preview,
                     operation,
                     result,
                     now(),
                 );
+            }
+            Done::Answered { replay, answer } => {
+                self.model.answer_prepared(replay, answer);
             }
             Done::Resent { exchange } => {
                 if let Some(server) = self.servers.get_mut(&exchange) {
@@ -891,10 +956,15 @@ impl<R: Resolve> Driver<R> {
                 // the attempt that its set of responses is not complete.
                 let _ = match status.as_u16() {
                     100..=199 => {
-                        self.model.receive_provisional(attempt, &response)
+                        let preview = Body::description(
+                            response.headers(),
+                            response.body(),
+                        );
+                        self.model
+                            .receive_provisional(attempt, &response, preview)
                     }
                     200..=299 => {
-                        let description = Description::from_message(
+                        let description = Body::description(
                             response.headers(),
                             response.body(),
                         );
@@ -959,9 +1029,15 @@ impl<R: Resolve> Driver<R> {
                 exchange,
                 status,
                 to_tag,
+                preview,
                 operation,
             } => {
-                self.submit_provisional(exchange, status, to_tag, operation);
+                self.submit_provisional(
+                    exchange, status, to_tag, preview, operation,
+                );
+            }
+            Effect::PrepareAnswer { replay, offer, usage } => {
+                self.prepare_answer(replay, offer, usage);
             }
             Effect::Resend2xx { exchange } => self.resend_2xx(exchange),
             Effect::StartInvite { attempt } => self.start_invite(attempt),
@@ -1031,12 +1107,7 @@ impl<R: Resolve> Driver<R> {
                 dialog_headers(response, &server.request, &self.contact)
                     .header(ALLOW, ALLOWED);
         }
-        let response = match body {
-            Some(body) => response
-                .header(CONTENT_TYPE, body.content_type().clone())
-                .body(body.body().clone()),
-            None => response.body(Bytes::new()),
-        };
+        let response = with_description(response, body);
 
         match response {
             Ok(response) => self.backlog.push_back(Job::Final {
@@ -1053,6 +1124,7 @@ impl<R: Resolve> Driver<R> {
         exchange: ExchangeKey,
         status: StatusCode,
         to_tag: Tag,
+        preview: Option<Description>,
         operation: Option<OperationId>,
     ) {
         let Some(server) = self.servers.get(&exchange) else {
@@ -1063,20 +1135,23 @@ impl<R: Resolve> Driver<R> {
         // UAC, so it carries what a 2xx does (RFC 3261 section 12.1.1).
         let response =
             Response::reply_to(&server.request).status(status).to_tag(to_tag);
-        let response =
-            dialog_headers(response, &server.request, &self.contact)
-                .body(Bytes::new());
+        let response = with_description(
+            dialog_headers(response, &server.request, &self.contact),
+            preview.clone(),
+        );
 
         match response {
             Ok(response) => self.backlog.push_back(Job::Provisional {
                 exchange,
                 operation,
+                preview,
                 responder: server.responder.clone(),
                 response,
             }),
             Err(_) => self.model.provisional_done(
                 exchange,
                 status,
+                preview,
                 operation,
                 Err(Error::InvalidInput),
                 now(),
@@ -1147,7 +1222,7 @@ impl<R: Resolve> Driver<R> {
     fn send_ack(&mut self, replay: ReplayKey) {
         // An ACK that cannot be built counts as one that did not get out, so
         // that a cleanup's BYE still follows it.
-        let Some(outgoing) = self.model.ack_request(replay) else {
+        let Some((outgoing, answer)) = self.model.ack_request(replay) else {
             self.model.ack_written(replay, false);
             return;
         };
@@ -1161,7 +1236,11 @@ impl<R: Resolve> Driver<R> {
             return;
         };
 
-        let request = outgoing.request.map(|()| Bytes::new());
+        let mut request = outgoing.request.map(|()| Bytes::new());
+        if let Some(answer) = answer {
+            describe(request.headers_mut(), &answer);
+            *request.body_mut() = answer.body().clone();
+        }
         let next_hop = outgoing.target.next_hop;
         self.backlog.push_back(Job::Ack {
             replay,
@@ -1205,6 +1284,45 @@ impl<R: Resolve> Driver<R> {
             branch: ack.branch.clone(),
             timeout: self.resend_timeout,
         });
+    }
+
+    /// Has the [`Negotiate`] prepare the answer to the offer of a 2xx, for
+    /// its ACK. Only an INVITE without an offer gets a 2xx with one, and a
+    /// UA without a negotiator sends none, so it is never asked. If it were,
+    /// it would have no answer.
+    fn prepare_answer(
+        &mut self,
+        replay: ReplayKey,
+        offer: Description,
+        usage: Option<UsageKey>,
+    ) {
+        if self.negotiator.is_none() {
+            self.model.answer_prepared(replay, None);
+            return;
+        }
+
+        let ua = self.shared.id;
+        let session = usage.map(|usage| Session::new(ua, usage));
+        self.answer_backlog.push_back(Answer {
+            replay,
+            offer: Offer { description: offer, session },
+            due: Instant::now() + self.answer_timeout,
+        });
+    }
+
+    /// Gives up on the answers in the backlog that are due, as on one whose
+    /// job ran out of time.
+    fn expire_answers(&mut self) {
+        let now = Instant::now();
+        while let Some(answer) = self.answer_backlog.front() {
+            if answer.due > now {
+                break;
+            }
+            let replay = answer.replay;
+            self.answer_backlog.pop_front();
+            self.model.answer_prepared(replay, None);
+        }
+        self.settle(None);
     }
 
     /// Sends the BYE that ends the dialog of a 2xx the UA did not keep, once
@@ -1342,6 +1460,12 @@ impl<R: Resolve> Driver<R> {
             model::Event::NegotiationCompleted { usage } => {
                 Event::Negotiated { session: Session::new(ua, usage) }
             }
+            model::Event::NegotiationFailed { usage } => {
+                Event::NegotiationFailed { session: Session::new(ua, usage) }
+            }
+            model::Event::AnswerChanged { usage } => {
+                Event::AnswerChanged { session: Session::new(ua, usage) }
+            }
             model::Event::AckTimeout { usage } => {
                 Event::AckTimeout { session: Session::new(ua, usage) }
             }
@@ -1411,8 +1535,32 @@ impl<R: Resolve> Driver<R> {
         }
     }
 
-    /// Spawns jobs from the backlog while there is room.
+    /// Spawns jobs from the backlogs while there is room.
     fn start_jobs(&mut self) {
+        while self.answers.len() < self.max_answers {
+            let Some(Answer { replay, offer, due }) =
+                self.answer_backlog.pop_front()
+            else {
+                break;
+            };
+            let Some(negotiator) = self.negotiator.clone() else {
+                break;
+            };
+            // An answer that does not come by the time it is due is none,
+            // so that a component that hangs holds the ACK for a bounded
+            // time, which the wait for a free job takes from.
+            let handle = self.answers.spawn(async move {
+                let answer =
+                    tokio::time::timeout_at(due, negotiator.answer(&offer))
+                        .await
+                        .unwrap_or(None);
+                Done::Answered { replay, answer }
+            });
+            // One that panics has none either.
+            self.fallbacks
+                .insert(handle.id(), Done::Answered { replay, answer: None });
+        }
+
         while self.jobs.len() < self.max_jobs {
             let Some(job) = self.backlog.pop_front() else {
                 return;
@@ -1446,14 +1594,19 @@ impl Job {
                 result: Err(SubmitError::Closed),
                 sent: None,
             },
-            Job::Provisional { exchange, operation, response, .. } => {
-                Done::Provisional {
-                    exchange: *exchange,
-                    operation: *operation,
-                    status: response.status(),
-                    result: Err(Error::Internal),
-                }
-            }
+            Job::Provisional {
+                exchange,
+                operation,
+                preview,
+                response,
+                ..
+            } => Done::Provisional {
+                exchange: *exchange,
+                operation: *operation,
+                status: response.status(),
+                preview: preview.clone(),
+                result: Err(Error::Internal),
+            },
             Job::Resend { exchange, .. } => {
                 Done::Resent { exchange: *exchange }
             }
@@ -1495,7 +1648,13 @@ impl Job {
                 let sent = sent.filter(|_| result.is_ok());
                 Done::Final { exchange, result, sent }
             }
-            Job::Provisional { exchange, operation, responder, response } => {
+            Job::Provisional {
+                exchange,
+                operation,
+                preview,
+                responder,
+                response,
+            } => {
                 let status = response.status();
                 // Each response is a job of its own, so a provisional can
                 // reach the core after the final it was submitted before.
@@ -1511,7 +1670,13 @@ impl Job {
                             _ => Error::CoreSubmissionRejected,
                         }
                     });
-                Done::Provisional { exchange, operation, status, result }
+                Done::Provisional {
+                    exchange,
+                    operation,
+                    status,
+                    preview,
+                    result,
+                }
             }
             // A copy that does not get out changes nothing. The next one, or
             // the peer's ACK, settles it. A copy stuck behind a full endpoint
@@ -1612,6 +1777,38 @@ fn dialog_headers(
         response = response.header(RECORD_ROUTE, value.clone());
     }
     response.header(CONTACT, format!("<{contact}>").as_str())
+}
+
+/// Finishes a response with a session description as its body, or without
+/// a body.
+fn with_description(
+    mut response: response::Builder,
+    description: Option<Description>,
+) -> Result<Response<Bytes>, signa_core::message::error::BuildError> {
+    let Some(description) = description else {
+        return response.body(Bytes::new());
+    };
+
+    response =
+        response.header(CONTENT_TYPE, description.content_type().clone());
+    if description.needs_disposition() {
+        response = response.header(CONTENT_DISPOSITION, "session");
+    }
+    response.body(description.body().clone())
+}
+
+/// Adds the Content headers that say what a session description is to a
+/// message that carries one: its Content-Type, and a Content-Disposition of
+/// `session` for a type other than `application/sdp`, which RFC 3261
+/// section 20.11 would take for something to render.
+fn describe(headers: &mut HeaderMap, description: &Description) {
+    headers.append(CONTENT_TYPE, description.content_type().clone());
+    if description.needs_disposition() {
+        headers.append(
+            CONTENT_DISPOSITION,
+            signa_core::HeaderValue::from_static("session"),
+        );
+    }
 }
 
 /// Resolves a next hop, or gives up after `timeout`. A resolver that never

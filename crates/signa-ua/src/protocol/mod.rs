@@ -3,9 +3,10 @@ The headers a UA core reads, and only as far as it needs them.
 
 signa-core keeps header values opaque, and its own address and CSeq readers
 are private to it. This module reads From, To, Call-ID, CSeq, Contact, Route,
-Record-Route and Require on top of the element scans of [`siparse::scan`], so that
-the grammar of RFC 3261 section 25.1 is followed rather than approximated by
-splitting at `,` or `;`. It is not a general typed-header API.
+Record-Route, Require and the Content headers of a body on top of the element
+scans of [`siparse::scan`], so that the grammar of RFC 3261 section 25.1 is
+followed rather than approximated by splitting at `,` or `;`. It is not a
+general typed-header API.
 
 What it returns borrows the message. Values are returned as written, with
 case, parameters and their order intact. A dialog keeps its own copy of what
@@ -15,8 +16,8 @@ it needs.
 use signa_core::{
     HeaderMap,
     message::header::{
-        CALL_ID, CONTACT, CSEQ, EXPIRES, FROM, HeaderName, RECORD_ROUTE,
-        REQUIRE, TO,
+        CALL_ID, CONTACT, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_TYPE,
+        CSEQ, EXPIRES, FROM, HeaderName, RECORD_ROUTE, REQUIRE, TO,
     },
 };
 use siparse::scan;
@@ -40,6 +41,9 @@ pub(crate) enum Field {
     RecordRoute,
     Require,
     Expires,
+    ContentType,
+    ContentDisposition,
+    ContentEncoding,
 }
 
 /// The URI and tag of a From or To value.
@@ -229,6 +233,113 @@ pub(crate) fn requires_extension(
     }
 
     Ok(any)
+}
+
+/// The type and subtype of a Content-Type, as written.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MediaType<'a> {
+    pub(crate) kind: &'a str,
+    pub(crate) subtype: &'a str,
+}
+
+impl MediaType<'_> {
+    /// Says whether this is `kind/subtype`. Both are compared without
+    /// regard to case (RFC 3261 section 7.3.1).
+    pub(crate) fn is(&self, kind: &str, subtype: &str) -> bool {
+        self.kind.eq_ignore_ascii_case(kind)
+            && self.subtype.eq_ignore_ascii_case(subtype)
+    }
+}
+
+/// Returns the media type of the Content-Type, or `None` without one.
+///
+/// `media-type` of RFC 3261 section 25.1 is a type, a slash and a subtype,
+/// all tokens, then parameters, which are checked and left alone.
+pub(crate) fn content_type(
+    headers: &HeaderMap,
+) -> Result<Option<MediaType<'_>>, Malformed> {
+    if headers.get(CONTENT_TYPE).is_none() {
+        return Ok(None);
+    }
+
+    let value = single(headers, CONTENT_TYPE, Field::ContentType)?;
+    media_type(value).map(Some)
+}
+
+/// Reads a `media-type` value, as [`content_type`] does.
+pub(crate) fn media_type(value: &str) -> Result<MediaType<'_>, Malformed> {
+    let malformed = Malformed(Field::ContentType);
+    let (kind, rest) = scan::token(scan::sws(value)).ok_or(malformed)?;
+    let rest = scan::separator(rest, '/').ok_or(malformed)?;
+    let (subtype, rest) = scan::token(rest).ok_or(malformed)?;
+    parameters(rest).ok_or(malformed)?;
+    Ok(MediaType { kind, subtype })
+}
+
+/// Returns the disposition type of the Content-Disposition, such as
+/// `session`, or `None` without one.
+///
+/// `Content-Disposition` of RFC 3261 section 20.11 is a token and then
+/// parameters. The `handling` parameter is not read. Whether a body that is
+/// not a session description is required or optional only matters to whoever
+/// handles that body, which is not the UA.
+pub(crate) fn content_disposition(
+    headers: &HeaderMap,
+) -> Result<Option<&str>, Malformed> {
+    let malformed = Malformed(Field::ContentDisposition);
+    if headers.get(CONTENT_DISPOSITION).is_none() {
+        return Ok(None);
+    }
+
+    let value =
+        single(headers, CONTENT_DISPOSITION, Field::ContentDisposition)?;
+    let (kind, rest) = scan::token(scan::sws(value)).ok_or(malformed)?;
+    parameters(rest).ok_or(malformed)?;
+    Ok(Some(kind))
+}
+
+/// Says whether the body has a content coding other than `identity`, which
+/// would have to be undone before the body means anything (RFC 3261 section
+/// 20.12). Each Content-Encoding row is a list of tokens.
+pub(crate) fn encoded(headers: &HeaderMap) -> Result<bool, Malformed> {
+    let malformed = Malformed(Field::ContentEncoding);
+    let mut any = false;
+
+    for value in headers.get_all(CONTENT_ENCODING) {
+        let mut rest = scan::sws(value.as_str());
+        loop {
+            let (coding, after) = scan::token(rest).ok_or(malformed)?;
+            any |= !coding.eq_ignore_ascii_case("identity");
+            rest = scan::sws(after);
+            match rest.strip_prefix(',') {
+                Some(after) => rest = scan::sws(after),
+                None if rest.is_empty() => break,
+                None => return Err(malformed),
+            }
+        }
+    }
+
+    Ok(any)
+}
+
+/// Checks `*(SEMI generic-param)` to the end of the value. A parameter value
+/// is a token, a host or a quoted string (RFC 3261 section 25.1).
+fn parameters(mut rest: &str) -> Option<()> {
+    loop {
+        rest = scan::sws(rest);
+        if rest.is_empty() {
+            return Some(());
+        }
+        rest = scan::separator(rest, ';')?;
+        let (_, after) = scan::token(rest)?;
+        rest = after;
+        if let Some(value) = scan::separator(rest, '=') {
+            let (_, after) = scan::quoted_string(value)
+                .or_else(|| scan::token(value))
+                .or_else(|| scan::host(value))?;
+            rest = after;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -426,5 +537,64 @@ mod tests {
                 "{rows:?}"
             );
         }
+    }
+    #[test]
+    fn content_type_has_a_type_and_a_subtype() {
+        assert_eq!(content_type(&headers(&[])), Ok(None));
+        let sdp =
+            headers(&[(CONTENT_TYPE, " Application/SDP ; charset=utf-8")]);
+        let media = content_type(&sdp).unwrap().unwrap();
+        assert_eq!(media, MediaType { kind: "Application", subtype: "SDP" });
+        assert!(media.is("application", "sdp"));
+
+        for value in ["application", "application/", "/sdp", "a/b c", "a/b;"] {
+            assert_eq!(
+                content_type(&headers(&[(CONTENT_TYPE, value)])),
+                Err(Malformed(Field::ContentType)),
+                "{value}",
+            );
+        }
+        let twice = headers(&[(CONTENT_TYPE, "a/b"), (CONTENT_TYPE, "a/b")]);
+        assert!(content_type(&twice).is_err());
+    }
+
+    #[test]
+    fn content_disposition_has_a_type_and_parameters() {
+        assert_eq!(content_disposition(&headers(&[])), Ok(None));
+        for (value, kind) in [
+            ("session", "session"),
+            ("render;handling=optional", "render"),
+            ("icon ; x=\"a;b\"", "icon"),
+        ] {
+            assert_eq!(
+                content_disposition(&headers(&[(CONTENT_DISPOSITION, value)])),
+                Ok(Some(kind)),
+                "{value}",
+            );
+        }
+
+        for value in ["", ";handling=optional", "session handling", "a;b=\""] {
+            assert_eq!(
+                content_disposition(&headers(&[(CONTENT_DISPOSITION, value)])),
+                Err(Malformed(Field::ContentDisposition)),
+                "{value}",
+            );
+        }
+    }
+
+    #[test]
+    fn only_identity_leaves_a_body_unencoded() {
+        assert_eq!(encoded(&headers(&[])), Ok(false));
+        assert_eq!(
+            encoded(&headers(&[(CONTENT_ENCODING, "Identity")])),
+            Ok(false)
+        );
+        assert_eq!(
+            encoded(&headers(&[(CONTENT_ENCODING, "identity, gzip")])),
+            Ok(true)
+        );
+        assert!(
+            encoded(&headers(&[(CONTENT_ENCODING, "gzip deflate")])).is_err()
+        );
     }
 }

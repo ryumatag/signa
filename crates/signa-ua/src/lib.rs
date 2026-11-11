@@ -19,11 +19,14 @@ endpoint.
 
 This is an early stage of the crate, and much of a UA core is missing:
 
-* The UA neither supplies nor checks the answer an ACK carries. So an
-  incoming INVITE without an offer gets a 488, and the UA refuses to send
-  one.
-* A 2xx without the answer to the INVITE's offer confirms its session, which
-  then never reports a completed negotiation, rather than fail it.
+* The UA reads no session description. It knows where offers and answers go,
+  and has the application's `Negotiate` prepare the answer an ACK owes, but
+  whether an answer suits its offer is for the application to judge. Only a
+  UA with a `Negotiate` sends an INVITE without an offer.
+* A multipart body is not taken apart, so an INVITE with one gets a 415, and
+  one in a response or an ACK counts as no session description.
+* There is no reliable provisional response (RFC 3262), so a session
+  description in a provisional response is only a preview.
 * A 2xx that cannot form a dialog, such as one without a Contact, gets no
   ACK. One beyond the UA's limits gets its ACK and a BYE, while the room
   kept for that lasts.
@@ -54,10 +57,11 @@ This is an early stage of the crate, and much of a UA core is missing:
 pub use self::ua::{
     AttachError, AttemptId, AttemptResult, AttemptSnapshot, CancelResult,
     Config, Description, EndReason, Error, Event, IncomingInvite,
-    InvalidContact, InviteAttempt, InviteId, InvitePlan, NegotiationState,
-    Operation, Query, Resolve, ResolveError, Session, SessionId, SessionPhase,
-    SessionSnapshot, StaticResolver, SubmitError, Ua, UaDriver, UaEvents,
-    UaHandle, WireEffect, attach,
+    InvalidContact, InviteAttempt, InviteId, InvitePlan, Negotiate,
+    NegotiationState, NoNegotiator, Offer, Operation, Query, Resolve,
+    ResolveError, Session, SessionId, SessionPhase, SessionSnapshot,
+    StaticResolver, SubmitError, Ua, UaDriver, UaEvents, UaHandle, WireEffect,
+    attach,
 };
 
 // The private state model. `dialog` knows nothing of `invite`, so other

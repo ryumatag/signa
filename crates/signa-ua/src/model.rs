@@ -32,7 +32,12 @@ transaction ends, in what [RFC 5407 section 2] calls the Mortal state. A BYE
 from the peer that crosses it gets a 200 there, and any other request a 481,
 rather than the 481 of a dialog nobody knows ([RFC 5407 section 3.2.1]).
 
-TODO: Re-INVITEs and the answer an ACK owes are still to come.
+Where offers and answers go is the model's too, as [`crate::negotiation`]
+says, though what they say is not. An answer the ACK of a 2xx owes comes from
+outside, through [`Effect::PrepareAnswer`] and [`Model::answer_prepared`], so
+that the model never waits for it.
+
+TODO: Re-INVITEs are still to come.
 
 [RFC 3261 section 17]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17
 [RFC 5407 section 2]: https://www.rfc-editor.org/rfc/rfc5407.html#section-2
@@ -62,16 +67,16 @@ use crate::{
     invite::{
         AttemptKey, AttemptResult, ByeIntent, CancelIntent, CancelResult,
         Direction, EndReason, ExchangeKey, ExchangeState, InviteAttempt,
-        InviteExchange, InviteUsage, MergeKey, Scope, UsageKey, UsagePhase,
-        Withdrawal,
+        InviteExchange, InviteUsage, MergeKey, Provisional, Scope, UsageKey,
+        UsagePhase, Withdrawal,
     },
-    negotiation::{Description, Negotiation},
+    negotiation::{Body, Description, Negotiation},
     operation::{Completion, OperationId, Operations, Stage, SubmitError},
     plan::{Identity, InvitePlan, PlannedInvite},
     protocol::{self, Field, Malformed},
     retention::{
-        AckObligation, Bye, ReplayContext, ReplayId, ReplayKey, Retention,
-        Retransmission, Source,
+        AckBody, AckObligation, Bye, ReplayContext, ReplayId, ReplayKey,
+        Retention, Retransmission, Source,
     },
     slot::Slots,
     timer::{Timer, TimerQueue},
@@ -154,9 +159,14 @@ impl Authority {
 pub(crate) enum Command {
     /// Accept an incoming INVITE with a 2xx that carries `answer`.
     Accept { authority: Authority, answer: Description },
-    /// Send a provisional response from 101 to 199 for an incoming INVITE.
-    /// It takes no authority, since it decides nothing.
-    Provisional { exchange: ExchangeKey, status: StatusCode },
+    /// Send a provisional response from 101 to 199 for an incoming INVITE,
+    /// with a preview of the answer to its offer if given. It takes no
+    /// authority, since it decides nothing.
+    Provisional {
+        exchange: ExchangeKey,
+        status: StatusCode,
+        preview: Option<Description>,
+    },
     /// Reject an incoming INVITE with a final response from 300 to 699.
     Reject { authority: Authority, status: StatusCode },
     /// Send an initial INVITE built from a plan, which carries an offer.
@@ -186,13 +196,14 @@ pub(crate) enum Effect {
         body: Option<Description>,
     },
     /// Submit a provisional response of an incoming INVITE through its
-    /// responder, with `to_tag` on its To, then report the verdict with
-    /// [`Model::provisional_done`]. `operation` is `None` when the UA sends
-    /// it again on its own.
+    /// responder, with `to_tag` on its To and `preview` as its body, then
+    /// report the verdict with [`Model::provisional_done`]. `operation` is
+    /// `None` when the UA sends it again on its own.
     SubmitProvisional {
         exchange: ExchangeKey,
         status: StatusCode,
         to_tag: Tag,
+        preview: Option<Description>,
         operation: Option<OperationId>,
     },
     /// Send the 2xx of an incoming INVITE again, as it was first submitted,
@@ -203,8 +214,17 @@ pub(crate) enum Effect {
     /// over, then report the outcome with [`Model::invite_started`] or
     /// [`Model::invite_failed`].
     StartInvite { attempt: AttemptKey },
-    /// Send the ACK of a received 2xx, then report the write with
-    /// [`Model::ack_written`].
+    /// Have the answer to `offer`, the offer of a received 2xx, prepared for
+    /// its ACK, outside the driver and within a deadline, then report it with
+    /// [`Model::answer_prepared`]. `usage` is the session the 2xx formed, or
+    /// `None` for a 2xx the UA ends, whose answer is to reject the offer.
+    PrepareAnswer {
+        replay: ReplayKey,
+        offer: Description,
+        usage: Option<UsageKey>,
+    },
+    /// Send the ACK of a received 2xx, which [`Model::ack_request`] builds,
+    /// then report the write with [`Model::ack_written`].
     SendAck { replay: ReplayKey },
     /// Send the ACK already sent for a 2xx again, for a copy of that 2xx.
     ResendAck { replay: ReplayKey },
@@ -286,6 +306,9 @@ pub(crate) enum Refusal {
     Busy,
     /// It is something this user agent does not take yet. A 500.
     Unsupported,
+    /// Its body is one the UA cannot tell the offer in, such as a multipart
+    /// body. A 415 (RFC 3261 section 8.2.3).
+    UnsupportedBody,
     /// Its CSeq is below the last one in its dialog, which RFC 3261 section
     /// 12.2.2 answers with a 500. So is one with the last number, by my
     /// policy (see `Dialog::remote_request`).
@@ -307,6 +330,7 @@ impl Refusal {
     pub(crate) fn status(self) -> StatusCode {
         let code = match self {
             Refusal::Malformed(_) => 400,
+            Refusal::UnsupportedBody => 415,
             Refusal::SipsRequestUri => 416,
             Refusal::BadExtension => 420,
             Refusal::SipsNotAllowed => 480,
@@ -348,8 +372,16 @@ pub(crate) enum Event {
     /// A 2xx confirmed the dialog. The ACK may still be owed, and the
     /// session descriptions may not be settled.
     DialogConfirmed { dialog: DialogKey, usage: UsageKey },
-    /// The offer/answer exchange of a usage completed.
+    /// The offer/answer exchange of a usage completed: the answer came, or
+    /// this user agent's answer is fixed.
     NegotiationCompleted { usage: UsageKey },
+    /// The offer/answer exchange of a usage failed, and the usage ends with
+    /// a BYE next.
+    NegotiationFailed { usage: UsageKey },
+    /// The answer in a 2xx differs from the preview of it an unreliable
+    /// provisional response carried, which RFC 3261 section 13.2.1 does not
+    /// allow. The preview stays the answer.
+    AnswerChanged { usage: UsageKey },
     /// No ACK came for the 2xx of an incoming INVITE by its deadline. The
     /// usage ends next.
     AckTimeout { usage: UsageKey },
@@ -537,8 +569,8 @@ impl<R: Random> Model<R> {
                         self.complete(operation, Err(Error::InvalidInput));
                     }
                 }
-                Command::Provisional { exchange, status } => {
-                    self.provisional(operation, exchange, status)
+                Command::Provisional { exchange, status, preview } => {
+                    self.provisional(operation, exchange, status, preview)
                 }
                 Command::Invite { plan } => self.invite(operation, *plan),
                 Command::Cancel { attempt } => {
@@ -635,16 +667,17 @@ impl<R: Random> Model<R> {
     /// Takes in an INVITE and returns the authority to decide it, or the
     /// reason to refuse it before the application sees it.
     ///
-    /// The checks follow the order of RFC 3261 section 8.2.2: the To tag and
-    /// the Request-URI, a merged request, then Require. Then come the
-    /// headers the dialog needs, and its Expires (section 13.3.1). `offer` is the session description of
-    /// the body, if it is an offer. Telling that is the job of the body
-    /// adapter, not of this model. The application's decision is due one decision timeout after
-    /// `now`.
+    /// The checks follow the order of RFC 3261 section 8.2: the To tag and
+    /// the Request-URI, a merged request, then Require, then the body
+    /// (section 8.2.3). Then come the headers the dialog needs, and its
+    /// Expires (section 13.3.1). `body` is what [`Body::read`] made of the
+    /// request's body. A session description in it is the offer, and an
+    /// INVITE without one gets an offer in its 2xx (section 13.2.1). The
+    /// application's decision is due one decision timeout after `now`.
     pub(crate) fn receive_invite<B>(
         &mut self,
         request: &Request<B>,
-        offer: Option<Description>,
+        body: Result<Body, Malformed>,
         now: Instant,
     ) -> Result<Authority, Refusal> {
         match self.classify(request)? {
@@ -677,6 +710,11 @@ impl<R: Random> Model<R> {
         if protocol::requires_extension(headers)? {
             return Err(Refusal::BadExtension);
         }
+        let offer = match body? {
+            Body::Session(offer) => Some(offer),
+            Body::Empty | Body::Other => None,
+            Body::Unsupported => return Err(Refusal::UnsupportedBody),
+        };
 
         if protocol::sips_on_the_way_back(headers)? {
             return Err(Refusal::SipsNotAllowed);
@@ -837,11 +875,18 @@ impl<R: Random> Model<R> {
     }
 
     /// Sends a provisional response the application chose.
+    ///
+    /// A preview of the answer goes only for an INVITE with an offer. RFC
+    /// 3261 section 13.2.1 lets the answer come in a provisional response as
+    /// well as in the 2xx. The offer of an INVITE without one goes in the 2xx
+    /// instead, since an unreliable provisional cannot carry an offer whose
+    /// answer is owed.
     fn provisional(
         &mut self,
         operation: OperationId,
         key: ExchangeKey,
         status: StatusCode,
+        preview: Option<Description>,
     ) {
         let Some(exchange) = self.exchanges.get(key) else {
             self.complete(operation, Err(Error::StaleDecision));
@@ -851,12 +896,15 @@ impl<R: Random> Model<R> {
             self.complete(operation, Err(Error::AlreadyFinalized));
             return;
         }
-        let Scope::Incoming { dialog: Some(dialog), .. } = &exchange.scope
+        let Scope::Incoming { dialog: Some(dialog), offer, .. } =
+            &exchange.scope
         else {
             unreachable!("a pending incoming exchange keeps its dialog");
         };
         // A 100 is the core's to send (RFC 3261 section 17.2.1).
-        if !(101..=199).contains(&status.as_u16()) {
+        if !(101..=199).contains(&status.as_u16())
+            || (preview.is_some() && offer.is_none())
+        {
             self.complete(operation, Err(Error::InvalidInput));
             return;
         }
@@ -866,6 +914,7 @@ impl<R: Random> Model<R> {
             exchange: key,
             status,
             to_tag,
+            preview,
             operation: Some(operation),
         });
     }
@@ -881,6 +930,7 @@ impl<R: Random> Model<R> {
         &mut self,
         key: ExchangeKey,
         status: StatusCode,
+        preview: Option<Description>,
         operation: Option<OperationId>,
         result: Result<(), Error>,
         now: Instant,
@@ -904,12 +954,12 @@ impl<R: Random> Model<R> {
         let Scope::Incoming { provisional, .. } = &mut exchange.scope else {
             return;
         };
-        if let Some((_, at)) = provisional.take() {
-            self.timers.cancel(at, Timer::Provisional(key));
+        if let Some(last) = provisional.take() {
+            self.timers.cancel(last.due, Timer::Provisional(key));
         }
-        let at = now + PROVISIONAL_INTERVAL;
-        *provisional = Some((status, at));
-        self.timers.set(at, Timer::Provisional(key));
+        let due = now + PROVISIONAL_INTERVAL;
+        *provisional = Some(Box::new(Provisional { status, preview, due }));
+        self.timers.set(due, Timer::Provisional(key));
     }
 
     /// Sends the last provisional response again, and sets the next time.
@@ -927,7 +977,7 @@ impl<R: Random> Model<R> {
         }
         let Scope::Incoming {
             dialog: Some(dialog),
-            provisional: Some((status, due)),
+            provisional: Some(provisional),
             ..
         } = &mut exchange.scope
         else {
@@ -935,12 +985,13 @@ impl<R: Random> Model<R> {
         };
 
         let next = after(at, PROVISIONAL_INTERVAL, now);
-        *due = next;
+        provisional.due = next;
         self.timers.set(next, Timer::Provisional(key));
         self.effects.push(Effect::SubmitProvisional {
             exchange: key,
-            status: *status,
+            status: provisional.status,
             to_tag: dialog.id().local_tag().clone(),
+            preview: provisional.preview.clone(),
             operation: None,
         });
     }
@@ -963,8 +1014,8 @@ impl<R: Random> Model<R> {
         if let Some(at) = expires_due.take() {
             self.timers.cancel(at, Timer::Expires(key));
         }
-        if let Some((_, at)) = provisional.take() {
-            self.timers.cancel(at, Timer::Provisional(key));
+        if let Some(provisional) = provisional.take() {
+            self.timers.cancel(provisional.due, Timer::Provisional(key));
         }
     }
 
@@ -1037,10 +1088,10 @@ impl<R: Random> Model<R> {
         // its own whose answer comes in the ACK (RFC 3261 section 13.2.1).
         let mut negotiation = Negotiation::Stable;
         if offer_in_request {
-            negotiation.offer_received().expect("stable");
-            negotiation.answer_sent().expect("the offer is outstanding");
+            negotiation.offer_received(cseq).expect("stable");
+            negotiation.answer_sent(cseq).expect("the offer is outstanding");
         } else {
-            negotiation.offer_sent().expect("stable");
+            negotiation.offer_sent(cseq).expect("stable");
         }
 
         dialog.confirm().expect("a pending dialog has not ended");
@@ -1058,6 +1109,10 @@ impl<R: Random> Model<R> {
             Source::Exchange(key),
         );
         self.usages.get_mut(usage).expect("just made").remote = offer;
+        if offer_in_request {
+            self.effects
+                .push(Effect::Notify(Event::NegotiationCompleted { usage }));
+        }
 
         // RFC 3261 section 13.3.1.4 has the 2xx go out again T1 later, and
         // gives up on its ACK 64 T1 after the first.
@@ -1097,7 +1152,12 @@ impl<R: Random> Model<R> {
     /// Keeps an ACK for a 2xx whose submission the core has not confirmed
     /// yet, so that the race between the two does not lose it. An ACK that
     /// matches no 2xx in flight is dropped.
-    fn hold_early_ack(&mut self, dialog: &DialogId, cseq: u32, answer: bool) {
+    fn hold_early_ack(
+        &mut self,
+        dialog: &DialogId,
+        cseq: u32,
+        answer: Option<Description>,
+    ) {
         let in_flight = self.exchanges.iter_mut().find(|(_, exchange)| {
             exchange.cseq == cseq
                 && matches!(
@@ -1115,8 +1175,10 @@ impl<R: Random> Model<R> {
         if let Some((_, exchange)) = in_flight {
             // A copy of the ACK carries what the first one did, so a copy
             // without a body does not undo an answer that came before it.
-            exchange.early_ack =
-                Some(exchange.early_ack == Some(true) || answer);
+            let held = exchange.early_ack.get_or_insert(None);
+            if held.is_none() {
+                *held = answer;
+            }
         }
     }
 
@@ -1334,14 +1396,14 @@ impl<R: Random> Model<R> {
             .push(Effect::Notify(Event::InviteWithdrawn { exchange: key }));
     }
 
-    /// Takes in an ACK as received. `answer` says whether it carries the
-    /// answer to an offer in the 2xx. An ACK without the dialog headers is
-    /// dropped. Nothing answers an ACK, since the ACK of a 2xx goes outside
-    /// any transaction (RFC 3261 section 13.2.2.4).
+    /// Takes in an ACK as received, with the session description it
+    /// carries, if any. An ACK without the dialog headers is dropped. Nothing
+    /// answers an ACK, since the ACK of a 2xx goes outside any transaction
+    /// (RFC 3261 section 13.2.2.4).
     pub(crate) fn receive_ack_request<B>(
         &mut self,
         request: &Request<B>,
-        answer: bool,
+        answer: Option<Description>,
     ) {
         let (Ok(Some(id)), Ok((cseq, _))) =
             (request_dialog(request), protocol::cseq(request.headers()))
@@ -1356,11 +1418,20 @@ impl<R: Random> Model<R> {
     /// dropped without a response or a change of state. One that matches
     /// stops the 2xx's retransmissions (RFC 3261 section 13.3.1.4), whatever
     /// its body says.
+    ///
+    /// What the body says is a second step. When the 2xx carried an offer,
+    /// the ACK owes the answer (section 13.2.1). An answer completes the
+    /// exchange, and the session keeps it for the application, whose SDP
+    /// component judges it. The UA does not. An ACK without one fails the
+    /// exchange, which the UA cannot repair, since the ACK takes no response.
+    /// The session then ends with a BYE, my policy for a session whose
+    /// descriptions never settled. An ACK for a 2xx that carried the answer
+    /// owes nothing, and a description in it is ignored.
     pub(crate) fn receive_ack(
         &mut self,
         dialog: &DialogId,
         cseq: u32,
-        answer: bool,
+        answer: Option<Description>,
     ) {
         let id = ReplayId {
             dialog: dialog.clone(),
@@ -1387,18 +1458,39 @@ impl<R: Random> Model<R> {
         if let Some((usage, record)) =
             usage.and_then(|usage| Some((usage, self.usages.get_mut(usage)?)))
         {
-            // TODO: Treat an ACK without the answer it owes as a negotiation
-            // failure. RFC 3261 section 13.2.1 requires the answer in the
-            // ACK when the 2xx carried the offer.
-            if answer && record.negotiation.answer_received().is_ok() {
-                self.effects.push(Effect::Notify(
-                    Event::NegotiationCompleted { usage },
-                ));
+            let mut failed = false;
+            if record.negotiation.awaits_answer(cseq) {
+                match answer {
+                    Some(answer) => {
+                        record
+                            .negotiation
+                            .answer_received(cseq)
+                            .expect("checked to await it");
+                        record.remote = Some(answer);
+                        self.effects.push(Effect::Notify(
+                            Event::NegotiationCompleted { usage },
+                        ));
+                    }
+                    None => {
+                        failed = true;
+                        self.effects.push(Effect::Notify(
+                            Event::NegotiationFailed { usage },
+                        ));
+                    }
+                }
             }
             // The application asked to end the session before the ACK, and
             // RFC 3261 section 15 lets its BYE go now.
-            if let ByeIntent::Deferred { operation } = record.bye {
-                self.start_bye(usage, operation, EndReason::LocalBye, true);
+            match record.bye {
+                ByeIntent::Deferred { operation, reason } => {
+                    let restore = reason == EndReason::LocalBye;
+                    self.start_bye(usage, operation, reason, restore);
+                }
+                ByeIntent::None if failed => {
+                    let reason = EndReason::NegotiationFailed;
+                    self.start_bye(usage, None, reason, false);
+                }
+                ByeIntent::None | ByeIntent::Sending => {}
             }
         }
         self.reclaim_replay(key);
@@ -1480,13 +1572,8 @@ impl<R: Random> Model<R> {
                 ByeIntent::None => {
                     self.start_bye(usage, None, EndReason::AckTimeout, false);
                 }
-                ByeIntent::Deferred { operation } => {
-                    self.start_bye(
-                        usage,
-                        operation,
-                        EndReason::LocalBye,
-                        false,
-                    );
+                ByeIntent::Deferred { operation, reason } => {
+                    self.start_bye(usage, operation, reason, false);
                 }
                 ByeIntent::Sending => {}
             }
@@ -1542,13 +1629,14 @@ impl<R: Random> Model<R> {
             self.complete(operation, Err(Error::InvalidInput));
             return;
         };
-        let attempt = match self.start_attempt(&planned.request, true) {
-            Ok(attempt) => attempt,
-            Err(error) => {
-                self.complete(operation, Err(error));
-                return;
-            }
-        };
+        let attempt =
+            match self.start_attempt(&planned.request, plan.has_offer()) {
+                Ok(attempt) => attempt,
+                Err(error) => {
+                    self.complete(operation, Err(error));
+                    return;
+                }
+            };
 
         let record = self.attempts.get_mut(attempt).expect("just opened");
         record.request = Some(Box::new(planned));
@@ -1733,9 +1821,7 @@ impl<R: Random> Model<R> {
                 continue;
             };
             match record.phase() {
-                UsagePhase::Established => {
-                    self.start_bye(usage, None, EndReason::LocalBye, true);
-                }
+                UsagePhase::Established => self.bye_when_ready(usage, None),
                 UsagePhase::Establishing => record.begin_ending(),
                 UsagePhase::Ending | UsagePhase::Ended => {}
             }
@@ -1810,23 +1896,31 @@ impl<R: Random> Model<R> {
     }
 
     /// Builds the ACK of the 2xx a replay context is for, from its dialog
-    /// (RFC 3261 section 13.2.2.4). A cleanup builds it from the dialog it
-    /// holds, which no table does.
+    /// (RFC 3261 section 13.2.2.4), with the answer it carries, if any. A
+    /// cleanup builds it from the dialog it holds, which no table does.
     pub(crate) fn ack_request(
         &mut self,
         replay: ReplayKey,
-    ) -> Option<Outgoing> {
+    ) -> Option<(Outgoing, Option<Description>)> {
         let context = self.replays.get_mut(replay)?;
         let cseq = context.id.cseq;
+        let answer = match &context.ack_body {
+            AckBody::Answer(answer) => Some(answer.clone()),
+            AckBody::Empty | AckBody::Unanswered => None,
+            AckBody::Preparing => return None,
+        };
         if let Some(dialog) = &mut context.dialog {
-            return dialog.request(Method::ACK, Sequence::Of(cseq)).ok();
+            let ack = dialog.request(Method::ACK, Sequence::Of(cseq)).ok()?;
+            return Some((ack, answer));
         }
         let dialog = *self.dialog_index.get(&context.id.dialog)?;
 
-        self.dialogs
+        let ack = self
+            .dialogs
             .get_mut(dialog)?
             .request(Method::ACK, Sequence::Of(cseq))
-            .ok()
+            .ok()?;
+        Some((ack, answer))
     }
 
     /// Builds the BYE of a cleanup from its dialog, as any request in a
@@ -1872,11 +1966,21 @@ impl<R: Random> Model<R> {
     /// one of an abandoned attempt. A 2xx for either is acknowledged and its
     /// dialog ended, as a fork the UA does not keep.
     ///
+    /// A session description in the response is a preview, which the early
+    /// session keeps for the application, as early media may need it. For an
+    /// INVITE with an offer it is the answer, since RFC 3261 section 13.2.1
+    /// has the UAC take the first session description it receives as one.
+    /// It completes nothing, though. The response is unreliable, and the 2xx
+    /// has to carry the answer or offer all the same (RFC 6337 section
+    /// 3.1.1). The first preview of a dialog is kept, from whichever
+    /// provisional brings one, and later ones are ignored.
+    ///
     /// [RFC 6141 section 4.9]: https://www.rfc-editor.org/rfc/rfc6141.html#section-4.9
     pub(crate) fn receive_provisional<B>(
         &mut self,
         key: AttemptKey,
         response: &Response<B>,
+        preview: Option<Description>,
     ) -> Result<(), Error> {
         let Some(attempt) = self.attempts.get(key) else {
             return Err(Error::StaleDecision);
@@ -1902,9 +2006,23 @@ impl<R: Random> Model<R> {
             cseq: attempt.origin.cseq(),
             direction: Direction::Outgoing,
         };
+        // A later provisional for an early dialog formed before may bring
+        // its first preview.
+        if let Some(&dialog) = self.dialog_index.get(&id) {
+            let early = attempt.forks.iter().find_map(|&usage| {
+                let record = self.usages.get(usage)?;
+                (record.dialog == dialog
+                    && record.phase() == UsagePhase::Establishing)
+                    .then_some(usage)
+            });
+            if let Some(usage) = early {
+                let record = self.usages.get_mut(usage).expect("found");
+                record.remote = record.remote.take().or(preview);
+            }
+            return Ok(());
+        }
         // Nor does one for a dialog this user agent ended with a BYE.
         if attempt.abandoned
-            || self.dialog_index.contains_key(&id)
             || self.replay_index.contains_key(&answered)
             || attempt.ended_early(&id).is_some()
         {
@@ -1915,7 +2033,7 @@ impl<R: Random> Model<R> {
             Dialog::uac(&attempt.origin, response, self.limits.routes)
                 .map_err(|_| Error::InvalidInput)?;
         let negotiation = if attempt.offer_in_request {
-            Negotiation::LocalOfferOutstanding
+            Negotiation::LocalOfferOutstanding { cseq: attempt.origin.cseq() }
         } else {
             Negotiation::Stable
         };
@@ -1931,11 +2049,10 @@ impl<R: Random> Model<R> {
             attempt.complete = false;
             return Err(Error::CapacityExceeded);
         };
-        let usage = self.usages.insert_reserved(InviteUsage::early(
-            dialog,
-            Direction::Outgoing,
-            negotiation,
-        ));
+        let mut record =
+            InviteUsage::early(dialog, Direction::Outgoing, negotiation);
+        record.remote = preview;
+        let usage = self.usages.insert_reserved(record);
         self.dialog_index.insert(id, dialog);
         let attempt = self.attempts.get_mut(key).expect("checked above");
         attempt.forks.push(usage);
@@ -2017,10 +2134,14 @@ impl<R: Random> Model<R> {
         };
 
         // The 2xx and its copies share one context. A copy, of a session or
-        // of a cleanup, gets the ACK again, and neither a new session nor a
-        // second BYE.
+        // of a cleanup, gets the ACK again, and neither a new session, nor a
+        // second answer, nor a second BYE. While the answer is prepared there
+        // is no ACK yet, and the copy gets the one that goes then.
         if let Some(&replay) = self.replay_index.get(&replay) {
-            self.effects.push(Effect::ResendAck { replay });
+            let context = self.replays.get(replay).expect("indexed");
+            if context.ack_body != AckBody::Preparing {
+                self.effects.push(Effect::ResendAck { replay });
+            }
             return Ok(());
         }
         let known = self.dialog_index.get(&id).copied();
@@ -2037,7 +2158,7 @@ impl<R: Random> Model<R> {
                     .map_err(|_| Error::InvalidInput)?;
             dialog.number_after(numbered);
             return self
-                .clean_up(key, dialog, replay)
+                .clean_up(key, dialog, replay, description)
                 .then_some(())
                 .ok_or(Error::CapacityExceeded);
         }
@@ -2058,25 +2179,23 @@ impl<R: Random> Model<R> {
                 .map_err(|_| Error::InvalidInput)?;
         if abandoned {
             return self
-                .clean_up(key, dialog, replay)
+                .clean_up(key, dialog, replay, description)
                 .then_some(())
                 .ok_or(Error::CapacityExceeded);
         }
         if forks >= self.limits.forks || !self.reserve_session() {
-            self.clean_up(key, dialog, replay);
+            self.clean_up(key, dialog, replay, description);
             return Err(Error::CapacityExceeded);
         }
 
-        // With an offer in the INVITE, the 2xx carries the answer. Without
-        // one, it carries the offer and the ACK owes the answer (RFC 3261
-        // section 13.2.1). Each fork starts from the INVITE's offer and
-        // goes on alone, since each answer comes from another peer.
-        let mut negotiation = if offer_in_request {
-            Negotiation::LocalOfferOutstanding
+        // Each fork starts from the INVITE's offer and goes on alone, since
+        // each answer, or offer, comes from another peer.
+        let cseq = replay.cseq;
+        let negotiation = if offer_in_request {
+            Negotiation::LocalOfferOutstanding { cseq }
         } else {
             Negotiation::Stable
         };
-        settle_at_2xx(&mut negotiation, description.is_some());
         let (replay, usage) = self.establish(
             dialog,
             Direction::Outgoing,
@@ -2084,9 +2203,8 @@ impl<R: Random> Model<R> {
             replay,
             Source::Attempt(key),
         );
-        self.usages.get_mut(usage).expect("just made").remote = description;
         self.attempts.get_mut(key).expect("checked above").forks.push(usage);
-        self.effects.push(Effect::SendAck { replay });
+        self.settle_2xx(usage, replay, cseq, description);
         Ok(())
     }
 
@@ -2139,7 +2257,7 @@ impl<R: Random> Model<R> {
             let record = self.dialogs.remove(dialog).expect("indexed");
             self.dialog_index.remove(record.id());
             self.end_usage(usage, EndReason::LocalBye);
-            let cleaned = self.clean_up(attempt, record, replay);
+            let cleaned = self.clean_up(attempt, record, replay, description);
             debug_assert!(cleaned, "the room was checked above");
             return if abandoned {
                 Ok(())
@@ -2148,12 +2266,8 @@ impl<R: Random> Model<R> {
             };
         }
 
-        let record = self.usages.get_mut(usage).expect("found above");
-        record.establish();
-        settle_at_2xx(&mut record.negotiation, description.is_some());
-        record.remote = description;
-        let settled = record.negotiation == Negotiation::Stable;
-
+        self.usages.get_mut(usage).expect("found above").establish();
+        let cseq = replay.cseq;
         let context = ReplayContext::new(
             replay.clone(),
             Source::Attempt(attempt),
@@ -2164,12 +2278,91 @@ impl<R: Random> Model<R> {
 
         self.effects
             .push(Effect::Notify(Event::DialogConfirmed { dialog, usage }));
-        if settled {
-            self.effects
-                .push(Effect::Notify(Event::NegotiationCompleted { usage }));
-        }
-        self.effects.push(Effect::SendAck { replay: key });
+        self.settle_2xx(usage, key, cseq, description);
         Ok(())
+    }
+
+    /// Moves a session's negotiation past the 2xx that confirmed it, and has
+    /// the ACK go now, or once the answer it owes is in.
+    ///
+    /// The 2xx carries the answer to the INVITE's offer, or an offer when the
+    /// INVITE had none, whose answer the ACK owes (RFC 3261 section 13.2.1).
+    /// That answer comes from outside, through [`Effect::PrepareAnswer`],
+    /// and the ACK waits for it. A 2xx without what it owes fails the
+    /// exchange. It is acknowledged all the same (section 13.2.2.4), and the
+    /// session ends with a BYE after the ACK, my policy for a session whose
+    /// descriptions never settled.
+    ///
+    /// When a provisional response previewed the answer, the preview stays
+    /// the answer. RFC 3261 section 13.2.1 has the UAC take the first session
+    /// description it receives as the answer and ignore later ones, and RFC
+    /// 6337 section 3.1.1 keeps it even when the 2xx carries another. The 2xx
+    /// still has to carry one, since only it is reliable, and a 2xx whose
+    /// description differs is reported. Neither rule applies to the offer of
+    /// an INVITE without one, which is the 2xx's own.
+    fn settle_2xx(
+        &mut self,
+        usage: UsageKey,
+        replay: ReplayKey,
+        cseq: u32,
+        description: Option<Description>,
+    ) {
+        let record = self.usages.get_mut(usage).expect("a session just made");
+
+        match (record.negotiation, description) {
+            (Negotiation::LocalOfferOutstanding { .. }, Some(answer)) => {
+                record
+                    .negotiation
+                    .answer_received(cseq)
+                    .expect("the INVITE's offer is outstanding");
+                match &record.remote {
+                    Some(preview) if *preview != answer => {
+                        self.effects.push(Effect::Notify(
+                            Event::AnswerChanged { usage },
+                        ));
+                    }
+                    Some(_) => {}
+                    None => record.remote = Some(answer),
+                }
+                self.effects.push(Effect::Notify(
+                    Event::NegotiationCompleted { usage },
+                ));
+                self.effects.push(Effect::SendAck { replay });
+            }
+            (Negotiation::Stable, Some(offer)) => {
+                record.negotiation.offer_received(cseq).expect("stable");
+                record.remote = Some(offer.clone());
+                let context = self.replays.get_mut(replay).expect("just made");
+                context.ack_body = AckBody::Preparing;
+                self.effects.push(Effect::PrepareAnswer {
+                    replay,
+                    offer,
+                    usage: Some(usage),
+                });
+            }
+            _ => {
+                self.fail_negotiation(usage);
+                self.effects.push(Effect::SendAck { replay });
+            }
+        }
+    }
+
+    /// Reports the failed exchange of a session that sent an INVITE, and
+    /// has it end with a BYE once its ACK has gone, unless a BYE is asked
+    /// for already.
+    fn fail_negotiation(&mut self, usage: UsageKey) {
+        let Some(record) = self.usages.get_mut(usage) else {
+            return;
+        };
+
+        if record.bye == ByeIntent::None {
+            record.begin_ending();
+            record.bye = ByeIntent::Deferred {
+                operation: None,
+                reason: EndReason::NegotiationFailed,
+            };
+        }
+        self.effects.push(Effect::Notify(Event::NegotiationFailed { usage }));
     }
 
     /// Keeps a 2xx the UA does not keep as a session, so that it gets its
@@ -2182,14 +2375,16 @@ impl<R: Random> Model<R> {
     /// session, so the application hears nothing of it but what the attempt
     /// reports.
     ///
-    /// TODO: Carry the answer in the ACK of a 2xx that holds an offer, which
-    /// section 13.2.2.4 asks of a dialog the UAC ends too. The UA sends no
-    /// INVITE without an offer yet, so each 2xx it gets holds an answer.
+    /// The 2xx of an INVITE without an offer carries one, and its ACK owes
+    /// the answer even for a dialog the UAC ends (section 13.2.1). The ACK
+    /// waits for an answer that rejects the offer, which the
+    /// [`Effect::PrepareAnswer`] without a usage asks for.
     fn clean_up(
         &mut self,
         attempt: AttemptKey,
         dialog: Dialog,
         replay: ReplayId,
+        description: Option<Description>,
     ) -> bool {
         let key = if self.cleanups < self.limits.cleanups {
             let context =
@@ -2207,8 +2402,81 @@ impl<R: Random> Model<R> {
 
         self.cleanups += 1;
         self.replay_index.insert(replay, key);
-        self.effects.push(Effect::SendAck { replay: key });
+        let late = self
+            .attempts
+            .get(attempt)
+            .is_some_and(|record| !record.offer_in_request);
+        match description.filter(|_| late) {
+            Some(offer) => {
+                let context = self.replays.get_mut(key).expect("just made");
+                context.ack_body = AckBody::Preparing;
+                self.effects.push(Effect::PrepareAnswer {
+                    replay: key,
+                    offer,
+                    usage: None,
+                });
+            }
+            None => self.effects.push(Effect::SendAck { replay: key }),
+        }
         true
+    }
+
+    /// Takes in the answer prepared for the ACK of a 2xx that carried an
+    /// offer, or `None` when none could be had in time.
+    ///
+    /// The answer goes in the ACK, and in every copy of it, so the exchange
+    /// is complete. An answer for a context that is gone, or that already
+    /// has its answer, is stale and changes nothing. A context's key names
+    /// its slot and the generation of the slot, so an answer for a reclaimed
+    /// context never reaches a new one in the same slot.
+    ///
+    /// Without an answer the exchange fails. The ACK goes without one
+    /// anyway, to stop the 2xx's retransmissions, and the dialog ends with a
+    /// BYE after it. Neither is a completed exchange, and RFC 3261 section
+    /// 13.2.1 is not met, so the attempt reports itself degraded, and a
+    /// session the failure ends says why.
+    pub(crate) fn answer_prepared(
+        &mut self,
+        key: ReplayKey,
+        answer: Option<Description>,
+    ) {
+        let Some(context) = self.replays.get_mut(key) else {
+            return;
+        };
+        if context.ack_body != AckBody::Preparing {
+            return;
+        }
+
+        let (usage, source, cseq) =
+            (context.usage, context.source, context.id.cseq);
+        let answered = answer.is_some();
+        context.ack_body = match answer {
+            Some(answer) => AckBody::Answer(answer),
+            None => AckBody::Unanswered,
+        };
+        let attempt = match source {
+            Source::Attempt(attempt) => self.attempts.get_mut(attempt),
+            Source::Exchange(_) => None,
+        };
+        if let (false, Some(record)) = (answered, attempt) {
+            record.degraded = true;
+        }
+
+        if let Some(usage) =
+            usage.filter(|&usage| self.usages.get(usage).is_some())
+        {
+            if answered {
+                let record = self.usages.get_mut(usage).expect("checked");
+                if record.negotiation.answer_sent(cseq).is_ok() {
+                    self.effects.push(Effect::Notify(
+                        Event::NegotiationCompleted { usage },
+                    ));
+                }
+            } else {
+                self.fail_negotiation(usage);
+            }
+        }
+        self.effects.push(Effect::SendAck { replay: key });
     }
 
     /// Records whether an ACK of a received 2xx was written.
@@ -2237,6 +2505,21 @@ impl<R: Random> Model<R> {
             replay.bye = Some(Bye::Sending);
             self.effects.push(Effect::SendBye { replay: key });
         }
+
+        // A BYE that waited for this ACK, since the ACK had an answer to
+        // carry, or the exchange failed, goes now.
+        let deferred =
+            replay.usage.and_then(|usage| match self.usages.get(usage)?.bye {
+                ByeIntent::Deferred { operation, reason } => {
+                    Some((usage, operation, reason))
+                }
+                ByeIntent::None | ByeIntent::Sending => None,
+            });
+        if let Some((usage, operation, reason)) = deferred {
+            let restore = reason == EndReason::LocalBye;
+            self.start_bye(usage, operation, reason, restore);
+        }
+        self.reclaim_replay(key);
     }
 
     /// Records that the core finished collecting the attempt's responses,
@@ -2294,28 +2577,6 @@ impl<R: Random> Model<R> {
     }
 }
 
-/// Moves a sent INVITE's negotiation past its 2xx, which carries the answer
-/// to the INVITE's offer, or an offer when the INVITE had none (RFC 3261
-/// section 13.2.1). `description` says whether the 2xx carries one.
-///
-/// TODO: Treat a 2xx without the answer it owes as a negotiation failure.
-/// Until then the offer stays outstanding, and the session never reports a
-/// completed negotiation.
-fn settle_at_2xx(negotiation: &mut Negotiation, description: bool) {
-    if !description {
-        return;
-    }
-    match negotiation {
-        Negotiation::LocalOfferOutstanding => {
-            negotiation.answer_received().expect("the offer is outstanding")
-        }
-        Negotiation::Stable => negotiation.offer_received().expect("stable"),
-        // An offer from the peer is already outstanding, so the 2xx holds
-        // no new one.
-        Negotiation::RemoteOfferOutstanding => {}
-    }
-}
-
 /// Usages.
 impl<R: Random> Model<R> {
     /// Ends a usage, as when the peer's BYE is accepted or its early dialog
@@ -2350,13 +2611,25 @@ impl<R: Random> Model<R> {
                 dialog.terminate();
             }
         } else if let Some(mut dialog) = self.dialogs.remove(usage.dialog) {
-            dialog.terminate();
             self.dialog_index.remove(dialog.id());
+            // An ACK that waits for its answer is owed all the same, and is
+            // built from the dialog once the answer is in, so the dialog
+            // goes to it, as to a cleanup.
+            let waiting = self.replays.iter_mut().find(|(_, replay)| {
+                replay.usage == Some(key)
+                    && replay.ack_body == AckBody::Preparing
+            });
+            match waiting {
+                Some((_, replay)) => replay.dialog = Some(Box::new(dialog)),
+                None => dialog.terminate(),
+            }
         }
         // A BYE the application asked for, deferred until the ACK, is not
         // needed any more. The session ended as it asked, as when the peer's
         // BYE crossed it, so the operation succeeds with nothing sent.
-        if let ByeIntent::Deferred { operation: Some(operation) } = usage.bye {
+        if let ByeIntent::Deferred { operation: Some(operation), .. } =
+            usage.bye
+        {
             self.complete(operation, Ok(Completion::Done));
         }
         let replays: Vec<ReplayKey> = self
@@ -2404,16 +2677,32 @@ impl<R: Random> Model<R> {
             return;
         }
 
+        self.bye_when_ready(key, operation);
+    }
+
+    /// Has the BYE of a usage that has none go, or wait for an ACK: the
+    /// peer's ACK of this user agent's 2xx, which RFC 3261 section 15 has a
+    /// callee wait for, or this user agent's own ACK while it waits for the
+    /// answer it carries, so that the BYE does not overtake it.
+    fn bye_when_ready(
+        &mut self,
+        key: UsageKey,
+        operation: Option<OperationId>,
+    ) {
         // A UAS keeps a usage only once its 2xx is committed, so only an ACK
         // still awaited holds the BYE back.
-        let awaiting_ack = usage.direction == Direction::Incoming
-            && self.replays.iter().any(|(_, replay)| {
-                replay.usage == Some(key)
-                    && replay.ack == AckObligation::AwaitingPeer
-            });
+        let awaiting_ack = self.replays.iter().any(|(_, replay)| {
+            replay.usage == Some(key)
+                && (replay.ack == AckObligation::AwaitingPeer
+                    || replay.ack_body == AckBody::Preparing)
+        });
+        let Some(usage) = self.usages.get_mut(key) else {
+            return;
+        };
         if awaiting_ack {
             usage.begin_ending();
-            usage.bye = ByeIntent::Deferred { operation };
+            usage.bye =
+                ByeIntent::Deferred { operation, reason: EndReason::LocalBye };
             return;
         }
 
@@ -2620,10 +2909,6 @@ impl<R: Random> Model<R> {
 
         self.effects
             .push(Effect::Notify(Event::DialogConfirmed { dialog, usage }));
-        if negotiation == Negotiation::Stable {
-            self.effects
-                .push(Effect::Notify(Event::NegotiationCompleted { usage }));
-        }
         (key, usage)
     }
 
@@ -2701,9 +2986,10 @@ mod tests {
         }
     }
 
-    /// An offer in an INVITE, which the model passes on without reading.
-    fn offer() -> Option<Description> {
-        Some(answer())
+    /// The body of an INVITE with an offer, which the model passes on
+    /// without reading.
+    fn offer() -> Result<Body, Malformed> {
+        Ok(Body::Session(answer()))
     }
 
     /// An answer, which the model passes on without reading.
@@ -2952,8 +3238,9 @@ mod tests {
     fn dialog_confirmed_is_not_ack_received_or_media_ready() {
         let clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority =
-            model.receive_invite(&request(INVITE), None, clock.now()).unwrap();
+        let authority = model
+            .receive_invite(&request(INVITE), Ok(Body::Empty), clock.now())
+            .unwrap();
         let exchange = authority.exchange;
 
         model
@@ -2982,11 +3269,11 @@ mod tests {
         );
         assert_eq!(
             model.usages.get(usage).unwrap().negotiation,
-            Negotiation::LocalOfferOutstanding,
+            Negotiation::LocalOfferOutstanding { cseq: 314159 },
         );
         assert!(!negotiated(&effects));
 
-        model.receive_ack(&id, 314159, true);
+        model.receive_ack(&id, 314159, Some(answer()));
         model.check();
 
         assert_eq!(
@@ -3284,8 +3571,8 @@ mod tests {
             Some(id.local_tag().clone()),
         );
 
-        model.receive_ack(&id, 314160, false);
-        model.receive_ack(&swapped, 314159, false);
+        model.receive_ack(&id, 314160, None);
+        model.receive_ack(&swapped, 314159, None);
         model.check();
 
         assert!(model.take_effects().is_empty());
@@ -3410,7 +3697,7 @@ mod tests {
         };
 
         model
-            .receive_provisional(attempt, &ringing("sip:bob@192.0.2.4"))
+            .receive_provisional(attempt, &ringing("sip:bob@192.0.2.4"), None)
             .unwrap();
         let (dialog, usage) = match model.take_effects()[..] {
             [Effect::Notify(Event::EarlyDialog { dialog, usage })] => {
@@ -3419,7 +3706,7 @@ mod tests {
             ref other => panic!("no early dialog: {other:?}"),
         };
         model
-            .receive_provisional(attempt, &ringing("sip:bob@192.0.2.5"))
+            .receive_provisional(attempt, &ringing("sip:bob@192.0.2.5"), None)
             .unwrap();
         model.check();
 
@@ -3467,6 +3754,7 @@ mod tests {
             .receive_provisional(
                 attempt,
                 &reply("180 Ringing", "first", "sip:bob@192.0.2.4", ""),
+                None,
             )
             .unwrap();
 
@@ -3688,7 +3976,7 @@ mod tests {
         let mut model = model(limits());
         let attempt = model.start_attempt(&request(INVITE), true).unwrap();
         let ringing = reply("180 Ringing", "early", "sip:bob@192.0.2.4", "");
-        model.receive_provisional(attempt, &ringing).unwrap();
+        model.receive_provisional(attempt, &ringing, None).unwrap();
         let usage = match model.take_effects()[..] {
             [Effect::Notify(Event::EarlyDialog { usage, .. })] => usage,
             ref other => panic!("no early dialog: {other:?}"),
@@ -3724,7 +4012,7 @@ mod tests {
             other => panic!("no ACK: {other:?}"),
         };
 
-        let ack = model.ack_request(replay).unwrap();
+        let ack = model.ack_request(replay).unwrap().0;
 
         assert_eq!(ack.request.method(), &Method::ACK);
         assert_eq!(ack.request.uri().as_str(), "sip:bob@192.0.2.4");
@@ -3736,8 +4024,9 @@ mod tests {
     fn a_received_ack_finds_its_2xx() {
         let clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority =
-            model.receive_invite(&request(INVITE), None, clock.now()).unwrap();
+        let authority = model
+            .receive_invite(&request(INVITE), Ok(Body::Empty), clock.now())
+            .unwrap();
         let exchange = authority.exchange;
         model
             .try_submit(Command::Accept { authority, answer: answer() })
@@ -3756,7 +4045,7 @@ mod tests {
             )
             .replace("314159 INVITE", "314159 ACK");
 
-        model.receive_ack_request(&request(&ack), true);
+        model.receive_ack_request(&request(&ack), Some(answer()));
         model.check();
 
         assert!(model.exchanges.get(exchange).is_none());
@@ -3828,9 +4117,9 @@ mod tests {
         model.take_effects();
 
         // One ACK for another INVITE, and the one for this 2xx, twice.
-        model.receive_ack(&uas_dialog(), 314160, false);
-        model.receive_ack(&uas_dialog(), 314159, false);
-        model.receive_ack(&uas_dialog(), 314159, false);
+        model.receive_ack(&uas_dialog(), 314160, None);
+        model.receive_ack(&uas_dialog(), 314159, None);
+        model.receive_ack(&uas_dialog(), 314159, None);
         model.final_committed(exchange, clock.now());
         model.check();
 
@@ -3853,8 +4142,9 @@ mod tests {
     fn an_early_ack_keeps_the_answer_it_carried() {
         let clock = Clock(Instant::now());
         let mut model = model(limits());
-        let authority =
-            model.receive_invite(&request(INVITE), None, clock.now()).unwrap();
+        let authority = model
+            .receive_invite(&request(INVITE), Ok(Body::Empty), clock.now())
+            .unwrap();
         let exchange = authority.exchange;
         model
             .try_submit(Command::Accept { authority, answer: answer() })
@@ -3862,8 +4152,8 @@ mod tests {
         model.run_commands();
         model.take_effects();
 
-        model.receive_ack(&uas_dialog(), 314159, true);
-        model.receive_ack(&uas_dialog(), 314159, false);
+        model.receive_ack(&uas_dialog(), 314159, Some(answer()));
+        model.receive_ack(&uas_dialog(), 314159, None);
         model.final_committed(exchange, clock.now());
         model.check();
 
@@ -4137,7 +4427,7 @@ mod tests {
         let deadline = clock.now() + T1 * 64;
         advance_to(&mut model, &mut clock, deadline);
 
-        model.receive_ack(&uas_dialog(), 314159, false);
+        model.receive_ack(&uas_dialog(), 314159, None);
         model.check();
 
         assert!(model.take_effects().is_empty());
@@ -4155,12 +4445,12 @@ mod tests {
         let mut model = model(limits());
         let (exchange, _, _) = accepted(&mut model, &clock);
 
-        model.receive_ack(&uas_dialog(), 314158, false);
+        model.receive_ack(&uas_dialog(), 314158, None);
         let next = model.next_deadline().unwrap();
         let effects = advance_to(&mut model, &mut clock, next);
         assert_eq!(effects, [Effect::Resend2xx { exchange }]);
 
-        model.receive_ack(&uas_dialog(), 314159, false);
+        model.receive_ack(&uas_dialog(), 314159, None);
         model.check();
         assert_eq!(model.next_deadline(), None);
         assert!(model.exchanges.get(exchange).is_none());
@@ -4222,7 +4512,11 @@ mod tests {
 
         let ringing = StatusCode::from_u16(180).unwrap();
         let operation = model
-            .try_submit(Command::Provisional { exchange, status: ringing })
+            .try_submit(Command::Provisional {
+                exchange,
+                status: ringing,
+                preview: None,
+            })
             .unwrap();
         model.run_commands();
         assert_eq!(
@@ -4231,12 +4525,14 @@ mod tests {
                 exchange,
                 status: ringing,
                 to_tag: tag.clone(),
+                preview: None,
                 operation: Some(operation),
             }],
         );
         model.provisional_done(
             exchange,
             ringing,
+            None,
             Some(operation),
             Ok(()),
             clock.now(),
@@ -4258,6 +4554,7 @@ mod tests {
                     exchange,
                     status: ringing,
                     to_tag: tag.clone(),
+                    preview: None,
                     operation: None,
                 }],
             );
@@ -4290,6 +4587,7 @@ mod tests {
             .try_submit(Command::Provisional {
                 exchange,
                 status: StatusCode::from_u16(100).unwrap(),
+                preview: None,
             })
             .unwrap();
         model.run_commands();
@@ -4300,6 +4598,7 @@ mod tests {
             .try_submit(Command::Provisional {
                 exchange,
                 status: StatusCode::from_u16(180).unwrap(),
+                preview: None,
             })
             .unwrap();
         model.run_commands();
@@ -4505,8 +4804,8 @@ mod tests {
         let (dialog, _) = confirmed(&model.take_effects());
         let replay = model.replays.iter().next().unwrap().0;
 
-        let ack = model.ack_request(replay).unwrap();
-        let again = model.ack_request(replay).unwrap();
+        let ack = model.ack_request(replay).unwrap().0;
+        let again = model.ack_request(replay).unwrap().0;
         let next = model
             .dialogs
             .get_mut(dialog)
@@ -4612,27 +4911,44 @@ mod tests {
         model.check();
     }
 
-    /// A 2xx without the answer the INVITE's offer is owed confirms the
-    /// dialog, and gets its ACK, but leaves the offer outstanding rather than
-    /// report a completed negotiation. The answer of a 2xx that has one is
-    /// kept for the session.
+    /// A 2xx without the answer to the INVITE's offer fails the exchange
+    /// (RFC 3261 section 13.2.1). It still gets its ACK, and the session
+    /// ends with a BYE once the ACK has gone, not before.
     #[test]
-    fn a_2xx_without_its_answer_leaves_the_offer_outstanding() {
+    fn a_2xx_without_its_answer_fails_the_negotiation() {
         let mut model = model(limits());
         let attempt = model.start_attempt(&request(INVITE), true).unwrap();
 
         model.receive_2xx(attempt, &callee(), None).unwrap();
+        model.check();
 
         let effects = model.take_effects();
         let (_, usage) = confirmed(&effects);
         assert!(!negotiated(&effects));
-        assert!(effects.iter().any(|e| matches!(e, Effect::SendAck { .. })));
+        assert!(
+            notices(&effects).contains(&Event::NegotiationFailed { usage })
+        );
+        assert_eq!(acks(&effects).len(), 1);
+        assert_eq!(session_byes(&effects, usage), 0);
         assert_eq!(
             model.usage_state(usage),
             Some((
-                UsagePhase::Established,
-                Negotiation::LocalOfferOutstanding,
+                UsagePhase::Ending,
+                Negotiation::LocalOfferOutstanding { cseq: 314159 },
                 None,
+            )),
+        );
+
+        model.ack_written(acks(&effects)[0], true);
+        let effects = model.take_effects();
+        assert_eq!(session_byes(&effects, usage), 1);
+        model.bye_started(usage, Ok(())).unwrap();
+        model.check();
+        assert_eq!(
+            model.ended(usage),
+            Some((
+                EndReason::NegotiationFailed,
+                Negotiation::LocalOfferOutstanding { cseq: 314159 },
             )),
         );
     }
@@ -4647,6 +4963,7 @@ mod tests {
             .receive_provisional(
                 attempt,
                 &reply("180 Ringing", "early", "sip:bob@192.0.2.4", ""),
+                None,
             )
             .unwrap();
         model.receive_2xx(attempt, &callee(), Some(answer())).unwrap();
@@ -4720,13 +5037,17 @@ mod tests {
         let attempt = model.start_attempt(&request(INVITE), true).unwrap();
 
         model
-            .receive_2xx(attempt, &fork("bob", "sip:bob@192.0.2.4"), offer())
+            .receive_2xx(
+                attempt,
+                &fork("bob", "sip:bob@192.0.2.4"),
+                Some(answer()),
+            )
             .unwrap();
         model
             .receive_2xx(
                 attempt,
                 &fork("carol", "sip:carol@192.0.2.5"),
-                offer(),
+                Some(answer()),
             )
             .unwrap();
         model.check();
@@ -4739,7 +5060,7 @@ mod tests {
         let sent: Vec<(String, String, String)> = acks(&effects)
             .into_iter()
             .map(|replay| {
-                let ack = model.ack_request(replay).unwrap().request;
+                let ack = model.ack_request(replay).unwrap().0.request;
                 let header = |name| ack.headers().get(name).unwrap().as_str();
                 (
                     ack.uri().as_str().to_owned(),
@@ -4781,21 +5102,21 @@ mod tests {
             fork("kept", "sip:bob@192.0.2.4"),
             fork("ended", "sip:carol@192.0.2.5"),
         );
-        model.receive_provisional(attempt, &ringing).unwrap();
-        model.receive_2xx(attempt, &kept, offer()).unwrap();
+        model.receive_provisional(attempt, &ringing, None).unwrap();
+        model.receive_2xx(attempt, &kept, Some(answer())).unwrap();
         let effects = model.take_effects();
         let (session, first) = (confirmations(&effects), acks(&effects));
         assert!(negotiated(&effects));
         assert_eq!(
-            model.receive_2xx(attempt, &ended, offer()),
+            model.receive_2xx(attempt, &ended, Some(answer())),
             Err(Error::CapacityExceeded),
         );
         let cleanup = acks(&model.take_effects())[0];
         model.ack_written(cleanup, true);
         assert_eq!(byes(&model.take_effects()), [cleanup]);
 
-        model.receive_2xx(attempt, &kept, offer()).unwrap();
-        model.receive_2xx(attempt, &ended, offer()).unwrap();
+        model.receive_2xx(attempt, &kept, Some(answer())).unwrap();
+        model.receive_2xx(attempt, &ended, Some(answer())).unwrap();
         model.ack_written(cleanup, true);
         model.check();
 
@@ -4822,25 +5143,33 @@ mod tests {
         let mut model = model(limits());
         let attempt = model.start_attempt(&request(INVITE), true).unwrap();
         let early = reply("180 Ringing", "early", "sip:bob@192.0.2.4", "");
-        model.receive_provisional(attempt, &early).unwrap();
+        model.receive_provisional(attempt, &early, None).unwrap();
         model
-            .receive_2xx(attempt, &fork("kept", "sip:dan@192.0.2.6"), offer())
+            .receive_2xx(
+                attempt,
+                &fork("kept", "sip:dan@192.0.2.6"),
+                Some(answer()),
+            )
             .unwrap();
         let kept = confirmations(&model.take_effects())[0];
 
         model.abandon_attempt(attempt).unwrap();
         model
-            .receive_2xx(attempt, &fork("early", "sip:bob@192.0.2.4"), offer())
+            .receive_2xx(
+                attempt,
+                &fork("early", "sip:bob@192.0.2.4"),
+                Some(answer()),
+            )
             .unwrap();
         model
             .receive_2xx(
                 attempt,
                 &fork("late", "sip:carol@192.0.2.5"),
-                offer(),
+                Some(answer()),
             )
             .unwrap();
         let after = reply("180 Ringing", "after", "sip:eve@192.0.2.7", "");
-        model.receive_provisional(attempt, &after).unwrap();
+        model.receive_provisional(attempt, &after, None).unwrap();
         model.check();
 
         let effects = model.take_effects();
@@ -4877,8 +5206,8 @@ mod tests {
     }
 
     /// Each fork negotiates on its own. One 2xx carries an answer and
-    /// settles its session, another carries none and leaves its own offer
-    /// outstanding, and each session keeps the description its peer sent.
+    /// settles its session, another carries none and fails its own exchange
+    /// alone, and each session keeps the description its peer sent.
     #[test]
     fn fork_sdp_state_is_not_shared() {
         let mut model = model(limits());
@@ -4915,6 +5244,16 @@ mod tests {
             })
             .collect();
         assert_eq!(completed, [sessions[0], sessions[2]]);
+        assert_eq!(
+            notices(&effects)
+                .into_iter()
+                .filter(|event| matches!(
+                    event,
+                    Event::NegotiationFailed { .. }
+                ))
+                .collect::<Vec<_>>(),
+            [Event::NegotiationFailed { usage: sessions[1] }],
+        );
         let state = |usage| {
             let (_, negotiation, remote) = model.usage_state(usage).unwrap();
             (negotiation, remote)
@@ -4922,7 +5261,7 @@ mod tests {
         assert_eq!(state(sessions[0]), (Negotiation::Stable, Some(bob)));
         assert_eq!(
             state(sessions[1]),
-            (Negotiation::LocalOfferOutstanding, None),
+            (Negotiation::LocalOfferOutstanding { cseq: 314159 }, None),
         );
         assert_eq!(state(sessions[2]), (Negotiation::Stable, Some(carol)));
     }
@@ -4940,11 +5279,11 @@ mod tests {
             fork("kept", "sip:bob@192.0.2.4"),
             fork("ended", "sip:carol@192.0.2.5"),
         );
-        model.receive_2xx(attempt, &kept, offer()).unwrap();
+        model.receive_2xx(attempt, &kept, Some(answer())).unwrap();
         let effects = model.take_effects();
         let (session, replay) =
             (confirmations(&effects)[0], acks(&effects)[0]);
-        let _ = model.receive_2xx(attempt, &ended, offer());
+        let _ = model.receive_2xx(attempt, &ended, Some(answer()));
         let cleanup = acks(&model.take_effects())[0];
         model.ack_written(replay, true);
         model.ack_written(cleanup, true);
@@ -4962,8 +5301,8 @@ mod tests {
         );
         assert_eq!(model.dialogs.len(), 0, "an ended session holds no dialog");
         assert!(model.has_replay(replay) && model.has_replay(cleanup));
-        model.receive_2xx(attempt, &kept, offer()).unwrap();
-        model.receive_2xx(attempt, &ended, offer()).unwrap();
+        model.receive_2xx(attempt, &kept, Some(answer())).unwrap();
+        model.receive_2xx(attempt, &ended, Some(answer())).unwrap();
         assert_eq!(
             model.take_effects(),
             [
@@ -5006,14 +5345,14 @@ mod tests {
             .receive_2xx(
                 late,
                 &late_fork("kept", "sip:bob@192.0.2.4"),
-                offer(),
+                Some(answer()),
             )
             .unwrap();
         model.take_effects();
         let _ = model.receive_2xx(
             late,
             &late_fork("ended", "sip:carol@192.0.2.5"),
-            offer(),
+            Some(answer()),
         );
         let cleanup = acks(&model.take_effects())[0];
 
@@ -5038,7 +5377,7 @@ mod tests {
         let attempt = model.start_attempt(&request(INVITE), true).unwrap();
         for tag in ["first", "second"] {
             let ringing = reply("180 Ringing", tag, "sip:bob@192.0.2.4", "");
-            model.receive_provisional(attempt, &ringing).unwrap();
+            model.receive_provisional(attempt, &ringing, None).unwrap();
         }
         let second = match notices(&model.take_effects())[..] {
             [_, Event::EarlyDialog { usage, .. }] => usage,
@@ -5046,14 +5385,18 @@ mod tests {
         };
 
         model
-            .receive_2xx(attempt, &fork("first", "sip:bob@192.0.2.4"), offer())
+            .receive_2xx(
+                attempt,
+                &fork("first", "sip:bob@192.0.2.4"),
+                Some(answer()),
+            )
             .unwrap();
         let confirmed = model.take_effects();
         assert_eq!(
             model.receive_2xx(
                 attempt,
                 &fork("second", "sip:bob@192.0.2.4"),
-                offer()
+                Some(answer())
             ),
             Err(Error::CapacityExceeded),
         );
@@ -5062,7 +5405,7 @@ mod tests {
             model.receive_2xx(
                 attempt,
                 &fork("third", "sip:carol@192.0.2.5"),
-                offer()
+                Some(answer())
             ),
             Err(Error::CapacityExceeded),
         );
@@ -5098,11 +5441,11 @@ mod tests {
                 let tag = format!("fork{n}");
                 let ok =
                     fork(&tag, &format!("sip:fork{n}@192.0.2.{}", n + 10));
-                model.receive_2xx(attempt, &ok, offer())
+                model.receive_2xx(attempt, &ok, Some(answer()))
             })
             .collect();
         let ringing = reply("180 Ringing", "early", "sip:bob@192.0.2.4", "");
-        let early = model.receive_provisional(attempt, &ringing);
+        let early = model.receive_provisional(attempt, &ringing, None);
         model.check();
 
         assert_eq!(
@@ -5161,20 +5504,28 @@ mod tests {
         let late = |model: &mut Model<Counter>, tag| {
             let late =
                 reply("183 Session Progress", tag, "sip:x@192.0.2.9", "");
-            model.receive_provisional(attempt, &late)
+            model.receive_provisional(attempt, &late, None)
         };
         model
-            .receive_2xx(attempt, &fork("ended", "sip:bob@192.0.2.4"), offer())
+            .receive_2xx(
+                attempt,
+                &fork("ended", "sip:bob@192.0.2.4"),
+                Some(answer()),
+            )
             .unwrap();
         let session = confirmations(&model.take_effects())[0];
         model.end_usage(session, EndReason::LocalBye);
         model
-            .receive_2xx(attempt, &fork("kept", "sip:dan@192.0.2.6"), offer())
+            .receive_2xx(
+                attempt,
+                &fork("kept", "sip:dan@192.0.2.6"),
+                Some(answer()),
+            )
             .unwrap();
         let _ = model.receive_2xx(
             attempt,
             &fork("beyond", "sip:carol@192.0.2.5"),
-            offer(),
+            Some(answer()),
         );
         model.take_effects();
         let before = model.attempt_state(attempt).unwrap();
@@ -5183,7 +5534,11 @@ mod tests {
         assert_eq!(late(&mut model, "beyond"), Ok(()));
         model.abandon_attempt(attempt).unwrap();
         model
-            .receive_2xx(attempt, &fork("given", "sip:eve@192.0.2.7"), offer())
+            .receive_2xx(
+                attempt,
+                &fork("given", "sip:eve@192.0.2.7"),
+                Some(answer()),
+            )
             .unwrap();
         model.take_effects();
         assert_eq!(late(&mut model, "given"), Ok(()));
@@ -5205,19 +5560,23 @@ mod tests {
         let attempt = model.start_attempt(&request(INVITE), true).unwrap();
         for tag in ["first", "second", "third"] {
             let ringing = reply("180 Ringing", tag, "sip:bob@192.0.2.4", "");
-            model.receive_provisional(attempt, &ringing).unwrap();
+            model.receive_provisional(attempt, &ringing, None).unwrap();
         }
         let third = match notices(&model.take_effects())[..] {
             [_, _, Event::EarlyDialog { usage, .. }] => usage,
             ref other => panic!("not three early dialogs: {other:?}"),
         };
         model
-            .receive_2xx(attempt, &fork("first", "sip:bob@192.0.2.4"), offer())
+            .receive_2xx(
+                attempt,
+                &fork("first", "sip:bob@192.0.2.4"),
+                Some(answer()),
+            )
             .unwrap();
         let _ = model.receive_2xx(
             attempt,
             &fork("second", "sip:bob@192.0.2.4"),
-            offer(),
+            Some(answer()),
         );
         model.take_effects();
 
@@ -5226,7 +5585,7 @@ mod tests {
                 model.receive_2xx(
                     attempt,
                     &fork("third", "sip:carol@192.0.2.5"),
-                    offer()
+                    Some(answer())
                 ),
                 Err(Error::CapacityExceeded),
             );
@@ -5309,7 +5668,7 @@ Contact: <sip:bob@192.0.2.4>
         model: &mut Model<Counter>,
     ) -> (AttemptKey, UsageKey, ReplayKey) {
         let attempt = model.start_attempt(&request(INVITE), true).unwrap();
-        model.receive_2xx(attempt, &callee(), offer()).unwrap();
+        model.receive_2xx(attempt, &callee(), Some(answer())).unwrap();
         let effects = model.take_effects();
         let (session, replay) =
             (confirmations(&effects)[0], acks(&effects)[0]);
@@ -5477,7 +5836,7 @@ Contact: <sip:bob@192.0.2.4>
         let clock = Clock(Instant::now());
         let mut model = model(limits());
         let (_, _, usage) = accepted(&mut model, &clock);
-        model.receive_ack(&uas_dialog(), 314159, false);
+        model.receive_ack(&uas_dialog(), 314159, None);
         model.take_effects();
 
         let options =
@@ -5526,7 +5885,7 @@ Contact: <sip:bob@192.0.2.4>
         );
         model.take_effects();
 
-        model.receive_2xx(attempt, &callee(), offer()).unwrap();
+        model.receive_2xx(attempt, &callee(), Some(answer())).unwrap();
         model.check();
         let effects = model.take_effects();
         assert_eq!(confirmations(&effects).len(), 1);
@@ -5589,7 +5948,7 @@ Contact: <sip:bob@192.0.2.4>
         let mut model = model(limits());
         let attempt = model.start_attempt(&request(INVITE), true).unwrap();
         let ringing = reply("180 Ringing", "early", "sip:bob@192.0.2.4", "");
-        model.receive_provisional(attempt, &ringing).unwrap();
+        model.receive_provisional(attempt, &ringing, None).unwrap();
         let early = match model.take_effects()[..] {
             [Effect::Notify(Event::EarlyDialog { usage, .. })] => usage,
             ref other => panic!("no early dialog: {other:?}"),
@@ -5607,13 +5966,17 @@ Contact: <sip:bob@192.0.2.4>
         assert_eq!(model.usage_state(early).unwrap().0, UsagePhase::Ending);
 
         model
-            .receive_2xx(attempt, &fork("early", "sip:bob@192.0.2.4"), offer())
+            .receive_2xx(
+                attempt,
+                &fork("early", "sip:bob@192.0.2.4"),
+                Some(answer()),
+            )
             .unwrap();
         model
             .receive_2xx(
                 attempt,
                 &fork("late", "sip:carol@192.0.2.5"),
-                offer(),
+                Some(answer()),
             )
             .unwrap();
         model.check();
@@ -5662,7 +6025,7 @@ Contact: <sip:bob@192.0.2.4>
             model.operations.snapshot(terminate).unwrap().outcome,
             None
         );
-        model.receive_ack(&uas_dialog(), 314159, false);
+        model.receive_ack(&uas_dialog(), 314159, None);
         model.check();
         assert_eq!(session_byes(&model.take_effects(), usage), 1);
 
@@ -5689,7 +6052,7 @@ Contact: <sip:bob@192.0.2.4>
         let mut model = model(limits());
         let attempt = model.start_attempt(&request(INVITE), true).unwrap();
         let ringing = reply("180 Ringing", "early", "sip:bob@192.0.2.4", "");
-        model.receive_provisional(attempt, &ringing).unwrap();
+        model.receive_provisional(attempt, &ringing, None).unwrap();
         let early = match model.take_effects()[..] {
             [Effect::Notify(Event::EarlyDialog { usage, .. })] => usage,
             ref other => panic!("no early dialog: {other:?}"),
@@ -5711,10 +6074,14 @@ Contact: <sip:bob@192.0.2.4>
             [Event::UsageEnded { usage: early, reason: EndReason::LocalBye }],
         );
 
-        model.receive_provisional(attempt, &ringing).unwrap();
+        model.receive_provisional(attempt, &ringing, None).unwrap();
         assert!(model.take_effects().is_empty());
         model
-            .receive_2xx(attempt, &fork("early", "sip:bob@192.0.2.4"), offer())
+            .receive_2xx(
+                attempt,
+                &fork("early", "sip:bob@192.0.2.4"),
+                Some(answer()),
+            )
             .unwrap();
         model.check();
         let cleanup = acks(&model.take_effects())[0];
@@ -5804,8 +6171,8 @@ Contact: <sip:bob@192.0.2.4>
         let mut model = self::model(limits());
         let (_, _, usage) = accepted(&mut model, &clock);
         run(&mut model, Command::Terminate { usage });
-        model.receive_ack(&uas_dialog(), 314159, false);
-        model.receive_ack(&uas_dialog(), 314159, false);
+        model.receive_ack(&uas_dialog(), 314159, None);
+        model.receive_ack(&uas_dialog(), 314159, None);
         assert_eq!(session_byes(&model.take_effects(), usage), 1);
         let bye = model.session_bye_request(usage).unwrap().request;
         assert_eq!(bye.headers().get("CSeq").unwrap(), "3 BYE");
@@ -5879,11 +6246,11 @@ Contact: <sip:bob@192.0.2.4>
         let started = model.bye_started(session, Ok(())).unwrap();
         model.take_effects();
 
-        model.receive_2xx(attempt, &callee(), offer()).unwrap();
+        model.receive_2xx(attempt, &callee(), Some(answer())).unwrap();
         assert_eq!(model.take_effects(), [Effect::ResendAck { replay }]);
         model.bye_answered(started, Ok(()));
         model.take_effects();
-        model.receive_2xx(attempt, &callee(), offer()).unwrap();
+        model.receive_2xx(attempt, &callee(), Some(answer())).unwrap();
         model.check();
         assert_eq!(model.take_effects(), [Effect::ResendAck { replay }]);
         assert_eq!(model.usages.len(), 0);
@@ -5900,7 +6267,7 @@ Contact: <sip:bob@192.0.2.4>
             let attempt = model.start_attempt(&invite(&call), true).unwrap();
             let ok =
                 callee_with("a84b4c76e66710@pc33.atlanta.example.com", &call);
-            model.receive_2xx(attempt, &ok, offer()).unwrap();
+            model.receive_2xx(attempt, &ok, Some(answer())).unwrap();
             let session = confirmations(&model.take_effects())[0];
             model.end_usage(session, EndReason::RemoteBye { flow: flow() });
             ended.push(session);
@@ -5924,7 +6291,7 @@ Contact: <sip:bob@192.0.2.4>
         let mut model = model(limits());
         let attempt = model.start_attempt(&request(INVITE), true).unwrap();
         let ringing = reply("180 Ringing", "early", "sip:bob@192.0.2.4", "");
-        model.receive_provisional(attempt, &ringing).unwrap();
+        model.receive_provisional(attempt, &ringing, None).unwrap();
         let early = match model.take_effects()[..] {
             [Effect::Notify(Event::EarlyDialog { usage, .. })] => usage,
             ref other => panic!("no early dialog: {other:?}"),
@@ -5936,10 +6303,14 @@ Contact: <sip:bob@192.0.2.4>
         model.take_effects();
         assert_eq!(model.dialogs.len(), 0, "the BYE is over");
 
-        model.receive_provisional(attempt, &ringing).unwrap();
+        model.receive_provisional(attempt, &ringing, None).unwrap();
         assert!(model.take_effects().is_empty());
         model
-            .receive_2xx(attempt, &fork("early", "sip:bob@192.0.2.4"), offer())
+            .receive_2xx(
+                attempt,
+                &fork("early", "sip:bob@192.0.2.4"),
+                Some(answer()),
+            )
             .unwrap();
         model.check();
 
@@ -5952,5 +6323,558 @@ Contact: <sip:bob@192.0.2.4>
         assert_eq!(bye.headers().get("CSeq").unwrap(), "314161 BYE");
         let state = model.attempt_state(attempt).unwrap();
         assert!(state.sessions.is_empty() && state.complete);
+    }
+
+    /// Returns the answers `effects` ask to be prepared, with the offer and
+    /// the session each is for.
+    fn answers_asked(
+        effects: &[Effect],
+    ) -> Vec<(ReplayKey, Description, Option<UsageKey>)> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::PrepareAnswer { replay, offer, usage } => {
+                    Some((*replay, offer.clone(), *usage))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn failures(effects: &[Effect]) -> Vec<UsageKey> {
+        notices(effects)
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::NegotiationFailed { usage } => Some(usage),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// An offer in the INVITE gets its answer in the 2xx (RFC 3261 section
+    /// 13.2.1). That completes the exchange, and the ACK carries no body.
+    #[test]
+    fn early_offer_answer_in_2xx() {
+        let mut model = model(limits());
+        let attempt = model.start_attempt(&request(INVITE), true).unwrap();
+
+        model.receive_2xx(attempt, &callee(), Some(answer())).unwrap();
+        model.check();
+
+        let effects = model.take_effects();
+        let (_, usage) = confirmed(&effects);
+        assert!(negotiated(&effects));
+        assert!(answers_asked(&effects).is_empty());
+        let (_, answered) = model.ack_request(acks(&effects)[0]).unwrap();
+        assert_eq!(answered, None);
+        assert_eq!(
+            model.usage_state(usage),
+            Some((
+                UsagePhase::Established,
+                Negotiation::Stable,
+                Some(answer())
+            )),
+        );
+    }
+
+    /// An INVITE without an offer gets the offer in the 2xx, and the ACK
+    /// owes the answer (RFC 3261 section 13.2.1). The ACK waits until the
+    /// answer is prepared, then carries it, and only then is the exchange
+    /// complete.
+    #[test]
+    fn offerless_invite_offer_in_2xx_answer_in_ack() {
+        let mut model = model(limits());
+        let attempt = model.start_attempt(&request(INVITE), false).unwrap();
+        let (offer, mine) = (description("v=0 offer\r\n"), answer());
+
+        model.receive_2xx(attempt, &callee(), Some(offer.clone())).unwrap();
+        model.check();
+
+        let effects = model.take_effects();
+        let (_, usage) = confirmed(&effects);
+        let asked = answers_asked(&effects);
+        assert_eq!(asked.len(), 1);
+        let (replay, asked_offer, asked_usage) = asked[0].clone();
+        assert_eq!((asked_offer, asked_usage), (offer.clone(), Some(usage)));
+        assert!(acks(&effects).is_empty() && !negotiated(&effects));
+        assert_eq!(
+            model.usage_state(usage),
+            Some((
+                UsagePhase::Established,
+                Negotiation::RemoteOfferOutstanding { cseq: 314159 },
+                Some(offer),
+            )),
+        );
+        assert!(model.ack_request(replay).is_none(), "no ACK without it");
+
+        model.answer_prepared(replay, Some(mine.clone()));
+        model.check();
+
+        let effects = model.take_effects();
+        assert!(negotiated(&effects));
+        assert_eq!(acks(&effects), [replay]);
+        assert_eq!(model.ack_request(replay).unwrap().1, Some(mine));
+        assert_eq!(model.usage_state(usage).unwrap().1, Negotiation::Stable);
+    }
+
+    /// A copy of the 2xx asks for no second answer. While the answer is
+    /// prepared it sends nothing, and once the ACK is out it gets the same
+    /// ACK, with the same answer, even if its offer differs (RFC 3261
+    /// section 13.2.2.4).
+    #[test]
+    fn duplicate_2xx_uses_identical_prepared_answer() {
+        let mut model = model(limits());
+        let attempt = model.start_attempt(&request(INVITE), false).unwrap();
+        model
+            .receive_2xx(attempt, &callee(), Some(description("v=0 a\r\n")))
+            .unwrap();
+        let replay = answers_asked(&model.take_effects())[0].0;
+
+        model
+            .receive_2xx(attempt, &callee(), Some(description("v=0 a\r\n")))
+            .unwrap();
+        assert_eq!(model.take_effects(), []);
+
+        model.answer_prepared(replay, Some(answer()));
+        model.ack_written(replay, true);
+        model.take_effects();
+        model
+            .receive_2xx(attempt, &callee(), Some(description("v=0 b\r\n")))
+            .unwrap();
+        model.check();
+
+        assert_eq!(model.take_effects(), [Effect::ResendAck { replay }]);
+        assert_eq!(model.ack_request(replay).unwrap().1, Some(answer()));
+    }
+
+    /// A description in an unreliable provisional is a preview. It is kept
+    /// for the early session, but settles nothing, and the 2xx still has to
+    /// carry the answer. One that does not fails the exchange.
+    #[test]
+    fn unreliable_preview_does_not_replace_final_answer_obligation() {
+        let mut model = model(limits());
+        let attempt = model.start_attempt(&request(INVITE), true).unwrap();
+        let progress =
+            reply("183 Session Progress", "callee", "sip:bob@192.0.2.4", "");
+
+        model.receive_provisional(attempt, &progress, Some(answer())).unwrap();
+        let effects = model.take_effects();
+        let Event::EarlyDialog { usage, .. } = notices(&effects)[0] else {
+            panic!("an early dialog");
+        };
+        assert!(!negotiated(&effects));
+        assert_eq!(
+            model.usage_state(usage),
+            Some((
+                UsagePhase::Establishing,
+                Negotiation::LocalOfferOutstanding { cseq: 314159 },
+                Some(answer()),
+            )),
+        );
+
+        model.receive_2xx(attempt, &callee(), None).unwrap();
+        model.check();
+
+        let effects = model.take_effects();
+        assert!(!negotiated(&effects));
+        assert_eq!(failures(&effects), [usage]);
+        model.ack_written(acks(&effects)[0], true);
+        assert_eq!(session_byes(&model.take_effects(), usage), 1);
+    }
+
+    /// A 2xx whose answer differs from the preview is reported, and the
+    /// preview stays the answer (RFC 3261 section 13.2.1, RFC 6337 section
+    /// 3.1.1). One that repeats the preview, as it should, is not reported.
+    #[test]
+    fn conflicting_preview_and_final_answer_is_reported() {
+        let mut model = model(limits());
+        let attempt = model.start_attempt(&request(INVITE), true).unwrap();
+        let (preview, changed) =
+            (description("v=0 preview\r\n"), description("v=0 final\r\n"));
+        for tag in ["bob", "carol"] {
+            let progress =
+                reply("183 Session Progress", tag, "sip:x@192.0.2.4", "");
+            model
+                .receive_provisional(attempt, &progress, Some(preview.clone()))
+                .unwrap();
+        }
+        model.take_effects();
+
+        model
+            .receive_2xx(
+                attempt,
+                &fork("bob", "sip:bob@192.0.2.4"),
+                Some(changed.clone()),
+            )
+            .unwrap();
+        model
+            .receive_2xx(
+                attempt,
+                &fork("carol", "sip:carol@192.0.2.5"),
+                Some(preview.clone()),
+            )
+            .unwrap();
+        model.check();
+
+        let effects = model.take_effects();
+        let sessions = confirmations(&effects);
+        let changes: Vec<Event> = notices(&effects)
+            .into_iter()
+            .filter(|event| matches!(event, Event::AnswerChanged { .. }))
+            .collect();
+        assert_eq!(changes, [Event::AnswerChanged { usage: sessions[0] }]);
+        assert_eq!(
+            model.usage_state(sessions[0]).unwrap().2,
+            Some(preview.clone())
+        );
+        assert_eq!(model.usage_state(sessions[1]).unwrap().2, Some(preview));
+        assert!(!sessions.iter().any(|&usage| {
+            model.usage_state(usage).unwrap().2 == Some(changed.clone())
+        }));
+        assert!(sessions.iter().all(|&usage| {
+            model.usage_state(usage).unwrap().1 == Negotiation::Stable
+        }));
+    }
+
+    /// Each fork's 2xx carries an offer of its own, and gets an answer of
+    /// its own. Answering one fork, or failing to, changes nothing for the
+    /// other.
+    #[test]
+    fn forked_offers_use_independent_answer_state() {
+        let mut model = model(limits());
+        let attempt = model.start_attempt(&request(INVITE), false).unwrap();
+        let (bob, carol) =
+            (description("v=0 bob\r\n"), description("v=0 carol\r\n"));
+
+        model
+            .receive_2xx(
+                attempt,
+                &fork("bob", "sip:bob@192.0.2.4"),
+                Some(bob.clone()),
+            )
+            .unwrap();
+        model
+            .receive_2xx(
+                attempt,
+                &fork("carol", "sip:carol@192.0.2.5"),
+                Some(carol.clone()),
+            )
+            .unwrap();
+        let asked = answers_asked(&model.take_effects());
+        assert_eq!(asked.len(), 2);
+        assert_ne!(asked[0].0, asked[1].0);
+        assert_eq!((&asked[0].1, &asked[1].1), (&bob, &carol));
+        let (sessions, replays) = (
+            [asked[0].2.unwrap(), asked[1].2.unwrap()],
+            [asked[0].0, asked[1].0],
+        );
+
+        model.answer_prepared(replays[0], Some(answer()));
+        model.check();
+        let effects = model.take_effects();
+        assert_eq!(acks(&effects), [replays[0]]);
+        assert!(model.ack_request(replays[1]).is_none());
+        assert_eq!(
+            model.usage_state(sessions[1]).unwrap().1,
+            Negotiation::RemoteOfferOutstanding { cseq: 314159 },
+        );
+
+        model.answer_prepared(replays[1], None);
+        model.check();
+        let effects = model.take_effects();
+        assert_eq!(failures(&effects), [sessions[1]]);
+        assert_eq!(model.usage_state(sessions[0]).unwrap().1, {
+            Negotiation::Stable
+        });
+        assert_eq!(model.ack_request(replays[0]).unwrap().1, Some(answer()));
+        assert_eq!(model.ack_request(replays[1]).unwrap().1, None);
+    }
+
+    /// An answer that comes back for a context that is gone, or already has
+    /// its answer, changes nothing. A context that took over the slot of a
+    /// reclaimed one keeps waiting for its own answer, since the key names
+    /// the slot's generation too.
+    #[test]
+    fn stale_provider_completion_cannot_commit_new_exchange() {
+        let mut model = model(Limits { replays: 1, ..limits() });
+        let first = model.start_attempt(&request(INVITE), false).unwrap();
+        model
+            .receive_2xx(first, &callee(), Some(description("v=0 a\r\n")))
+            .unwrap();
+        let old = answers_asked(&model.take_effects())[0].0;
+        model.answer_prepared(old, Some(answer()));
+        model.answer_prepared(old, Some(description("v=0 late\r\n")));
+        assert_eq!(model.ack_request(old).unwrap().1, Some(answer()));
+
+        // The session ends and the responses stop, which reclaims the
+        // context. A second attempt's 2xx takes the only slot there is.
+        model.ack_written(old, true);
+        let session = model.attempt_state(first).unwrap().sessions[0];
+        model.end_usage(session, EndReason::LocalBye);
+        model.response_collection_finished(first);
+        assert!(!model.has_replay(old));
+        let second =
+            model.start_attempt(&invite("second@example.com"), false).unwrap();
+        let second_2xx = callee_with(
+            "a84b4c76e66710@pc33.atlanta.example.com",
+            "second@example.com",
+        );
+        model.take_effects();
+        model
+            .receive_2xx(second, &second_2xx, Some(description("v=0 b\r\n")))
+            .unwrap();
+        let new = answers_asked(&model.take_effects())[0].0;
+        assert_ne!(new, old);
+
+        model.answer_prepared(old, Some(description("v=0 stale\r\n")));
+        model.check();
+
+        assert_eq!(model.take_effects(), []);
+        assert!(model.ack_request(new).is_none(), "still waiting");
+        model.answer_prepared(new, Some(answer()));
+        assert_eq!(model.ack_request(new).unwrap().1, Some(answer()));
+    }
+
+    /// The 2xx of a dialog the UA does not keep, here of an attempt given
+    /// up, still owes the answer to its offer in the ACK. The ACK waits for
+    /// an answer that rejects the offer, and the BYE follows the ACK. Ending
+    /// the dialog was the application's choice, so nothing is degraded.
+    #[test]
+    fn unwanted_late_offer_uses_valid_rejection_answer_then_bye() {
+        let mut model = model(limits());
+        let attempt = model.start_attempt(&request(INVITE), false).unwrap();
+        model.abandon_attempt(attempt).unwrap();
+        model.take_effects();
+        let rejection = description("v=0 m=audio 0\r\n");
+
+        model
+            .receive_2xx(attempt, &callee(), Some(description("v=0 a\r\n")))
+            .unwrap();
+        model.check();
+        let effects = model.take_effects();
+        let asked = answers_asked(&effects);
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].2, None, "an answer that rejects");
+        assert!(
+            acks(&effects).is_empty() && confirmations(&effects).is_empty()
+        );
+
+        model.answer_prepared(asked[0].0, Some(rejection.clone()));
+        let effects = model.take_effects();
+        assert_eq!(acks(&effects), [asked[0].0]);
+        assert_eq!(model.ack_request(asked[0].0).unwrap().1, Some(rejection));
+        model.ack_written(asked[0].0, true);
+        assert_eq!(byes(&model.take_effects()), [asked[0].0]);
+        model.check();
+        let state = model.attempt_state(attempt).unwrap();
+        assert!(state.complete && !state.degraded);
+    }
+
+    /// No answer comes for the offer of a 2xx, as for one the SDP component
+    /// cannot read, or one too late. The ACK goes anyway, without an answer,
+    /// to stop the 2xx's retransmissions, the session ends with a BYE after
+    /// it, and the failure shows: on the session, and on the attempt, which
+    /// is degraded, since the ACK broke RFC 3261 section 13.2.1.
+    #[test]
+    fn malformed_late_offer_uses_bounded_best_effort_teardown_and_reports_failure()
+     {
+        let mut model = model(limits());
+        let attempt = model.start_attempt(&request(INVITE), false).unwrap();
+        model
+            .receive_2xx(attempt, &callee(), Some(description("garbage")))
+            .unwrap();
+        let effects = model.take_effects();
+        let (_, usage) = confirmed(&effects);
+        let replay = answers_asked(&effects)[0].0;
+
+        model.answer_prepared(replay, None);
+        model.check();
+
+        let effects = model.take_effects();
+        assert_eq!(failures(&effects), [usage]);
+        assert_eq!(acks(&effects), [replay]);
+        assert_eq!(session_byes(&effects, usage), 0, "not before the ACK");
+        assert_eq!(model.ack_request(replay).unwrap().1, None);
+        assert!(model.attempt_state(attempt).unwrap().degraded);
+
+        model.ack_written(replay, true);
+        assert_eq!(session_byes(&model.take_effects(), usage), 1);
+        model.bye_started(usage, Ok(())).unwrap();
+        model.check();
+        assert_eq!(
+            model.ended(usage).unwrap().0,
+            EndReason::NegotiationFailed
+        );
+    }
+
+    /// A BYE the application asks for while the ACK waits for its answer
+    /// waits too, so that it does not overtake the ACK.
+    #[test]
+    fn a_bye_waits_for_an_ack_that_waits_for_its_answer() {
+        let mut model = model(limits());
+        let attempt = model.start_attempt(&request(INVITE), false).unwrap();
+        model
+            .receive_2xx(attempt, &callee(), Some(description("v=0 a\r\n")))
+            .unwrap();
+        let effects = model.take_effects();
+        let (_, usage) = confirmed(&effects);
+        let replay = answers_asked(&effects)[0].0;
+
+        let operation = run(&mut model, Command::Terminate { usage });
+        model.check();
+        assert_eq!(session_byes(&model.take_effects(), usage), 0);
+        assert_eq!(model.usage_state(usage).unwrap().0, UsagePhase::Ending);
+
+        model.answer_prepared(replay, Some(answer()));
+        model.ack_written(replay, true);
+        model.check();
+
+        assert_eq!(session_byes(&model.take_effects(), usage), 1);
+        model.bye_started(usage, Ok(())).unwrap();
+        assert_eq!(model.ended(usage).unwrap().0, EndReason::LocalBye);
+        assert_eq!(model.take_outcome(operation), None, "the BYE's response");
+    }
+
+    /// The 2xx of a UAS that took an INVITE without an offer carries the
+    /// application's offer, and the ACK owes the answer. An ACK that comes
+    /// without one still stops the 2xx's retransmissions, since it is the
+    /// ACK, but the exchange fails, and the UA ends the session with a BYE.
+    #[test]
+    fn an_ack_without_the_answer_it_owes_ends_the_session() {
+        let mut model = model(limits());
+        let clock = Clock(Instant::now());
+        let authority = model
+            .receive_invite(&request(INVITE), Ok(Body::Other), clock.now())
+            .unwrap();
+        let exchange = authority.exchange;
+        run(&mut model, Command::Accept { authority, answer: answer() });
+        model.final_committed(exchange, clock.now());
+        let (_, usage) = confirmed(&model.take_effects());
+
+        model.receive_ack(&uas_dialog(), 314159, None);
+        model.check();
+
+        let effects = model.take_effects();
+        assert_eq!(failures(&effects), [usage]);
+        assert!(!negotiated(&effects));
+        assert_eq!(session_byes(&effects, usage), 1);
+        assert_eq!(model.timers.len(), 0, "no more retransmissions");
+        model.bye_started(usage, Ok(())).unwrap();
+        assert_eq!(
+            model.ended(usage).unwrap().0,
+            EndReason::NegotiationFailed
+        );
+    }
+
+    /// A body the UA cannot tell the offer in gets a 415 (RFC 3261 section
+    /// 8.2.3), after Require, and one with malformed Content headers a 400.
+    /// A preview goes only for an INVITE with an offer, since an unreliable
+    /// provisional cannot carry the offer an INVITE without one gets.
+    #[test]
+    fn what_an_incoming_invite_body_allows() {
+        let mut model = model(limits());
+        let clock = Clock(Instant::now());
+        let malformed = Malformed(protocol::Field::ContentType);
+
+        assert_eq!(
+            model.receive_invite(
+                &request(INVITE),
+                Ok(Body::Unsupported),
+                clock.now()
+            ),
+            Err(Refusal::UnsupportedBody),
+        );
+        assert_eq!(Refusal::UnsupportedBody.status().as_u16(), 415);
+        assert_eq!(
+            model.receive_invite(
+                &request(INVITE),
+                Err(malformed),
+                clock.now()
+            ),
+            Err(Refusal::Malformed(protocol::Field::ContentType)),
+        );
+
+        let authority = model
+            .receive_invite(&request(INVITE), Ok(Body::Empty), clock.now())
+            .unwrap();
+        let preview = run(
+            &mut model,
+            Command::Provisional {
+                exchange: authority.exchange,
+                status: StatusCode::from_u16(183).unwrap(),
+                preview: Some(answer()),
+            },
+        );
+        assert_eq!(
+            model.take_outcome(preview),
+            Some(Err(Error::InvalidInput))
+        );
+        model.check();
+    }
+
+    /// A session that ends while its ACK waits for the answer still gets
+    /// that ACK, built from its dialog, once the answer is in.
+    #[test]
+    fn an_ack_waiting_for_its_answer_outlives_its_session() {
+        let mut model = model(limits());
+        let attempt = model.start_attempt(&request(INVITE), false).unwrap();
+        model
+            .receive_2xx(attempt, &callee(), Some(description("v=0 a\r\n")))
+            .unwrap();
+        let effects = model.take_effects();
+        let (_, usage) = confirmed(&effects);
+        let replay = answers_asked(&effects)[0].0;
+
+        model.end_usage(usage, EndReason::Unconfirmed);
+        model.check();
+        model.answer_prepared(replay, Some(answer()));
+        model.check();
+
+        assert_eq!(acks(&model.take_effects()), [replay]);
+        let (ack, answered) = model.ack_request(replay).unwrap();
+        assert_eq!(ack.request.method(), Method::ACK);
+        assert_eq!(answered, Some(answer()));
+    }
+
+    /// The responses of an attempt stop while the first ACK of a 2xx is
+    /// still on its way, as for a late fork near Timer M whose next hop is
+    /// slow to resolve. The ACK's record stays until its first try is over,
+    /// so the BYE that waits for it still goes: the BYE of a failed exchange,
+    /// and the one the application asked for while the answer was prepared.
+    #[test]
+    fn a_bye_after_the_ack_goes_when_the_responses_stop_first() {
+        for asked in [false, true] {
+            let mut model = model(limits());
+            let attempt =
+                model.start_attempt(&request(INVITE), false).unwrap();
+            model
+                .receive_2xx(attempt, &callee(), Some(description("v=0\r\n")))
+                .unwrap();
+            let effects = model.take_effects();
+            let (_, usage) = confirmed(&effects);
+            let replay = answers_asked(&effects)[0].0;
+            if asked {
+                run(&mut model, Command::Terminate { usage });
+            }
+
+            let answer = asked.then(answer);
+            model.answer_prepared(replay, answer);
+            model.response_collection_finished(attempt);
+            model.check();
+            assert!(model.has_replay(replay));
+            model.take_effects();
+            model.ack_written(replay, true);
+            model.check();
+
+            assert_eq!(session_byes(&model.take_effects(), usage), 1);
+            assert!(!model.has_replay(replay));
+            model.bye_started(usage, Ok(())).unwrap();
+            let reason = if asked {
+                EndReason::LocalBye
+            } else {
+                EndReason::NegotiationFailed
+            };
+            assert_eq!(model.ended(usage).unwrap().0, reason);
+        }
     }
 }

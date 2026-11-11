@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 use crate::{
     dialog::{Dialog, DialogId},
     invite::{AttemptKey, Direction, ExchangeKey, UsageKey},
+    negotiation::Description,
     slot::Key,
 };
 
@@ -60,6 +61,26 @@ pub(crate) enum AckObligation {
     Satisfied,
     /// The ACK could not be written, or did not arrive by its deadline.
     Failed,
+}
+
+/// What the ACK of a received 2xx carries.
+///
+/// An ACK carries the answer when its 2xx carried the offer (RFC 3261 section
+/// 13.2.1), and the answer is fixed once it is in. Every copy of the ACK
+/// carries the same one, and a copy of the 2xx asks for no new answer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AckBody {
+    /// No session description, as when the 2xx carried the answer.
+    Empty,
+    /// The ACK waits for the answer to the 2xx's offer, which the runtime
+    /// prepares outside the driver.
+    Preparing,
+    /// The answer to the 2xx's offer.
+    Answer(Description),
+    /// No answer could be had for the 2xx's offer, so the ACK goes without
+    /// one. It still stops the 2xx's retransmissions, but it does not
+    /// complete the exchange, and the dialog ends with a BYE after it.
+    Unanswered,
 }
 
 /// Where the BYE of a cleanup stands.
@@ -128,6 +149,9 @@ pub(crate) struct ReplayContext {
     /// The session the 2xx formed, or `None` for a cleanup.
     pub(crate) usage: Option<UsageKey>,
     pub(crate) ack: AckObligation,
+    /// What the ACK of a received 2xx carries. A 2xx this user agent sent
+    /// keeps `Empty`.
+    pub(crate) ack_body: AckBody,
     /// Set for a 2xx this user agent sent, while it awaits the ACK.
     pub(crate) retransmission: Option<Retransmission>,
     /// The dialog of a cleanup, until its BYE is built. A session's dialog
@@ -155,6 +179,7 @@ impl ReplayContext {
             source,
             usage: Some(usage),
             ack,
+            ack_body: AckBody::Empty,
             retransmission: None,
             dialog: None,
             bye: None,
@@ -177,6 +202,7 @@ impl ReplayContext {
             source: Source::Attempt(attempt),
             usage: None,
             ack: AckObligation::NeedToSend,
+            ack_body: AckBody::Empty,
             retransmission: None,
             dialog: Some(Box::new(dialog)),
             bye: Some(Bye::Owed),
@@ -197,9 +223,17 @@ impl ReplayContext {
     }
 
     /// Derived from the facts above, so it cannot disagree with them.
+    ///
+    /// The first ACK of a received 2xx holds the context too, until its
+    /// first try is over, and so does an answer it waits for. The ACK is owed
+    /// whether or not copies of the 2xx still come, and what follows it, such
+    /// as a BYE that waits for it, goes from its record.
     pub(crate) fn retention(&self) -> Retention {
         let bye_owed = matches!(self.bye, Some(Bye::Owed | Bye::Sending));
-        match (self.duplicates_end && !bye_owed, self.usage_ended) {
+        let ack_owed = self.ack_body == AckBody::Preparing
+            || self.ack == AckObligation::NeedToSend;
+        let done = self.duplicates_end && !bye_owed && !ack_owed;
+        match (done, self.usage_ended) {
             (true, _) => Retention::Reclaimable,
             (false, true) => Retention::ReplayOnly,
             (false, false) => Retention::Live,
@@ -271,12 +305,29 @@ mod tests {
     #[test]
     fn retention_follows_the_duplicates_not_the_usage() {
         let mut replay = context(Direction::Outgoing);
+        replay.ack = AckObligation::Satisfied;
         assert_eq!(replay.retention(), Retention::Live);
 
         replay.usage_ended();
         assert_eq!(replay.retention(), Retention::ReplayOnly);
 
         replay.duplicates_ended();
+        assert_eq!(replay.retention(), Retention::Reclaimable);
+    }
+
+    #[test]
+    fn an_ack_not_yet_tried_holds_the_context() {
+        let mut replay = context(Direction::Outgoing);
+        replay.ack_body = AckBody::Preparing;
+
+        replay.usage_ended();
+        replay.duplicates_ended();
+        assert_eq!(replay.retention(), Retention::ReplayOnly);
+
+        replay.ack_body = AckBody::Unanswered;
+        assert_eq!(replay.retention(), Retention::ReplayOnly);
+
+        replay.ack = AckObligation::Failed;
         assert_eq!(replay.retention(), Retention::Reclaimable);
     }
 
@@ -293,6 +344,7 @@ mod tests {
     #[test]
     fn a_cleanup_waits_for_its_bye() {
         let mut replay = cleanup();
+        replay.ack = AckObligation::Failed;
         assert_eq!(replay.usage, None);
         assert_eq!(replay.retention(), Retention::ReplayOnly);
 

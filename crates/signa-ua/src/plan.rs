@@ -12,17 +12,21 @@ INVITE:
   an Allow of the methods it takes (section 13.2.1).
 
 There is no Supported. This UA supports no extension, and an INVITE without
-Supported says the same. A plan always carries an offer, since the UA cannot
-supply the answer an ACK would owe for an offer in the 2xx.
+Supported says the same.
+
+An INVITE without an offer gets one in its 2xx, and owes the answer in the ACK
+(RFC 3261 section 13.2.1). The UA can send one only when it has a way to have
+that answer prepared, so a plan without an offer is for a UA that has one.
 */
 
 use bytes::Bytes;
 use signa_core::{
     HeaderMap, HeaderName, HeaderValue, Method, Request, Uri,
     message::header::{
-        ALLOW, AUTHORIZATION, CALL_ID, CONTACT, CONTENT_LENGTH, CONTENT_TYPE,
-        CSEQ, FROM, MAX_FORWARDS, PROXY_AUTHORIZATION, PROXY_REQUIRE,
-        RECORD_ROUTE, REQUIRE, ROUTE, SUPPORTED, TO, Tag, VIA,
+        ALLOW, AUTHORIZATION, CALL_ID, CONTACT, CONTENT_DISPOSITION,
+        CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, CSEQ, FROM,
+        MAX_FORWARDS, PROXY_AUTHORIZATION, PROXY_REQUIRE, RECORD_ROUTE,
+        REQUIRE, ROUTE, SUPPORTED, TO, Tag, VIA,
     },
 };
 
@@ -41,11 +45,12 @@ pub(crate) const ALLOWED: &str = "INVITE, ACK, CANCEL, BYE, OPTIONS";
 /// for an extension this UA does not have. So are Authorization and
 /// Proxy-Authorization, since the ACK of a 2xx has to carry the INVITE's
 /// credentials (RFC 3261 section 13.2.2.4), and the UA builds that ACK from
-/// the dialog without them.
+/// the dialog without them. The Content headers describe the offer, which
+/// is the UA's to write.
 ///
 /// TODO: Take credentials, and copy them into the ACK, once the UA answers
 /// a challenge.
-const OWNED: [HeaderName; 17] = [
+const OWNED: [HeaderName; 19] = [
     VIA,
     FROM,
     TO,
@@ -56,6 +61,8 @@ const OWNED: [HeaderName; 17] = [
     ROUTE,
     RECORD_ROUTE,
     CONTENT_TYPE,
+    CONTENT_DISPOSITION,
+    CONTENT_ENCODING,
     CONTENT_LENGTH,
     ALLOW,
     SUPPORTED,
@@ -65,7 +72,7 @@ const OWNED: [HeaderName; 17] = [
     PROXY_AUTHORIZATION,
 ];
 
-/// An initial INVITE to send, with the offer it carries.
+/// An initial INVITE to send, with the offer it carries, if any.
 ///
 /// The UA picks the From tag, the Call-ID and the first CSeq number, and adds
 /// its Contact, Max-Forwards and Allow. Everything else comes from the plan.
@@ -78,7 +85,7 @@ pub struct InvitePlan {
     display_name: Option<Box<str>>,
     routes: Vec<Uri>,
     headers: HeaderMap,
-    offer: Description,
+    offer: Option<Description>,
 }
 
 // Only the runtime makes a plan.
@@ -95,8 +102,32 @@ impl InvitePlan {
             display_name: None,
             routes: Vec::new(),
             headers: HeaderMap::new(),
-            offer,
+            offer: Some(offer),
         }
+    }
+
+    /// Plans an INVITE to `request_uri` from `from` without an offer, a late
+    /// offer. The 2xx of each fork then carries an offer, and the ACK owes
+    /// the answer (RFC 3261 section 13.2.1), which the UA has the
+    /// [`Negotiate`] of its configuration prepare. A UA without one refuses
+    /// such a plan, since it could only answer with an empty ACK.
+    ///
+    /// [`Negotiate`]: crate::Negotiate
+    pub fn without_offer(request_uri: Uri, from: Uri) -> InvitePlan {
+        InvitePlan {
+            request_uri,
+            from,
+            to: None,
+            display_name: None,
+            routes: Vec::new(),
+            headers: HeaderMap::new(),
+            offer: None,
+        }
+    }
+
+    /// Says whether the INVITE carries an offer.
+    pub(crate) fn has_offer(&self) -> bool {
+        self.offer.is_some()
     }
 
     /// Sets the URI of the To.
@@ -136,7 +167,7 @@ impl InvitePlan {
 
     /// Says whether the UA can send the plan: each URI is a SIP or SIPS URI
     /// with only what Table 1 of RFC 3261 section 19.1.1 allows where it goes,
-    /// no header is one the UA writes, the offer has a body, and the display
+    /// no header is one the UA writes, an offer has a body, and the display
     /// name can be quoted.
     pub(crate) fn is_valid(&self) -> bool {
         let fits = |uri: &Uri, place| allowed_in(uri.as_str(), place);
@@ -149,7 +180,7 @@ impl InvitePlan {
             && parties
             && self.routes.iter().all(|uri| fits(uri, Place::Dialog))
             && self.headers.iter().all(|(name, _)| !OWNED.contains(name))
-            && !self.offer.body().is_empty()
+            && self.offer.as_ref().is_none_or(|offer| !offer.body().is_empty())
             && self.display_name.as_deref().is_none_or(quotable)
     }
 
@@ -198,10 +229,18 @@ impl InvitePlan {
             request = request.header(name.clone(), value.clone());
         }
 
-        let request = request
-            .header(CONTENT_TYPE, self.offer.content_type().clone())
-            .body(self.offer.body().clone())
-            .ok()?;
+        let request = match &self.offer {
+            Some(offer) => {
+                request =
+                    request.header(CONTENT_TYPE, offer.content_type().clone());
+                if offer.needs_disposition() {
+                    request = request.header(CONTENT_DISPOSITION, "session");
+                }
+                request.body(offer.body().clone())
+            }
+            None => request.body(Bytes::new()),
+        }
+        .ok()?;
         Some(PlannedInvite {
             request,
             next_hop: target.next_hop,
@@ -370,6 +409,10 @@ mod tests {
             plan().to(uri("sip:bob@example.com?Subject=x")),
             plan().route(uri("sip:p1.example.com;lr;method=INVITE")),
             plan().route(uri("sip:p1.example.com;lr?Subject=x")),
+            plan().header(
+                CONTENT_DISPOSITION,
+                HeaderValue::from_static("render"),
+            ),
         ];
 
         for plan in refused {
@@ -377,6 +420,41 @@ mod tests {
             assert!(plan.build(&identity(), "sip:a@192.0.2.1").is_none());
         }
         assert!(plan().is_valid());
+    }
+
+    /// A plan without an offer makes an INVITE without a body or Content
+    /// headers. A description of a type other than `application/sdp` goes
+    /// with `Content-Disposition: session`, without which RFC 3261 section
+    /// 20.11 would not take it for one.
+    #[test]
+    fn the_offer_decides_the_body() {
+        let offerless = InvitePlan::without_offer(
+            uri("sip:bob@biloxi.example.com"),
+            uri("sip:alice@atlanta.example.com"),
+        );
+        let other = InvitePlan::new(
+            uri("sip:bob@biloxi.example.com"),
+            uri("sip:alice@atlanta.example.com"),
+            Description::new(
+                HeaderValue::from_static("application/vnd.example"),
+                Bytes::from_static(b"offer"),
+            ),
+        );
+
+        let request = offerless
+            .build(&identity(), "sip:alice@192.0.2.1")
+            .unwrap()
+            .request;
+        assert!(request.body().is_empty());
+        assert!(request.headers().get(CONTENT_TYPE).is_none());
+
+        let request =
+            other.build(&identity(), "sip:alice@192.0.2.1").unwrap().request;
+        assert_eq!(request.headers().get(CONTENT_DISPOSITION).unwrap(), {
+            "session"
+        });
+        let sdp = plan().build(&identity(), "sip:a@192.0.2.1").unwrap();
+        assert!(sdp.request.headers().get(CONTENT_DISPOSITION).is_none());
     }
 
     /// A first route without `lr` takes the Request-URI, and the planned
@@ -419,7 +497,7 @@ mod tests {
         let planned = InvitePlan::new(
             uri("sips:bob@biloxi.example.com"),
             uri("sips:alice@atlanta.example.com"),
-            plan().offer,
+            plan().offer.unwrap(),
         )
         .route(uri("sip:192.0.2.10"))
         .build(&identity(), "sip:alice@192.0.2.1")
@@ -437,7 +515,7 @@ mod tests {
         let request = InvitePlan::new(
             uri("sip:bob@192.0.2.4:5070;transport=tcp;user=phone;x=y"),
             uri("sip:alice@atlanta.example.com"),
-            plan().offer,
+            plan().offer.unwrap(),
         )
         .build(&identity(), "sip:alice@192.0.2.1")
         .unwrap()

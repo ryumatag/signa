@@ -6,6 +6,7 @@ side by hand, so that what goes on the wire is what the test checks.
 */
 
 use std::{
+    future::Future,
     net::SocketAddr,
     sync::{
         Arc,
@@ -23,8 +24,9 @@ use signa_core::{
 };
 use signa_ua::{
     AttachError, AttemptResult, CancelResult, Config, Description, EndReason,
-    Error, Event, InvitePlan, Query, Resolve, ResolveError, Session,
-    SessionPhase, StaticResolver, Ua, UaEvents, attach,
+    Error, Event, InvitePlan, Negotiate, NegotiationState, Offer, Query,
+    Resolve, ResolveError, Session, SessionPhase, StaticResolver, Ua,
+    UaEvents, attach,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -860,26 +862,28 @@ async fn the_decision_timeout_answers_an_undecided_invite() {
     peer.quiet("SIP/2.0 200", Duration::from_millis(200)).await;
 }
 
-/// An INVITE without an offer gets a 488 before the application sees it,
-/// since this UA cannot check the answer its ACK would carry yet. One that
-/// requires an extension gets a 420 that lists it as unsupported.
+/// An INVITE whose body may hold its offer where the UA cannot take it out,
+/// as a multipart body, gets a 415 that says what the UA takes (RFC 3261
+/// section 21.4.13), before the application sees it. One that requires an
+/// extension gets a 420 that lists it as unsupported.
 #[tokio::test]
-async fn an_offerless_or_extended_invite_is_refused() {
+async fn a_multipart_or_extended_invite_is_refused() {
     let (mut ua, udp, _) = start_fast();
     tokio::spawn(ua.driver);
     let peer = Peer::new().await;
-    let offerless = invite_to_ua(peer.address(), "offerless").replace(
-        "Content-Type: application/sdp\nContent-Length: 5\n\nv=0\n",
-        "Content-Length: 0\n\n",
+    let multipart = invite_to_ua(peer.address(), "multipart").replace(
+        "Content-Type: application/sdp\n",
+        "Content-Type: multipart/mixed;boundary=x\n",
     );
     let extended = invite_to_ua(peer.address(), "extended").replace(
         "Max-Forwards: 70\n",
         "Max-Forwards: 70\nRequire: 100rel, timer\n",
     );
 
-    peer.send(&offerless, udp).await;
-    let (refused, _) = peer.recv_starting("SIP/2.0 488").await;
-    assert_eq!(header(&refused, "Call-ID"), ["offerless"]);
+    peer.send(&multipart, udp).await;
+    let (refused, _) = peer.recv_starting("SIP/2.0 415").await;
+    assert_eq!(header(&refused, "Call-ID"), ["multipart"]);
+    assert_eq!(header(&refused, "Accept"), ["application/sdp"]);
     assert!(header(&refused, "To")[0].contains(";tag="));
 
     peer.send(&extended, udp).await;
@@ -1992,6 +1996,14 @@ async fn incoming_requests_report_their_flow() {
 /// A UA with its own endpoint on loopback, whose Contact names its address,
 /// so that another UA's requests in the dialog reach it.
 fn ua_on(transport: &str) -> (Ua, SocketAddr) {
+    let (endpoint, incoming, address) = bound(transport);
+    let contact = format!("sip:ua@{address};transport={transport}");
+    let config = Config::new(&contact).unwrap().timers(fast());
+    (attach(endpoint, incoming, config).unwrap(), address)
+}
+
+/// An endpoint on `transport` with [`fast`] timers, and its address.
+fn bound(transport: &str) -> (Endpoint, Incoming, SocketAddr) {
     let local = "127.0.0.1:0".parse().unwrap();
     let builder = Endpoint::builder().timers(fast());
     let builder = if transport == "tcp" {
@@ -2005,9 +2017,7 @@ fn ua_on(transport: &str) -> (Ua, SocketAddr) {
     } else {
         endpoint.udp_addr().unwrap()
     };
-    let contact = format!("sip:ua@{address};transport={transport}");
-    let config = Config::new(&contact).unwrap().timers(fast());
-    (attach(endpoint, incoming, config).unwrap(), address)
+    (endpoint, incoming, address)
 }
 
 /// Two UAs make a call, over UDP and over TCP. The caller's INVITE is
@@ -2220,4 +2230,402 @@ async fn a_bye_without_room_for_its_answer_changes_nothing() {
     })
     .await;
     assert!(matches!(reason, EndReason::RemoteBye { .. }));
+}
+
+/// A stand-in for an SDP component, which an application plugs in as its
+/// [`Negotiate`] without signa-ua depending on it. It answers each `m=` line
+/// of an offer with the same media on a port of its own, or on port 0 when
+/// the UA is to end the dialog, which rejects the stream (RFC 3264 section
+/// 6). It has no answer for an offer that does not start with `v=0`, and
+/// never answers one whose session name is `hang`, as a component that
+/// hangs.
+#[derive(Clone, Default)]
+struct Sdp {
+    calls: Arc<AtomicUsize>,
+}
+
+impl Negotiate for Sdp {
+    fn answer(
+        &self,
+        offer: &Offer,
+    ) -> impl Future<Output = Option<Description>> + Send {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let text = String::from_utf8(offer.description().body().to_vec());
+        let port = if offer.session().is_some() { 49170 } else { 0 };
+
+        async move {
+            let text = text.ok().filter(|text| text.starts_with("v=0"))?;
+            if text.contains("s=hang") {
+                std::future::pending::<()>().await;
+            }
+            let mut answer = String::from(
+                "v=0\r\no=- 2 2 IN IP4 127.0.0.1\r\ns=-\r\n\
+                 c=IN IP4 127.0.0.1\r\nt=0 0\r\n",
+            );
+            for line in text.lines().filter(|line| line.starts_with("m=")) {
+                let mut fields = line[2..].splitn(3, ' ');
+                let (media, _, rest) =
+                    (fields.next()?, fields.next()?, fields.next()?);
+                answer.push_str(&format!("m={media} {port} {rest}\r\n"));
+            }
+            Some(Description::new(
+                HeaderValue::from_static("application/sdp"),
+                Bytes::from(answer),
+            ))
+        }
+    }
+}
+
+/// An SDP offer whose session name is `name`.
+fn offer_named(name: &str) -> String {
+    format!(
+        "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns={name}\r\n\
+         c=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 4000 RTP/AVP 0\r\n"
+    )
+}
+
+fn described(text: &str) -> Description {
+    Description::new(
+        HeaderValue::from_static("application/sdp"),
+        Bytes::from(text.to_owned()),
+    )
+}
+
+/// The 2xx of the peer to an INVITE it received as `request`, carrying
+/// `body` as an SDP offer, as one without an offer gets it.
+fn ok_offering(request: &str, tag: &str, contact: &str, body: &str) -> String {
+    let request = Request::from_bytes(request.as_bytes()).unwrap();
+    let response = Response::reply_to(&request)
+        .status(StatusCode::OK)
+        .to_tag(tag)
+        .header("Contact", format!("<{contact}>").as_str())
+        .header("Content-Type", "application/sdp")
+        .body(Bytes::from(body.to_owned()));
+    String::from_utf8(response.unwrap().to_bytes().to_vec()).unwrap()
+}
+
+/// The body of a message, after its head.
+fn body(message: &str) -> &str {
+    message.split_once("\r\n\r\n").unwrap().1
+}
+
+/// A UA with the [`Sdp`] stand-in as its negotiator, on UDP with
+/// [`fast`] timers, and the stand-in's count of calls.
+fn negotiating(answer_timeout: Duration) -> (Ua, SocketAddr, Sdp) {
+    negotiating_with(answer_timeout, 64)
+}
+
+/// [`negotiating`] with at most `answers` prepared at once.
+fn negotiating_with(
+    answer_timeout: Duration,
+    answers: usize,
+) -> (Ua, SocketAddr, Sdp) {
+    let (endpoint, incoming, address) = bound("udp");
+    let sdp = Sdp::default();
+    let config = Config::new(&format!("sip:ua@{address}"))
+        .unwrap()
+        .timers(fast())
+        .negotiator(sdp.clone())
+        .max_answers(answers)
+        .answer_timeout(answer_timeout);
+    (attach(endpoint, incoming, config).unwrap(), address, sdp)
+}
+
+/// A UA without a [`Negotiate`] refuses a plan without an offer, and hands
+/// it back, since it could only answer the 2xx's offer with an empty ACK.
+#[tokio::test]
+async fn a_plan_without_an_offer_needs_a_negotiator() {
+    let (ua, _, _) = start_fast();
+    let plan = InvitePlan::without_offer(
+        "sip:peer@127.0.0.1".parse().unwrap(),
+        "sip:ua@127.0.0.1".parse().unwrap(),
+    );
+
+    let refused = ua.handle.try_invite(plan).unwrap_err();
+    assert_eq!(refused.error(), Error::InvalidInput);
+}
+
+/// An INVITE sent without an offer gets the offer in its 2xx, and the ACK
+/// carries the answer the negotiator prepared (RFC 3261 section 13.2.1). A
+/// copy of the 2xx gets the very same ACK, and the negotiator is not asked
+/// again.
+#[tokio::test]
+async fn offerless_invite_offer_in_2xx_answer_in_ack() {
+    let (mut ua, _, sdp) = negotiating(WAIT);
+    tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+    let to = peer.address().to_string();
+    let plan = InvitePlan::without_offer(
+        format!("sip:peer@{to}").parse().unwrap(),
+        "sip:ua@127.0.0.1".parse().unwrap(),
+    );
+
+    ua.handle.try_invite(plan).unwrap().await.unwrap();
+    let (request, from) = peer.recv_starting("INVITE").await;
+    assert!(header(&request, "Content-Type").is_empty());
+    assert_eq!(body(&request), "");
+    let (contact, offer) = (format!("sip:peer@{to}"), offer_named("call"));
+    let ok = ok_offering(&request, "late", &contact, &offer);
+    peer.send(&ok, from).await;
+    let (ack, _) = peer.recv_starting("ACK").await;
+    peer.send(&ok, from).await;
+    let (again, _) = peer.recv_starting("ACK").await;
+
+    assert_eq!(header(&ack, "Content-Type"), ["application/sdp"]);
+    assert!(body(&ack).contains("m=audio 49170 RTP/AVP 0"));
+    assert_eq!(again, ack);
+    assert_eq!(sdp.calls.load(Ordering::SeqCst), 1);
+    let session = event(&mut ua.events, |event| match event {
+        Event::Negotiated { session, .. } => Some(session),
+        _ => None,
+    })
+    .await;
+    let snapshot = ua.handle.snapshot(&session).await.unwrap().unwrap();
+    assert_eq!(snapshot.negotiation, NegotiationState::Settled);
+    assert_eq!(snapshot.remote_description, Some(described(&offer)));
+}
+
+/// Two UAs make a call with a late offer: the caller sends no offer, the
+/// callee's application accepts with one, and the caller's negotiator puts
+/// the answer in the ACK. Both sides report the exchange complete, and the
+/// callee's session has the answer.
+#[tokio::test]
+async fn two_uas_negotiate_a_late_offer() {
+    let (Ua { handle: caller, events: mut caller_events, driver }, _, _) =
+        negotiating(WAIT);
+    tokio::spawn(driver);
+    let (Ua { handle: callee, events: mut callee_events, driver }, address) =
+        ua_on("udp");
+    tokio::spawn(driver);
+    let plan = InvitePlan::without_offer(
+        format!("sip:ua@{address}").parse().unwrap(),
+        "sip:caller@127.0.0.1".parse().unwrap(),
+    );
+
+    caller.try_invite(plan).unwrap().await.unwrap();
+    let incoming = invite(&mut callee_events).await;
+    assert_eq!(incoming.offer(), None);
+    let answered = incoming
+        .try_accept(described(&offer_named("callee")))
+        .unwrap()
+        .await
+        .unwrap();
+
+    let settled = event(&mut callee_events, |event| match event {
+        Event::Negotiated { session, .. } => Some(session),
+        _ => None,
+    })
+    .await;
+    assert_eq!(settled, answered);
+    event(&mut caller_events, |event| match event {
+        Event::Negotiated { .. } => Some(()),
+        _ => None,
+    })
+    .await;
+    let snapshot = callee.snapshot(&answered).await.unwrap().unwrap();
+    assert_eq!(snapshot.negotiation, NegotiationState::Settled);
+    let answer = snapshot.remote_description.unwrap();
+    assert!(String::from_utf8_lossy(answer.body()).contains("m=audio 49170"));
+}
+
+/// A negotiator that never answers holds up only the ACK that waits for its
+/// answer. Another call's ACK and a CANCEL go meanwhile. At the answer
+/// timeout the waiting ACK goes without an answer, to stop the 2xx's
+/// retransmissions, a BYE ends the session, and the attempt reports itself
+/// degraded.
+#[tokio::test]
+async fn provider_timeout_does_not_block_unrelated_ack_or_cancel() {
+    let (mut ua, _, _) = negotiating(Duration::from_millis(500));
+    tokio::spawn(ua.driver);
+    let (hung, other, cancelled) =
+        (Peer::new().await, Peer::new().await, Peer::new().await);
+    let late = InvitePlan::without_offer(
+        format!("sip:peer@{}", hung.address()).parse().unwrap(),
+        "sip:ua@127.0.0.1".parse().unwrap(),
+    );
+
+    let attempt = ua.handle.try_invite(late).unwrap().await.unwrap();
+    let (request, from) = hung.recv_starting("INVITE").await;
+    let contact = format!("sip:peer@{}", hung.address());
+    let ok = ok_offering(&request, "hung", &contact, &offer_named("hang"));
+    hung.send(&ok, from).await;
+    hung.quiet("ACK", Duration::from_millis(100)).await;
+
+    let to = other.address().to_string();
+    ua.handle.try_invite(plan_to(&to, "other")).unwrap().await.unwrap();
+    let (request, from) = other.recv_starting("INVITE").await;
+    let ok_other = answer(&request, "200", "other", &format!("sip:peer@{to}"));
+    other.send(&ok_other, from).await;
+    let (ack, _) = other.recv_starting("ACK").await;
+    assert_eq!(header(&ack, "Call-ID"), header(&request, "Call-ID"));
+
+    let to = cancelled.address().to_string();
+    let ringing = ua.handle.try_invite(plan_to(&to, "ring")).unwrap().await;
+    let ringing = ringing.unwrap();
+    let (request, from) = cancelled.recv_starting("INVITE").await;
+    cancelled.send(&reply_with(&request, 180, "ring"), from).await;
+    let cancel = ua.handle.try_cancel(&ringing).unwrap();
+    assert_eq!(cancel.await, Ok(CancelResult::Sent));
+    cancelled.recv_starting("CANCEL").await;
+
+    let (unanswered, _) = hung.recv_starting("ACK").await;
+    assert!(header(&unanswered, "Content-Type").is_empty());
+    assert_eq!(body(&unanswered), "");
+    let (bye, _) = hung.recv_starting("BYE").await;
+    assert_eq!(header(&bye, "Call-ID"), header(&unanswered, "Call-ID"));
+    let failed = event(&mut ua.events, |event| match event {
+        Event::NegotiationFailed { session, .. } => Some(session),
+        _ => None,
+    })
+    .await;
+    let state = ua.handle.attempt_snapshot(&attempt).await.unwrap().unwrap();
+    assert!(state.degraded);
+    let snapshot = ua.handle.snapshot(&failed).await.unwrap().unwrap();
+    assert_eq!(snapshot.end_reason, Some(EndReason::NegotiationFailed));
+}
+
+/// The ACK of the peer for the 2xx `ok` to its INVITE `call`, carrying
+/// `answer` as its body.
+fn ack_with(ok: &str, peer: SocketAddr, call: &str, answer: &str) -> String {
+    ack_for(ok, peer, call, 1).replace(
+        "Content-Length: 0\n",
+        &format!(
+            "Content-Type: application/sdp\nContent-Length: {}\n",
+            answer.len()
+        ),
+    ) + answer
+}
+
+/// An INVITE without an offer reaches the application, whose 2xx carries
+/// the offer. The ACK brings the answer, which completes the exchange, and
+/// the session keeps it. An ACK without the answer still stops the 2xx's
+/// retransmissions, but fails the exchange, and the UA ends the session with
+/// a BYE.
+#[tokio::test]
+async fn an_offerless_invite_gets_its_answer_in_the_ack() {
+    let (mut ua, udp, _) = start_fast();
+    tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+    // Without a Record-Route, so that the BYE goes straight to the peer.
+    let offerless = |call: &str| {
+        direct_invite(peer.address(), call).replace(
+            "Content-Type: application/sdp\nContent-Length: 5\n\nv=0\n",
+            "Content-Length: 0\n\n",
+        )
+    };
+    let mine = described(&offer_named("ua"));
+
+    for call in ["answered", "unanswered"] {
+        peer.send(&offerless(call), udp).await;
+        let incoming = invite(&mut ua.events).await;
+        assert_eq!(incoming.offer(), None);
+        let session =
+            incoming.try_accept(mine.clone()).unwrap().await.unwrap();
+        let (ok, _) = peer.recv_starting("SIP/2.0 200").await;
+        assert_eq!(header(&ok, "Content-Type"), ["application/sdp"]);
+        assert_eq!(body(&ok), offer_named("ua"));
+
+        let theirs = "v=0\r\ns=peer\r\n";
+        let ack = if call == "answered" {
+            ack_with(&ok, peer.address(), call, theirs)
+        } else {
+            ack_for(&ok, peer.address(), call, 1)
+        };
+        peer.send(&ack, udp).await;
+
+        if call == "answered" {
+            let settled = event(&mut ua.events, |event| match event {
+                Event::Negotiated { session, .. } => Some(session),
+                _ => None,
+            })
+            .await;
+            assert_eq!(settled, session);
+            let snapshot = ua.handle.snapshot(&session).await.unwrap();
+            let snapshot = snapshot.unwrap();
+            assert_eq!(snapshot.remote_description, Some(described(theirs)));
+            assert_eq!(snapshot.phase, SessionPhase::Established);
+        } else {
+            let failed = event(&mut ua.events, |event| match event {
+                Event::NegotiationFailed { session, .. } => Some(session),
+                _ => None,
+            })
+            .await;
+            assert_eq!(failed, session);
+            let (bye, _) = peer.recv_starting("BYE").await;
+            assert_eq!(header(&bye, "Call-ID"), [call]);
+            let reason = event(&mut ua.events, |event| match event {
+                Event::Ended { reason, .. } => Some(reason),
+                _ => None,
+            })
+            .await;
+            assert_eq!(reason, EndReason::NegotiationFailed);
+        }
+        peer.quiet("SIP/2.0 200", Duration::from_millis(100)).await;
+    }
+}
+
+/// A provisional response previews the answer, as for early media, and
+/// carries it. The 2xx has to carry the same answer, so an accept with
+/// another is handed back, and one with the preview goes.
+#[tokio::test]
+async fn a_provisional_previews_the_answer() {
+    let (mut ua, udp, _) = start_fast();
+    tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+    let progress = StatusCode::from_u16(183).unwrap();
+    let preview = described("v=0\r\ns=preview\r\n");
+
+    peer.send(&invite_to_ua(peer.address(), "preview"), udp).await;
+    let mut incoming = invite(&mut ua.events).await;
+    assert_eq!(incoming.offer(), Some(&sdp()));
+    let sent = incoming.try_provisional_with(progress, preview.clone());
+    assert_eq!(sent.unwrap().await, Ok(()));
+    let (early, _) = peer.recv_starting("SIP/2.0 183").await;
+    assert_eq!(body(&early), "v=0\r\ns=preview\r\n");
+
+    let refused = incoming.try_accept(sdp()).unwrap_err();
+    assert_eq!(refused.error(), Error::InvalidInput);
+    let (incoming, _) = refused.into_inner();
+    incoming.try_accept(preview).unwrap().await.unwrap();
+    let (ok, _) = peer.recv_starting("SIP/2.0 200").await;
+    assert_eq!(body(&ok), body(&early));
+    assert_eq!(header(&ok, "To"), header(&early, "To"));
+}
+
+/// The answer timeout counts from the 2xx, also for an offer that waits for
+/// a free job. With one job and three offers whose answers never come, each
+/// ACK goes, without an answer, about one timeout after its 2xx, rather than
+/// one timeout after the offer ahead of it gave up.
+#[tokio::test]
+async fn answers_waiting_for_a_job_are_due_from_their_2xx() {
+    let timeout_after = Duration::from_millis(300);
+    let (ua, _, _) = negotiating_with(timeout_after, 1);
+    tokio::spawn(ua.driver);
+    let peers = [Peer::new().await, Peer::new().await, Peer::new().await];
+
+    let mut oks = Vec::new();
+    for peer in &peers {
+        let plan = InvitePlan::without_offer(
+            format!("sip:peer@{}", peer.address()).parse().unwrap(),
+            "sip:ua@127.0.0.1".parse().unwrap(),
+        );
+        ua.handle.try_invite(plan).unwrap().await.unwrap();
+        let (request, from) = peer.recv_starting("INVITE").await;
+        let contact = format!("sip:peer@{}", peer.address());
+        oks.push((
+            ok_offering(&request, "hung", &contact, &offer_named("hang")),
+            from,
+        ));
+    }
+    let start = tokio::time::Instant::now();
+    for (peer, (ok, from)) in peers.iter().zip(&oks) {
+        peer.send(ok, *from).await;
+    }
+
+    for peer in &peers {
+        let (ack, _) = peer.recv_starting("ACK").await;
+        assert_eq!(body(&ack), "");
+    }
+    // Three timeouts one after the other would take 900 ms.
+    assert!(start.elapsed() < timeout_after * 2, "{:?}", start.elapsed());
 }

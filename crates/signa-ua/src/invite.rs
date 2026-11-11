@@ -155,6 +155,13 @@ pub enum EndReason {
     /// Its early dialog ended without a 2xx: the INVITE got another final
     /// response or failed, or its responses stopped (RFC 3261 section 12.3).
     Unconfirmed,
+    /// The offer/answer exchange of its INVITE failed, so the UA ended the
+    /// session with a BYE: the 2xx or the ACK lacked the answer or offer it
+    /// owed (RFC 3261 section 13.2.1), or no answer could be had for the
+    /// offer of a 2xx. [`Event::NegotiationFailed`] said so before.
+    ///
+    /// [`Event::NegotiationFailed`]: crate::Event::NegotiationFailed
+    NegotiationFailed,
 }
 
 impl InviteAttempt {
@@ -230,8 +237,11 @@ pub(crate) struct InviteUsage {
     /// Kept per usage, so that each fork negotiates on its own.
     pub(crate) negotiation: Negotiation,
     /// The last session description the peer sent in this usage: the offer
-    /// of an INVITE this user agent took, or the answer in the 2xx of one it
-    /// sent.
+    /// of an INVITE this user agent took and the answer in its ACK, or what
+    /// the provisional responses and the 2xx of one it sent carried. A
+    /// preview an unreliable provisional gave of the answer stays, whatever
+    /// the 2xx carries, since the UAC takes the first description as the
+    /// answer (RFC 3261 section 13.2.1).
     pub(crate) remote: Option<Description>,
     /// The BYE that is to end the usage, once asked for.
     pub(crate) bye: ByeIntent,
@@ -242,10 +252,13 @@ pub(crate) struct InviteUsage {
 pub(crate) enum ByeIntent {
     /// Nobody asked to end the usage.
     None,
-    /// The application asked, and the BYE waits for the ACK of this user
-    /// agent's 2xx. RFC 3261 section 15 keeps a callee from sending a BYE
-    /// before that ACK or the end of its server transaction.
-    Deferred { operation: Option<OperationId> },
+    /// The BYE waits for an ACK. A callee waits for the ACK of its 2xx,
+    /// since RFC 3261 section 15 keeps it from sending a BYE before that ACK
+    /// or the end of its server transaction. A caller waits for its own ACK
+    /// to go when the ACK has to carry an answer still being prepared, so
+    /// that the BYE does not overtake it. `operation` is the application's,
+    /// if it asked, and `reason` what the session ends with.
+    Deferred { operation: Option<OperationId>, reason: EndReason },
     /// The BYE is on its way to the core.
     Sending,
 }
@@ -340,12 +353,23 @@ pub(crate) enum Scope {
         /// final is under way.
         expires_due: Option<Instant>,
         /// The last provisional response the application chose, and when it
-        /// is due again, while no final is under way.
-        provisional: Option<(StatusCode, Instant)>,
+        /// is due again, while no final is under way. It may carry a preview
+        /// of the answer, so it is boxed to keep the scope small.
+        provisional: Option<Box<Provisional>>,
         /// How the caller gave the INVITE up before it had a final response,
         /// if it did. It is rare, and a BYE's flow is large, so it is boxed.
         withdrawn: Option<Box<Withdrawal>>,
     },
+}
+
+/// A provisional response the UA sends again until a final is under way
+/// (RFC 3261 section 13.3.1.1).
+#[derive(Debug)]
+pub(crate) struct Provisional {
+    pub(crate) status: StatusCode,
+    /// The preview of the answer it carried, if any.
+    pub(crate) preview: Option<Description>,
+    pub(crate) due: Instant,
 }
 
 /// How a caller gives up an INVITE that has no final response yet.
@@ -405,10 +429,10 @@ pub(crate) struct InviteExchange {
     pub(crate) cseq: u32,
     state: ExchangeState,
     /// An ACK that arrived while the 2xx was handed to the core and its
-    /// verdict had not come back, and whether it carried an answer. The core
-    /// takes the 2xx before it sends it, so the ACK is for this 2xx, and it
-    /// applies once the verdict is in.
-    pub(crate) early_ack: Option<bool>,
+    /// verdict had not come back, with the session description it carried,
+    /// if any. The core takes the 2xx before it sends it, so the ACK is for
+    /// this 2xx, and it applies once the verdict is in.
+    pub(crate) early_ack: Option<Option<Description>>,
 }
 
 /// The final response of an exchange is already decided or under way.
@@ -577,12 +601,12 @@ mod tests {
         let mut usage = InviteUsage::early(
             dialog(),
             Direction::Outgoing,
-            Negotiation::LocalOfferOutstanding,
+            Negotiation::LocalOfferOutstanding { cseq: 1 },
         );
         let mut ending = InviteUsage::early(
             dialog(),
             Direction::Outgoing,
-            Negotiation::LocalOfferOutstanding,
+            Negotiation::LocalOfferOutstanding { cseq: 1 },
         );
 
         usage.establish();
