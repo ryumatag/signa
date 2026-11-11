@@ -1,25 +1,29 @@
 /*!
 re-INVITEs in either direction (RFC 3261 section 14): the remote target a 2xx
 refreshes (RFC 6141 section 4.6), re-INVITEs that overlap or cross (RFC 3261
-section 14.2), and one without an offer.
+section 14.2), one without an offer, and the races of RFC 5407 with a BYE
+(section 3.2.3) and with the ACK of the initial 2xx (sections 3.1.4 and
+3.1.5).
 */
 
 use std::{net::SocketAddr, sync::atomic::Ordering, time::Duration};
 
 use signa_core::StatusCode;
 use signa_ua::{
-    Error, Event, InvitePlan, NegotiationState, ReinvitePlan, SessionPhase, Ua,
+    Error, Event, InvitePlan, NegotiationState, ReinvitePlan, Session,
+    SessionPhase, Ua, UaEvents,
 };
 
 use crate::support::{
     WAIT, call_from, config,
-    events::{event, invite, reinvite},
+    events::{event, events_for, invite, reinvite},
     message::{
-        answer, body, branch, described, header, offer_named, ok_offering,
-        ok_to, reinvite_of, reply_with, sdp,
+        ack_answering, ack_for, answer, body, branch, described,
+        direct_invite, header, in_dialog, offer_named, offerless_invite,
+        ok_offering, ok_to, reinvite_of, reply_with, sdp,
     },
     negotiating,
-    peer::Peer,
+    peer::{Peer, Raw},
     start, start_fast, ua_on,
 };
 
@@ -323,4 +327,181 @@ async fn a_reinvite_without_an_offer_answers_in_the_ack() {
     tokio::spawn(driver);
     let refused = handle.try_reinvite(&session, ReinvitePlan::without_offer());
     assert_eq!(refused.unwrap_err().error(), Error::InvalidInput);
+}
+
+/// Sets up a call from the raw `peer` to the UA, accepted and acknowledged,
+/// and returns the UA's 2xx and the session.
+async fn called_by(
+    peer: &mut Raw,
+    events: &mut UaEvents,
+    call: &str,
+) -> (String, Session) {
+    let me = peer.address();
+    peer.send(&direct_invite(me, call)).await;
+    let accepted = invite(events).await.try_accept(sdp()).unwrap();
+    let ok = peer.recv_answer("SIP/2.0 200", "1 INVITE").await;
+    peer.send(&ack_for(&ok, me, call, 1)).await;
+    // The UA sends no re-INVITE of its own before the ACK is in (RFC 3261
+    // section 14.1), so a test waits for it, and drops a copy of the 2xx
+    // that was on its way.
+    peer.drain(Duration::from_millis(60)).await;
+    (ok, accepted.await.unwrap())
+}
+
+/// The UA hangs up right after it sent a re-INVITE, and the 2xx to the
+/// re-INVITE crosses the BYE (RFC 5407 section 3.2.3). The 2xx still gets
+/// its ACK, a new transaction with the re-INVITE's CSeq number, and the
+/// re-INVITE fails with `SessionEnded`, since the session ended at the BYE.
+/// Over UDP and TCP.
+#[tokio::test]
+async fn a_2xx_that_crosses_the_bye_still_gets_its_ack() {
+    for transport in ["UDP", "TCP"] {
+        let (mut ua, udp, tcp) = start_fast();
+        let driver = tokio::spawn(ua.driver);
+        let mut peer = Raw::start(transport, udp, tcp).await;
+        let contact = format!("sip:peer@{}", peer.address());
+        let (_, session) = called_by(&mut peer, &mut ua.events, "hold").await;
+
+        let plan = ReinvitePlan::new(described(&offer_named("hold")));
+        let reinviting = ua.handle.try_reinvite(&session, plan).unwrap();
+        let request = peer.recv_starting("INVITE").await;
+        let ending = ua.handle.try_terminate(&session).unwrap();
+        let bye = peer.recv_starting("BYE").await;
+        peer.send(&answer(&request, "200", "unused", &contact)).await;
+        let ack = peer.recv_starting("ACK").await;
+        peer.send(&ok_to(&bye)).await;
+
+        let number = |message: &str| -> String {
+            header(message, "CSeq")[0].split(' ').next().unwrap().to_owned()
+        };
+        assert_eq!(number(&ack), number(&request), "{transport}");
+        assert_ne!(branch(&ack), branch(&request), "{transport}");
+        assert_eq!(reinviting.await, Err(Error::SessionEnded), "{transport}");
+        assert_eq!(ending.await, Ok(()), "{transport}");
+        // Over UDP the BYE went again until its 200.
+        let another_bye = |message: &str| {
+            message.starts_with("BYE") && branch(message) != branch(&bye)
+        };
+        peer.quiet_where(another_bye, Duration::from_millis(200)).await;
+        driver.abort();
+    }
+}
+
+/// The peer hangs up while its re-INVITE waits for the application. The BYE
+/// gets a 200 and the re-INVITE a 487 (RFC 3261 section 15.1.2), and the
+/// application's accept after that sends nothing. Over UDP and TCP.
+#[tokio::test]
+async fn a_bye_ends_the_peers_pending_reinvite() {
+    for transport in ["UDP", "TCP"] {
+        let (mut ua, udp, tcp) = start_fast();
+        let driver = tokio::spawn(ua.driver);
+        let mut peer = Raw::start(transport, udp, tcp).await;
+        let me = peer.address();
+        let (ok, _) = called_by(&mut peer, &mut ua.events, "pending").await;
+
+        let offer = offer_named("pending");
+        peer.send(&reinvite_of(&ok, me, "pending", 2, me, &offer)).await;
+        let incoming = reinvite(&mut ua.events).await;
+        peer.send(&in_dialog("BYE", "UDP", &ok, me, "pending", 3)).await;
+        let bye = peer.recv_final("3 BYE").await;
+        let terminated = peer.recv_final("2 INVITE").await;
+        let late = incoming.try_accept(sdp()).unwrap().await;
+
+        assert!(bye.starts_with("SIP/2.0 200"), "{transport}: {bye}");
+        assert!(terminated.starts_with("SIP/2.0 487"), "{transport}");
+        assert!(
+            matches!(
+                late,
+                Err(Error::AlreadyFinalized | Error::StaleDecision)
+            ),
+            "{transport}: {late:?}",
+        );
+        let accepted = |message: &str| {
+            message.starts_with("SIP/2.0 200")
+                && header(message, "CSeq") == ["2 INVITE"]
+        };
+        peer.quiet_where(accepted, Duration::from_millis(200)).await;
+        driver.abort();
+    }
+}
+
+/// The peer sends a re-INVITE before the UA has the ACK of its initial 2xx,
+/// which carried the answer. The re-INVITE is taken, as RFC 5407 section
+/// 3.1.4 recommends. Each ACK, with the CSeq number of its INVITE, stops
+/// the copies of its 2xx, and the session goes on at its next revision.
+/// Over UDP and TCP.
+#[tokio::test]
+async fn a_reinvite_before_the_ack_of_an_answer_is_taken() {
+    for transport in ["UDP", "TCP"] {
+        let (mut ua, udp, tcp) = start_fast();
+        let driver = tokio::spawn(ua.driver);
+        let mut peer = Raw::start(transport, udp, tcp).await;
+        let me = peer.address();
+
+        peer.send(&direct_invite(me, "answered")).await;
+        let accepted = invite(&mut ua.events).await.try_accept(sdp()).unwrap();
+        let ok = peer.recv_answer("SIP/2.0 200", "1 INVITE").await;
+        let offer = offer_named("answered");
+        peer.send(&reinvite_of(&ok, me, "answered", 2, me, &offer)).await;
+        let incoming = reinvite(&mut ua.events).await;
+        drop(incoming.try_accept(sdp()).unwrap());
+        let reok = peer.recv_answer("SIP/2.0 200", "2 INVITE").await;
+        peer.send(&ack_for(&ok, me, "answered", 1)).await;
+        let second = ack_for(&reok, me, "answered", 2)
+            .replace("branch=z9hG4bK-ack-", "branch=z9hG4bK-ack2-");
+        peer.send(&second).await;
+        let session = accepted.await.unwrap();
+
+        // A copy already on its way may come. Later ones would come at most
+        // T2 (80 ms) apart, and the ACK deadline of 64 T1 is 1.28 s.
+        peer.drain(Duration::from_millis(50)).await;
+        let copy_or_bye = |message: &str| {
+            message.starts_with("BYE") || message.starts_with("SIP/2.0 200")
+        };
+        peer.quiet_where(copy_or_bye, Duration::from_millis(300)).await;
+        let snapshot = ua.handle.snapshot(&session).await.unwrap().unwrap();
+        assert_eq!(snapshot.phase, SessionPhase::Established, "{transport}");
+        assert_eq!(snapshot.session_revision, 2, "{transport}");
+        driver.abort();
+    }
+}
+
+/// The peer sends a re-INVITE with an offer before the ACK that owes the
+/// answer to the offer in the UA's 2xx. The offers collide, so the
+/// re-INVITE gets a 491 without reaching the application (RFC 5407 section
+/// 3.1.5), and the ACK then completes the exchange. Over UDP and TCP.
+#[tokio::test]
+async fn a_reinvite_before_the_ack_of_an_offer_gets_a_491() {
+    for transport in ["UDP", "TCP"] {
+        let (mut ua, udp, tcp) = start_fast();
+        let driver = tokio::spawn(ua.driver);
+        let mut peer = Raw::start(transport, udp, tcp).await;
+        let me = peer.address();
+
+        peer.send(&offerless_invite(me, "offering")).await;
+        let accepted = invite(&mut ua.events).await.try_accept(sdp()).unwrap();
+        let ok = peer.recv_answer("SIP/2.0 200", "1 INVITE").await;
+        let offer = offer_named("crossing");
+        peer.send(&reinvite_of(&ok, me, "offering", 2, me, &offer)).await;
+        let pending = peer.recv_final("2 INVITE").await;
+        peer.send(&ack_answering(&ok, me, "offering", 1)).await;
+        let session = accepted.await.unwrap();
+
+        assert!(pending.starts_with("SIP/2.0 491"), "{transport}: {pending}");
+        let seen =
+            events_for(&mut ua.events, Duration::from_millis(100)).await;
+        assert!(
+            !seen.iter().any(|event| matches!(event, Event::Reinvite(_))),
+            "{transport}: {seen:?}",
+        );
+        peer.quiet("BYE", Duration::from_millis(200)).await;
+        let snapshot = ua.handle.snapshot(&session).await.unwrap().unwrap();
+        assert_eq!(snapshot.phase, SessionPhase::Established, "{transport}");
+        assert_eq!(
+            snapshot.negotiation,
+            NegotiationState::Settled,
+            "{transport}"
+        );
+        driver.abort();
+    }
 }

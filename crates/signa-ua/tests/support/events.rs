@@ -85,3 +85,18 @@ pub(crate) async fn report_within(
 ) -> ShutdownReport {
     timeout(wait, shutdown).await.expect("a report in time").unwrap()
 }
+
+/// The events that come within `wait`.
+pub(crate) async fn events_for(
+    events: &mut UaEvents,
+    wait: Duration,
+) -> Vec<Event> {
+    let mut seen = Vec::new();
+    let _ = timeout(wait, async {
+        while let Some(event) = events.recv().await {
+            seen.push(event);
+        }
+    })
+    .await;
+    seen
+}

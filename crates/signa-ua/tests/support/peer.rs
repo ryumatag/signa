@@ -2,11 +2,16 @@
 Raw peers on loopback, over UDP and TCP, that play the other side of a UA.
 */
 
-use std::{net::SocketAddr, time::Duration};
+use std::{collections::VecDeque, net::SocketAddr, sync::Arc, time::Duration};
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpStream, UdpSocket},
+    net::{
+        TcpListener, TcpStream, UdpSocket,
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+    },
+    sync::mpsc,
+    task::JoinSet,
     time::timeout,
 };
 
@@ -164,21 +169,7 @@ impl TcpPeer {
 
     /// Takes the first whole message out of the buffer.
     fn framed(&mut self) -> Option<String> {
-        let end = self.buffer.windows(4).position(|w| w == b"\r\n\r\n")?;
-        let head = std::str::from_utf8(&self.buffer[..end]).unwrap();
-        let length = head
-            .lines()
-            .filter_map(|line| line.split_once(':'))
-            .find(|(name, _)| {
-                name.trim().eq_ignore_ascii_case("content-length")
-            })
-            .map_or(0, |(_, value)| value.trim().parse().unwrap());
-        let total = end + 4 + length;
-        if self.buffer.len() < total {
-            return None;
-        }
-        let message = self.buffer.drain(..total).collect();
-        Some(String::from_utf8(message).unwrap())
+        framed(&mut self.buffer)
     }
 
     pub(crate) async fn recv_starting(&mut self, start: &str) -> String {
@@ -295,6 +286,264 @@ impl Wire {
             {
                 return sent;
             }
+        }
+    }
+}
+
+/// Takes the first whole message out of `buffer`, framed by its
+/// Content-Length.
+fn framed(buffer: &mut Vec<u8>) -> Option<String> {
+    let end = buffer.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let head = std::str::from_utf8(&buffer[..end]).unwrap();
+    let length = head
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+        .map_or(0, |(_, value)| value.trim().parse().unwrap());
+    let total = end + 4 + length;
+    if buffer.len() < total {
+        return None;
+    }
+    let message = buffer.drain(..total).collect();
+    Some(String::from_utf8(message).unwrap())
+}
+
+/// A raw peer over UDP or TCP that takes the UA's requests as well as its
+/// responses, so that a test can hold back an answer and send something
+/// that crosses it.
+///
+/// Over TCP the UA opens connections of its own for its requests (RFC 3261
+/// section 18.1.1), so the peer listens at the address its Via and Contact
+/// name, and reads every connection the UA opens there besides the one it
+/// opened to the UA. What it sends goes on that one, the answers to the UA's
+/// requests too. A client transaction takes a response by its branch (RFC
+/// 3261 section 17.1.3), so that is enough for these tests, but it leaves
+/// out the answer on the connection of the request that a real peer sends
+/// (section 18.2.2). Over UDP one socket does all of it. `Wire` stays the
+/// peer of tests that never take a request of the UA's.
+///
+/// A message read but not taken, such as a 100 Trying or the other of two
+/// answers, waits for the next receive, so that the order in which the UA
+/// sends things that a test does not order matters to no test.
+pub(crate) struct Raw {
+    transport: &'static str,
+    address: SocketAddr,
+    out: Out,
+    messages: mpsc::UnboundedReceiver<String>,
+    stash: VecDeque<String>,
+    readers: JoinSet<()>,
+}
+
+enum Out {
+    Udp { socket: Arc<UdpSocket>, to: SocketAddr },
+    Tcp(OwnedWriteHalf),
+}
+
+impl Raw {
+    /// Starts a peer for `transport`, `UDP` or `TCP`, of the UA at `udp` and
+    /// `tcp`.
+    pub(crate) async fn start(
+        transport: &'static str,
+        udp: SocketAddr,
+        tcp: SocketAddr,
+    ) -> Raw {
+        assert!(matches!(transport, "UDP" | "TCP"), "{transport}");
+        let (sender, messages) = mpsc::unbounded_channel();
+        let mut readers = JoinSet::new();
+        let (address, out) = if transport == "UDP" {
+            let socket =
+                Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let reading = socket.clone();
+            readers.spawn(async move {
+                let mut buffer = vec![0; 65_536];
+                while let Ok((n, _)) = reading.recv_from(&mut buffer).await {
+                    let message = String::from_utf8_lossy(&buffer[..n]);
+                    if sender.send(message.into_owned()).is_err() {
+                        return;
+                    }
+                }
+            });
+            (socket.local_addr().unwrap(), Out::Udp { socket, to: udp })
+        } else {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (read, write) =
+                TcpStream::connect(tcp).await.unwrap().into_split();
+            readers.spawn(read_frames(read, sender.clone()));
+            readers.spawn(async move {
+                let mut connections = JoinSet::new();
+                while let Ok((stream, _)) = listener.accept().await {
+                    let (read, write) = stream.into_split();
+                    let sender = sender.clone();
+                    // Nothing goes on this connection, which only has to
+                    // stay open.
+                    connections.spawn(async move {
+                        read_frames(read, sender).await;
+                        drop(write);
+                    });
+                }
+            });
+            (address, Out::Tcp(write))
+        };
+        let stash = VecDeque::new();
+        Raw { transport, address, out, messages, stash, readers }
+    }
+
+    /// The address the peer's Via and Contact name.
+    pub(crate) fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    /// What a plan's Request-URI takes after `sip:peer@` to reach the peer.
+    pub(crate) fn target(&self) -> String {
+        if self.transport == "UDP" {
+            self.address.to_string()
+        } else {
+            format!("{};transport=tcp", self.address)
+        }
+    }
+
+    /// Sends `message`, written for UDP as the message helpers write it.
+    /// Its Via takes the peer's transport. Over TCP its Contact gets a
+    /// `transport` parameter too, so that the UA's requests come to the
+    /// listener. Each line ends in CRLF.
+    pub(crate) async fn send(&mut self, message: &str) {
+        let via = format!("SIP/2.0/{}", self.transport);
+        let plain = format!("Contact: <sip:peer@{}>", self.address);
+        let tcp =
+            format!("Contact: <sip:peer@{};transport=tcp>", self.address);
+        let message = message
+            .replace("\r\n", "\n")
+            .split('\n')
+            .map(|line| {
+                if line.starts_with("Via: ") {
+                    line.replace("SIP/2.0/UDP", &via)
+                } else if self.transport == "TCP" && line == plain {
+                    tcp.clone()
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        match &mut self.out {
+            Out::Udp { socket, to } => {
+                socket.send_to(message.as_bytes(), *to).await.unwrap();
+            }
+            Out::Tcp(write) => {
+                write.write_all(message.as_bytes()).await.unwrap()
+            }
+        }
+    }
+
+    /// Receives the first message from the UA, on any connection, for which
+    /// `wanted` holds, first among those read before. The others wait for a
+    /// later receive.
+    pub(crate) async fn recv_where(
+        &mut self,
+        wanted: impl Fn(&str) -> bool,
+    ) -> String {
+        if let Some(i) = self.stash.iter().position(|message| wanted(message))
+        {
+            return self.stash.remove(i).expect("found");
+        }
+        let read = async {
+            loop {
+                let message =
+                    self.messages.recv().await.expect("readers running");
+                if wanted(&message) {
+                    return message;
+                }
+                self.stash.push_back(message);
+            }
+        };
+        timeout(WAIT, read).await.expect("a message in time")
+    }
+
+    /// Receives the first message that starts with `start`.
+    pub(crate) async fn recv_starting(&mut self, start: &str) -> String {
+        self.recv_where(|message| message.starts_with(start)).await
+    }
+
+    /// Receives the first message that starts with `start` and has `cseq`
+    /// as its CSeq.
+    pub(crate) async fn recv_answer(
+        &mut self,
+        start: &str,
+        cseq: &str,
+    ) -> String {
+        self.recv_where(|message| {
+            message.starts_with(start) && header(message, "CSeq") == [cseq]
+        })
+        .await
+    }
+
+    /// Receives the first final response with `cseq` as its CSeq.
+    pub(crate) async fn recv_final(&mut self, cseq: &str) -> String {
+        self.recv_where(|message| {
+            message.starts_with("SIP/2.0 ")
+                && !message.starts_with("SIP/2.0 1")
+                && header(message, "CSeq") == [cseq]
+        })
+        .await
+    }
+
+    /// Checks that no message for which `unwanted` holds arrives within
+    /// `wait`, or waits among those read before. The rest is dropped.
+    pub(crate) async fn quiet_where(
+        &mut self,
+        unwanted: impl Fn(&str) -> bool,
+        wait: Duration,
+    ) {
+        let transport = self.transport;
+        for message in self.stash.drain(..) {
+            assert!(!unwanted(&message), "{transport}: unexpected {message}");
+        }
+        let _ = timeout(wait, async {
+            while let Some(message) = self.messages.recv().await {
+                assert!(
+                    !unwanted(&message),
+                    "{transport}: unexpected {message}"
+                );
+            }
+        })
+        .await;
+    }
+
+    /// Checks that nothing starting with `start` arrives within `wait`.
+    pub(crate) async fn quiet(&mut self, start: &str, wait: Duration) {
+        self.quiet_where(|message| message.starts_with(start), wait).await;
+    }
+
+    /// Drops what arrives within `wait`, and what waits, such as a copy
+    /// already on its way.
+    pub(crate) async fn drain(&mut self, wait: Duration) {
+        self.quiet_where(|_| false, wait).await;
+    }
+}
+
+impl Drop for Raw {
+    fn drop(&mut self) {
+        self.readers.abort_all();
+    }
+}
+
+/// Sends each message read off `read` to `sender`, until either closes.
+async fn read_frames(
+    mut read: OwnedReadHalf,
+    sender: mpsc::UnboundedSender<String>,
+) {
+    let mut buffer = Vec::new();
+    let mut chunk = [0; 4096];
+    loop {
+        while let Some(message) = framed(&mut buffer) {
+            if sender.send(message).is_err() {
+                return;
+            }
+        }
+        match read.read(&mut chunk).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => buffer.extend_from_slice(&chunk[..n]),
         }
     }
 }

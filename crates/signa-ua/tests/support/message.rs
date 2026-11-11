@@ -121,6 +121,30 @@ pub(crate) fn direct_invite(peer: SocketAddr, call: &str) -> String {
         .replace("Record-Route: <sip:proxy.example.com;lr>\n", "")
 }
 
+/// [`direct_invite`] without its offer.
+pub(crate) fn offerless_invite(peer: SocketAddr, call: &str) -> String {
+    let invite = direct_invite(peer, call)
+        .replace("Content-Type: application/sdp\n", "")
+        .replace("Content-Length: 5\n\nv=0\n", "Content-Length: 0\n\n");
+    assert!(!invite.contains("application/sdp") && invite.ends_with("\n\n"));
+    invite
+}
+
+/// [`ack_for`] with an SDP answer, for a 2xx that carried an offer.
+pub(crate) fn ack_answering(
+    ok: &str,
+    peer: SocketAddr,
+    call: &str,
+    cseq: u32,
+) -> String {
+    let ack = ack_for(ok, peer, call, cseq).replace(
+        "Content-Length: 0\n",
+        "Content-Type: application/sdp\nContent-Length: 5\n",
+    );
+    assert!(ack.contains("application/sdp"));
+    ack + "v=0\n"
+}
+
 /// The value of the `branch` parameter of the top Via of `message`.
 pub(crate) fn branch(message: &str) -> &str {
     let via = header(message, "Via")[0];
