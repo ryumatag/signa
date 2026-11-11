@@ -31,14 +31,12 @@ use signa_core::{
 };
 
 use crate::{
+    capability,
     negotiation::Description,
     routing::{
         Place, RemoteTarget, RouteSet, allowed_in, party_uri, request_target,
     },
 };
-
-/// The methods this UA takes, as an Allow value.
-pub(crate) const ALLOWED: &str = "INVITE, ACK, CANCEL, BYE, OPTIONS";
 
 /// The headers the UA writes itself. A plan that sets one of them is
 /// refused. Require and Proxy-Require are among them, since they would ask
@@ -224,7 +222,7 @@ impl InvitePlan {
         for route in &target.route {
             request = request.header(ROUTE, format!("<{route}>").as_str());
         }
-        request = request.header(ALLOW, ALLOWED);
+        request = request.header(ALLOW, capability::ALLOW);
         for (name, value) in self.headers.iter() {
             request = request.header(name.clone(), value.clone());
         }
@@ -409,7 +407,7 @@ mod tests {
             rows(ROUTE),
             ["<sip:p1.example.com;lr>", "<sip:p2.example.com;lr>"],
         );
-        assert_eq!(rows(ALLOW), [ALLOWED]);
+        assert_eq!(rows(ALLOW), [capability::ALLOW]);
         assert_eq!(rows(USER_AGENT), ["test"]);
         assert_eq!(rows(CONTENT_TYPE), ["application/sdp"]);
         assert!(rows(SUPPORTED).is_empty());

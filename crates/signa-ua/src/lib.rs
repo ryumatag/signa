@@ -32,8 +32,9 @@ This is an early stage of the crate, and much of a UA core is missing:
   kept for that lasts.
 * In a dialog, the UA takes BYE itself. Other requests than INVITE are
   answered as outside a dialog, without asking the application.
-* Outside a dialog, OPTIONS gets a 200 with the methods the UA takes, without
-  asking the application, and other requests but INVITE a 405 or a 501.
+* Outside a dialog, OPTIONS gets a 200 with the methods, body type and
+  coding the UA takes, without asking the application, and other requests
+  but INVITE a 405 or a 501.
 * A re-INVITE of the UA's own cannot be cancelled. A session description in
   a provisional response to one is not kept, and its 2xx has to carry the
   answer. A re-INVITE asked for while the last 2xx of the session waits for
@@ -73,6 +74,7 @@ pub use self::ua::{
 // The private state model. `dialog` knows nothing of `invite`, so other
 // usages can share it later. `docs/signa-ua-rfc-test-map.md` maps the rules
 // these modules keep to their tests.
+mod capability;
 mod dialog;
 mod error;
 mod invite;

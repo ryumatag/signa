@@ -8,15 +8,18 @@ without an offer, whose answer comes in the ACK.
 use std::{net::SocketAddr, time::Duration};
 
 use signa_core::StatusCode;
-use signa_ua::{EndReason, Error, Event, SessionPhase};
+use signa_ua::{
+    EndReason, Error, Event, IncomingInvite, ReinvitePlan, SessionPhase,
+    UaEvents,
+};
 use tokio::time::timeout;
 
 use crate::support::{
-    WAIT, config,
-    events::{event, invite, invite_within},
+    WAIT, call_from, config,
+    events::{event, invite, invite_within, reinvite},
     message::{
-        ack_for, body, described, direct_invite, header, invite_over,
-        invite_to_ua, offer_named, sdp,
+        ack_for, body, cancel_of, described, direct_invite, header, in_dialog,
+        invite_over, invite_to_ua, offer_named, plan_to, reinvite_of, sdp,
     },
     peer::{Peer, TcpPeer},
     start_fast, start_fast_with,
@@ -344,6 +347,305 @@ Content-Length: 0
         let expected: &[&str] =
             if allow { &["INVITE, ACK, CANCEL, BYE, OPTIONS"] } else { &[] };
         assert_eq!(header(&response, "Allow"), expected, "{method}");
+    }
+}
+
+/// A request outside a dialog from `peer`, with `headers` after its CSeq and
+/// `body` as its body. An INVITE needs a Contact, which `headers` gives.
+fn request_from(
+    peer: SocketAddr,
+    method: &str,
+    call: &str,
+    headers: &str,
+    body: &str,
+) -> String {
+    // `Peer::send` ends each line with CRLF, the body's included.
+    let length = body.replace('\n', "\r\n").len();
+    format!(
+        "{method} sip:ua@127.0.0.1 SIP/2.0
+Via: SIP/2.0/UDP {peer};branch=z9hG4bK-{call}
+Max-Forwards: 70
+To: <sip:ua@127.0.0.1>
+From: <sip:peer@{peer}>;tag=peer-{call}
+Call-ID: {call}
+CSeq: 1 {method}
+{headers}Content-Length: {length}
+
+{body}"
+    )
+}
+
+/// The first response other than a 100 that `peer` gets for `call`,
+/// skipping those of earlier calls, such as a retransmitted final.
+async fn response_to(peer: &Peer, call: &str) -> String {
+    loop {
+        let (message, _) = peer.recv_starting("SIP/2.0").await;
+        if header(&message, "Call-ID") == [call]
+            && !message.starts_with("SIP/2.0 100")
+        {
+            return message;
+        }
+    }
+}
+
+/// The INVITE `call` as it reaches the application. A response to it comes
+/// first only when the UA refused it, which fails the test with it.
+async fn taken(
+    events: &mut UaEvents,
+    peer: &Peer,
+    call: &str,
+) -> IncomingInvite {
+    let incoming = tokio::select! {
+        incoming = invite(events) => incoming,
+        response = response_to(peer, call) => panic!("{call} refused: {response}"),
+    };
+    assert_eq!(call_id(&incoming), call);
+    incoming
+}
+
+/// The Call-ID of the INVITE `invite` hands over.
+fn call_id(invite: &IncomingInvite) -> String {
+    let request = invite.request().to_bytes();
+    let request = std::str::from_utf8(&request).unwrap();
+    header(request, "Call-ID")[0].to_owned()
+}
+
+/// The status code of `response`.
+fn status(response: &str) -> &str {
+    &response["SIP/2.0 ".len().."SIP/2.0 ".len() + 3]
+}
+
+/// The values of every row of `name` in `message`, split at the commas.
+fn listed<'a>(message: &'a str, name: &str) -> Vec<&'a str> {
+    header(message, name)
+        .into_iter()
+        .flat_map(|row| row.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+/// The methods of RFC 3261 and its extensions that the UA knows, which get
+/// a 405 when it does not take them.
+const KNOWN: [&str; 9] = [
+    "REGISTER",
+    "PRACK",
+    "SUBSCRIBE",
+    "NOTIFY",
+    "PUBLISH",
+    "INFO",
+    "REFER",
+    "MESSAGE",
+    "UPDATE",
+];
+
+/// What the 200 to OPTIONS advertises, the UA takes (RFC 3261 section
+/// 11.2). An INVITE reaches the application and a CANCEL cancels it, a BYE
+/// outside a dialog gets a 481 and one in a dialog a 200, and OPTIONS gets
+/// the same 200 in a dialog as outside one. A method outside the Allow gets
+/// a 405 with the same Allow, or a 501 when the UA does not know it. An
+/// INVITE whose body has a type of the Accept and a coding of the
+/// Accept-Encoding reaches the application with its offer. A tag of the
+/// Supported passes the Require check, and any other gets a 420 that lists
+/// it. So a value added to what the UA advertises, without the UA taking
+/// it, fails here.
+#[tokio::test]
+async fn the_ua_takes_what_it_advertises() {
+    let (mut ua, udp, _) = start_fast();
+    tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+    let me = peer.address();
+    let contact = format!("Contact: <sip:peer@{me}>\n");
+    let sdp = "Content-Type: application/sdp\n";
+
+    peer.send(&request_from(me, "OPTIONS", "ask", "", ""), udp).await;
+    let outside = response_to(&peer, "ask").await;
+    assert_eq!(status(&outside), "200");
+    let allow = listed(&outside, "Allow");
+    let accept = listed(&outside, "Accept");
+    let encodings = listed(&outside, "Accept-Encoding");
+    let supported = listed(&outside, "Supported");
+
+    // An ACK gets no response. `call_from` sends the ACK of a 2xx below, and
+    // `matching_ack_stops_retransmission_unrelated_ack_does_not` shows what
+    // it does.
+    let mut methods = vec!["INVITE", "CANCEL", "BYE", "OPTIONS", "FROBNICATE"];
+    methods.extend(KNOWN);
+    let extra: Vec<&str> =
+        allow.iter().copied().filter(|m| !methods.contains(m)).collect();
+    methods.extend(extra);
+    methods.retain(|method| *method != "ACK");
+    for method in methods {
+        let call = format!("method-{method}");
+        if !allow.contains(&method) {
+            peer.send(&request_from(me, method, &call, "", ""), udp).await;
+            let response = response_to(&peer, &call).await;
+            if KNOWN.contains(&method) {
+                assert_eq!(status(&response), "405", "{method}");
+                assert_eq!(listed(&response, "Allow"), allow, "{method}");
+            } else {
+                assert_eq!(status(&response), "501", "{method}");
+                assert!(header(&response, "Allow").is_empty(), "{method}");
+            }
+            continue;
+        }
+        match method {
+            "INVITE" => {
+                let invite = request_from(me, method, &call, &contact, "");
+                peer.send(&invite, udp).await;
+                let incoming = taken(&mut ua.events, &peer, &call).await;
+                drop(incoming.try_reject(StatusCode::BUSY_HERE).unwrap());
+            }
+            "CANCEL" => {
+                let invite = request_from(me, "INVITE", &call, &contact, "");
+                peer.send(&invite, udp).await;
+                let _incoming = taken(&mut ua.events, &peer, &call).await;
+                peer.send(&cancel_of("UDP", me, &call), udp).await;
+                let mut statuses = Vec::new();
+                for _ in 0..2 {
+                    let response = response_to(&peer, &call).await;
+                    let cseq = header(&response, "CSeq")[0].to_owned();
+                    statuses.push((cseq, status(&response).to_owned()));
+                }
+                statuses.sort();
+                assert_eq!(
+                    statuses,
+                    [
+                        ("1 CANCEL".to_owned(), "200".to_owned()),
+                        ("1 INVITE".to_owned(), "487".to_owned()),
+                    ],
+                );
+            }
+            "BYE" | "OPTIONS" => {
+                peer.send(&request_from(me, method, &call, "", ""), udp).await;
+                let response = response_to(&peer, &call).await;
+                let expected = if method == "BYE" { "481" } else { "200" };
+                assert_eq!(status(&response), expected, "{method}");
+            }
+            // A method added to the Allow that this test does not know yet
+            // must at least not be refused as one the UA does not take.
+            _ => {
+                peer.send(&request_from(me, method, &call, "", ""), udp).await;
+                let response = response_to(&peer, &call).await;
+                assert!(
+                    !["405", "501"].contains(&status(&response)),
+                    "{method}"
+                );
+            }
+        }
+    }
+
+    for (n, (kind, coding)) in accept
+        .iter()
+        .flat_map(|kind| encodings.iter().map(move |coding| (kind, coding)))
+        .enumerate()
+    {
+        let call = format!("accept-{n}");
+        let headers = format!(
+            "{contact}Content-Type: {kind}\nContent-Encoding: {coding}\n"
+        );
+        peer.send(&request_from(me, "INVITE", &call, &headers, "v=0\n"), udp)
+            .await;
+        let incoming = taken(&mut ua.events, &peer, &call).await;
+        assert!(incoming.offer().is_some(), "{kind} {coding}");
+        drop(incoming.try_reject(StatusCode::BUSY_HERE).unwrap());
+    }
+
+    // The UA lists no option tag today, so this loop waits for the first.
+    for (n, tag) in supported.iter().enumerate() {
+        let call = format!("supported-{n}");
+        let headers = format!("{contact}{sdp}Require: {tag}\n");
+        peer.send(&request_from(me, "INVITE", &call, &headers, "v=0\n"), udp)
+            .await;
+        let incoming = taken(&mut ua.events, &peer, &call).await;
+        drop(incoming.try_reject(StatusCode::BUSY_HERE).unwrap());
+    }
+    let unlisted = "x-not-listed";
+    let headers = format!("{contact}{sdp}Require: {unlisted}\n");
+    peer.send(&request_from(me, "INVITE", "unlisted", &headers, "v=0\n"), udp)
+        .await;
+    let refused = response_to(&peer, "unlisted").await;
+    assert_eq!(status(&refused), "420");
+    assert_eq!(listed(&refused, "Unsupported"), [unlisted]);
+
+    let (ok, _session) = call_from(&peer, udp, &mut ua.events, "dialog").await;
+    peer.send(&in_dialog("OPTIONS", "UDP", &ok, me, "dialog", 2), udp).await;
+    let options = response_to(&peer, "dialog").await;
+    peer.send(&in_dialog("MESSAGE", "UDP", &ok, me, "dialog", 3), udp).await;
+    let message = response_to(&peer, "dialog").await;
+    peer.send(&in_dialog("BYE", "UDP", &ok, me, "dialog", 4), udp).await;
+    let bye = response_to(&peer, "dialog").await;
+
+    assert_eq!(status(&options), "200");
+    for name in ["Allow", "Accept", "Accept-Encoding", "Supported"] {
+        assert_eq!(listed(&options, name), listed(&outside, name));
+    }
+    assert_eq!(status(&message), "405");
+    assert_eq!(listed(&message, "Allow"), allow);
+    assert_eq!(status(&bye), "200");
+    assert_eq!(header(&bye, "CSeq"), ["4 BYE"]);
+}
+
+/// Each response and request that advertises what the UA takes says the
+/// same as the 200 to OPTIONS: the Allow of a 405, of the 2xx of an INVITE
+/// and of a re-INVITE, and of the UA's INVITE and re-INVITE, and the Accept
+/// and Accept-Encoding of a 415. None carries a Supported, since the UA has
+/// no extension.
+#[tokio::test]
+async fn every_advertisement_says_the_same() {
+    let (mut ua, udp, _) = start_fast();
+    tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+    let me = peer.address();
+    let contact = format!("Contact: <sip:peer@{me}>\n");
+
+    peer.send(&request_from(me, "OPTIONS", "ask", "", ""), udp).await;
+    let ok = response_to(&peer, "ask").await;
+    peer.send(&request_from(me, "MESSAGE", "message", "", ""), udp).await;
+    let not_allowed = response_to(&peer, "message").await;
+    let multipart =
+        format!("{contact}Content-Type: multipart/mixed;boundary=x\n");
+    let invite =
+        request_from(me, "INVITE", "multipart", &multipart, "--x--\n");
+    peer.send(&invite, udp).await;
+    let unsupported = response_to(&peer, "multipart").await;
+    let (accepted, session) =
+        call_from(&peer, udp, &mut ua.events, "accepted").await;
+    peer.send(&reinvite_of(&accepted, me, "accepted", 2, me, "v=0\r\n"), udp)
+        .await;
+    let incoming = reinvite(&mut ua.events).await;
+    drop(incoming.try_accept(sdp()).unwrap());
+    let (reaccepted, _) = peer.recv_starting("SIP/2.0 200").await;
+    peer.send(&ack_for(&reaccepted, me, "accepted", 2), udp).await;
+    peer.drain(Duration::from_millis(60)).await;
+    drop(ua.handle.try_reinvite(&session, ReinvitePlan::new(sdp())).unwrap());
+    let (reinvite, _) = peer.recv_starting("INVITE").await;
+    let to = me.to_string();
+    drop(ua.handle.try_invite(plan_to(&to, "outgoing")).unwrap());
+    let outgoing = loop {
+        let (request, _) = peer.recv_starting("INVITE").await;
+        if header(&request, "Subject") == ["outgoing"] {
+            break request;
+        }
+    };
+
+    assert_eq!(status(&not_allowed), "405");
+    assert_eq!(status(&unsupported), "415");
+    assert_eq!(header(&reaccepted, "CSeq"), ["2 INVITE"]);
+    let allow = listed(&ok, "Allow");
+    assert!(!allow.is_empty());
+    for message in [&not_allowed, &accepted, &reaccepted, &reinvite, &outgoing]
+    {
+        assert_eq!(listed(message, "Allow"), allow, "{message}");
+    }
+    for name in ["Accept", "Accept-Encoding"] {
+        assert!(!listed(&ok, name).is_empty(), "{name}");
+        assert_eq!(listed(&unsupported, name), listed(&ok, name), "{name}");
+    }
+    let all =
+        [&ok, &not_allowed, &unsupported, &accepted, &reaccepted, &reinvite];
+    for message in all.into_iter().chain([&outgoing]) {
+        assert!(header(message, "Supported").is_empty(), "{message}");
     }
 }
 

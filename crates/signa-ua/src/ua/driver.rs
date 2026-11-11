@@ -105,6 +105,7 @@ use super::{
     ShutdownRequest,
 };
 use crate::{
+    capability,
     error::Error,
     invite::{AttemptKey, CancelResult, ExchangeKey, UsageKey},
     model::{
@@ -112,7 +113,6 @@ use crate::{
     },
     negotiation::{Body, Description},
     operation::{Completion, OperationId},
-    plan::ALLOWED,
     protocol,
     retention::ReplayKey,
     timer,
@@ -1170,10 +1170,11 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
     ///   (section 15.1.2).
     ///
     /// Then a BYE outside a dialog gets a 481 (section 15.1.2), and OPTIONS a
-    /// 200 with the methods the UA takes. Section 11.2 asks for the status an
-    /// INVITE would get, which only the application knows. The 200 is my
-    /// policy, so that a peer that checks whether the UA is up, as many
-    /// trunks do, gets an answer.
+    /// 200 with the methods, body type and coding the UA takes, from
+    /// [`capability`]. Section 11.2 asks for the status an INVITE would get,
+    /// which only the application knows. The 200 is my policy, so that a
+    /// peer that checks whether the UA is up, as many trunks do, gets an
+    /// answer.
     ///
     /// Each answer needs a job. A request that finds no room changes
     /// nothing, and its responder is dropped unanswered, so that signa-core
@@ -1198,7 +1199,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
 
         let method = request.method().clone();
         if method != Method::BYE && method != Method::OPTIONS {
-            let (status, allow) = if KNOWN.contains(&method) {
+            let (status, allow) = if capability::KNOWN.contains(&method) {
                 (405, true)
             } else {
                 (501, false)
@@ -1206,7 +1207,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             let status = StatusCode::from_u16(status).expect("a status");
             let mut response = Response::reply_to(&request).status(status);
             if allow {
-                response = response.header(ALLOW, ALLOWED);
+                response = response.header(ALLOW, capability::ALLOW);
             }
             self.answer(responder, response, lane);
             return;
@@ -1250,7 +1251,9 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
 
         let response = Response::reply_to(&request)
             .status(StatusCode::OK)
-            .header(ALLOW, ALLOWED);
+            .header(ALLOW, capability::ALLOW)
+            .header(ACCEPT, capability::ACCEPT)
+            .header(ACCEPT_ENCODING, capability::ACCEPT_ENCODING);
         self.answer(responder, response, lane);
     }
 
@@ -1278,8 +1281,8 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         // and no content coding.
         if refusal == Refusal::UnsupportedBody {
             response = response
-                .header(ACCEPT, "application/sdp")
-                .header(ACCEPT_ENCODING, "identity");
+                .header(ACCEPT, capability::ACCEPT)
+                .header(ACCEPT_ENCODING, capability::ACCEPT_ENCODING);
         }
         // RFC 5630 section 5.1.2 has a UAS that is not reached over SIPS say
         // so with the warning 380.
@@ -1683,7 +1686,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         if status.is_success() {
             response =
                 dialog_headers(response, &server.request, &self.contact)
-                    .header(ALLOW, ALLOWED);
+                    .header(ALLOW, capability::ALLOW);
         }
         let response = with_description(response, body);
 
@@ -1830,7 +1833,10 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             signa_core::HeaderValue::from_bytes(contact.as_bytes())
                 .expect("the configuration checked the Contact URI"),
         );
-        headers.append(ALLOW, signa_core::HeaderValue::from_static(ALLOWED));
+        headers.append(
+            ALLOW,
+            signa_core::HeaderValue::from_static(capability::ALLOW),
+        );
         if let Some(offer) = offer {
             describe(request.headers_mut(), &offer);
             *request.body_mut() = offer.body().clone();
@@ -2564,20 +2570,6 @@ async fn report_lag(events: mpsc::Sender<Event>, room: usize, missed: u64) {
         place.send(Event::Lagged { missed });
     }
 }
-
-/// Methods of RFC 3261 and its extensions that the UA knows, and answers
-/// with a 405 outside a dialog rather than a 501.
-const KNOWN: [Method; 9] = [
-    Method::REGISTER,
-    Method::PRACK,
-    Method::SUBSCRIBE,
-    Method::NOTIFY,
-    Method::PUBLISH,
-    Method::INFO,
-    Method::REFER,
-    Method::MESSAGE,
-    Method::UPDATE,
-];
 
 /// Returns the host and port of a Contact URI, as `warn-agent` takes them.
 fn warn_agent(contact: &str) -> Box<str> {
