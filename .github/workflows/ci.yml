@@ -131,6 +131,7 @@ jobs:
           cargo clippy --workspace --all-targets -- -D warnings
           cargo clippy --workspace --all-targets --no-default-features -- -D warnings
           cargo clippy -p signa-ua --all-targets --features __fuzz -- -D warnings
+          cargo clippy -p signa --all-targets --features ua -- -D warnings
           cargo clippy --manifest-path bench/Cargo.toml --all-targets -- -D warnings
           cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
           for manifest in examples/*/Cargo.toml; do
@@ -170,6 +171,12 @@ jobs:
           toolchain: "1.85"
       - name: Test
         run: cargo +1.85 test --workspace --verbose
+        env:
+          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
+      # The workspace builds each member with its default features, so the
+      # facade's `ua` feature needs a run of its own.
+      - name: Test the facade with signa-ua
+        run: cargo +1.85 test -p signa --features ua --test facade --verbose
         env:
           CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
 

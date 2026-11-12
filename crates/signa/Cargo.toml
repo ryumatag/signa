@@ -28,11 +28,14 @@ include = [
 default = ["tokio"]
 # The endpoint and its sockets, from signa-core.
 tokio = ["signa-core/tokio"]
+# signa-ua's dialogs and INVITE usage, as `signa::ua`. Its UA runs on an
+# endpoint, so it needs `tokio`, and without its own `tokio` feature signa-ua
+# has no public API.
+ua = ["tokio", "dep:signa-ua", "signa-ua/tokio"]
 
-# TODO: Add signa-ua behind a `ua` feature once it has an API. A feature that
-# brings nothing would only be one more name to keep compatible.
 [dependencies]
 signa-core = { version = "0.1.0", path = "../signa-core", default-features = false }
+signa-ua = { version = "0.0.1", path = "../signa-ua", default-features = false, optional = true }
 
 [dev-dependencies]
 bytes = "1.12.1"
@@ -43,3 +46,7 @@ tokio = { version = "1.54", features = ["macros", "rt-multi-thread"] }
 [[test]]
 name = "facade"
 required-features = ["tokio"]
+
+# docs.rs builds the default features only, which would leave `signa::ua` out.
+[package.metadata.docs.rs]
+features = ["ua"]

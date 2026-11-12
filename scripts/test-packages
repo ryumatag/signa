@@ -45,3 +45,13 @@ for package in signa-core signa-ua signa; do
   echo "===== $package, no default features ====="
   cargo test -p "$package" --no-default-features ${harness[@]+"${harness[@]}"}
 done
+
+# The facade with signa-ua. The second run builds the same features while
+# `ua` turns `tokio` on, and guards that it does. The facade's tests need
+# `tokio`, and naming their target makes Cargo fail, rather than skip it,
+# should `ua` stop turning it on.
+echo "===== signa, ua ====="
+cargo test -p signa --features ua ${harness[@]+"${harness[@]}"}
+echo "===== signa, ua without default features ====="
+cargo test -p signa --no-default-features --features ua --test facade \
+  ${harness[@]+"${harness[@]}"}

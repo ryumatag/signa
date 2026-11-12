@@ -1,6 +1,7 @@
 //! The facade re-exports signa-core's items rather than copies, so the two
 //! crates' paths name the same types and code written against the paths of
-//! signa 0.3 compiles unchanged.
+//! signa 0.3 compiles unchanged. With the `ua` feature it re-exports
+//! signa-ua the same way.
 
 use std::any::TypeId;
 
@@ -102,4 +103,55 @@ fn facade_existing_endpoint_imports_compile() {
     assert_eq!(CALL_ID, signa_core::message::header::CALL_ID);
     assert_eq!(FROM, signa_core::message::header::FROM);
     assert_eq!(TO, signa_core::message::header::TO);
+}
+
+// `signa::ua` is signa-ua itself, so the checks of its items below guard the
+// form of the re-export, not each item. What matters more is that a UA
+// attaches to an endpoint built through the facade, since both crates name
+// signa-core's endpoint.
+#[cfg(feature = "ua")]
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn facade_ua_type_identity() {
+    use signa::{
+        endpoint::Endpoint,
+        ua::{
+            AttachError, Config, Description, Error, Event, IncomingInvite,
+            InvitePlan, ReinvitePlan, Session, ShutdownMode, ShutdownOutcome,
+            StaticResolver, Ua, UaDriver, UaEvents, UaHandle, attach,
+        },
+    };
+
+    assert!(same::<Ua, signa_ua::Ua>());
+    assert!(same::<UaHandle, signa_ua::UaHandle>());
+    assert!(same::<UaEvents, signa_ua::UaEvents>());
+    assert!(same::<UaDriver, signa_ua::UaDriver>());
+    assert!(same::<Config, signa_ua::Config>());
+    assert!(same::<Event, signa_ua::Event>());
+    assert!(same::<IncomingInvite, signa_ua::IncomingInvite>());
+    assert!(same::<InvitePlan, signa_ua::InvitePlan>());
+    assert!(same::<ReinvitePlan, signa_ua::ReinvitePlan>());
+    assert!(same::<Session, signa_ua::Session>());
+    assert!(same::<Description, signa_ua::Description>());
+    assert!(same::<StaticResolver, signa_ua::StaticResolver>());
+    assert!(same::<Error, signa_ua::Error>());
+    assert!(same::<AttachError, signa_ua::AttachError>());
+    assert!(same::<ShutdownMode, signa_ua::ShutdownMode>());
+    assert!(same::<ShutdownOutcome, signa_ua::ShutdownOutcome>());
+
+    let (endpoint, incoming) = Endpoint::builder()
+        .udp("127.0.0.1:0".parse().unwrap())
+        .bind()
+        .unwrap();
+    let config = Config::new("sip:ua@127.0.0.1").unwrap();
+    let ua = attach(endpoint, incoming, config).unwrap();
+    let driver = tokio::spawn(ua.driver);
+    // A zero timeout drains a UA with nothing to do, rather than expiring.
+    let report = ua
+        .handle
+        .shutdown(ShutdownMode::DrainExisting, std::time::Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(report.outcome, ShutdownOutcome::Drained);
+    driver.await.unwrap();
 }
