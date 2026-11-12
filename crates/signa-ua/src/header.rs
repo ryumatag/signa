@@ -228,16 +228,9 @@ pub(crate) fn requires_extension(
     let mut any = false;
 
     for value in headers.get_all(REQUIRE) {
-        let mut rest = scan::sws(value.as_str());
-        loop {
-            let (_, after) = scan::token(rest).ok_or(malformed)?;
+        for tag in value::tokens(value.as_str()) {
+            tag.map_err(|_| malformed)?;
             any = true;
-            rest = scan::sws(after);
-            match rest.strip_prefix(',') {
-                Some(after) => rest = scan::sws(after),
-                None if rest.is_empty() => break,
-                None => return Err(malformed),
-            }
         }
     }
 
@@ -263,7 +256,7 @@ impl MediaType<'_> {
 /// Returns the media type of the Content-Type, or `None` without one.
 ///
 /// `media-type` of RFC 3261 section 25.1 is a type, a slash and a subtype,
-/// all tokens, then parameters, which are checked and left alone.
+/// then `m-parameter`s, which are checked and left alone.
 pub(crate) fn content_type(
     headers: &HeaderMap,
 ) -> Result<Option<MediaType<'_>>, Malformed> {
@@ -277,12 +270,9 @@ pub(crate) fn content_type(
 
 /// Reads a `media-type` value, as [`content_type`] does.
 pub(crate) fn media_type(value: &str) -> Result<MediaType<'_>, Malformed> {
-    let malformed = Malformed(Field::ContentType);
-    let (kind, rest) = scan::token(scan::sws(value)).ok_or(malformed)?;
-    let rest = scan::separator(rest, '/').ok_or(malformed)?;
-    let (subtype, rest) = scan::token(rest).ok_or(malformed)?;
-    parameters(rest).ok_or(malformed)?;
-    Ok(MediaType { kind, subtype })
+    let media =
+        value::media_type(value).map_err(|_| Malformed(Field::ContentType))?;
+    Ok(MediaType { kind: media.kind, subtype: media.subtype })
 }
 
 /// Returns the disposition type of the Content-Disposition, such as
@@ -315,16 +305,9 @@ pub(crate) fn encoded(headers: &HeaderMap) -> Result<bool, Malformed> {
     let mut any = false;
 
     for value in headers.get_all(CONTENT_ENCODING) {
-        let mut rest = scan::sws(value.as_str());
-        loop {
-            let (coding, after) = scan::token(rest).ok_or(malformed)?;
+        for coding in value::tokens(value.as_str()) {
+            let coding = coding.map_err(|_| malformed)?;
             any |= !coding.eq_ignore_ascii_case("identity");
-            rest = scan::sws(after);
-            match rest.strip_prefix(',') {
-                Some(after) => rest = scan::sws(after),
-                None if rest.is_empty() => break,
-                None => return Err(malformed),
-            }
         }
     }
 
@@ -332,10 +315,6 @@ pub(crate) fn encoded(headers: &HeaderMap) -> Result<bool, Malformed> {
 }
 
 /// Checks `*(SEMI generic-param)` to the end of the value.
-///
-/// A Content-Type's `m-parameter` is narrower, a token and a value that is
-/// a token or a quoted string. I check it as a `generic-param` all the same,
-/// since the UA reads none of these parameters.
 fn parameters(rest: &str) -> Option<()> {
     let (_, rest) = value::params(rest).ok()?;
     scan::sws(rest).is_empty().then_some(())
@@ -583,7 +562,15 @@ mod tests {
         assert_eq!(media, MediaType { kind: "Application", subtype: "SDP" });
         assert!(media.is("application", "sdp"));
 
-        for value in ["application", "application/", "/sdp", "a/b c", "a/b;"] {
+        // An `m-parameter` always has a value, unlike a `generic-param`.
+        for value in [
+            "application",
+            "application/",
+            "/sdp",
+            "a/b c",
+            "a/b;",
+            "application/sdp;charset",
+        ] {
             assert_eq!(
                 content_type(&headers(&[(CONTENT_TYPE, value)])),
                 Err(Malformed(Field::ContentType)),
