@@ -1688,12 +1688,8 @@ impl Driver {
     }
 
     // Builds a route outside `on_request`, for the benchmark hook and tests.
-    // Incoming envelopes get theirs when the driver admits the request. The
-    // socket tests that call it are skipped under Miri.
-    #[cfg_attr(
-        not(any(all(test, not(miri)), feature = "__bench")),
-        allow(dead_code)
-    )]
+    // Incoming envelopes get theirs when the driver admits the request.
+    #[cfg_attr(not(any(test, feature = "__bench")), allow(dead_code))]
     pub(super) fn prepare_reply(
         &self,
         mut request: Request<Bytes>,
@@ -3126,8 +3122,7 @@ fn send_on(
     }
 }
 
-// These private driver tests use sockets, which Miri cannot provide.
-#[cfg(all(test, not(miri)))]
+#[cfg(test)]
 mod tests {
     use std::{
         sync::Mutex,

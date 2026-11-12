@@ -659,16 +659,10 @@ mod tests {
     #[test]
     fn every_final_class_transitions_from_calling_and_proceeding() {
         let start = Instant::now();
-        // Class boundaries exercise both final-response paths under Miri
-        // without repeating parsing and ACK encoding for all 2,000 cases.
-        #[cfg(miri)]
-        let codes = [200, 299, 300, 399, 400, 499, 500, 599, 600, 699];
-        #[cfg(not(miri))]
-        let codes = 200..700;
 
         for reliable in [false, true] {
             for proceeding in [false, true] {
-                for code in codes.clone() {
+                for code in 200..700 {
                     let mut tx = client(reliable, start);
 
                     if proceeding {

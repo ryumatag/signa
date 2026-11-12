@@ -10,9 +10,6 @@ its tests. `interop` holds the ignored tests that `scripts/interop/run` runs
 against SIPp, an independent implementation.
 */
 
-// Every test binds loopback sockets, which Miri does not provide.
-#![cfg(not(miri))]
-
 mod cancel_bye;
 mod interop;
 mod limits;

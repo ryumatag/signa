@@ -294,7 +294,7 @@ mod tests {
         }
 
         QuickCheck::new()
-            .tests(if cfg!(miri) { 8 } else { 100 })
+            .tests(100)
             .quickcheck(property as fn(Vec<(u8, u16)>) -> bool);
     }
 }

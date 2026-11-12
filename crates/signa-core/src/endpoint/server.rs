@@ -972,7 +972,7 @@ pub(super) struct Submission {
     pub(super) done: oneshot::Sender<Result<(), SubmitError>>,
 }
 
-#[cfg(all(test, not(miri)))]
+#[cfg(test)]
 mod integration {
     use std::{future::poll_fn, time::Duration};
 

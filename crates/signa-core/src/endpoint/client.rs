@@ -997,8 +997,8 @@ fn validate_identity(request: &Request<Bytes>) -> Result<(), Error> {
 
 // A final-response `Service` client for the driver and transport tests. It
 // runs on the TU operations and is not public API. Only the socket tests use
-// it, and Miri skips those.
-#[cfg(all(test, not(miri)))]
+// it.
+#[cfg(test)]
 pub(super) mod compatibility {
     use std::pin::Pin;
 
@@ -1151,8 +1151,7 @@ pub(super) mod compatibility {
 mod tests {
     use super::*;
 
-    // These stream tests need an executor but no I/O driver, including under
-    // Miri.
+    // These stream tests need an executor but no I/O driver.
     fn run(future: impl Future<Output = ()>) {
         tokio::runtime::Builder::new_current_thread()
             .build()

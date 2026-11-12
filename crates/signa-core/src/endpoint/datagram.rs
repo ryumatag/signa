@@ -291,8 +291,7 @@ impl Datagram {
     }
 }
 
-// These queue tests use sockets, which Miri cannot provide.
-#[cfg(all(test, not(miri)))]
+#[cfg(test)]
 mod tests {
     use std::{
         future::{Future, poll_fn},

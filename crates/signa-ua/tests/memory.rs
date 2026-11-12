@@ -17,9 +17,6 @@ assert are generous, so that they catch a leak or a buffer kept by mistake,
 not a few bytes more.
 */
 
-// Every test binds loopback sockets, which Miri does not provide.
-#![cfg(not(miri))]
-
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     net::SocketAddr,

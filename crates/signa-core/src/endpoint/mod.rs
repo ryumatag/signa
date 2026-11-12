@@ -218,12 +218,12 @@ use std::{
 use bytes::Bytes;
 use tokio::sync::{Semaphore, mpsc, watch};
 
-#[cfg(all(test, not(miri)))]
+#[cfg(test)]
 use self::client::compatibility::Client;
 use self::{admission::ClientAdmission, driver::Command};
 #[cfg(feature = "__bench")]
 use self::{builder::Config, driver::Driver};
-#[cfg(all(test, not(miri)))]
+#[cfg(test)]
 use crate::transport::Transport;
 use crate::transport::{WriteLimits, budget::Budget};
 #[cfg(feature = "__bench")]
@@ -344,9 +344,6 @@ impl Endpoint {
     /// # Example
     ///
     /// ```
-    /// # #[cfg(miri)] // Miri has no sockets.
-    /// # fn main() {}
-    /// # #[cfg(not(miri))]
     /// # #[tokio::main(flavor = "current_thread")]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let (endpoint, _incoming) = signa_core::endpoint::Endpoint::builder()
@@ -380,9 +377,6 @@ impl Endpoint {
     /// # Example
     ///
     /// ```
-    /// # #[cfg(miri)] // Miri has no sockets.
-    /// # fn main() {}
-    /// # #[cfg(not(miri))]
     /// # #[tokio::main(flavor = "current_thread")]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let (endpoint, _incoming) = signa_core::endpoint::Endpoint::builder()
@@ -416,7 +410,7 @@ impl Endpoint {
     }
 
     // See `client::compatibility`.
-    #[cfg(all(test, not(miri)))]
+    #[cfg(test)]
     fn client(&self, transport: Transport, next_hop: SocketAddr) -> Client {
         Client::new(
             self.commands.clone(),
@@ -487,9 +481,6 @@ impl Endpoint {
     /// ```
     /// use std::time::Duration;
     ///
-    /// # #[cfg(miri)] // Miri has no sockets.
-    /// # fn main() {}
-    /// # #[cfg(not(miri))]
     /// # #[tokio::main(flavor = "current_thread")]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let (endpoint, _incoming) = signa_core::endpoint::Endpoint::builder()
@@ -552,9 +543,6 @@ impl Endpoint {
     /// use signa_core::endpoint::ReceivedAck;
     /// use tokio::sync::oneshot;
     ///
-    /// # #[cfg(miri)] // Miri has no sockets.
-    /// # fn main() {}
-    /// # #[cfg(not(miri))]
     /// # #[tokio::main(flavor = "current_thread")]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let (endpoint, _incoming) = signa_core::endpoint::Endpoint::builder()
@@ -633,8 +621,7 @@ pub fn reply_driver(
     Ok((request, route, driver.run()))
 }
 
-// These integration tests use sockets, which Miri cannot provide.
-#[cfg(all(test, not(miri)))]
+#[cfg(test)]
 mod tests {
     use std::{
         collections::{HashMap, hash_map::DefaultHasher},

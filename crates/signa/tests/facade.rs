@@ -111,7 +111,6 @@ fn facade_existing_endpoint_imports_compile() {
 // signa-core's endpoint.
 #[cfg(feature = "ua")]
 #[tokio::test]
-#[cfg_attr(miri, ignore)]
 async fn facade_ua_type_identity() {
     use signa::{
         endpoint::Endpoint,

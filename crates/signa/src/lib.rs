@@ -44,7 +44,7 @@ pub use signa_core::{message, transaction, transport};
 pub use signa_ua as ua;
 
 // Runs the README's quick start with the doctests, so it cannot drift from the
-// API. Miri has no sockets to run it on.
-#[cfg(all(doctest, feature = "tokio", not(miri)))]
+// API.
+#[cfg(all(doctest, feature = "tokio"))]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;

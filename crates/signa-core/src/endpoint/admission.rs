@@ -312,7 +312,7 @@ mod tests {
             .map(|_| {
                 let admission = admission.clone();
                 std::thread::spawn(move || {
-                    for _ in 0..if cfg!(miri) { 4 } else { 1000 } {
+                    for _ in 0..1000 {
                         if let Ok(mut permit) = admission.acquire(&request()) {
                             assert!(
                                 admission.0.count.load(Ordering::Relaxed) <= 4

@@ -515,7 +515,7 @@ mod tests {
         )
     }
 
-    // No I/O driver is needed. Keeping it disabled also permits Miri on macOS.
+    // No I/O driver is needed.
     #[test]
     fn enqueue_drops_the_original_response_before_waiting_for_io() {
         use std::{

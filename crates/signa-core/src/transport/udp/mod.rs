@@ -269,7 +269,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn a_datagram_arrives_with_its_flow() {
         let alice = Socket::bind(LOCALHOST).unwrap();
         let bob = Socket::bind(LOCALHOST).unwrap();
@@ -285,7 +284,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn the_received_flow_is_the_reply_path() {
         let alice = Socket::bind(LOCALHOST).unwrap();
         let bob = Socket::bind(LOCALHOST).unwrap();
@@ -301,7 +299,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn datagrams_share_the_read_buffer() {
         let alice = Socket::bind(LOCALHOST).unwrap();
         let bob = Socket::bind(LOCALHOST).unwrap();
@@ -321,7 +318,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn an_empty_datagram_is_returned() {
         let alice = Socket::bind(LOCALHOST).unwrap();
         let bob = Socket::bind(LOCALHOST).unwrap();
@@ -334,7 +330,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn ipv6_works_the_same() {
         let alice = Socket::bind(LOCALHOST_V6).unwrap();
         let bob = Socket::bind(LOCALHOST_V6).unwrap();
@@ -356,7 +351,6 @@ mod tests {
         target_vendor = "apple"
     ))]
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn a_wildcard_socket_learns_the_destination() {
         let alice = Socket::bind(LOCALHOST).unwrap();
         let bob = Socket::bind(UNSPECIFIED).unwrap();
@@ -377,7 +371,6 @@ mod tests {
         target_vendor = "apple"
     ))]
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn a_wildcard_ipv6_socket_learns_the_destination() {
         let unspecified =
             SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
@@ -398,7 +391,6 @@ mod tests {
     // socket there can pick any of those addresses as its source.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn a_wildcard_socket_sends_from_the_flow_address() {
         let alice = Socket::bind(UNSPECIFIED).unwrap();
         let bob = Socket::bind(LOCALHOST).unwrap();

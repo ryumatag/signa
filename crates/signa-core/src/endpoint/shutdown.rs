@@ -96,9 +96,6 @@ impl ShutdownOutcome {
 ///
 /// use signa_core::endpoint::{Endpoint, ShutdownOutcome};
 ///
-/// # #[cfg(miri)] // Miri has no sockets.
-/// # fn main() {}
-/// # #[cfg(not(miri))]
 /// # #[tokio::main(flavor = "current_thread")]
 /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let (endpoint, _incoming) =

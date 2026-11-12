@@ -172,7 +172,7 @@ mod tests {
             .map(|_| {
                 let budget = budget.clone();
                 std::thread::spawn(move || {
-                    for _ in 0..if cfg!(miri) { 4 } else { 1000 } {
+                    for _ in 0..1000 {
                         if let Some(_permit) = budget.acquire(3) {
                             assert!(
                                 budget.0.messages.load(Ordering::Relaxed) <= 4

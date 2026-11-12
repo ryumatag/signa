@@ -72,7 +72,6 @@ async fn read_response(stream: &mut TcpStream) -> Response<Bytes> {
 // `sent-by` each get their own response. The Via alone cannot tell them
 // apart, so the reply route keeps the connection.
 #[tokio::test]
-#[cfg_attr(miri, ignore)]
 async fn two_tcp_connections_with_one_sent_by_get_their_own_responses() {
     let (endpoint, mut incoming) = Endpoint::builder()
         .tcp("127.0.0.1:0".parse().unwrap())
@@ -119,7 +118,6 @@ async fn two_tcp_connections_with_one_sent_by_get_their_own_responses() {
 // from the address the request came to, whatever its size. The 1300-byte
 // limit of section 18.1.1 is for requests.
 #[tokio::test]
-#[cfg_attr(miri, ignore)]
 async fn a_udp_response_above_1300_bytes_stays_on_udp() {
     let (endpoint, mut incoming) = Endpoint::builder()
         .udp("127.0.0.1:0".parse().unwrap())

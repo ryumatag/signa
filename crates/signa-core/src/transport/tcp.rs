@@ -999,9 +999,8 @@ mod tests {
         }
     }
 
-    // The async receipt tests build runtimes without an I/O driver to run
-    // under Miri. #[tokio::test] initializes kqueue, which Miri does not
-    // support. Channels and mock writers need no I/O driver.
+    // The async receipt tests build runtimes without an I/O driver, since
+    // channels and mock writers need none.
 
     #[test]
     fn new_requests_leave_output_capacity_for_protocol_messages() {
@@ -1029,7 +1028,6 @@ mod tests {
     // likes. Closing still ends the connection once the queue is written, and
     // the connection keeps its reservation until then.
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn closing_writes_the_queue_and_ends_the_connection() {
         let tasks = Tasks::new();
         let (tx, rx) = mpsc::channel(1);
@@ -1185,7 +1183,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn closing_stops_a_listener_waiting_to_accept() {
         let tasks = Tasks::new();
         let (tx, _rx) = mpsc::channel(1);
@@ -1206,7 +1203,6 @@ mod tests {
     // channel ends the wait, so a peer that keeps sending cannot hold the
     // endpoint's teardown.
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn a_reader_held_by_backpressure_ends_with_the_channel() {
         let tasks = Tasks::new();
         let (tx, mut rx) = mpsc::channel(1);
@@ -1617,7 +1613,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn a_request_arrives_and_its_response_goes_back() {
         let (addr, mut rx) = listen(config());
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -1639,7 +1634,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn a_fragmented_request_is_put_together() {
         let (addr, mut rx) = listen(config());
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -1654,7 +1648,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn queued_messages_are_written_in_order() {
         let (addr, mut rx) = listen(config());
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -1670,7 +1663,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn a_ping_is_answered_with_a_pong() {
         let (addr, _rx) = listen(config());
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -1682,7 +1674,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn an_idle_connection_is_closed() {
         let (addr, _rx) = listen(config());
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -1692,7 +1683,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn a_bad_message_closes_the_connection() {
         let (addr, mut rx) = listen(Config {
             idle_timeout: Duration::from_secs(10),
@@ -1706,7 +1696,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn the_writer_reports_a_closed_connection() {
         let (addr, mut rx) = listen(config());
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -1730,7 +1719,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn the_connection_limit_holds_the_backlog() {
         let (addr, mut rx) = listen(Config { max_connections: 1, ..config() });
         let mut first = TcpStream::connect(addr).await.unwrap();
@@ -1752,7 +1740,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn a_connected_client_sends_and_receives() {
         let (addr, mut server_rx) = listen(config());
         let (client_tx, mut client_rx) = mpsc::channel(4);
@@ -1774,7 +1761,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore)]
     async fn a_client_takes_a_pong_in_stride() {
         let (tx, mut rx) = mpsc::channel(4);
         let listener = std::net::TcpListener::bind(LOCALHOST).unwrap();

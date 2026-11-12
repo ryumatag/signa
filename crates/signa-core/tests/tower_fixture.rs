@@ -891,7 +891,6 @@ async fn observe_end(mut events: ServerEvents) {
 }
 
 #[tokio::test]
-#[cfg_attr(miri, ignore)]
 async fn wrappers_see_every_submission_and_no_protocol_output() {
     let log = Log::default();
     let count = Arc::new(AtomicUsize::new(0));
@@ -949,7 +948,6 @@ async fn wrappers_see_every_submission_and_no_protocol_output() {
 }
 
 #[tokio::test]
-#[cfg_attr(miri, ignore)]
 async fn handler_end_comes_before_transaction_end() {
     let (mut harness, dispatching) = Harness::start(LIMITS, Identity::new());
     let uac = harness.uac().await;
@@ -973,7 +971,6 @@ async fn handler_end_comes_before_transaction_end() {
 }
 
 #[tokio::test]
-#[cfg_attr(miri, ignore)]
 async fn acks_progress_while_every_handler_waits_for_one() {
     let limits = Limits { handlers: 2, ..LIMITS };
     let (mut harness, dispatching) = Harness::start(limits, Identity::new());
@@ -1040,7 +1037,6 @@ async fn acks_progress_while_every_handler_waits_for_one() {
 }
 
 #[tokio::test]
-#[cfg_attr(miri, ignore)]
 async fn a_cancel_is_answered_while_the_request_service_is_not_ready() {
     let (mut harness, dispatching) = Harness::start(LIMITS, Identity::new());
     harness.gate.closed.store(true, Ordering::SeqCst);
@@ -1073,7 +1069,6 @@ async fn a_cancel_is_answered_while_the_request_service_is_not_ready() {
 }
 
 #[tokio::test]
-#[cfg_attr(miri, ignore)]
 async fn buffered_calls_are_bounded_and_overflow_gets_a_503() {
     let limits = Limits { handlers: 1, queued: 1, ..LIMITS };
     let (mut harness, dispatching) = Harness::start(limits, Identity::new());
@@ -1112,7 +1107,6 @@ async fn buffered_calls_are_bounded_and_overflow_gets_a_503() {
 }
 
 #[tokio::test]
-#[cfg_attr(miri, ignore)]
 async fn a_tower_timeout_drops_the_handler_but_cancels_nothing() {
     // The timeout ends the handler's future. Its responder drops unanswered,
     // which is signa's 500, not a CANCEL and not the end of the transaction.
