@@ -13,6 +13,27 @@ use crate::message::{byte_str::ByteStr, error::InvalidHeaderName};
 /// spelling. Parsing is case-insensitive, standard compact forms normalize to
 /// their long-form standard headers, and custom header names are normalized to
 /// lowercase.
+///
+/// # Equality
+///
+/// A `HeaderName` equals a string when [`HeaderName::from_bytes`] would read
+/// the string as that name. The comparison ignores ASCII case, a compact form
+/// equals its long form, and a string that is not a valid name equals nothing.
+/// [`HeaderMap`](super::HeaderMap) looks up rows by string the same way.
+///
+/// # Example
+///
+/// ```
+/// use signa_core::message::header::{HeaderName, VIA};
+///
+/// assert_eq!(VIA, "Via");
+/// assert_eq!(VIA, "VIA");
+/// assert_eq!(VIA, "v");
+/// assert_ne!(VIA, "Via:");
+///
+/// let account = HeaderName::from_static("x-account-id");
+/// assert_eq!(account, "X-Account-ID");
+/// ```
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct HeaderName(Repr);
 
@@ -793,6 +814,27 @@ impl HeaderName {
             Repr::Custom(_) => None,
         }
     }
+
+    /// Returns whether `from_bytes` would read `src` as this name, without
+    /// building one.
+    ///
+    /// A custom name is a lowercase token that no standard name or compact
+    /// form matches, so a string that equals it ignoring case reads back as
+    /// the same custom name. A standard name can be spelled only as its long
+    /// or compact form.
+    fn eq_str(&self, src: &str) -> bool {
+        match self.0 {
+            Repr::Standard(standard) => {
+                src.eq_ignore_ascii_case(standard.as_str())
+                    || standard.compact_form().is_some_and(|compact| {
+                        src.eq_ignore_ascii_case(compact)
+                    })
+            }
+            Repr::Custom(ref custom) => {
+                src.eq_ignore_ascii_case(custom.as_str())
+            }
+        }
+    }
 }
 
 impl fmt::Debug for HeaderName {
@@ -804,6 +846,30 @@ impl fmt::Debug for HeaderName {
 impl fmt::Display for HeaderName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_ref())
+    }
+}
+
+impl PartialEq<str> for HeaderName {
+    fn eq(&self, other: &str) -> bool {
+        self.eq_str(other)
+    }
+}
+
+impl PartialEq<&str> for HeaderName {
+    fn eq(&self, other: &&str) -> bool {
+        self.eq_str(other)
+    }
+}
+
+impl PartialEq<HeaderName> for str {
+    fn eq(&self, other: &HeaderName) -> bool {
+        other.eq_str(self)
+    }
+}
+
+impl PartialEq<HeaderName> for &str {
+    fn eq(&self, other: &HeaderName) -> bool {
+        other.eq_str(self)
     }
 }
 
@@ -1021,6 +1087,85 @@ mod tests {
 
         assert_eq!(a, b);
         assert_eq!(b, c);
+    }
+
+    #[test]
+    fn standard_names_equal_their_spellings_in_any_case() {
+        for test in TEST_HEADERS {
+            let header = &test.header;
+            let upper = test.canonical.to_ascii_uppercase();
+
+            assert_eq!(*header, test.canonical);
+            assert_eq!(*header, test.lower);
+            assert_eq!(*header, *upper);
+            assert_eq!(test.canonical, *header);
+            assert_eq!(*upper, *header);
+
+            if let Some(compact) = test.compact {
+                assert_eq!(*header, compact);
+                assert_eq!(*header, *compact.to_ascii_uppercase());
+            }
+
+            assert_ne!(*header, format!("{}:", test.canonical).as_str());
+            assert_ne!(*header, &test.canonical[1..]);
+        }
+    }
+
+    #[test]
+    fn standard_names_differ_from_other_names() {
+        assert_ne!(super::konst::VIA, "Call-ID");
+        assert_ne!(super::konst::VIA, "i");
+        assert_ne!(super::konst::CALL_ID, "v");
+        assert_ne!(super::konst::WARNING, "w");
+        assert_ne!(super::konst::VIA, "x-via");
+    }
+
+    #[test]
+    fn custom_names_equal_strings_ignoring_case() {
+        let name = HeaderName::from_bytes(b"X-Account-Id").unwrap();
+
+        assert_eq!(name, "x-account-id");
+        assert_eq!(name, "X-ACCOUNT-ID");
+        assert_eq!("X-Account-Id", name);
+        assert_ne!(name, "x-account");
+        assert_ne!(name, "x-account-id ");
+        assert_ne!(name, "");
+    }
+
+    #[test]
+    fn str_equality_matches_from_bytes() {
+        // A string equals a name exactly when `from_bytes` reads it as that
+        // name. The pool mixes standard names, with and without a compact
+        // form, and custom ones. Random strings rarely name any of them, so
+        // the fixed spellings after the random run cover the matches.
+        fn property(src: String, index: usize) -> bool {
+            let pool = [
+                super::konst::VIA,
+                super::konst::CALL_ID,
+                super::konst::WARNING,
+                HeaderName::from_static("x-a"),
+                HeaderName::from_static("x-account-id"),
+            ];
+            let name = &pool[index % pool.len()];
+            let parsed = HeaderName::from_bytes(src.as_bytes()).ok();
+
+            let consistent =
+                (*name == *src) == (parsed.as_ref() == Some(name));
+            let symmetric = (*src == *name) == (*name == *src);
+            let parsed_equal = parsed.is_none_or(|parsed| parsed == *src);
+            consistent && symmetric && parsed_equal
+        }
+
+        quickcheck::QuickCheck::new()
+            .tests(2000)
+            .quickcheck(property as fn(String, usize) -> bool);
+
+        for src in ["v", "V", "via", "VIA", "Via", "i", "x-A", "X-ACCOUNT-ID"]
+        {
+            for index in 0..5 {
+                assert!(property(src.to_owned(), index), "{src} at {index}");
+            }
+        }
     }
 
     #[test]
