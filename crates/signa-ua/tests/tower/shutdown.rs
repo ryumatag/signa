@@ -59,6 +59,7 @@ async fn shutdown_waits_for_or_aborts_tracked_adapter_work() {
     let me = peer.address();
     peer.send(&direct_invite(me, "decided"), udp).await;
     peer.recv_starting("SIP/2.0 100").await;
+    gate.reached().await;
 
     let mut shutdown = serving
         .handle
@@ -121,6 +122,7 @@ async fn a_termination_takes_the_decision_a_handler_holds() {
     let peer = Peer::new().await;
     peer.send(&direct_invite(peer.address(), "taken"), udp).await;
     peer.recv_starting("SIP/2.0 100").await;
+    gate.reached().await;
 
     let shutdown = serving
         .handle

@@ -158,4 +158,18 @@ impl Gate {
         let mut open = self.0.subscribe();
         open.wait_for(|open| *open).await.expect("the gate is kept");
     }
+
+    /// Waits until a handler waits at the gate, and so holds its INVITE.
+    /// The 100 Trying does not say that much, since signa-core sends it
+    /// before the UA takes the INVITE, and a shutdown that reaches the UA
+    /// first answers the INVITE with a 503 without handing it on.
+    async fn reached(&self) {
+        timeout(WAIT, async {
+            while self.0.receiver_count() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a handler reaches the gate");
+    }
 }
