@@ -214,10 +214,15 @@ jobs:
   # inputs, so this catches undefined behavior there that siparse's own tests
   # may not reach.
   #
-  # The socket tests are `#[cfg_attr(miri, ignore)]`, since Miri has no
-  # network I/O.
+  # Miri has no network I/O, so signa-core's socket tests are
+  # `#[cfg_attr(miri, ignore)]`, and signa-ua's loopback test binaries build
+  # empty under Miri. signa-ua's property tests and races run a few scripts
+  # and orders there, since Miri runs them about a thousand times slower and
+  # the full search took hours. The timeout stops a test that grows slow
+  # again well before the six hours GitHub allows.
   miri:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7

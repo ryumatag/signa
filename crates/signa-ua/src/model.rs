@@ -10557,7 +10557,10 @@ Contact: <sip:alice@192.0.2.1>
         });
         let mut exchanges = Vec::new();
         let mut replays = Vec::new();
-        for n in 0..200 {
+        // Twenty generations are as many reuses of the slot for Miri, which
+        // runs each about a thousand times slower.
+        let rounds = if cfg!(miri) { 20 } else { 200 };
+        for n in 0..rounds {
             let call = format!("reuse{n}@example.com");
             let authority =
                 model.receive_invite(&invite(&call), offer(), clock.now());
@@ -11781,7 +11784,10 @@ Contact: <sip:{host}@192.0.2.9>
     }
 
     /// A QuickCheck run of `tests` inputs of up to `size` steps each, unless
-    /// `QUICKCHECK_TESTS` sets how many, for a longer search.
+    /// `QUICKCHECK_TESTS` sets how many, for a longer search. Under Miri it
+    /// is two inputs of up to 50 steps. Miri runs the model about a thousand
+    /// times slower, and is there for undefined behavior in what the model
+    /// calls, which a few scripts reach, not for the search.
     ///
     /// The inputs come from a seed, which `SIGNA_UA_SEED` sets and is random
     /// otherwise. A failing test prints it, and QuickCheck prints the input
@@ -11801,6 +11807,8 @@ Contact: <sip:{host}@192.0.2.9>
             Err(error) => panic!("SIGNA_UA_SEED: {error}"),
         };
         eprintln!("rerun with SIGNA_UA_SEED={seed}");
+        let (size, tests) =
+            if cfg!(miri) { (size.min(50), 2) } else { (size, tests) };
         let checker = quickcheck::QuickCheck::new()
             .rng(quickcheck::Gen::from_size_and_seed(size, seed));
         if std::env::var_os("QUICKCHECK_TESTS").is_some() {
@@ -11891,6 +11899,10 @@ Contact: <sip:{host}@192.0.2.9>
     /// the inputs in their order, at the end. A failure prints the order.
     /// Each input has to change something in some order, or the race does
     /// not race it.
+    ///
+    /// Under Miri, a race takes eight of its orders, evenly spaced, and does
+    /// not ask each input to act, since those orders may not show it. The
+    /// 720 orders of six inputs are too many for Miri.
     fn race(
         name: &str,
         setup: &[Race],
@@ -11901,7 +11913,9 @@ Contact: <sip:{host}@192.0.2.9>
         // most a race needs so far.
         assert!(inputs.len() <= 6, "{name}: {} inputs", inputs.len());
         let mut acted = vec![false; inputs.len()];
-        for order in orders(inputs.len()) {
+        let all = orders(inputs.len());
+        let step = if cfg!(miri) { all.len().div_ceil(8) } else { 1 };
+        for order in all.into_iter().step_by(step) {
             let names: Vec<&str> =
                 order.iter().map(|&index| inputs[index].name()).collect();
             let run = || {
@@ -11925,8 +11939,10 @@ Contact: <sip:{host}@192.0.2.9>
                 std::panic::resume_unwind(panic);
             }
         }
-        for (input, acted) in inputs.iter().zip(acted) {
-            assert!(acted, "{name}: {} never did anything", input.name());
+        if step == 1 {
+            for (input, acted) in inputs.iter().zip(acted) {
+                assert!(acted, "{name}: {} never did anything", input.name());
+            }
         }
     }
 
