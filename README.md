@@ -23,10 +23,14 @@ Its design draws heavily on the [hyper] and [http] crates.
 
 The repository is a Cargo workspace of three crates:
 
-* `signa`, the crate to depend on. It re-exports signa-core and is to become
-  the front of a SIP application framework.
+* `signa`, the crate to depend on. It re-exports signa-core, and signa-ua
+  behind its `ua` feature, and is to become the front of a SIP application
+  framework.
 * `signa-core`, the messages, transports and transactions described below.
-* `signa-ua`, dialogs and INVITE usage for user agents. It has no API yet.
+* `signa-ua`, dialogs and INVITE usage for user agents, on the public API of
+  signa-core. See [Dialogs and INVITE usage](#dialogs-and-invite-usage).
+
+signa-ua depends on signa-core, which depends on neither of the others.
 
 [RFC 3261 section 17]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17
 [hyper]: https://docs.rs/hyper
@@ -49,11 +53,13 @@ The repository is a Cargo workspace of three crates:
 
 ### What the application does
 
-The application is the transaction user (TU). It owns dialogs and calls, the
-ACK for a 2xx, retransmitting its own 2xx until the ACK, what a received CANCEL
-means, proxy routing and forking decisions, Timer C, next-hop selection
-(RFC 3263), authentication, registration, SDP and media, and handler dispatch.
-The examples below show several of these on top of signa.
+On signa-core, the application is the transaction user (TU). It owns dialogs
+and calls, the ACK for a 2xx, retransmitting its own 2xx until the ACK, what a
+received CANCEL means, proxy routing and forking decisions, Timer C, next-hop
+selection (RFC 3263), authentication, registration, SDP and media, and handler
+dispatch. The examples below show several of these on top of signa. signa-ua
+takes on the dialogs and the INVITE sessions of a user agent, as described
+below.
 
 The TU is not a Rust trait. signa has no service trait. An ordinary receive
 loop uses the API directly, and a Tower adapter can be built outside signa.
@@ -80,6 +86,37 @@ API:
 Reception is fixed per endpoint. `Reception::Stateful`, the default, runs
 transactions over UDP and TCP. `Reception::Stateless` delivers every message
 over UDP without transactions, for a stateless proxy.
+
+### Dialogs and INVITE usage
+
+signa-ua keeps the dialogs that INVITEs form and the INVITE session of each,
+on top of signa-core's transactions. It acknowledges each 2xx that forms a
+dialog, within its limits, sends its own 2xx again until the ACK, and answers
+what the application leaves unanswered. The application decides each incoming INVITE, says when to call, hang up or
+change a session, and owns SDP, media and call policy.
+
+* Initial INVITEs both ways, with the offer in the INVITE or in the 2xx. A
+  UA sends an INVITE without an offer only with a `Negotiate` provider, which
+  prepares the answer each ACK carries.
+* A session of its own for each fork, and an ACK for each 2xx of a dialog.
+* CANCEL, BYE either way, and re-INVITE either way with target refresh.
+* Limits on the UA's tables, queues and jobs, and a shutdown in two phases.
+
+`signa::ua::attach` starts a UA on an endpoint of its own and returns a
+handle for operations, a receiver of events, and the driver future that
+runs it. Its documentation says what submitting, the event queue, a
+shutdown and dropping each part do, and `Config` the limits.
+
+signa-ua is at an early stage. It implements parts of RFC 3261 and RFC 6141,
+claims conformance to neither as a whole, and is not a complete UA. It has no
+reliable provisional responses, UPDATE, REFER or session timers, no
+authentication and no DNS, and a rejection carries no header of its own,
+such as the Contact of a 3xx. Its [crate documentation](https://docs.rs/signa-ua)
+lists what it does not do yet.
+[`docs/signa-ua-rfc-test-map.md`](docs/signa-ua-rfc-test-map.md) says which
+tests show each rule, and which rules are partial or not supported. Beyond its
+own tests, it has run against SIPp alone, by hand: a call, a CANCEL and a
+re-INVITE from SIPp, and a call to SIPp, over UDP and TCP.
 
 ### Quick start
 
@@ -175,8 +212,9 @@ The `ua-` examples build on signa-ua instead, through the facade's `ua`
 feature. The UA takes on the dialogs and the INVITE usage, and the example
 plays the application:
 
-* [`examples/ua-call`](examples/ua-call): two UAs call each other; the
-  callee rings and answers, the caller hangs up.
+* [`examples/ua-call`](examples/ua-call): two UAs call each other. The
+  callee rings, answers and hangs up, and its UA holds the BYE until the
+  ACK.
 * [`examples/ua-late-offer`](examples/ua-late-offer): an INVITE without an
   offer, answered in the ACK by a `Negotiate` provider.
 * [`examples/ua-fork`](examples/ua-fork): a caller that takes a 2xx from
@@ -204,22 +242,27 @@ conformance to any of them as a whole.
 
 The [crate documentation] lists what is supported, partial, left to the TU and
 unsupported, section by section. [`docs/rfc-test-map.md`](docs/rfc-test-map.md)
-maps each requirement to its tests.
+maps each requirement to its tests. signa-ua's scope is above, and in its own
+map.
 
 ### Deliberate omissions
 
-signa 0.3 has no dialog or call layer, no TLS and so no SIPS, no RFC 3263
-resolution, no PRACK or session timers, no authentication, SDP or media, and no
-proxy routing logic. Stateless reception is UDP-only and cannot share an
-endpoint with stateful reception. RFC 2543 transactions are not matched.
-`sips:` Request-URIs are refused, but nothing else about SIPS, Route or the
-target is checked. A `sip:` URI does not make plaintext safe.
+signa-core has no dialog or call layer, which signa-ua adds for INVITE
+sessions. Neither has TLS, and so SIPS, nor RFC 3263 resolution, PRACK,
+session timers, authentication, SDP or media, and neither has proxy routing
+logic. Stateless reception is UDP-only and cannot share an endpoint with
+stateful reception. RFC 2543 transactions are not matched. signa-core refuses
+`sips:` Request-URIs, but checks nothing else about SIPS, Route or the target,
+which signa-ua does for the requests it sends. A `sip:` URI does not make
+plaintext safe.
 
 ### Features and MSRV
 
 * `tokio`, on by default, enables the endpoint and its sockets. Without it the
   message types, transaction timer configuration and transport metadata stay
   available without a runtime.
+* `ua` adds signa-ua as the `signa::ua` module, and turns on `tokio`, since a
+  UA runs on an endpoint.
 
 The minimum supported Rust version is 1.85.
 
@@ -229,6 +272,10 @@ The minimum supported Rust version is 1.85.
   the lifetimes it separates, and the RFC scope in the crate documentation.
 * [`docs/rfc-test-map.md`](docs/rfc-test-map.md), requirements and their
   tests.
+* [signa-ua's documentation](https://docs.rs/signa-ua), with what the UA does
+  and how to run it, and
+  [`docs/signa-ua-rfc-test-map.md`](docs/signa-ua-rfc-test-map.md), its
+  requirements and their tests.
 * [siparse], the SIP message head parser signa builds on.
 
 [siparse]: https://docs.rs/siparse

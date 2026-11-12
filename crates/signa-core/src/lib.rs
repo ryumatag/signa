@@ -160,7 +160,8 @@ that:
 These can be built above signa with its current API:
 
 * A complete UA, PBX, registrar, proxy or B2BUA, and dialog and call state.
-  The examples show the TU parts each needs.
+  The examples show the TU parts each needs. signa-ua keeps dialogs and
+  INVITE usage on signa-core's public API.
 * RFC 3263 resolution and failover, which pick a target and start the next
   transaction.
 * Authentication policy, SDP and media.
@@ -168,8 +169,9 @@ These can be built above signa with its current API:
   processing. The header API cannot yet remove only the first value of a
   header, so the proxy examples rebuild those rows.
 * A helper for UAS 2xx retransmission. The repository's `examples/invite-uas`
-  has the loop. I keep it out of signa because it has to fit the TU's dialog
-  ACK dispatch, duplicate ACKs, an answer carried in the ACK, and the
+  has the loop, and signa-ua retransmits the 2xx of its INVITE sessions. I
+  keep it out of signa-core because it has to fit the TU's dialog ACK
+  dispatch, duplicate ACKs, an answer carried in the ACK, and the
   application's lifetimes.
 
 Reliable provisional responses and PRACK (RFC 3262) and session timers

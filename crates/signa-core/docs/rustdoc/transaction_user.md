@@ -53,6 +53,9 @@ The TU:
 * does authentication, registration, SDP and media,
 * dispatches requests to handlers, bounds them, and times them out.
 
+signa-ua is a TU of this kind for the dialogs and INVITE sessions of a user
+agent, and leaves the rest of the list to the application.
+
 # Lifetimes
 
 Four lifetimes meet at the boundary. Each ends for its own reason, and the

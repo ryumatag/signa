@@ -14,7 +14,7 @@ use signa_core::{
 };
 use signa_ua::{
     AttachError, Error, Event, InvitePlan, Query, Resolve, ResolveError,
-    SessionPhase, StaticResolver, Ua, attach,
+    SessionPhase, ShutdownMode, StaticResolver, Ua, attach,
 };
 use tokio::{sync::Notify, time::timeout};
 
@@ -22,7 +22,10 @@ use crate::support::{
     WAIT, bind, config,
     events::{event, invite},
     fast,
-    message::{answer, header, invite_to_ua, plan_to, sdp},
+    message::{
+        ack_for, answer, direct_invite, header, in_dialog, invite_to_ua,
+        plan_to, sdp,
+    },
     peer::Peer,
     stand_in::{Hosts, Slow},
     start, start_fast, start_fast_with, ua_on,
@@ -119,6 +122,28 @@ async fn observer_drop_does_not_drop_responder_or_client_control() {
     // (Table 1 of RFC 3261 section 19.1.1).
     assert_eq!(header(&ack, "To"), ["<sip:peer@127.0.0.1>;tag=peer"]);
     peer.quiet("CANCEL", Duration::from_millis(300)).await;
+}
+
+/// Dropping the handle of an acknowledged session sends no BYE. The session
+/// stays up, and the peer's BYE still finds it.
+#[tokio::test]
+async fn session_drop_sends_no_bye() {
+    let (mut ua, address) = start(config());
+    tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+    let me = peer.address();
+
+    peer.send(&direct_invite(me, "kept"), address).await;
+    let accepted = invite(&mut ua.events).await.try_accept(sdp()).unwrap();
+    let (ok, _) = peer.recv_starting("SIP/2.0 200").await;
+    peer.send(&ack_for(&ok, me, "kept", 1), address).await;
+    // `Session` is a plain handle, so this is all its drop does.
+    let _ = accepted.await.unwrap();
+
+    peer.quiet("BYE", Duration::from_millis(300)).await;
+    peer.send(&in_dialog("BYE", "UDP", &ok, me, "kept", 2), address).await;
+    let (response, _) = peer.recv_starting("SIP/2.0 200").await;
+    assert_eq!(header(&response, "CSeq"), ["2 BYE"]);
 }
 
 /// The ACK of one dialog waits for its next hop, which never resolves. The
@@ -226,6 +251,58 @@ async fn driver_drop_is_forced_stop_not_graceful_shutdown() {
     peer.quiet("SIP/2.0 200", Duration::from_millis(300)).await;
 }
 
+/// A resolver whose resolutions never end. Each holds a clone of `held`
+/// while it runs, and says on `started` that it began.
+struct Stuck {
+    started: Arc<Notify>,
+    held: Arc<()>,
+}
+
+impl Resolve for Stuck {
+    async fn resolve(&self, _: &Query) -> Result<Target, ResolveError> {
+        let _held = self.held.clone();
+        self.started.notify_one();
+        std::future::pending().await
+    }
+}
+
+/// Dropping the driver aborts the UA's tasks, such as a resolution that
+/// would run for ten minutes, and a shutdown waiting for its report gets
+/// `DriverStopped` in its place.
+#[tokio::test]
+async fn driver_drop_aborts_tasks_and_fails_the_shutdown() {
+    let started = Arc::new(Notify::new());
+    let held = Arc::new(());
+    let resolver = Stuck { started: started.clone(), held: held.clone() };
+    let config =
+        config().resolver(resolver).resolve_timeout(Duration::from_secs(600));
+    let (ua, _) = start(config);
+    let driver = tokio::spawn(ua.driver);
+
+    let pending = ua.handle.try_invite(plan_to("127.0.0.1", "stuck")).unwrap();
+    timeout(WAIT, started.notified()).await.unwrap();
+    // The attempt holds the drain, so the shutdown waits for it.
+    let shutdown =
+        ua.handle.shutdown(ShutdownMode::DrainExisting, Duration::MAX);
+    driver.abort();
+
+    assert_eq!(
+        timeout(WAIT, shutdown).await.unwrap(),
+        Err(Error::DriverStopped)
+    );
+    assert_eq!(
+        timeout(WAIT, pending).await.unwrap(),
+        Err(Error::DriverStopped)
+    );
+    timeout(WAIT, async {
+        while Arc::strong_count(&held) > 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the resolution's task was aborted");
+}
+
 /// An INVITE whose decision is dropped gets a 500, and a rejected one the
 /// status the application chose.
 #[tokio::test]
@@ -308,6 +385,35 @@ async fn operations_beyond_the_limit_are_busy_until_one_ends() {
     tokio::spawn(ua.driver);
     first.await.unwrap();
     ua.handle.try_invite(refused.into_inner()).unwrap().await.unwrap();
+}
+
+/// An operation's place comes back once its outcome is in, while its
+/// future still waits to be polled.
+#[tokio::test]
+async fn an_unread_outcome_holds_no_place() {
+    let (ua, _) = start(config().max_operations(1));
+    tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+    let to = peer.address().to_string();
+
+    let first = ua.handle.try_invite(plan_to(&to, "first")).unwrap();
+    peer.recv_starting("INVITE").await;
+
+    let mut plan = plan_to(&to, "second");
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let second = loop {
+        match ua.handle.try_invite(plan) {
+            Ok(second) => break second,
+            Err(refused) => {
+                assert_eq!(refused.error(), Error::Busy);
+                assert!(tokio::time::Instant::now() < deadline, "no place");
+                plan = refused.into_inner();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    };
+    second.await.unwrap();
+    first.await.unwrap();
 }
 
 /// A resolver that panics fails the INVITE it was resolving, and the UA

@@ -135,6 +135,24 @@ async fn a_config_at_its_extremes_still_runs() {
     peer.recv_starting("INVITE").await;
 }
 
+/// A limit of zero counts as one, so the UA builds and takes one operation
+/// at a time.
+#[tokio::test]
+async fn a_limit_of_zero_counts_as_one() {
+    let config = config().command_capacity(0).max_operations(0);
+    let (ua, _) = start(config);
+    let peer = Peer::new().await;
+    let to = peer.address().to_string();
+
+    let first = ua.handle.try_invite(plan_to(&to, "first")).unwrap();
+    let refused = ua.handle.try_invite(plan_to(&to, "second")).unwrap_err();
+    assert_eq!(refused.error(), Error::Busy);
+
+    tokio::spawn(ua.driver);
+    first.await.unwrap();
+    peer.recv_starting("INVITE").await;
+}
+
 /// The count of dropped notifications comes as soon as the application
 /// makes room, even if nothing else happens.
 #[tokio::test]

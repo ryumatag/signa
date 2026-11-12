@@ -363,8 +363,10 @@ impl<R, N> Config<R, N> {
         self
     }
 
-    /// Sets how many operations may run or keep an outcome at once. A
-    /// submission beyond it gets [`Error::Busy`]. The default is 1024.
+    /// Sets how many operations may run at once. A submission beyond it
+    /// gets [`Error::Busy`]. An operation's place comes back once its outcome
+    /// is in, whether or not its [`Operation`] has been polled. The default
+    /// is 1024.
     pub fn max_operations(mut self, limit: usize) -> Config<R, N> {
         self.operations = bounded(limit);
         self
@@ -384,7 +386,8 @@ impl<R, N> Config<R, N> {
     }
 
     /// Sets how many INVITEs this UA may have sent and still collect
-    /// responses for. The default is 256.
+    /// responses for. An INVITE beyond it fails with
+    /// [`Error::CapacityExceeded`], and nothing is sent. The default is 256.
     pub fn max_attempts(mut self, limit: usize) -> Config<R, N> {
         self.attempts = bounded(limit);
         self
@@ -392,6 +395,11 @@ impl<R, N> Config<R, N> {
 
     /// Sets how many dialogs, early or confirmed, the UA keeps. The default
     /// is 1024.
+    ///
+    /// An accept without room fails with [`Error::CapacityExceeded`], and the
+    /// UA answers the INVITE with a 503. A 2xx to an INVITE of this UA's
+    /// without room gets its ACK and a BYE, as for [`Config::max_forks`], and
+    /// a provisional response without room forms no early dialog.
     pub fn max_dialogs(mut self, limit: usize) -> Config<R, N> {
         self.dialogs = bounded(limit);
         self
@@ -482,6 +490,10 @@ impl<R, N> Config<R, N> {
     /// parsed header table comes on top, which the parser bounds to 100 rows.
     /// An INVITE that does not fit gets a 503. Bytes the application copies
     /// out of the INVITE are its own.
+    ///
+    /// What signa-core keeps of an INVITE is not counted. Until the final
+    /// response, its transaction keeps a slice of the INVITE, and with it the
+    /// buffer the INVITE arrived in, which over UDP is a chunk of 256 KiB.
     pub fn max_invite_bytes(mut self, bytes: usize) -> Config<R, N> {
         self.invite_bytes = bounded(bytes);
         self
@@ -586,19 +598,19 @@ pub struct Ua {
 ///
 /// # Events
 ///
-/// Events arrive in order through a bounded queue. An [`IncomingInvite`] always
-/// gets through, since the UA answers an INVITE it has no room to report with a
+/// Events arrive in order through a bounded queue. No [`IncomingInvite`] is
+/// lost unanswered. The UA answers an INVITE it has no room to report with a
 /// 503, as it does once [`UaEvents`] is dropped. A notification that does not
 /// fit is dropped and counted, and the count comes as [`Event::Lagged`] as soon
-/// as there is room, before any later notification. Nothing the protocol needs
-/// is lost with it. The outcome of an operation comes through its
-/// [`Operation`], and the state of a session through [`UaHandle::snapshot`].
+/// as there is room. Nothing the protocol needs is lost with it. The outcome
+/// of an operation comes through its [`Operation`], and the state of a session
+/// through [`UaHandle::snapshot`].
 ///
 /// # Shutting down
 ///
 /// [`UaHandle::shutdown`] stops the UA in two phases. The UA stops taking new
 /// work and ends what is under way, or lets the application end it, while
-/// its endpoint keeps taking the requests that needs. Then it shuts the
+/// its endpoint keeps taking the requests that work needs. Then it shuts the
 /// endpoint down, and the driver returns once both have stopped or the
 /// deadline came. Dropping the driver instead is a forced stop.
 ///
@@ -613,10 +625,15 @@ pub struct Ua {
 ///
 /// Dropping a handle sends nothing. A [`Session`] or [`InviteAttempt`] going
 /// away is neither a BYE nor a CANCEL, and the UA keeps answering and
-/// acknowledging for it. Only [`UaHandle::try_terminate`],
-/// [`UaHandle::try_cancel`] and [`UaHandle::try_abandon`] send those. The
-/// exception is an [`IncomingInvite`] dropped without a decision. Nobody can
-/// answer it any more, so the UA does, with a 500.
+/// acknowledging for it. The application ends them with
+/// [`UaHandle::try_terminate`], [`UaHandle::try_cancel`] and
+/// [`UaHandle::try_abandon`], or all at once with a
+/// [`ShutdownMode::Terminate`] shutdown. The UA sends a BYE of its own only
+/// for a dialog it cannot keep or that cannot go on, such as a fork beyond
+/// its limits or a session whose ACK never came.
+///
+/// The exception is an [`IncomingInvite`] dropped without a decision.
+/// Nobody can answer it any more, so the UA does, with a 500.
 ///
 /// # Errors
 ///
@@ -681,8 +698,8 @@ struct Shared {
     /// offer.
     late_offer: bool,
     commands: mpsc::Sender<Command>,
-    /// One permit per operation that runs or keeps its outcome. A submission
-    /// takes one, so that the driver always has room for what it admitted.
+    /// One permit per operation that runs. A submission takes one, so that
+    /// the driver always has room for what it admitted.
     operations: Arc<Semaphore>,
     /// The shutdown asked for so far, which every call to
     /// [`UaHandle::shutdown`] merges into.
@@ -926,10 +943,17 @@ impl UaHandle {
     /// The BYE goes in a client transaction of its own, through the
     /// dialog's route set. The session ends once the endpoint has it, with
     /// [`Event::Ended`] and [`EndReason::LocalBye`], before any response,
-    /// as RFC 3261 section 15.1.1 has it. A session this UA answered waits
-    /// for the ACK of its 2xx first, since section 15 keeps the callee from
-    /// sending its BYE before that, and shows as [`SessionPhase::Ending`]
-    /// meanwhile. If the ACK never comes, the BYE goes at the ACK deadline.
+    /// as RFC 3261 section 15.1.1 has it.
+    ///
+    /// The BYE waits for an ACK first, and the session shows as
+    /// [`SessionPhase::Ending`] meanwhile. A session this UA answered waits
+    /// for the ACK of its 2xx, since section 15 keeps the callee from sending
+    /// its BYE before that. A session whose ACK waits for the answer of the
+    /// [`Negotiate`] waits for that ACK to go. If the ACK of this UA's 2xx
+    /// never comes, the BYE goes at the ACK deadline, after
+    /// [`Event::AckTimeout`], and the session ends with
+    /// [`EndReason::LocalBye`] even if the BYE then cannot reach the
+    /// endpoint, since the dialog cannot go on without the ACK.
     ///
     /// The operation completes with the BYE's response. A 2xx is success.
     /// It fails with [`Error::RemoteFailure`] for another final response,
@@ -939,7 +963,8 @@ impl UaHandle {
     /// session has ended either way, and the UA sends no second BYE.
     ///
     /// When the BYE never reaches the endpoint, the session stays as it
-    /// was, and the operation fails, with nothing sent:
+    /// was, but for the ACK deadline above, and the operation fails, with
+    /// nothing sent:
     ///
     /// * with [`Error::Unroutable`] when the next hop does not resolve or
     ///   needs TLS,
@@ -1211,10 +1236,11 @@ pub enum ShutdownMode {
     ///   and an ACK and a BYE for each 2xx that comes later.
     /// * Every session gets a BYE, a callee's after the ACK of its 2xx, and
     ///   ends with [`EndReason::Shutdown`]. A re-INVITE the peer sent in it
-    ///   gets a 487, as RFC 3261 section 15.1.2 recommends when the peer's
-    ///   BYE leaves one pending. A re-INVITE this UA sent goes on, since the
-    ///   UA does not cancel its own, and one the peer never answers holds
-    ///   the shutdown until its deadline.
+    ///   that waits for a decision gets a 487 once the BYE goes, as RFC 3261
+    ///   section 15.1.2 recommends when the peer's BYE leaves one pending,
+    ///   and a new one a 491, since the session is ending. A re-INVITE this
+    ///   UA sent goes on, since the UA does not cancel its own, and one the
+    ///   peer never answers holds the shutdown until its deadline.
     ///
     /// None of this takes an operation of the application's, so it goes
     /// whatever the limit of [`Config::max_operations`]. The BYEs start
@@ -1368,8 +1394,7 @@ impl<T> error::Error for SubmitError<T> {}
 /// The outcome of a submitted operation.
 ///
 /// It resolves once the operation has ended. Dropping it withdraws nothing.
-/// The operation goes on, and its outcome is kept for a while before the UA
-/// lets go of it.
+/// The operation goes on to its outcome, which nobody reads then.
 #[must_use = "an operation goes on without its future, but its outcome is lost"]
 pub struct Operation<T> {
     receiver: oneshot::Receiver<Result<Completion, Error>>,
@@ -1528,7 +1553,11 @@ pub enum Event {
     },
     /// No ACK came for the 2xx of an incoming INVITE within 64 T1 of the
     /// endpoint taking it, which is a little after its first transmission.
-    /// The session ends next, with [`Event::Ended`].
+    /// The session ends next, with [`Event::Ended`] and
+    /// [`EndReason::AckTimeout`]. If the application or a
+    /// [`ShutdownMode::Terminate`] asked for its BYE while it waited for the
+    /// ACK, that BYE goes now, and the session ends with
+    /// [`EndReason::LocalBye`] or [`EndReason::Shutdown`] instead.
     ///
     /// It does not come for the 2xx of a re-INVITE once the peer sent a
     /// newer re-INVITE. The peer most likely lost the contact the 2xx went
@@ -1823,9 +1852,9 @@ impl IncomingInvite {
     ///
     /// The 200 copies the INVITE's Record-Route and carries the UA's Contact.
     /// The UA sends it again until the ACK arrives, on every transport
-    /// (RFC 3261 section 13.3.1.4). If none arrives within 64 T1, the session
-    /// ends with [`Event::AckTimeout`], except as that event says for a
-    /// re-INVITE.
+    /// (RFC 3261 section 13.3.1.4). If none arrives within 64 T1, the UA
+    /// reports [`Event::AckTimeout`] and ends the session, except as that
+    /// event says for a re-INVITE.
     ///
     /// The operation completes once the endpoint has the 200, with the
     /// [`Session`] it established. That is neither the ACK nor delivery to

@@ -7970,8 +7970,8 @@ Contact: <sip:bob@192.0.2.4>
     /// A callee that hangs up before the ACK of its 2xx holds its BYE back
     /// (RFC 3261 section 15) and shows the session as ending. The ACK lets
     /// it go. Without an ACK, it goes at the ACK deadline, as RFC 3261
-    /// section 13.3.1.4 asks anyway, and the session ends by the
-    /// application's BYE.
+    /// section 13.3.1.4 asks anyway. The deadline is reported, and the
+    /// session still ends by the application's BYE, or a termination's.
     #[test]
     fn callee_bye_waits_for_ack_or_ack_deadline() {
         let mut clock = Clock(Instant::now());
@@ -7999,10 +7999,39 @@ Contact: <sip:bob@192.0.2.4>
         let deadline = clock.now() + T1 * 64;
         let effects = advance_to(&mut model, &mut clock, deadline);
         assert_eq!(session_byes(&effects, usage), 1);
+        assert!(notices(&effects).contains(&Event::AckTimeout { usage }));
         model.bye_started(usage, Ok(())).unwrap();
         assert_eq!(
             notices(&model.take_effects()),
             [Event::UsageEnded { usage, reason: EndReason::LocalBye }],
+        );
+
+        // Once the ACK deadline has passed, the session cannot go on, so a
+        // BYE that then fails to reach the core ends it all the same.
+        let mut model = self::model(limits());
+        let (_, _, usage) = accepted(&mut model, &clock);
+        let terminate = run(&mut model, Command::Terminate { usage });
+        let deadline = clock.now() + T1 * 64;
+        advance_to(&mut model, &mut clock, deadline);
+        model.bye_started(usage, Err(Error::Unroutable));
+        assert_eq!(
+            end_of(&model, usage).map(|(reason, _)| reason),
+            Some(EndReason::LocalBye),
+        );
+        assert_eq!(outcome(&model, terminate), Some(Err(Error::Unroutable)));
+
+        // A termination's BYE waits the same way, and keeps its own reason.
+        let mut model = self::model(limits());
+        let (_, _, usage) = accepted(&mut model, &clock);
+        model.shut_down(true);
+        let deadline = clock.now() + T1 * 64;
+        let effects = advance_to(&mut model, &mut clock, deadline);
+        assert_eq!(session_byes(&effects, usage), 1);
+        assert!(notices(&effects).contains(&Event::AckTimeout { usage }));
+        model.bye_started(usage, Ok(())).unwrap();
+        assert_eq!(
+            notices(&model.take_effects()),
+            [Event::UsageEnded { usage, reason: EndReason::Shutdown }],
         );
     }
 

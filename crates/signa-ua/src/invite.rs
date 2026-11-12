@@ -144,7 +144,9 @@ pub enum EndReason {
     /// This UA ended it with a BYE, which reached the endpoint. The BYE may
     /// have been the application's, or the UA's own for an attempt given
     /// up. RFC 3261 section 15.1.1 ends the session then, whatever the
-    /// response to the BYE.
+    /// response to the BYE. An application's BYE that waited for the ACK of
+    /// this UA's 2xx until the ACK deadline ends the session even if it could
+    /// not reach the endpoint.
     LocalBye,
     /// The peer ended it with a BYE (RFC 3261 section 15.1.2).
     #[non_exhaustive]
@@ -153,14 +155,15 @@ pub enum EndReason {
         flow: Flow,
     },
     /// No ACK came for this UA's 2xx in time, so the UA ended the session
-    /// with a BYE, as RFC 3261 section 13.3.1.4 asks, or without one if the
-    /// BYE could not reach the endpoint.
+    /// with a BYE, as RFC 3261 section 13.3.1.4 recommends, or without one if the
+    /// BYE could not reach the endpoint. A session whose BYE was asked for
+    /// while it waited for the ACK ends with that BYE's reason instead.
     AckTimeout,
     /// Its early dialog ended without a 2xx: the INVITE got another final
     /// response or failed, or its responses stopped (RFC 3261 section 12.3).
     Unconfirmed,
     /// The offer/answer exchange of its INVITE failed, so the UA ended the
-    /// session with a BYE: the 2xx or the ACK lacked the answer or offer it
+    /// session with a BYE. The 2xx or the ACK lacked the answer or offer it
     /// owed (RFC 3261 section 13.2.1), or no answer could be had for the
     /// offer of a 2xx. [`Event::NegotiationFailed`] said so before.
     ///
