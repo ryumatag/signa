@@ -34,8 +34,8 @@ tokio = ["signa-core/tokio"]
 ua = ["tokio", "dep:signa-ua", "signa-ua/tokio"]
 
 [dependencies]
-signa-core = { version = "0.1.1", path = "../signa-core", default-features = false }
-signa-ua = { version = "0.1.0", path = "../signa-ua", default-features = false, optional = true }
+signa-core = { version = "0.1.2", path = "../signa-core", default-features = false }
+signa-ua = { version = "0.1.1", path = "../signa-ua", default-features = false, optional = true }
 
 [dev-dependencies]
 bytes = "1.12.1"
