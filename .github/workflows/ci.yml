@@ -49,8 +49,8 @@ jobs:
   # Runs the examples, which check their own outcomes and fail otherwise. They
   # use RFC 3261's timers, so each one's graceful shutdown waits about 32 s for
   # Timer J, L, M or D. Each is a workspace of its own, built through the
-  # `signa` facade. The external Tower fixture in signa-core's `tests/` runs
-  # with the tests above.
+  # `signa` facade, and the `ua-` ones through its `ua` feature. The external
+  # Tower fixture in signa-core's `tests/` runs with the tests above.
   examples:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -63,6 +63,10 @@ jobs:
           - invite-uac
           - fork-proxy
           - stateless-proxy
+          - ua-call
+          - ua-late-offer
+          - ua-fork
+          - ua-shutdown
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7

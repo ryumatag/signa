@@ -1,0 +1,21 @@
+# A UA takes two forked 2xx responses, keeps one session and ends the other.
+[package]
+publish = false
+name = "ua-fork"
+version = "0.0.0"
+edition = "2024"
+# The crates' MSRV, so that clippy suggests nothing they could not use.
+rust-version = "1.85"
+
+# Each example is a workspace of its own, so that its dependencies do not pile
+# up on the crates.
+[workspace]
+
+[dependencies]
+bytes = "1.12.1"
+signa = { path = "../../crates/signa", features = ["ua"] }
+tokio = { version = "1.54", features = ["macros", "net", "rt-multi-thread", "time"] }
+
+[[bin]]
+name = "ua-fork"
+path = "main.rs"

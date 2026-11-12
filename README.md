@@ -171,6 +171,19 @@ CI runs them with RFC 3261's timers. `--t1-ms 50` makes most of them quicker.
 * [`examples/stateless-proxy`](examples/stateless-proxy): a UDP
   stateless proxy with a stable branch for an INVITE, its CANCEL and its ACK.
 
+The `ua-` examples build on signa-ua instead, through the facade's `ua`
+feature. The UA takes on the dialogs and the INVITE usage, and the example
+plays the application:
+
+* [`examples/ua-call`](examples/ua-call): two UAs call each other; the
+  callee rings and answers, the caller hangs up.
+* [`examples/ua-late-offer`](examples/ua-late-offer): an INVITE without an
+  offer, answered in the ACK by a `Negotiate` provider.
+* [`examples/ua-fork`](examples/ua-fork): a caller that takes a 2xx from
+  each of two forks, keeps one session and ends the other.
+* [`examples/ua-shutdown`](examples/ua-shutdown): a UA that shuts down with
+  a call up and one ringing, and ends both.
+
 signa-core's [`tests/tower_fixture.rs`](crates/signa-core/tests/tower_fixture.rs)
 builds a Tower adapter and a bounded dispatcher outside signa, against its
 public API only. signa has no Tower dependency.
