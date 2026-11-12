@@ -1,6 +1,6 @@
 [package]
 name = "signa-ua"
-version = "0.0.1"  #:version
+version = "0.1.0"  #:version
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ryumatag/signa"
 documentation = "https://docs.rs/signa-ua"
@@ -36,7 +36,7 @@ __fuzz = []
 bytes = { version = "1.12.1", default-features = false, features = ["std"] }
 # RFC 3261 section 19.3 requires tags with cryptographic randomness.
 getrandom = { version = "0.4", default-features = false }
-signa-core = { version = "0.1.0", path = "../signa-core", default-features = false }
+signa-core = { version = "0.1.1", path = "../signa-core", default-features = false }
 # The element scans of RFC 3261 section 25.1, for the few headers a UA reads.
 siparse = "0.4.4"
 tokio = { version = "1.54", default-features = false, features = ["macros", "rt", "sync", "time"], optional = true }
