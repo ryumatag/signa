@@ -1,11 +1,8 @@
-use std::{
-    error, fmt,
-    iter::FusedIterator,
-    net::{Ipv4Addr, Ipv6Addr},
-    num::ParseIntError,
-};
+use std::{error, fmt, iter::FusedIterator, num::ParseIntError};
 
-use super::component::{Component, hex};
+use siparse::{ErrorKind, uri};
+
+use super::component::Component;
 
 /// A SIP URI scheme. Recognizing SIPS does not enable a secure transport.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -91,7 +88,8 @@ impl error::Error for InvalidSipUri {}
 
 /// A borrowed SIP/SIPS URI with validated component boundaries.
 ///
-/// Parsing allocates nothing and retains the original text. Getters do not
+/// siparse validates the text. Parsing allocates nothing and retains the
+/// original text. Getters do not
 /// decode escapes or choose routing defaults. The view checks generic parameter
 /// syntax, not specialized parameter values or their usage rules. Iteration
 /// preserves duplicates. [`SipUri::parameter`] rejects ambiguous lookups.
@@ -120,14 +118,7 @@ impl error::Error for InvalidSipUri {}
 #[derive(Clone, Copy)]
 pub struct SipUri<'a> {
     src: &'a str,
-    scheme: Scheme,
-    // These offsets are boundaries of ASCII delimiters in validated text.
-    // password_at is the @ position when there is no password.
-    password_at: usize,
-    host_start: usize,
-    host_end: usize,
-    port_end: usize,
-    params_end: usize,
+    parts: uri::SipUri<'a>,
 }
 
 impl<'a> SipUri<'a> {
@@ -139,117 +130,23 @@ impl<'a> SipUri<'a> {
     /// invalid escapes or invalid IP literals. It does not validate whether
     /// parameter combinations are suitable for routing or a particular header.
     pub fn parse(src: &'a str) -> Result<SipUri<'a>, InvalidSipUri> {
-        let scheme =
-            scheme(src).ok_or_else(|| invalid(InvalidSipUriKind::Scheme))?;
-        let start = scheme.as_str().len() + 1;
-
-        // Raw @ is not allowed in any later component. User information may
-        // contain ; and ?, so identify it before looking for those delimiters.
-        let (host_start, password_at) = if let Some(at) =
-            src[start..].find('@')
-        {
-            let at = start + at;
-            let info = &src[start..at];
-            let password_at = info.find(':').map_or(at, |colon| start + colon);
-            component(
-                &src[start..password_at],
-                user_char,
-                false,
-                InvalidSipUriKind::User,
-            )?;
-            if password_at < at {
-                component(
-                    &src[password_at + 1..at],
-                    password_char,
-                    true,
-                    InvalidSipUriKind::Password,
-                )?;
-            }
-            (at + 1, password_at)
-        } else {
-            (start, start - 1)
-        };
-
-        let port_end = src[host_start..]
-            .find([';', '?'])
-            .map_or(src.len(), |n| host_start + n);
-        let authority = &src[host_start..port_end];
-        let host_len = if authority.starts_with('[') {
-            let close = authority
-                .find(']')
-                .ok_or_else(|| invalid(InvalidSipUriKind::Host))?;
-            host(&authority[..=close])?;
-            close + 1
-        } else {
-            let end = authority.find(':').unwrap_or(authority.len());
-            host(&authority[..end])?;
-            end
-        };
-        let host_end = host_start + host_len;
-        if host_end < port_end {
-            let rest = &src[host_end..port_end];
-            if !rest.starts_with(':')
-                || rest.len() == 1
-                || !rest.as_bytes()[1..].iter().all(u8::is_ascii_digit)
-            {
-                return Err(invalid(InvalidSipUriKind::Port));
-            }
-        }
-
-        let params_end =
-            src[port_end..].find('?').map_or(src.len(), |n| port_end + n);
-        let params = &src[port_end..params_end];
-        if !params.is_empty() {
-            for pair in params[1..].split(';') {
-                let (name, value) = pair
-                    .split_once('=')
-                    .map_or((pair, None), |(n, v)| (n, Some(v)));
-                component(
-                    name,
-                    param_char,
-                    false,
-                    InvalidSipUriKind::Parameter,
-                )?;
-                if let Some(value) = value {
-                    component(
-                        value,
-                        param_char,
-                        false,
-                        InvalidSipUriKind::Parameter,
-                    )?;
-                }
-            }
-        }
-
-        if params_end < src.len() {
-            for pair in src[params_end + 1..].split('&') {
-                let (name, value) = pair
-                    .split_once('=')
-                    .ok_or_else(|| invalid(InvalidSipUriKind::Header))?;
-                component(
-                    name,
-                    header_char,
-                    false,
-                    InvalidSipUriKind::Header,
-                )?;
-                component(
-                    value,
-                    header_char,
-                    true,
-                    InvalidSipUriKind::Header,
-                )?;
-            }
-        }
-
-        Ok(SipUri {
-            src,
-            scheme,
-            password_at,
-            host_start,
-            host_end,
-            port_end,
-            params_end,
-        })
+        let parts = uri::sip_uri(src).map_err(|error| {
+            invalid(match error.kind() {
+                ErrorKind::UriScheme => InvalidSipUriKind::Scheme,
+                ErrorKind::UriUser => InvalidSipUriKind::User,
+                ErrorKind::UriPassword => InvalidSipUriKind::Password,
+                ErrorKind::UriHost => InvalidSipUriKind::Host,
+                ErrorKind::UriPort => InvalidSipUriKind::Port,
+                ErrorKind::UriParam => InvalidSipUriKind::Parameter,
+                ErrorKind::UriHeader => InvalidSipUriKind::Header,
+                ErrorKind::UriEscape => InvalidSipUriKind::Escape,
+                // `sip_uri` returns only the kinds above. A kind a later
+                // siparse adds is still an error, and not `Scheme`, which
+                // `Uri::sip` reads as another scheme rather than a failure.
+                _ => InvalidSipUriKind::Host,
+            })
+        })?;
+        Ok(SipUri { src, parts })
     }
 
     /// Returns the original URI, including its scheme spelling and escapes.
@@ -259,21 +156,20 @@ impl<'a> SipUri<'a> {
 
     /// Returns the parsed scheme without implying a transport choice.
     pub fn scheme(&self) -> Scheme {
-        self.scheme
+        match self.parts.scheme {
+            uri::Scheme::Sip => Scheme::Sip,
+            uri::Scheme::Sips => Scheme::Sips,
+        }
     }
 
     /// Returns the escaped user, or `None` if user information was absent.
     pub fn user(&self) -> Option<Component<'a>> {
-        let start = self.scheme.as_str().len() + 1;
-        (self.host_start > start)
-            .then(|| Component(&self.src[start..self.password_at]))
+        self.parts.user.map(Component)
     }
 
     /// Returns the escaped password, distinguishing absent from empty.
     pub fn password(&self) -> Option<Component<'a>> {
-        (self.password_at + 1 < self.host_start).then(|| {
-            Component(&self.src[self.password_at + 1..self.host_start - 1])
-        })
+        self.parts.password.map(Component)
     }
 
     /// Returns the original host text, without IPv6 brackets.
@@ -281,8 +177,10 @@ impl<'a> SipUri<'a> {
     /// Host names retain case and an optional trailing dot. IP literals are
     /// validated using RFC 5954's grammar. No name resolution is performed.
     pub fn host(&self) -> &'a str {
-        let raw = &self.src[self.host_start..self.host_end];
-        if raw.starts_with('[') { &raw[1..raw.len() - 1] } else { raw }
+        let host = self.parts.host;
+        host.strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host)
     }
 
     /// Returns the original explicit port digits, or `None` when omitted.
@@ -290,8 +188,7 @@ impl<'a> SipUri<'a> {
     /// RFC 3261 defines this component as one or more digits, without a
     /// syntactic upper bound. Leading zeroes and oversized values are retained.
     pub fn port(&self) -> Option<&'a str> {
-        (self.port_end > self.host_end)
-            .then(|| &self.src[self.host_end + 1..self.port_end])
+        self.parts.port
     }
 
     /// Converts an explicit port to `u16`, without supplying a default.
@@ -305,11 +202,7 @@ impl<'a> SipUri<'a> {
 
     /// Iterates URI parameters in their original order, including duplicates.
     pub fn parameters(&self) -> Parameters<'a> {
-        Parameters(
-            self.src[self.port_end..self.params_end]
-                .strip_prefix(';')
-                .unwrap_or(""),
-        )
+        Parameters(self.parts.params.iter())
     }
 
     /// Looks up an unescaped parameter name, ignoring ASCII case.
@@ -321,8 +214,8 @@ impl<'a> SipUri<'a> {
     ///
     /// Returns [`InvalidSipUriKind::DuplicateParameter`] when multiple names
     /// match, including names with different case or escape spelling. No
-    /// occurrence is silently chosen. This scans only the requested name so
-    /// parsing and lookup stay linear without allocating a parameter index.
+    /// occurrence is silently chosen. This scans only the requested name, so
+    /// lookup stays linear and needs no parameter index.
     pub fn parameter(
         &self,
         name: &str,
@@ -347,11 +240,7 @@ impl<'a> SipUri<'a> {
     /// octets can include controls. Request construction must validate and
     /// apply its own policy rather than insert these bytes into a message.
     pub fn headers(&self) -> Headers<'a> {
-        Headers(if self.params_end < self.src.len() {
-            &self.src[self.params_end + 1..]
-        } else {
-            ""
-        })
+        Headers(self.parts.headers.iter())
     }
 }
 
@@ -393,22 +282,27 @@ impl<'a> Parameter<'a> {
 }
 
 /// URI parameters in wire order. Each item borrows the original text.
-#[derive(Clone, Debug)]
-pub struct Parameters<'a>(&'a str);
+#[derive(Clone)]
+pub struct Parameters<'a>(uri::UriParamsIter<'a>);
 
 impl<'a> Iterator for Parameters<'a> {
     type Item = Parameter<'a>;
 
     fn next(&mut self) -> Option<Parameter<'a>> {
-        let pair = take(&mut self.0, ';')?;
-        let (name, value) = pair
-            .split_once('=')
-            .map_or((pair, None), |(n, v)| (n, Some(Component(v))));
-        Some(Parameter { name: Component(name), value })
+        let uri::UriParam { name, value } = self.0.next()?;
+        Some(Parameter { name: Component(name), value: value.map(Component) })
     }
 }
 
 impl FusedIterator for Parameters<'_> {}
+
+// The parameters left, rather than siparse's iterator, whose name is not
+// part of this API.
+impl fmt::Debug for Parameters<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.clone()).finish()
+    }
+}
 
 /// One URI header pair. Its value may be empty but is always present.
 #[derive(Clone, Copy, Debug)]
@@ -430,122 +324,28 @@ impl<'a> Header<'a> {
 }
 
 /// URI header pairs in wire order. Duplicates are retained.
-#[derive(Clone, Debug)]
-pub struct Headers<'a>(&'a str);
+#[derive(Clone)]
+pub struct Headers<'a>(uri::UriHeadersIter<'a>);
 
 impl<'a> Iterator for Headers<'a> {
     type Item = Header<'a>;
 
     fn next(&mut self) -> Option<Header<'a>> {
-        let pair = take(&mut self.0, '&')?;
-        let (name, value) =
-            pair.split_once('=').expect("validated URI header pair");
+        let uri::UriHeader { name, value } = self.0.next()?;
         Some(Header { name: Component(name), value: Component(value) })
     }
 }
 
 impl FusedIterator for Headers<'_> {}
 
-fn take<'a>(rest: &mut &'a str, delimiter: char) -> Option<&'a str> {
-    if rest.is_empty() {
-        return None;
-    }
-    let (item, tail) = rest.split_once(delimiter).unwrap_or((rest, ""));
-    *rest = tail;
-    Some(item)
-}
-
-fn scheme(src: &str) -> Option<Scheme> {
-    if src.get(..4).is_some_and(|s| s.eq_ignore_ascii_case("sip:")) {
-        Some(Scheme::Sip)
-    } else if src.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("sips:")) {
-        Some(Scheme::Sips)
-    } else {
-        None
+impl fmt::Debug for Headers<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.clone()).finish()
     }
 }
 
 fn invalid(kind: InvalidSipUriKind) -> InvalidSipUri {
     InvalidSipUri { kind }
-}
-
-fn component(
-    src: &str,
-    allowed: impl Fn(u8) -> bool,
-    empty: bool,
-    kind: InvalidSipUriKind,
-) -> Result<(), InvalidSipUri> {
-    if src.is_empty() && !empty {
-        return Err(invalid(kind));
-    }
-    let bytes = src.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            if bytes.get(index + 1).and_then(|&b| hex(b)).is_none()
-                || bytes.get(index + 2).and_then(|&b| hex(b)).is_none()
-            {
-                return Err(invalid(InvalidSipUriKind::Escape));
-            }
-            index += 3;
-        } else if allowed(bytes[index]) {
-            index += 1;
-        } else {
-            return Err(invalid(kind));
-        }
-    }
-    Ok(())
-}
-
-fn unreserved(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&b)
-}
-
-fn user_char(b: u8) -> bool {
-    unreserved(b) || b"&=+$,;?/".contains(&b)
-}
-
-fn password_char(b: u8) -> bool {
-    unreserved(b) || b"&=+$,".contains(&b)
-}
-
-fn param_char(b: u8) -> bool {
-    unreserved(b) || b"[]/:&+$".contains(&b)
-}
-
-fn header_char(b: u8) -> bool {
-    unreserved(b) || b"[]/?:+$".contains(&b)
-}
-
-fn host(src: &str) -> Result<(), InvalidSipUri> {
-    if let Some(inner) =
-        src.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
-    {
-        return inner
-            .parse::<Ipv6Addr>()
-            .map(|_| ())
-            .map_err(|_| invalid(InvalidSipUriKind::Host));
-    }
-    if src.parse::<Ipv4Addr>().is_ok() {
-        return Ok(());
-    }
-
-    // RFC 3261 hostname labels end in alphanum, and the top label begins
-    // with ALPHA. RFC 5954 replaces the older permissive IPv4 production.
-    let name = src.strip_suffix('.').unwrap_or(src);
-    let top = name.rsplit('.').next().unwrap_or("");
-    if !top.as_bytes().first().is_some_and(u8::is_ascii_alphabetic) {
-        return Err(invalid(InvalidSipUriKind::Host));
-    }
-    for label in name.split('.') {
-        if !label.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
-            || !label.as_bytes().last().is_some_and(u8::is_ascii_alphanumeric)
-            || !label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        {
-            return Err(invalid(InvalidSipUriKind::Host));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -686,6 +486,9 @@ mod tests {
             ("sip:a%gg@example.com", K::Escape),
             ("sip:example.com;x=%", K::Escape),
             ("sip:example.com?x=%a", K::Escape),
+            ("sip:alice:%zz@example.com", K::Escape),
+            ("sip:example.com;%=x", K::Escape),
+            ("sip:example.com?%=x", K::Escape),
         ] {
             assert_eq!(SipUri::parse(src).unwrap_err().kind(), kind, "{src}");
         }
@@ -736,38 +539,29 @@ mod tests {
     #[cfg_attr(miri, ignore = "exhaustive input is too slow under Miri")]
     fn every_byte_obeys_its_component_class() {
         for byte in 0..=255u8 {
-            // An explicit RFC alphabet is independent of the predicates used
-            // by the parser, including their ASCII/UTF-8 boundary checks.
+            // The RFC 3261 alphabets, spelled out here rather than taken
+            // from siparse, so that the test does not share the parser's.
             let unreserved = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.!~*'()";
-            for (prefix, suffix, allowed, extra) in [
-                (
-                    "sip:",
-                    "@example.com",
-                    user_char as fn(u8) -> bool,
-                    &b"&=+$,;?/"[..],
-                ),
-                ("sip:alice:", "@example.com", password_char, &b"&=+$,"[..]),
-                ("sip:example.com;x=", "", param_char, &b"[]/:&+$"[..]),
-                ("sip:example.com?x=", "", header_char, &b"[]/?:+$"[..]),
+            for (prefix, suffix, extra) in [
+                ("sip:", "@example.com", &b"&=+$,;?/"[..]),
+                ("sip:alice:", "@example.com", &b"&=+$,"[..]),
+                ("sip:example.com;x=", "", &b"[]/:&+$"[..]),
+                ("sip:example.com?x=", "", &b"[]/?:+$"[..]),
             ] {
                 let mut src = prefix.as_bytes().to_vec();
                 src.push(byte);
                 src.extend_from_slice(suffix.as_bytes());
-                // Some delimiter bytes can form another valid URI structure.
-                // This checks the component scanner directly, not that split.
-                let part = String::from_utf8_lossy(&[byte]).into_owned();
+                // A delimiter byte outside the class does not split the URI
+                // into another valid shape. It leaves an empty or malformed
+                // component, so the whole parse rejects it like any other
+                // byte outside the class.
+                let parsed = std::str::from_utf8(&src)
+                    .is_ok_and(|src| SipUri::parse(src).is_ok());
                 assert_eq!(
-                    component(&part, allowed, false, InvalidSipUriKind::User)
-                        .is_ok(),
+                    parsed,
                     unreserved.contains(&byte) || extra.contains(&byte),
-                    "{byte:#x}"
+                    "{prefix}{byte:#x}{suffix}"
                 );
-                if allowed(byte) {
-                    assert!(
-                        SipUri::parse(std::str::from_utf8(&src).unwrap())
-                            .is_ok()
-                    );
-                }
             }
         }
     }
@@ -788,5 +582,23 @@ mod tests {
         assert_eq!(headers.next().unwrap().value().as_str(), "z");
         assert!(headers.next().is_none());
         assert!(headers.next().is_none());
+    }
+
+    // Debug shows the items left, not siparse's iterator type.
+    #[test]
+    fn iterators_debug_as_the_items_left() {
+        let uri = SipUri::parse("sip:example.com;lr?x=y").unwrap();
+        assert_eq!(
+            format!("{:?}", uri.parameters()),
+            r#"[Parameter { name: "lr", value: None }]"#
+        );
+
+        let mut headers = uri.headers();
+        assert_eq!(
+            format!("{headers:?}"),
+            r#"[Header { name: "x", value: "y" }]"#
+        );
+        headers.next();
+        assert_eq!(format!("{headers:?}"), "[]");
     }
 }

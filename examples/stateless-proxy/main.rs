@@ -51,10 +51,11 @@ This is not a complete or production SIP proxy. It does not do:
   fields. This proxy drops them.
 * SIPS, TLS, TCP, DNS resolution ([RFC 3263]) and authentication.
 
-Its Via handling is simplified too. It splits a Via row at the first comma
-outside a quoted string, and does not handle a quoted parameter that contains
-a semicolon. A wildcard-bound proxy would have to compare `sent-by` with every
-address it advertises, not with one socket address.
+Its Via handling is simplified too. It reads Via values with siparse, but
+treats the top value as its own only when `sent-by` is an IP address equal to
+the socket address it is bound to, so a hostname never matches. A
+wildcard-bound proxy would have to compare `sent-by` with every address it
+advertises, not with one socket address.
 
 [RFC 3261 sections 9.2 and 17.2.3]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17.2.3
 [RFC 3261 section 16.11]: https://www.rfc-editor.org/rfc/rfc3261.html#section-16.11
@@ -66,7 +67,11 @@ address it advertises, not with one socket address.
 [`Endpoint::forward_response`]: signa::endpoint::Endpoint::forward_response
 */
 
-use std::{error::Error, net::SocketAddr, time::Duration};
+use std::{
+    error::Error,
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 
 use bytes::Bytes;
 use signa::{
@@ -81,6 +86,7 @@ use signa::{
     transaction::Timers,
     transport::Transport,
 };
+use siparse::value::{self, ViaParm};
 use tokio::{net::UdpSocket, time::timeout};
 
 /// What the proxy's forwarding depends on. None of it may change while a
@@ -193,17 +199,18 @@ async fn run_proxy(
 /// [RFC 3261 sections 9.1 and 17.1.1.3]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17.1.1.3
 fn stable_branch(request: &Request<Bytes>, secret: u64) -> Option<Branch> {
     let row = request.headers().get(VIA)?.as_str();
-    let (top, _) = split_first_value(row);
-    let via = parse_via(top)?;
+    let via = value::via_parms(row).next()?.ok()?;
     let received =
-        via.branch.filter(|branch| branch.starts_with("z9hG4bK"))?;
+        branch(&via).filter(|branch| branch.starts_with("z9hG4bK"))?;
 
     // FNV-1a over the inputs, separated so that no two inputs run together.
     // Any hash that gives the same output for the same input across the
-    // proxy's lifetime works. Hash the `sent-by` as written, with the host
-    // in lowercase.
+    // proxy's lifetime works. Hash the `sent-by` host in lowercase and its
+    // port as written.
+    let host = via.host.to_ascii_lowercase();
+    let port = via.port.unwrap_or("");
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325 ^ secret;
-    for part in [received, "\0", &via.sent_by.to_ascii_lowercase()] {
+    for part in [received, "\0", &host, "\0", port] {
         for byte in part.bytes() {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(0x0100_0000_01b3);
@@ -238,15 +245,20 @@ fn decrement_max_forwards(headers: &mut HeaderMap) -> bool {
 /// stays as the new first row.
 fn remove_own_via(headers: &mut HeaderMap, own: SocketAddr) -> bool {
     let Some(first) = headers.get(VIA) else { return false };
-    let (top, rest) = split_first_value(first.as_str());
-    let ours = parse_via(top)
-        .and_then(|via| sent_by_address(via.sent_by))
+    let mut vias = value::via_parms(first.as_str());
+    let ours = vias
+        .next()
+        .and_then(Result::ok)
+        .and_then(|via| sent_by_address(&via))
         .is_some_and(|sent_by| sent_by == own);
     if !ours {
         return false;
     }
 
-    match rest {
+    // The rest of the row after the comma that ends the top value. siparse
+    // returns it as written, whitespace included, and empty when the top
+    // value was the last one. Trimmed, it is the new first row.
+    match Some(vias.as_str().trim()).filter(|rest| !rest.is_empty()) {
         Some(rest) => {
             let rest = HeaderValue::from_bytes(rest.as_bytes())
                 .expect("a part of a valid value");
@@ -268,51 +280,27 @@ fn remove_own_via(headers: &mut HeaderMap, own: SocketAddr) -> bool {
     true
 }
 
-/// Splits a Via row at the first comma outside a quoted string, returning the
-/// first value and the rest after the comma, if any.
-fn split_first_value(row: &str) -> (&str, Option<&str>) {
-    let mut quoted = false;
-    let mut escaped = false;
-    for (at, c) in row.char_indices() {
-        match c {
-            _ if escaped => escaped = false,
-            '\\' if quoted => escaped = true,
-            '"' => quoted = !quoted,
-            ',' if !quoted => {
-                let rest = row[at + 1..].trim_start();
-                return (
-                    row[..at].trim_end(),
-                    Some(rest).filter(|r| !r.is_empty()),
-                );
-            }
-            _ => {}
-        }
-    }
-    (row.trim_end(), None)
-}
-
-/// The parts of one Via value this proxy reads.
-struct ViaValue<'a> {
-    sent_by: &'a str,
-    branch: Option<&'a str>,
-}
-
-/// Reads `SIP/2.0/UDP sent-by;params`. It takes whitespace around the
-/// semicolons but not the whitespace the grammar allows around the slashes.
-fn parse_via(value: &str) -> Option<ViaValue<'_>> {
-    let (_protocol, rest) = value.trim().split_once(char::is_whitespace)?;
-    let mut parts = rest.trim_start().split(';');
-    let sent_by = parts.next()?.trim();
-    let branch = parts.find_map(|param| {
-        let (name, value) = param.split_once('=')?;
-        name.trim().eq_ignore_ascii_case("branch").then(|| value.trim())
-    });
-    Some(ViaValue { sent_by, branch })
+/// The `branch` parameter of a Via value, as written. Parameter names are
+/// case-insensitive (RFC 3261 section 7.3.1).
+fn branch<'a>(via: &ViaParm<'a>) -> Option<&'a str> {
+    let mut params = via.params.iter();
+    params.find(|param| param.name.eq_ignore_ascii_case("branch"))?.value
 }
 
 /// The address a numeric `sent-by` names, with 5060 when it has no port.
-fn sent_by_address(sent_by: &str) -> Option<SocketAddr> {
-    sent_by.parse().ok().or_else(|| format!("{sent_by}:5060").parse().ok())
+///
+/// siparse checks only the characters of a host, so an IPv6 reference must
+/// hold an IPv6 address and anything else an IPv4 one. `[192.0.2.1]` is
+/// neither.
+fn sent_by_address(via: &ViaParm<'_>) -> Option<SocketAddr> {
+    let ip = match via.host.strip_prefix('[') {
+        Some(reference) => {
+            IpAddr::V6(reference.strip_suffix(']')?.parse().ok()?)
+        }
+        None => IpAddr::V4(via.host.parse().ok()?),
+    };
+    let port = via.port.map_or(Some(5060), |port| port.parse().ok())?;
+    Some(SocketAddr::new(ip, port))
 }
 
 /// The UAS: rings, then takes a CANCEL with a 200 and ends the INVITE with a
