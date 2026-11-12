@@ -107,13 +107,13 @@ use super::{
 use crate::{
     capability,
     error::Error,
+    header,
     invite::{AttemptKey, CancelResult, ExchangeKey, UsageKey},
     model::{
         self, ByeStarted, Effect, InDialog, Model, Random, Refusal, Released,
     },
     negotiation::{Body, Description},
     operation::{Completion, OperationId},
-    protocol,
     retention::ReplayKey,
     timer,
 };
@@ -1213,8 +1213,8 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             return;
         }
         let headers = request.headers();
-        let checked = protocol::to(headers).and_then(|to| {
-            Ok((to.tag.is_some(), protocol::requires_extension(headers)?))
+        let checked = header::to(headers).and_then(|to| {
+            Ok((to.tag.is_some(), header::requires_extension(headers)?))
         });
         let in_dialog = match checked {
             Ok((_, true)) => {

@@ -33,7 +33,7 @@ use signa_core::{
     transport::Transport,
 };
 
-use crate::protocol::addresses;
+use crate::header::addresses;
 
 /// One URI of a route set.
 #[derive(Clone, Debug, Eq, PartialEq)]

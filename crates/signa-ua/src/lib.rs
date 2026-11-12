@@ -129,12 +129,12 @@ pub use self::ua::{
 mod capability;
 mod dialog;
 mod error;
+mod header;
 mod invite;
 mod model;
 mod negotiation;
 mod operation;
 mod plan;
-mod protocol;
 mod retention;
 mod routing;
 mod slot;
