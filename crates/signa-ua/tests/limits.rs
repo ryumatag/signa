@@ -332,6 +332,19 @@ async fn a_ua_that_stops_reading_events_still_answers_its_peer() {
         far.try_invite(plan_to(address)).unwrap().await.unwrap();
         let answered = invite(&mut ua.events).await.try_accept(sdp()).unwrap();
         let answered = answered.await.unwrap();
+        // The queue holds one event, and an INVITE that finds it taken gets
+        // a 503. The 2xx confirmed the session and completed its offer and
+        // answer, and the second of the two comes as a count of one dropped
+        // event if the first was still there. Once the application has read
+        // both, the INVITE the far UA holds finds the queue empty. This UA's
+        // own INVITE comes after, since its events fill the queue again.
+        event(&mut ua.events, |event| match event {
+            Event::Negotiated { .. } | Event::Lagged { .. } => Some(()),
+            _ => None,
+        })
+        .await;
+        let held = far.try_invite(plan_to(address)).unwrap().await.unwrap();
+        let undecided = invite(&mut ua.events).await;
         let far_calling = event(&mut far_events, |event| match event {
             Event::Confirmed { attempt: Some(_), session, .. } => {
                 Some(session)
@@ -357,8 +370,6 @@ async fn a_ua_that_stops_reading_events_still_answers_its_peer() {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
-        let held = far.try_invite(plan_to(address)).unwrap().await.unwrap();
-        let undecided = invite(&mut ua.events).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // From here on the application reads no event.
