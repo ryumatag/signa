@@ -556,6 +556,7 @@ mod tests {
     // and ends with a visible character because siparse strips leading
     // whitespace as part of the separator.
     #[test]
+    #[cfg_attr(miri, ignore = "exhaustive input is too slow under Miri")]
     fn agrees_with_siparse_for_every_byte_and_backslash_run() {
         for byte in 0..=255u8 {
             for backslashes in 0..=4 {

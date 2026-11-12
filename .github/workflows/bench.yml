@@ -1,25 +1,93 @@
 name: bench
 
-# Pull requests compare against their base. A squash merge lands the same
-# tree on `main`, so a push there is not benchmarked again. A release tag
-# compares against the release before it.
+# A comparison takes about ten minutes, and most changes do not need one. A
+# branch or pull request runs it only when its head commit asks with one of
+# the trailers below. A signa-core release tag always runs it, against the
+# signa-core release before it. The benchmarks measure signa-core alone, so
+# the signa-ua and facade tags do not.
+#
+# Pull requests compare against their base, and a push to an `rt/` branch
+# against where it left `main`, so a branch can be measured on a push
+# before it has a pull request. A squash merge lands the same tree on
+# `main`, so a push there is not benchmarked again.
+#
+# Any of these trailers in the head commit message requests a run, and
+# each adjusts it:
+#
+#   Bench-Filter: ^endpoint/   benchmarks to run, or `default` for FILTER
+#   Bench-Base: HEAD~1         base revision, relative to the head
+#
+# `Bench-Filter: default` runs FILTER, for a request that changes nothing
+# else. `Bench-Base: HEAD~1` compares one attempt against the previous one.
 on:
   pull_request:
   push:
     branches:
-      - main
+      - 'rt/**'
     tags:
-      - '[0-9]+.[0-9]+.[0-9]+*'
+      - 'signa-core-[0-9]+.[0-9]+.[0-9]+*'
 
 permissions:
   contents: read
 
-# A newer push to the same branch makes an in-flight comparison stale.
-concurrency:
-  group: bench-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
+  # Reads the trailers and decides whether to run.
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.plan.outputs.run }}
+      filter: ${{ steps.plan.outputs.filter }}
+      base: ${{ steps.plan.outputs.base }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          # A pull request checks out a merge commit, but the trailers are
+          # on the branch tip.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Read the trailers
+        id: plan
+        run: |
+          trailer() {
+            if [[ "$GITHUB_REF_TYPE" != tag ]]; then
+              git log -1 --format="%(trailers:key=$1,valueonly)" | head -n 1
+            fi
+          }
+
+          # A tag always runs. A branch or pull request runs when its head
+          # commit has a `Bench-` trailer. An unknown one is more likely a
+          # typo than a new request, so it fails the run instead of being
+          # ignored.
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            run=true
+          else
+            keys=$(git log -1 --format='%(trailers:only,keyonly)' |
+              grep -i '^bench-' || true)
+            unknown=$(grep -ivxE 'bench-(filter|base)' <<< "$keys" |
+              paste -sd ' ' - || true)
+            if [[ -n "$unknown" ]]; then
+              echo "::error::Unknown trailer: $unknown"
+              exit 1
+            fi
+            if [[ -n "$keys" ]]; then
+              run=true
+            else
+              run=false
+              echo "No Bench- trailer in the head commit. Skipping."
+            fi
+          fi
+
+          filter=$(trailer Bench-Filter)
+          if [[ "$filter" == default ]]; then
+            filter=
+          fi
+
+          {
+            echo "run=$run"
+            echo "filter=$filter"
+            echo "base=$(trailer Bench-Base)"
+          } >> "$GITHUB_OUTPUT"
+
   # Compares the benchmarks against a base commit. Shared runners are noisy,
   # so the result is informational and never fails the job. Clippy and the
   # benchmark assertions run in `ci`.
@@ -32,14 +100,24 @@ jobs:
   # the difference, not the absolute numbers. A change of a few percent is
   # jitter here, which the threshold in the summary hides.
   compare:
+    needs: plan
+    if: needs.plan.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # A newer requested run on the same branch makes an in-flight comparison
+    # stale. A push and the pull request for it share the branch name, so
+    # only the later of the two runs. The group is on the job, not the
+    # workflow, so that a push without a trailer leaves a requested run
+    # alone.
+    concurrency:
+      group: bench-${{ github.head_ref || github.ref_name }}
+      cancel-in-progress: true
     env:
       # The message and endpoint groups. The per-value groups, `from_bytes`
       # and `from_shared`, are left out. Each takes a few nanoseconds, the
       # `parse` group runs the same code on whole messages, and together they
       # would add as much time again to the run.
-      FILTER: '^(parse|encode|frame|prepend|transaction|transport|endpoint)/'
+      FILTER: ${{ needs.plan.outputs.filter || '^(parse|encode|frame|prepend|transaction|transport|endpoint)/' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -50,16 +128,30 @@ jobs:
       - name: Pick the base commit
         env:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REQUESTED: ${{ needs.plan.outputs.base }}
         run: |
-          if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+          # A pull request checks out a merge commit, so its head is the
+          # branch tip instead.
+          head="${PR_HEAD_SHA:-$GITHUB_SHA}"
+
+          if [[ -n "$REQUESTED" ]]; then
+            # `HEAD` names the head commit, not the merge commit.
+            base=$(git rev-parse --verify "${REQUESTED/#HEAD/$head}^{commit}")
+            label="$REQUESTED ($base)"
+          elif [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
             base="$PR_BASE_SHA"
             label="$base"
+          elif [[ "$GITHUB_REF_TYPE" == branch ]]; then
+            base=$(git merge-base origin/main "$head")
+            label="main ($base)"
           else
-            # The highest release below this tag. Only `x.y.z` tags count as a
-            # base, so a pre-release never is one.
+            # The highest signa-core release below this tag. Only
+            # `signa-core-x.y.z` tags count as a base, so a pre-release
+            # never is one.
             previous=$(
               {
-                git tag --list | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$'
+                git tag --list | grep -E '^signa-core-[0-9]+\.[0-9]+\.[0-9]+$'
                 echo "$GITHUB_REF_NAME"
               } | sort -uV | awk -v tag="$GITHUB_REF_NAME" \
                 '$0 == tag { print prev; exit } { prev = $0 }'

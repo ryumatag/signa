@@ -209,20 +209,20 @@ jobs:
           done
 
   # signa's own `unsafe` is `from_utf8_unchecked` on bytes a check has
-  # accepted, which Miri cannot verify. The tests still drive siparse's
-  # raw-pointer cursor and the `bytes` crate's buffer sharing with signa's
-  # inputs, so this catches undefined behavior there that siparse's own tests
-  # may not reach.
+  # accepted, which Miri cannot verify, and the `recvmsg` and `sendmsg` calls
+  # for packet info, which Miri cannot run. What it can check is siparse's
+  # raw-pointer cursor and the `bytes` crate's buffer sharing as signa's
+  # message parsing drives them, which siparse's own tests may not reach. So
+  # only signa-core's `message` tests run here. The transaction machines and
+  # signa-ua are safe code over tables and timers, and running them took
+  # about twelve minutes for nothing Miri could find. The exhaustive byte tests in
+  # `message` are ignored under Miri for the same reason.
   #
-  # Miri has no network I/O, so signa-core's socket tests are
-  # `#[cfg_attr(miri, ignore)]`, and signa-ua's loopback test binaries build
-  # empty under Miri. signa-ua's property tests and races run a few scripts
-  # and orders there, since Miri runs them about a thousand times slower and
-  # the full search took hours. The timeout stops a test that grows slow
-  # again well before the six hours GitHub allows.
+  # When signa gains `unsafe` that Miri can check, its module joins the
+  # filter.
   miri:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -232,4 +232,5 @@ jobs:
           toolchain: nightly
           components: miri
       - name: Run tests under Miri
-        run: cargo miri test --workspace --verbose
+        run: >-
+          cargo miri test -p signa-core --lib --verbose -- message::

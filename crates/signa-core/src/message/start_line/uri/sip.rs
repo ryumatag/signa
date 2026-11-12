@@ -733,6 +733,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "exhaustive input is too slow under Miri")]
     fn every_byte_obeys_its_component_class() {
         for byte in 0..=255u8 {
             // An explicit RFC alphabet is independent of the predicates used
