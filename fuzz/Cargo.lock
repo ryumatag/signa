@@ -116,6 +116,6 @@ dependencies = [
 
 [[package]]
 name = "siparse"
-version = "0.4.4"
+version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a90e40b3565a54a8b0411169c9c0fead93f5624ec180c4507b5de83f4cdf7b01"
+checksum = "4ffbdb6d92b6a7e1dfe393bdc539cb31fb0a39beb5ce1ffb5ed070dbc4453204"
