@@ -39,7 +39,7 @@ getrandom = { version = "0.4", default-features = false }
 signa-core = { version = "0.1.1", path = "../signa-core", default-features = false }
 # The productions and element scans of RFC 3261 section 25.1, for the few
 # headers a UA reads.
-siparse = "0.4.6"
+siparse = "0.4.7"
 tokio = { version = "1.54", default-features = false, features = ["macros", "rt", "sync", "time"], optional = true }
 
 [dev-dependencies]
