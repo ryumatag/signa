@@ -14,7 +14,7 @@ use crate::message::{
     extensions::Extensions,
     header::{
         CALL_ID, CSEQ, FROM, HeaderMap, HeaderName, HeaderValue, TO, Tag, VIA,
-        address::has_tag,
+        address::tagged,
     },
     request::Request,
 };
@@ -482,7 +482,10 @@ impl Builder {
     ///
     /// [`Builder::body`] reports [`InvalidTag`] for a tag that is not a SIP
     /// token. It also returns a [`BuildError`] if there is not exactly one
-    /// `To` header field.
+    /// `To` header field, or if that field is not one `name-addr` or
+    /// `addr-spec` followed by `generic-param`s (RFC 3261 section 25.1). A
+    /// value that cannot be read might already hold a tag, so I report it
+    /// rather than append a second one or send the response without one.
     ///
     /// # Example
     ///
@@ -527,8 +530,10 @@ impl Builder {
             let (Some(to), None) = (values.next(), values.next()) else {
                 return Err(BuildError::missing("single To header"));
             };
-            if has_tag(to.as_str()) {
-                return Ok(head);
+            match tagged(to.as_str()) {
+                Some(true) => return Ok(head),
+                Some(false) => {}
+                None => return Err(BuildError::missing("readable To header")),
             }
 
             // A token after `;tag=` keeps a valid header value valid. Without
@@ -652,6 +657,39 @@ mod tests {
         }
     }
 
+    // Appending `;tag=` works for every value siparse reads, since a header
+    // parameter may follow any address, after whitespace or a fold too.
+    #[test]
+    fn a_tag_appended_to_a_readable_value_reads_back() {
+        use crate::message::header::address;
+
+        for to in [
+            "<sip:bob@b>",
+            "\"Bob; B.\" <sip:bob@b>",
+            "<sip:bob@[2001:db8::1]>",
+            "tel:+12015550123;phone-context=example.com",
+            "<sip:bob@b>;x=[2001:db8::1]",
+            "<sip:bob@b>\r\n ",
+        ] {
+            let response = Response::builder()
+                .status(StatusCode::OK)
+                .header(TO, to)
+                .to_tag("uas")
+                .body(())
+                .unwrap();
+
+            let tagged = response.headers().get(TO).unwrap().as_str();
+            let tag = siparse::value::address(tagged)
+                .unwrap()
+                .params
+                .iter()
+                .find(|param| param.name == "tag")
+                .and_then(|param| param.value);
+            assert_eq!(tag, Some("uas"), "{to:?}");
+            assert_eq!(address::uri(tagged), address::uri(to), "{to:?}");
+        }
+    }
+
     #[test]
     fn to_tag_keeps_the_tag_of_a_request_within_a_dialog() {
         let response = Response::builder()
@@ -684,6 +722,17 @@ mod tests {
             }
 
             assert!(builder.to_tag("uas").body(()).is_err(), "{headers:?}");
+        }
+
+        for to in ["Bob<sip:bob@b>", "<sip:bob@b>;x=a/b", "\"Bob <sip:bob@b>"]
+        {
+            let error = Response::builder()
+                .status(StatusCode::OK)
+                .header(TO, to)
+                .to_tag("uas")
+                .body(())
+                .unwrap_err();
+            assert_eq!(error.to_string(), "builder has no readable To header");
         }
     }
 

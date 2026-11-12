@@ -2,70 +2,40 @@
 The protocol layer's minimal interpretation of address header parameters.
 */
 
-use siparse::scan::{quoted_string, sws, token};
+use siparse::value;
 
-// Only identify the header's tag. The message parser owns head syntax, and
-// siparse's lexer skips quoted text. URI parameters inside <> are not tags.
-pub(crate) fn has_tag(mut rest: &str) -> bool {
-    while let Some(ch) = rest.chars().next() {
-        match ch {
-            '"' => match quoted_string(rest) {
-                Some((_, tail)) => rest = tail,
-                None => return true,
-            },
-            '<' => match rest.split_once('>') {
-                Some((_, tail)) => rest = tail,
-                None => return true,
-            },
-            ';' => match token(sws(&rest[1..])) {
-                Some((name, tail)) => {
-                    if name.eq_ignore_ascii_case("tag") {
-                        return true;
-                    }
+/// Returns whether a From or To value has a `tag` header parameter, or
+/// `None` if the value is not one `name-addr` or `addr-spec` followed by
+/// `generic-param`s (RFC 3261 section 25.1).
+///
+/// A `tag` URI parameter inside the angle brackets is not a header
+/// parameter. A valueless `tag` still counts.
+pub(crate) fn tagged(value: &str) -> Option<bool> {
+    let address = value::address(value).ok()?;
+    let mut params = address.params.iter();
+    Some(params.any(|param| param.name.eq_ignore_ascii_case("tag")))
+}
 
-                    rest = tail;
-                }
-                None => return true,
-            },
-            _ => rest = &rest[ch.len_utf8()..],
-        }
-    }
-
-    false
+/// Returns whether a From or To value has a `tag` header parameter, counting
+/// a value that [`tagged`] cannot read as tagged.
+///
+/// The callers add a tag only to a value without one. Appending `;tag=` to a
+/// value they cannot read could add a second tag.
+#[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+pub(crate) fn has_tag(value: &str) -> bool {
+    tagged(value).unwrap_or(true)
 }
 
 /// Returns the URI of a From or To value, or `None` if the value is not a
-/// `name-addr` or `addr-spec` followed by parameters (RFC 3261 section 25.1).
+/// `name-addr` or `addr-spec` followed by `generic-param`s (RFC 3261 section
+/// 25.1).
 ///
 /// This reads the structure the protocol layer copies into an ACK or CANCEL.
-/// The caller validates the URI itself. Parameters are not interpreted.
+/// The caller validates the URI itself. Parameters are checked against
+/// `generic-param` but not interpreted.
 #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
 pub(crate) fn uri(value: &str) -> Option<&str> {
-    let mut rest = sws(value);
-    let (uri, params) = if let Some(quoted) =
-        rest.starts_with('"').then(|| quoted_string(rest)).flatten()
-    {
-        rest = sws(quoted.1).strip_prefix('<')?;
-        rest.split_once('>')?
-    } else if let Some((mut display, addr)) = rest.split_once('<') {
-        // An unquoted display name is tokens separated by whitespace.
-        loop {
-            display = sws(display);
-            if display.is_empty() {
-                break;
-            }
-            display = token(display)?.1;
-        }
-        addr.split_once('>')?
-    } else {
-        // Without angle brackets, a `;` starts the header parameters.
-        let end = rest.find(';').unwrap_or(rest.len());
-        (rest[..end].trim_end(), &rest[end..])
-    };
-
-    let params = sws(params);
-    (!uri.is_empty() && (params.is_empty() || params.starts_with(';')))
-        .then_some(uri)
+    value::address(value).ok().map(|address| address.uri)
 }
 
 #[cfg(test)]
@@ -81,6 +51,12 @@ mod tests {
             ("sip:bob@example.com;tag=1", "sip:bob@example.com"),
             ("  sip:bob@example.com ", "sip:bob@example.com"),
             ("A B <tel:+1-201-555-0123>", "tel:+1-201-555-0123"),
+            ("<sip:bob@[2001:db8::1]>", "sip:bob@[2001:db8::1]"),
+            ("sip:bob@[2001:db8::1];tag=1", "sip:bob@[2001:db8::1]"),
+            ("<sip:bob@example.com>\r\n ;tag=1", "sip:bob@example.com"),
+            // Without angle brackets, a `;` ends the URI, so the
+            // `phone-context` is a header parameter (RFC 3261 section 20).
+            ("tel:+12015550123;phone-context=example.com", "tel:+12015550123"),
         ] {
             assert_eq!(uri(value), Some(expected), "{value}");
         }
@@ -94,6 +70,15 @@ mod tests {
             "Bob; <sip:bob@example.com>",
             "<sip:bob@example.com> junk",
             ";tag=1",
+            // RFC 3261 section 25.1 requires whitespace after an unquoted
+            // display name and none inside the angle brackets. A `gen-value`
+            // cannot hold `/`, an `addr-spec` needs a scheme, and one without
+            // angle brackets cannot hold `?` (section 20).
+            "Bob<sip:bob@example.com>",
+            "< sip:bob@example.com>",
+            "<sip:bob@example.com>;x=a/b",
+            "<bob@example.com>",
+            "sip:bob@example.com?subject=lunch",
         ] {
             assert_eq!(uri(value), None, "{value}");
         }
@@ -105,6 +90,11 @@ mod tests {
             "<sip:bob@example.com>;tag=bob",
             "sip:bob@example.com; TAG = bob",
             "\"Bob\" <sip:bob@example.com>;x=\"a;b\";tag=bob",
+            "sip:bob@[2001:db8::1];tag=bob",
+            "<sip:bob@example.com>\t;tag=bob",
+            "<sip:bob@example.com>\r\n ;tag=bob",
+            // A valueless tag is still a tag, so nothing appends another.
+            "<sip:bob@example.com>;tag",
         ] {
             assert!(has_tag(value), "{value}");
         }
@@ -113,8 +103,28 @@ mod tests {
             "<sip:bob@example.com;tag=uri>",
             "\";tag=display\" <sip:bob@example.com>",
             "<sip:bob@example.com>;x=\";tag=value\"",
+            "<sip:bob@[2001:db8::1]>",
+            "<sip:bob@example.com>;x=[2001:db8::1]",
+            "<sip:bob@example.com>\r\n ",
         ] {
             assert!(!has_tag(value), "{value}");
+        }
+    }
+
+    #[test]
+    fn unreadable_values_count_as_tagged() {
+        for value in [
+            "",
+            "\"Bob <sip:bob@example.com>",
+            "<sip:bob@example.com",
+            "Bob<sip:bob@example.com>",
+            "<sip:bob@example.com>;x=a/b",
+            "<sip:bob@example.com>;",
+            "<sip:bob@example.com>;tag=",
+            "sip:bob@example.com?subject=lunch",
+        ] {
+            assert_eq!(tagged(value), None, "{value}");
+            assert!(has_tag(value), "{value}");
         }
     }
 }

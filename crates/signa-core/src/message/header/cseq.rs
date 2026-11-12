@@ -5,7 +5,7 @@
 //! applications belongs to a separate crate, so this stays inside signa and
 //! reads only what the protocol layer needs.
 
-use siparse::scan;
+use siparse::value;
 
 use crate::message::{Method, header::value::HeaderValue};
 
@@ -27,17 +27,10 @@ impl CSeq {
     /// method, so a lowercase `invite` is one, and does not equal
     /// [`Method::INVITE`].
     pub fn parse(value: &HeaderValue) -> Option<CSeq> {
-        let rest = scan::sws(value.as_str());
-        let (digits, rest) = scan::digits(rest)?;
+        let cseq = value::cseq(value.as_str()).ok()?;
         // The digits have no sign, so this only fails above `u32::MAX`.
-        let number = digits.parse().ok()?;
-        let rest = scan::lws(rest)?;
-        let (method, rest) = scan::token(rest)?;
-        // siparse keeps trailing whitespace, including a trailing fold.
-        if !scan::sws(rest).is_empty() {
-            return None;
-        }
-        let method = Method::from_bytes(method.as_bytes()).ok()?;
+        let number = cseq.number.parse().ok()?;
+        let method = Method::from_bytes(cseq.method.as_bytes()).ok()?;
         Some(CSeq { number, method })
     }
 }

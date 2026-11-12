@@ -45,7 +45,8 @@ The UA core's part, which this example does:
 
 There is no dialog layer beyond picking the To tag and building the ACK and
 BYE, no route set (the ACK and BYE go to the Contact), no SDP, PRACK or
-authentication. Its header parsing is simplified, as noted where it happens.
+authentication. The ACK and BYE go only to a Contact with a numeric host and
+an explicit port, since the example resolves no names.
 
 [RFC 6026 section 8.4]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.4
 [RFC 3261 section 17.1.1.3]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17.1.1.3
@@ -69,12 +70,16 @@ use signa::{
         CancelOutcome, ClientControl, Endpoint, Responses, ShutdownOutcome,
         Target, ViaMode,
     },
-    message::header::{
-        CALL_ID, CONTACT, CSEQ, FROM, HeaderName, HeaderValue, TO, VIA,
+    message::{
+        header::{
+            CALL_ID, CONTACT, CSEQ, FROM, HeaderName, HeaderValue, TO, VIA,
+        },
+        uri::SipUri,
     },
     transaction::Timers,
     transport::Transport,
 };
+use siparse::value;
 use tokio::{net::UdpSocket, task::JoinHandle, time::timeout};
 
 type BoxError = Box<dyn Error + Send + Sync>;
@@ -453,23 +458,23 @@ fn header(request: &Request<Bytes>, name: HeaderName) -> &str {
     request.headers().get(name).map_or("", HeaderValue::as_str)
 }
 
-// Simplified header reading. A typed-header crate does this properly.
+// siparse reads the From, To and Contact values (RFC 3261 section 25.1).
+// `tag_of` returns the first `tag` as written, so a quoted one keeps its
+// quotes. The far side never sends a repeated or quoted tag.
 
-/// The `tag` parameter of a From or To value. It reads parameters after the
-/// closing `>` only, so it needs a name-addr, which this example always
-/// sends.
+/// The `tag` parameter of a From or To value.
 fn tag_of(value: &HeaderValue) -> Option<&str> {
-    let (_, params) = value.as_str().rsplit_once('>')?;
-    params.split(';').find_map(|param| {
-        let (name, value) = param.split_once('=')?;
-        name.trim().eq_ignore_ascii_case("tag").then(|| value.trim())
-    })
+    let address = value::address(value.as_str()).ok()?;
+    let mut params = address.params.iter();
+    params.find(|param| param.name.eq_ignore_ascii_case("tag"))?.value
 }
 
-/// The numeric host and port of a Contact such as `<sip:bob@1.2.3.4:5060>`.
+/// The numeric host and explicit port of a Contact such as
+/// `<sip:bob@192.0.2.4:5060>`. A host name would need resolving, which
+/// this example does not do.
 fn contact_address(value: &HeaderValue) -> Option<SocketAddr> {
-    let value = value.as_str();
-    let uri = &value[value.find('<')? + 1..value.find('>')?];
-    let host_port = uri.split_once('@')?.1.split(';').next()?;
-    host_port.parse().ok()
+    let address = value::address(value.as_str()).ok()?;
+    let uri = SipUri::parse(address.uri).ok()?;
+    let ip = uri.host().parse().ok()?;
+    Some(SocketAddr::new(ip, uri.port_u16().ok()??))
 }

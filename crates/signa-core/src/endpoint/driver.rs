@@ -2947,6 +2947,9 @@ impl Driver {
             .and_then(|bytes| Response::from_shared(bytes).ok())
             .and_then(|response| response.headers().get(TO).cloned())
             .filter(|to| has_tag(to.as_str()));
+        // An unreadable request To counts as tagged, so the 500 copies it
+        // rather than risk a second tag. `to_tag` would refuse it, and a 500
+        // without a tag still ends the peer's retransmissions.
         let request_tagged =
             headers.get(TO).is_some_and(|to| has_tag(to.as_str()));
         let mut builder = Response::builder().status(SERVER_ERROR);

@@ -251,6 +251,8 @@ impl ReplyRoute {
             return Err(ReplyError::InvalidResponse);
         };
 
+        // `has_tag` counts an unreadable To as tagged, so a response to such
+        // a request can only copy it unchanged.
         if original == supplied {
             return if response.status().as_u16() == 100
                 || has_tag(original.as_str())

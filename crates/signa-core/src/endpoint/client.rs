@@ -24,13 +24,14 @@ use super::{
 };
 use crate::{
     message::{
-        Method, Uri,
+        Method,
         header::{
             CALL_ID, CSEQ, FROM, HeaderName, HeaderValue, TO, address,
             cseq::CSeq,
         },
         request::Request,
         response::Response,
+        uri::{InvalidSipUriKind, SipUri},
     },
     transport::{
         Flow, Transport, WriteLimits,
@@ -949,47 +950,24 @@ fn validate_identity(request: &Request<Bytes>) -> Result<(), Error> {
         }
     };
 
-    // A SIP or SIPS URI gets its structure checked. Another scheme, such as
-    // `tel:`, needs `scheme ":"` and what the message layer accepts after it.
-    let valid_uri = |uri: &str| {
-        let Ok(uri) = uri.parse::<Uri>() else { return false };
-        match uri.sip() {
-            Ok(Some(_)) => true,
-            Ok(None) => {
-                uri.as_str().split_once(':').is_some_and(|(scheme, rest)| {
-                    !rest.is_empty()
-                        && scheme
-                            .bytes()
-                            .next()
-                            .is_some_and(|b| b.is_ascii_alphabetic())
-                        && scheme.bytes().all(|b| {
-                            b.is_ascii_alphanumeric() || b"+-.".contains(&b)
-                        })
-                })
-            }
-            Err(_) => false,
-        }
-    };
+    // `value::address` already requires `scheme ":"` with something after
+    // it, and keeps the URI within the character set of a Request-URI. RFC
+    // 3261 section 25.1 lets an `addr-spec` be any `absoluteURI`, so another
+    // scheme, such as `tel:`, needs nothing more. A SIP or SIPS URI also gets
+    // its structure checked.
     for name in [FROM, TO] {
-        let value = one(name.clone())?;
-        if !address::uri(value).is_some_and(valid_uri) {
+        let valid = address::uri(one(name.clone())?).is_some_and(|uri| {
+            match SipUri::parse(uri) {
+                Ok(_) => true,
+                Err(error) => error.kind() == InvalidSipUriKind::Scheme,
+            }
+        });
+        if !valid {
             return Err(Error::invalid_header(name));
         }
     }
 
-    let call_id = one(CALL_ID)?.trim();
-    let word = |word: &str| {
-        !word.is_empty()
-            && word.bytes().all(|b| {
-                b.is_ascii_alphanumeric()
-                    || b"-.!%*_+`'~()<>:\\\"/[]?{}".contains(&b)
-            })
-    };
-    let valid = match call_id.split_once('@') {
-        Some((local, host)) => word(local) && word(host),
-        None => word(call_id),
-    };
-    if !valid {
+    if siparse::value::call_id(one(CALL_ID)?).is_err() {
         return Err(Error::invalid_header(CALL_ID));
     }
     Ok(())
@@ -1334,7 +1312,12 @@ mod tests {
             ("From", "\"Alice\" <sip:alice@example.com>"),
             ("From", "sip:alice@example.com;tag=1"),
             ("To", "Bob <tel:+12015550123>;tag=x"),
+            ("To", "<tel:+12015550123;phone-context=example.com>"),
+            ("To", "tel:+12015550123;phone-context=example.com"),
+            ("To", "<sips:bob@example.com>"),
+            ("To", "<SIP:bob@example.com>"),
             ("Call-ID", "f81d4fae-7dec-11d0-a765-00a0c91e6bf6"),
+            ("Call-ID", " a84b4c76e66710@pc33.example.com "),
             ("Call-ID", "a!%*_+`'~()<>:\\\"/[]?{}@[2001:db8::1]"),
         ] {
             let mut request = invite();
@@ -1371,7 +1354,14 @@ mod tests {
             ("To", "<not a uri>"),
             ("To", "<bob@example.com>"),
             ("To", "<sip:>"),
+            ("To", "<tel:>"),
+            ("To", "<1tel:+12015550123>"),
             ("To", "\"Bob <sip:bob@example.com>"),
+            ("To", "Bob<sip:bob@example.com>"),
+            ("To", "sip:bob@example.com?subject=lunch"),
+            // siparse reads these, and the SIP structure check rejects them.
+            ("To", "<sip:bob@example.com:50x>"),
+            ("To", "<sips:bob@[2001:db8::1>"),
             ("Call-ID", "two words"),
             ("Call-ID", "a@b@c"),
             ("Call-ID", "@example.com"),
@@ -1385,6 +1375,10 @@ mod tests {
                 validate(&request).unwrap_err().is_invalid_header(),
                 "{name}: {value}"
             );
+        }
+
+        for to in ["<sip:bob@example.com:50x>", "<sips:bob@[2001:db8::1>"] {
+            assert!(address::uri(to).is_some(), "{to}");
         }
 
         for cseq in ["2147483648 INVITE", "4294967295 INVITE", "1 OPTIONS"] {

@@ -56,8 +56,8 @@ once the caller has it. A later write failure arrives in [`ServerEvents`].
 This is not a complete UA. It keeps no dialog after the ACK wait, does no
 SDP offer/answer (an ACK may carry the answer), sends no BYE, has no PRACK,
 session timers, authentication or Record-Route handling, and builds its
-Contact from the local address. Its header parsing is simplified, as noted
-where it happens.
+Contact from the local address. Its caller sends the ACK only to a Contact
+with a numeric host and an explicit port, since the example resolves no names.
 
 [RFC 6026 section 8.7]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.7
 [RFC 3261 section 13.3.1.4]: https://www.rfc-editor.org/rfc/rfc3261.html#section-13.3.1.4
@@ -89,12 +89,16 @@ use signa::{
         Responses, ServerEvent, ServerEvents, ServerTransactionId,
         ShutdownOutcome, Target, ViaMode,
     },
-    message::header::{
-        CALL_ID, CONTACT, CSEQ, FROM, HeaderMap, HeaderValue, TO, Tag, VIA,
+    message::{
+        header::{
+            CALL_ID, CONTACT, CSEQ, FROM, HeaderMap, HeaderValue, TO, Tag, VIA,
+        },
+        uri::SipUri,
     },
     transaction::Timers,
     transport::Transport,
 };
+use siparse::value;
 use tokio::{
     sync::oneshot,
     time::{Instant, sleep, sleep_until, timeout},
@@ -545,28 +549,28 @@ async fn count_2xx(
     arrivals
 }
 
-// Simplified header reading. A typed-header crate does this properly.
+// siparse reads the From, To, CSeq and Contact values (RFC 3261 section
+// 25.1). `tag_of` returns the first `tag` as written, so a quoted one keeps
+// its quotes. Neither side here sends a repeated or quoted tag.
 
-/// The `tag` parameter of a From or To value. It reads parameters after the
-/// closing `>` only, so it needs a name-addr, which this example always
-/// sends.
+/// The `tag` parameter of a From or To value.
 fn tag_of(value: &HeaderValue) -> Option<&str> {
-    let (_, params) = value.as_str().rsplit_once('>')?;
-    params.split(';').find_map(|param| {
-        let (name, value) = param.split_once('=')?;
-        name.trim().eq_ignore_ascii_case("tag").then(|| value.trim())
-    })
+    let address = value::address(value.as_str()).ok()?;
+    let mut params = address.params.iter();
+    params.find(|param| param.name.eq_ignore_ascii_case("tag"))?.value
 }
 
 /// The number of a CSeq value.
 fn cseq_number(value: &HeaderValue) -> Option<u32> {
-    value.as_str().split_whitespace().next()?.parse().ok()
+    value::cseq(value.as_str()).ok()?.number.parse().ok()
 }
 
-/// The numeric host and port of a Contact such as `<sip:uas@1.2.3.4:5060>`.
+/// The numeric host and explicit port of a Contact such as
+/// `<sip:uas@192.0.2.4:5060>`. A host name would need resolving, which
+/// this example does not do.
 fn contact_address(value: &HeaderValue) -> Option<SocketAddr> {
-    let value = value.as_str();
-    let uri = &value[value.find('<')? + 1..value.find('>')?];
-    let host_port = uri.split_once('@')?.1.split(';').next()?;
-    host_port.parse().ok()
+    let address = value::address(value.as_str()).ok()?;
+    let uri = SipUri::parse(address.uri).ok()?;
+    let ip = uri.host().parse().ok()?;
+    Some(SocketAddr::new(ip, uri.port_u16().ok()??))
 }
