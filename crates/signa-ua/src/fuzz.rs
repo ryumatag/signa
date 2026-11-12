@@ -29,12 +29,12 @@ use signa_core::{
 
 use crate::{
     error::Error,
+    header,
     invite::{CancelResult, ExchangeKey},
     model::{
         Authority, ByeStarted, Command, Effect, Event, Limits, Model, Random,
     },
     negotiation::{Body, Description},
-    protocol,
 };
 
 /// The bytes of a session description a UA keeps at most, as the runtime's
@@ -50,16 +50,16 @@ pub fn headers(data: &[u8]) {
     };
     let headers = request.headers();
 
-    let _ = protocol::call_id(headers);
-    let _ = protocol::from(headers);
-    let _ = protocol::to(headers);
-    let _ = protocol::contact(headers);
-    let _ = protocol::cseq(headers);
-    let _ = protocol::expires(headers);
-    let _ = protocol::requires_extension(headers);
-    let _ = protocol::content_type(headers);
-    let _ = protocol::content_disposition(headers);
-    let _ = protocol::encoded(headers);
+    let _ = header::call_id(headers);
+    let _ = header::from(headers);
+    let _ = header::to(headers);
+    let _ = header::contact(headers);
+    let _ = header::cseq(headers);
+    let _ = header::expires(headers);
+    let _ = header::requires_extension(headers);
+    let _ = header::content_type(headers);
+    let _ = header::content_disposition(headers);
+    let _ = header::encoded(headers);
     let _ = Body::read(headers, request.body(), DESCRIPTION_LIMIT);
 
     let model = model();
@@ -208,10 +208,10 @@ impl Fuzzed {
             // the rest itself.
             Method::BYE | Method::OPTIONS => {
                 let _ = self.model.knows_dialog(&request);
-                let checked = protocol::to(headers).and_then(|to| {
+                let checked = header::to(headers).and_then(|to| {
                     Ok((
                         to.tag.is_some(),
-                        protocol::requires_extension(headers)?,
+                        header::requires_extension(headers)?,
                     ))
                 });
                 if let Ok((true, false)) = checked {

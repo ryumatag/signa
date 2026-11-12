@@ -28,7 +28,7 @@ use std::fmt;
 use bytes::Bytes;
 use signa_core::{HeaderMap, HeaderValue, message::header::CONTENT_TYPE};
 
-use crate::protocol::{self, Malformed};
+use crate::header::{self, Malformed};
 
 /// A session description to carry in a message, such as the answer in a 2xx.
 ///
@@ -86,7 +86,7 @@ impl Description {
     /// to be taken for one. Without that header, RFC 3261 section 20.11 makes
     /// only `application/sdp` a session description.
     pub(crate) fn needs_disposition(&self) -> bool {
-        !protocol::media_type(self.content_type.as_str())
+        !header::media_type(self.content_type.as_str())
             .is_ok_and(|media| media.is("application", "sdp"))
     }
 }
@@ -134,9 +134,9 @@ impl Body {
         if body.is_empty() {
             return Ok(Body::Empty);
         }
-        let media = protocol::content_type(headers)?
-            .ok_or(Malformed(protocol::Field::ContentType))?;
-        let disposition = protocol::content_disposition(headers)?;
+        let media = header::content_type(headers)?
+            .ok_or(Malformed(header::Field::ContentType))?;
+        let disposition = header::content_disposition(headers)?;
 
         let multipart = media.kind.eq_ignore_ascii_case("multipart");
         let session = match disposition {
@@ -147,7 +147,7 @@ impl Body {
         if !session {
             return Ok(Body::Other);
         }
-        if multipart || protocol::encoded(headers)? {
+        if multipart || header::encoded(headers)? {
             return Ok(Body::Unsupported);
         }
         if body.len() > limit {

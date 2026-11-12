@@ -30,7 +30,7 @@ use signa_core::{
 };
 
 use crate::{
-    protocol::{self, Field, Malformed},
+    header::{self, Field, Malformed},
     routing::{
         InvalidRouteSet, Order, RemoteTarget, RequestTarget, RouteSet,
         request_target,
@@ -101,10 +101,10 @@ impl DialogId {
     ) -> bool {
         let headers = response.headers();
         let (Ok(call_id), Ok(from), Ok(to), Ok((number, method))) = (
-            protocol::call_id(headers),
-            protocol::from(headers),
-            protocol::to(headers),
-            protocol::cseq(headers),
+            header::call_id(headers),
+            header::from(headers),
+            header::to(headers),
+            header::cseq(headers),
         ) else {
             return false;
         };
@@ -191,15 +191,15 @@ impl Origin {
         request: &Request<B>,
     ) -> Result<Origin, DialogError> {
         let headers = request.headers();
-        let from = protocol::from(headers)?;
+        let from = header::from(headers)?;
         let local_tag = tag(from.tag, Field::From)?
             .ok_or(DialogError::Malformed(Field::From))?;
 
         Ok(Origin {
-            call_id: protocol::call_id(headers)?.into(),
+            call_id: header::call_id(headers)?.into(),
             local_tag,
             local_uri: from.uri.into(),
-            cseq: protocol::cseq(headers)?.0,
+            cseq: header::cseq(headers)?.0,
         })
     }
 
@@ -215,9 +215,9 @@ impl Origin {
     pub(crate) fn answered_by<B>(&self, response: &Response<B>) -> bool {
         let headers = response.headers();
         let (Ok(call_id), Ok(from), Ok((cseq, method))) = (
-            protocol::call_id(headers),
-            protocol::from(headers),
-            protocol::cseq(headers),
+            header::call_id(headers),
+            header::from(headers),
+            header::cseq(headers),
         ) else {
             return false;
         };
@@ -234,7 +234,7 @@ impl Origin {
     }
 }
 
-/// Parses a tag that `protocol` has already checked to be a token.
+/// Parses a tag that `header` has already checked to be a token.
 fn tag(tag: Option<&str>, field: Field) -> Result<Option<Tag>, DialogError> {
     tag.map(str::parse).transpose().map_err(|_| DialogError::Malformed(field))
 }
@@ -246,13 +246,13 @@ pub(crate) fn request_dialog<B>(
     request: &Request<B>,
 ) -> Result<Option<DialogId>, DialogError> {
     let headers = request.headers();
-    let Some(local_tag) = tag(protocol::to(headers)?.tag, Field::To)? else {
+    let Some(local_tag) = tag(header::to(headers)?.tag, Field::To)? else {
         return Ok(None);
     };
-    let remote_tag = tag(protocol::from(headers)?.tag, Field::From)?;
+    let remote_tag = tag(header::from(headers)?.tag, Field::From)?;
 
     Ok(Some(DialogId::new(
-        protocol::call_id(headers)?.into(),
+        header::call_id(headers)?.into(),
         local_tag,
         remote_tag,
     )))
@@ -262,7 +262,7 @@ pub(crate) fn request_dialog<B>(
 pub(crate) fn response_tag<B>(
     response: &Response<B>,
 ) -> Result<Option<Tag>, DialogError> {
-    tag(protocol::to(response.headers())?.tag, Field::To)
+    tag(header::to(response.headers())?.tag, Field::To)
 }
 
 /// Why a request is out of order in a dialog.
@@ -354,14 +354,14 @@ impl Dialog {
         route_limit: usize,
     ) -> Result<Dialog, DialogError> {
         let headers = request.headers();
-        let from = protocol::from(headers)?;
-        let to = protocol::to(headers)?;
-        let contact = protocol::contact(headers)?
+        let from = header::from(headers)?;
+        let to = header::to(headers)?;
+        let contact = header::contact(headers)?
             .ok_or(DialogError::Malformed(Field::Contact))?;
 
         Ok(Dialog {
             id: DialogId::new(
-                protocol::call_id(headers)?.into(),
+                header::call_id(headers)?.into(),
                 local_tag,
                 tag(from.tag, Field::From)?,
             ),
@@ -376,7 +376,7 @@ impl Dialog {
                 route_limit,
             )?,
             local_cseq: None,
-            remote_cseq: Some(protocol::cseq(headers)?.0),
+            remote_cseq: Some(header::cseq(headers)?.0),
             secure: false,
             target_revision: 0,
         })
@@ -391,8 +391,8 @@ impl Dialog {
         route_limit: usize,
     ) -> Result<Dialog, DialogError> {
         let headers = response.headers();
-        let to = protocol::to(headers)?;
-        let contact = protocol::contact(headers)?
+        let to = header::to(headers)?;
+        let contact = header::contact(headers)?
             .ok_or(DialogError::Malformed(Field::Contact))?;
         let phase = if response.status().is_success() {
             DialogPhase::Confirmed
@@ -482,7 +482,7 @@ impl Dialog {
             route_limit,
         )?;
         let mut target = self.target.clone();
-        let contact = protocol::contact(headers)?;
+        let contact = header::contact(headers)?;
         if let Some(contact) = contact {
             target
                 .refresh(contact)
@@ -522,7 +522,7 @@ impl Dialog {
         &mut self,
         headers: &HeaderMap,
     ) -> Result<(), DialogError> {
-        match protocol::contact(headers)? {
+        match header::contact(headers)? {
             Some(contact) => self.refresh_to(contact),
             None => Ok(()),
         }

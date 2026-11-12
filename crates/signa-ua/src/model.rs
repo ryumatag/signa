@@ -80,6 +80,7 @@ use crate::{
         response_tag,
     },
     error::Error,
+    header::{self, Field, Malformed},
     invite::{
         AttemptKey, AttemptResult, ByeIntent, CancelIntent, CancelResult,
         Direction, EndReason, ExchangeKey, ExchangeState, InviteAttempt,
@@ -89,7 +90,6 @@ use crate::{
     negotiation::{Body, Description, Negotiation},
     operation::{Completion, OperationId, Operations, Stage, SubmitError},
     plan::{Identity, InvitePlan, PlannedInvite},
-    protocol::{self, Field, Malformed},
     retention::{
         AckBody, AckObligation, Bye, ReplayContext, ReplayId, ReplayKey,
         Retention, Retransmission, Source,
@@ -913,7 +913,7 @@ impl<R: Random> Model<R> {
             }
             Incoming::InDialog(dialog) => Some(dialog),
         };
-        if protocol::is_sips(request.uri().as_str()) {
+        if header::is_sips(request.uri().as_str()) {
             return Err(Refusal::SipsRequestUri);
         }
         if let Some(dialog) = dialog {
@@ -922,9 +922,9 @@ impl<R: Random> Model<R> {
 
         let headers = request.headers();
         let merge = MergeKey {
-            call_id: protocol::call_id(headers)?.into(),
-            from_tag: protocol::from(headers)?.tag.map(Into::into),
-            cseq: protocol::cseq(headers)?.0,
+            call_id: header::call_id(headers)?.into(),
+            from_tag: header::from(headers)?.tag.map(Into::into),
+            cseq: header::cseq(headers)?.0,
         };
         // The core absorbs a retransmission in the INVITE's transaction, so a
         // request that reaches the UA with the identity of an exchange it
@@ -932,7 +932,7 @@ impl<R: Random> Model<R> {
         if self.merge_index.contains_key(&merge) {
             return Err(Refusal::Merged);
         }
-        if protocol::requires_extension(headers)? {
+        if header::requires_extension(headers)? {
             return Err(Refusal::BadExtension);
         }
         let offer = match body? {
@@ -942,10 +942,10 @@ impl<R: Random> Model<R> {
             Body::TooLarge => return Err(Refusal::TooLarge),
         };
 
-        if protocol::sips_on_the_way_back(headers)? {
+        if header::sips_on_the_way_back(headers)? {
             return Err(Refusal::SipsNotAllowed);
         }
-        let expires = protocol::expires(headers)?;
+        let expires = header::expires(headers)?;
 
         let Some(local_tag) = self.tag() else {
             return Err(Refusal::Internal);
@@ -1026,7 +1026,7 @@ impl<R: Random> Model<R> {
         now: Instant,
     ) -> Result<Authority, Refusal> {
         let headers = request.headers();
-        if protocol::requires_extension(headers)? {
+        if header::requires_extension(headers)? {
             return Err(Refusal::BadExtension);
         }
         let offer = match body? {
@@ -1035,7 +1035,7 @@ impl<R: Random> Model<R> {
             Body::Unsupported => return Err(Refusal::UnsupportedBody),
             Body::TooLarge => return Err(Refusal::TooLarge),
         };
-        let (cseq, _) = protocol::cseq(headers)?;
+        let (cseq, _) = header::cseq(headers)?;
         // The index and the table change together, so a dialog the index
         // names is there. One that were not would be no dialog to take a
         // re-INVITE in.
@@ -1074,11 +1074,11 @@ impl<R: Random> Model<R> {
         {
             return Err(Refusal::RequestPending);
         }
-        let contact = protocol::contact(headers)?;
+        let contact = header::contact(headers)?;
         if contact.is_some_and(|contact| RemoteTarget::new(contact).is_err()) {
             return Err(Refusal::Malformed(Field::Contact));
         }
-        let expires = protocol::expires(headers)?;
+        let expires = header::expires(headers)?;
 
         if self.reinvites >= self.limits.reinvites {
             return Err(Refusal::Busy);
@@ -1917,7 +1917,7 @@ impl<R: Random> Model<R> {
         let Some(id) = request_dialog(request)? else {
             return Ok(InDialog::Other);
         };
-        let (cseq, _) = protocol::cseq(request.headers())?;
+        let (cseq, _) = header::cseq(request.headers())?;
         let bye = *request.method() == Method::BYE;
 
         if let Some(&key) = self.dialog_index.get(&id) {
@@ -2041,7 +2041,7 @@ impl<R: Random> Model<R> {
         answer: Option<Description>,
     ) {
         let (Ok(Some(id)), Ok((cseq, _))) =
-            (request_dialog(request), protocol::cseq(request.headers()))
+            (request_dialog(request), header::cseq(request.headers()))
         else {
             return;
         };
@@ -8781,7 +8781,7 @@ Contact: <sip:bob@192.0.2.4>
     fn what_an_incoming_invite_body_allows() {
         let mut model = model(limits());
         let clock = Clock(Instant::now());
-        let malformed = Malformed(protocol::Field::ContentType);
+        let malformed = Malformed(header::Field::ContentType);
 
         assert_eq!(
             model.receive_invite(
@@ -8798,7 +8798,7 @@ Contact: <sip:bob@192.0.2.4>
                 Err(malformed),
                 clock.now()
             ),
-            Err(Refusal::Malformed(protocol::Field::ContentType)),
+            Err(Refusal::Malformed(header::Field::ContentType)),
         );
 
         let authority = model
@@ -8927,8 +8927,7 @@ Contact: <sip:bob@192.0.2.4>
         let operation = run(model, Command::Reinvite { usage, offer });
         let exchange = started(&model.take_effects());
         let (outgoing, _) = model.take_reinvite(exchange).unwrap();
-        let (cseq, method) =
-            protocol::cseq(outgoing.request.headers()).unwrap();
+        let (cseq, method) = header::cseq(outgoing.request.headers()).unwrap();
         assert_eq!(method, "INVITE");
         model.reinvite_started(exchange, Ok(()), now);
         model.check();
@@ -9016,7 +9015,7 @@ Contact: <sip:bob@192.0.2.4>
         let ack = acks(&effects)[0];
         let (ack, _) = model.ack_request(ack).unwrap();
         assert_eq!(
-            protocol::cseq(ack.request.headers()).unwrap(),
+            header::cseq(ack.request.headers()).unwrap(),
             (cseq, "ACK")
         );
         assert_eq!(ack.request.uri().as_str(), "sip:bob@192.0.2.40");
@@ -9188,7 +9187,7 @@ Contact: <sip:bob@192.0.2.4>
         );
         let exchange = started(&model.take_effects());
         let (outgoing, _) = model.take_reinvite(exchange).unwrap();
-        let (cseq, _) = protocol::cseq(outgoing.request.headers()).unwrap();
+        let (cseq, _) = header::cseq(outgoing.request.headers()).unwrap();
         model.reinvite_started(exchange, Ok(()), clock.now());
         let glare = response(&format!(
             "SIP/2.0 491 Request Pending
@@ -9299,7 +9298,7 @@ CSeq: {cseq} INVITE
         assert_ne!(second, first);
         let (outgoing, carried) = model.take_reinvite(second).unwrap();
         assert_eq!(
-            protocol::cseq(outgoing.request.headers()).unwrap(),
+            header::cseq(outgoing.request.headers()).unwrap(),
             (cseq + 1, "INVITE"),
         );
         assert_eq!(carried, Some(hold));
@@ -9599,7 +9598,7 @@ CSeq: {cseq} INVITE
         let (ack, body) = model.ack_request(replay).unwrap();
         assert_eq!(body, Some(first_answer));
         assert_eq!(
-            protocol::cseq(ack.request.headers()).unwrap(),
+            header::cseq(ack.request.headers()).unwrap(),
             (late_cseq, "ACK"),
         );
         assert_eq!(model.usage_state(usage).unwrap().session_revision, 3);
@@ -9720,7 +9719,7 @@ CSeq: {cseq} INVITE
         let ack = acks(&effects)[0];
         let (ack_request, _) = model.ack_request(ack).unwrap();
         assert_eq!(
-            protocol::cseq(ack_request.request.headers()).unwrap(),
+            header::cseq(ack_request.request.headers()).unwrap(),
             (cseq, "ACK")
         );
         model.bye_answered(bye, Ok(()));
@@ -9757,7 +9756,7 @@ CSeq: {cseq} INVITE
         let ack = acks(&model.take_effects())[0];
         let (ack_request, _) = model.ack_request(ack).unwrap();
         assert_eq!(
-            protocol::cseq(ack_request.request.headers()).unwrap(),
+            header::cseq(ack_request.request.headers()).unwrap(),
             (cseq, "ACK")
         );
     }
@@ -10030,7 +10029,7 @@ Contact: <sip:alice@192.0.2.1>
         );
         let exchange = started(&model.take_effects());
         let (outgoing, _) = model.take_reinvite(exchange).unwrap();
-        let (cseq, _) = protocol::cseq(outgoing.request.headers()).unwrap();
+        let (cseq, _) = header::cseq(outgoing.request.headers()).unwrap();
         model.reinvite_started(exchange, Ok(()), clock.now());
         model.receive_reinvite_response(
             exchange,
@@ -10154,7 +10153,7 @@ Contact: <sip:alice@192.0.2.1>
         assert_eq!(acks(&model.take_effects()), [replay]);
         let (ack, body) = model.ack_request(replay).unwrap();
         assert_eq!(
-            protocol::cseq(ack.request.headers()).unwrap(),
+            header::cseq(ack.request.headers()).unwrap(),
             (cseq, "ACK")
         );
         assert_eq!(body, Some(description("v=0 rejected")));
@@ -10429,7 +10428,7 @@ Contact: <sip:alice@192.0.2.1>
             );
             assert_eq!(&*outgoing.target.next_hop, "sip:bob@192.0.2.99");
             assert_eq!(
-                protocol::cseq(outgoing.request.headers()).unwrap(),
+                header::cseq(outgoing.request.headers()).unwrap(),
                 (cseq, "ACK"),
             );
         }
