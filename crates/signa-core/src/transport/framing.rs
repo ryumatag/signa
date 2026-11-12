@@ -15,7 +15,10 @@ how to read and when to close.
 use std::{error, fmt, mem};
 
 use bytes::{Buf, Bytes, BytesMut};
-use siparse::{Status, find_head_end, parse_ping, parse_pong};
+use siparse::{
+    Status,
+    frame::{find_head_end, parse_ping, parse_pong},
+};
 
 use super::MessageLimits;
 use crate::message::{
