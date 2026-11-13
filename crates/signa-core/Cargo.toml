@@ -38,8 +38,8 @@ __bench = []
 
 [dependencies]
 bytes = { version = "1.12.1", default-features = false, features = ["std"] }
-# `frame` arrived in 0.4.7.
-siparse = "0.4.7"
+# `value::via_parm` arrived in 0.4.9.
+siparse = "0.4.9"
 # RFC 3261 section 19.3 requires tags with cryptographic randomness.
 getrandom = { version = "0.4", default-features = false }
 tokio = { version = "1.54", default-features = false, features = ["io-util", "net", "rt", "sync", "time"], optional = true }
