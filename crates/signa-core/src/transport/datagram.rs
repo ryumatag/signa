@@ -500,8 +500,8 @@ impl fmt::Debug for DatagramWrite {
 #[non_exhaustive]
 pub enum WritePath<'a> {
     /// Nothing more. The backend sends from the source to the destination
-    /// the way it would choose itself. A request to a plain address goes so,
-    /// and so does a response to a request that arrived without context.
+    /// the way it would choose itself. A request to a plain address goes this
+    /// way, and so does a response to a request that arrived without context.
     Default,
     /// A response, with the context its request arrived with.
     ///
@@ -530,8 +530,8 @@ pub enum WritePath<'a> {
 #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
 pub(crate) struct Path {
     pub(crate) context: TransportContext,
-    /// Set on a prepared path. Boxed, so that the many received contexts do
-    /// not carry its room.
+    /// Set on a prepared path. It is boxed, so that the many received
+    /// contexts do not pay for its room.
     pub(crate) prepared: Option<Box<Prepared>>,
     pub(crate) _permit: Option<Permit>,
 }

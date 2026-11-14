@@ -1025,16 +1025,16 @@ impl Endpoint {
     }
 
     /// Prepares `request` for [`Endpoint::start_prepared`] toward `target`,
-    /// and tells its exact size.
+    /// and reports its exact size.
     ///
     /// Preparing does everything [`Endpoint::start`] does before the request
     /// goes out. It checks the request, takes its place in client admission,
     /// selects the source, opens or picks the TCP connection, and prepends the
-    /// Via with its `sent-by` and a fresh branch. [`PreparedRequest::encoded_len`]
-    /// is then the size of the bytes that starting it sends, Via included, so
-    /// a caller can pick TCP for a request over 1300 bytes
-    /// ([RFC 3261 section 18.1.1]) without encoding it to guess. Nothing is
-    /// written to the network.
+    /// Via with its `sent-by` and a fresh branch.
+    /// [`PreparedRequest::encoded_len`] is then the size of the bytes that
+    /// starting it sends, Via included, so a caller can pick TCP for a request
+    /// over 1300 bytes ([RFC 3261 section 18.1.1]) without encoding it to
+    /// guess. Nothing is written to the network.
     ///
     /// A preparation holds its admission until it is started or dropped.
     /// [`PreparedRequest::into_request`] gives the request back without the
@@ -1042,8 +1042,9 @@ impl Endpoint {
     ///
     /// # Cancellation
     ///
-    /// As for [`Endpoint::start`], except that nothing is sent. A prepared
-    /// request whose future is dropped is dropped with it.
+    /// As for [`Endpoint::start`], except that nothing is sent. Dropping the
+    /// future after the driver has prepared the request drops the
+    /// preparation, and its admission with it.
     ///
     /// # Errors
     ///
@@ -1074,7 +1075,8 @@ impl Endpoint {
     ///         return endpoint.start_prepared(prepared).await;
     ///     }
     ///     let tcp = Target::new(Transport::Tcp, next_hop);
-    ///     let prepared = endpoint.prepare(prepared.into_request(), tcp).await?;
+    ///     let request = prepared.into_request();
+    ///     let prepared = endpoint.prepare(request, tcp).await?;
     ///     endpoint.start_prepared(prepared).await
     /// }
     /// ```
@@ -1110,9 +1112,10 @@ impl Endpoint {
     /// the source and connection it fixed.
     ///
     /// The request goes out as [`Endpoint::start`] sends it, byte for byte
-    /// what [`PreparedRequest::encoded_len`] measured. A preparation is never
-    /// sent another way in its place. One of another endpoint, or one whose
-    /// TCP connection has closed since, fails with [`Error::is_stale_path`].
+    /// what [`PreparedRequest::encoded_len`] measured. The endpoint never sends
+    /// a preparation another way in its place. One of another endpoint, or
+    /// one whose TCP connection has closed since, fails with
+    /// [`Error::is_stale_path`].
     ///
     /// # Cancellation
     ///

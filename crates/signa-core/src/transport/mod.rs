@@ -117,8 +117,8 @@ impl fmt::Display for Transport {
 /// the local address is the one the datagram was received on, which matters on
 /// a socket bound to a wildcard address. Over TCP it is the connection's own.
 ///
-/// The endpoint delivers the flow a request arrived on in its incoming
-/// envelope, as `ServerRequest::flow` and `ReceivedRequest::flow`.
+/// The endpoint delivers the flow a message arrived on in its incoming
+/// envelope, as the `ReceiveInfo::flow` of its `received` field.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct Flow {
     /// The protocol.

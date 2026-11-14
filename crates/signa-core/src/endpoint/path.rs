@@ -13,13 +13,13 @@ and gets it back in two ways:
   The path fixes its source, destination, context and the `sent-by` its Via
   names, and the backend checks it once, when it is prepared.
 
-Three addresses are kept apart. Those a datagram was observed with are in
-[`ReceiveInfo`], and nothing derives a send path from them. A response goes
-from the address its request was sent to and to where SIP says, see
-[`WritePath::Reply`], and a request from and to its path's addresses. The `sent-by` a request
-advertises is the path's, or the source address, and the endpoint checks the
-responses to a client transaction against the `sent-by` that transaction
-advertised.
+Three addresses are kept apart. The addresses a datagram was observed with
+are in [`ReceiveInfo`], and no send path is made from them. A response goes
+out from the address its request was sent to, toward where SIP sends it, see
+[`WritePath::Reply`]. A request goes out between its path's addresses. The
+`sent-by` a request advertises is its path's, or else its source address, and
+the endpoint checks the responses to a client transaction against the
+`sent-by` that transaction advertised.
 
 Every context the endpoint keeps is a copy of its own, so a backend that
 slices it out of a capture buffer does not keep that buffer alive.
@@ -79,8 +79,8 @@ pub struct PathSelection {
 }
 
 impl PathSelection {
-    /// Selects datagrams from `source` to `destination`, without context, that
-    /// advertise `source` as their `sent-by`.
+    /// Selects `source` and `destination`, without context. A request on the
+    /// path advertises `source` as its `sent-by`.
     pub fn new(source: SocketAddr, destination: SocketAddr) -> PathSelection {
         PathSelection {
             source,
@@ -174,9 +174,9 @@ impl fmt::Debug for SendPath {
 /// context.
 ///
 /// These are observed addresses. For an intercepting backend the destination
-/// need not be an address of this host, and nothing here lets anything send
-/// from it. A response goes back through the message's reply route, which
-/// keeps the same context.
+/// need not be an address of this host. Holding them lets nothing send. A
+/// response goes back through the message's reply route, from the address the
+/// message was sent to and with the same context.
 #[derive(Clone)]
 pub struct ReceiveInfo {
     flow: Flow,
@@ -309,8 +309,11 @@ impl Endpoint {
     /// look up anything or write to the network.
     ///
     /// The endpoint's own socket accepts a source on its port without
-    /// context, at its own address or, when it is bound to a wildcard, at an
-    /// address of this host the caller picks.
+    /// context, at its own address. When it is bound to a wildcard, it also
+    /// accepts an address of this host that the caller picks, on Linux,
+    /// Android and Apple's systems, where it names the source of each
+    /// datagram. Elsewhere, such as on Windows, the kernel picks that source,
+    /// so the socket refuses the path.
     ///
     /// # Cancellation
     ///

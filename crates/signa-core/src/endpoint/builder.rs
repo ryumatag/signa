@@ -511,18 +511,19 @@ impl Builder {
     /// request's context for its responses, from admission until the last of
     /// its envelope, reply route and server transaction drops, and of each
     /// [`SendPath`] until the last clone and the last transaction sent on it
-    /// drop. A received context takes one message and its length plus about
-    /// 80 bytes of bookkeeping, and a path about 110 bytes more for its
-    /// addresses. A datagram without context, which is all the socket gives,
-    /// takes nothing. A clone of a context's bytes the application keeps is
-    /// its own and not counted.
+    /// drop. A received context counts as one message, and as its length plus
+    /// about 80 bytes of bookkeeping. A path counts about 110 bytes more for
+    /// its addresses. A datagram without context, which is all the socket
+    /// gives, counts nothing. A clone of a context's bytes that the
+    /// application keeps is its own, and is not counted.
     ///
-    /// New requests and paths may use three quarters of the limits, and ACKs
-    /// and matched CANCELs the rest. A request whose context does not fit is
-    /// refused as when [`Builder::max_pending_requests`] is full: a stateful
-    /// endpoint answers it with a stateless 503 and a stateless one discards
-    /// it. An ACK that does not fit is discarded and counted, and
-    /// [`Endpoint::prepare_path`] fails with [`Error::is_busy`].
+    /// New requests and paths leave one quarter of both limits (rounded down)
+    /// for ACKs and matched CANCELs, as new client requests do with the write
+    /// limits. A request whose context does not fit is refused as when
+    /// [`Builder::max_pending_requests`] is full. A stateful endpoint answers
+    /// it with a stateless 503, and a stateless one discards it. An ACK that
+    /// does not fit is discarded and counted, and [`Endpoint::prepare_path`]
+    /// fails with [`Error::is_busy`].
     ///
     /// The default is 8192 messages and 4 MiB. Both must be positive.
     ///

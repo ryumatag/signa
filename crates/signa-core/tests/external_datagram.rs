@@ -838,8 +838,8 @@ async fn a_response_without_rport_goes_to_the_via_port_with_the_context() {
 // domains. The same request, branch and addresses in both makes a
 // transaction in each, and each answers on its own wire with its own
 // context. Within one domain the same request over another NIC is a
-// retransmission: the NIC is no part of the matching key of RFC 3261 section
-// 17.2.3, and the cached response goes back the way the first copy came.
+// retransmission, since the NIC is no part of the matching key of RFC 3261
+// section 17.2.3. Its cached response goes back the way the first copy came.
 #[tokio::test]
 async fn identical_tuples_in_separate_domains_stay_apart() {
     let (a_wire, b_wire) = (Wire::default(), Wire::default());
