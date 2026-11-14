@@ -143,7 +143,8 @@ seconds with the default timers. Work the TU does outside a transaction, such
 as retransmitting a 2xx until its ACK, holds the drain only through a
 [`WorkGuard`]. [`ShutdownOutcome`] says whether the endpoint drained or hit
 its deadline, and the [`Shutdown`] future resolves only after the endpoint's
-TCP listener and connection tasks have ended. A stateless endpoint has no
+TCP listener and connection tasks have ended and its UDP socket or
+[backend](Builder::udp_io) has closed. A stateless endpoint has no
 transactions, and its unread events do not hold the drain, so it stops once
 its writes in flight finish, and keeps delivering events until then.
 
@@ -271,8 +272,9 @@ mod timer;
 /// reply is in flight. [`ServerEvents`] and [`Incoming`] do not keep it
 /// running, and dropping `Incoming` starts an immediate shutdown. When the
 /// last of those handles drops, the driver stops, closes its sockets and drops
-/// its transactions, and its TCP connections get five seconds to write what is
-/// already queued. [`Endpoint::shutdown`] stops it with a grace period instead.
+/// its transactions, and its TCP connections and UDP socket or
+/// [backend](Builder::udp_io) get five seconds to write what is already
+/// queued. [`Endpoint::shutdown`] stops it with a grace period instead.
 /// Keeping a handle does not hold a graceful shutdown, except a [`WorkGuard`].
 ///
 /// See the [module docs](self) for what it does.
@@ -315,7 +317,7 @@ pub struct ConnectionStats {
 }
 
 /// Cumulative counts of received messages discarded because their queue was
-/// full.
+/// full, and of datagrams the UDP backend could not deliver whole.
 ///
 /// Each counts a message once, when it is discarded. A message that waits in
 /// a queue is not counted, and a retransmission that is admitted later does
@@ -336,6 +338,11 @@ pub struct ReceptionStats {
     /// Stateless responses discarded because
     /// [`Builder::client_response_budget`] was full.
     pub dropped_stateless_responses: u64,
+    /// Datagrams the UDP backend reported truncated. The endpoint's own
+    /// socket never truncates one.
+    pub truncated_datagrams: u64,
+    /// Errors the UDP socket or backend returned instead of a datagram.
+    pub receive_errors: u64,
 }
 
 impl Endpoint {
@@ -364,6 +371,10 @@ impl Endpoint {
             dropped_stateless_responses: counters
                 .stateless_responses
                 .load(Ordering::Relaxed),
+            truncated_datagrams: counters
+                .truncated_datagrams
+                .load(Ordering::Relaxed),
+            receive_errors: counters.receive_errors.load(Ordering::Relaxed),
         }
     }
 
@@ -399,7 +410,8 @@ impl Endpoint {
         Builder::new()
     }
 
-    /// The address of the UDP socket, if one was bound.
+    /// The address of the UDP socket, if one was bound, or the local address
+    /// of the [UDP backend](Builder::udp_io).
     pub fn udp_addr(&self) -> Option<SocketAddr> {
         self.udp
     }
@@ -454,13 +466,17 @@ impl Endpoint {
     ///
     /// Once drained, the endpoint stops taking commands and guards, runs the
     /// operations already queued, closes its listener and idle connections,
-    /// lets each TCP writer finish its queue, and resolves with
+    /// lets each TCP writer finish its queue, closes its UDP socket or
+    /// [backend](Builder::udp_io), and resolves with
     /// [`ShutdownOutcome::Drained`]. At `timeout` it stops instead, with
     /// [`ShutdownOutcome::DeadlineExpired`]. What is left then sees
     /// [`Error::is_closed`], [`ReplyError::Closed`] or
-    /// [`ServerEvent::EndpointClosed`], and no response is made up for it. In
-    /// both cases the future resolves only after the endpoint's TCP tasks
-    /// have ended, so no write the endpoint owned continues after it.
+    /// [`ServerEvent::EndpointClosed`], or the error a backend reports for a
+    /// write it fails on close, and no response is made up for it. In both
+    /// cases the future resolves only after the endpoint's TCP tasks have
+    /// ended and its UDP backend has closed, so no write the endpoint owned
+    /// continues after it. A backend that has not finished closing by the
+    /// deadline gets one more poll and is then dropped.
     ///
     /// Other handles to the endpoint go on working until it stops, and calling
     /// this on more than one of them is fine. Every caller waits for the same
@@ -608,7 +624,10 @@ pub fn reply_driver(
     let driver = Driver::new(
         incoming,
         Config::default(),
-        udp,
+        udp.map(|socket| {
+            Box::new(udp::Io::new(socket))
+                as Box<dyn crate::transport::datagram::DatagramIo>
+        }),
         tcp,
         tcp_tx,
         rx,
@@ -1733,7 +1752,7 @@ mod tests {
         let driver = Driver::new(
             incoming,
             config,
-            Some(socket),
+            Some(Box::new(udp::Io::new(socket))),
             tcp,
             tx,
             rx,

@@ -41,7 +41,8 @@ Its design draws heavily on the [`http`] and [`hyper`] crates.
   and runs the INVITE and non-INVITE client and server transactions of
   RFC 3261 section 17 as updated by RFC 6026 and RFC 4320. It exposes the
   transaction-user API, bounds the work it holds, and drains that work in a
-  graceful shutdown.
+  graceful shutdown. Its UDP datagrams can travel over a backend the
+  application supplies, such as a NIC adapter, in place of its own socket.
 * Stateless reception over UDP for a stateless proxy (RFC 3261 section 16.11).
   Every request and response arrives as an event without a transaction. The
   application forwards requests with a branch it computed, and responses by
@@ -180,8 +181,8 @@ their own.
 
 These are limited by signa itself:
 
-* TLS, and so SIPS. The transport interface is private, so a transport cannot
-  be added from outside.
+* TLS, and so SIPS. Only a UDP backend can be supplied from outside, through
+  [`transport::datagram`], so a stream transport cannot be added.
 * Stateless reception over TCP. Binding refuses it, since a response's Via
   does not identify the upstream connection.
 * Stateful and stateless reception on one endpoint. Two endpoints on two
@@ -210,7 +211,9 @@ The minimum supported Rust version is 1.85.
 - [`transaction`] exposes transaction timer configuration. Its state machines
   are internal protocol machinery.
 - [`transport`] exposes [`transport::Flow`], [`transport::Transport`] and
-  [`transport::MessageLimits`]. Socket and framing implementations are private.
+  [`transport::MessageLimits`], and [`transport::datagram`] the contract of a
+  UDP backend that takes the place of the endpoint's socket. Socket and
+  framing implementations are private.
 - The `endpoint` module, enabled by `tokio`, provides running protocol
   operations and their handles.
 

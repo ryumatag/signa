@@ -2,7 +2,7 @@
 Endpoint configuration, socket binding and task startup.
 */
 
-use std::{net::SocketAddr, time::Duration};
+use std::{fmt, net::SocketAddr, time::Duration};
 
 use tokio::sync::mpsc;
 
@@ -12,7 +12,10 @@ use super::{
 };
 use crate::{
     transaction::Timers,
-    transport::{MessageLimits, WriteLimits, budget::Budget, tcp, udp},
+    transport::{
+        MessageLimits, WriteLimits, budget::Budget, datagram::DatagramIo, tcp,
+        udp,
+    },
 };
 
 /// How an endpoint receives messages, fixed when it is bound.
@@ -172,9 +175,28 @@ impl Default for Config {
 /// ```
 #[derive(Debug)]
 pub struct Builder {
-    udp: Option<SocketAddr>,
+    udp: Option<Udp>,
     tcp: Option<SocketAddr>,
     config: Config,
+}
+
+/// Where the endpoint's UDP datagrams go.
+enum Udp {
+    /// A socket of its own, bound to this address.
+    Bind(SocketAddr),
+    /// A backend the application supplied.
+    Io(Box<dyn DatagramIo>),
+}
+
+impl fmt::Debug for Udp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Udp::Bind(addr) => f.debug_tuple("Bind").field(addr).finish(),
+            Udp::Io(io) => {
+                f.debug_tuple("Io").field(&io.local_addr()).finish()
+            }
+        }
+    }
 }
 
 impl Default for Builder {
@@ -195,8 +217,31 @@ impl Builder {
     /// address answers each request from the address it came to. Elsewhere the
     /// kernel picks the source address, so bind to one address there when the
     /// host has several.
+    ///
+    /// This replaces a backend set with [`Builder::udp_io`].
     pub fn udp(mut self, addr: SocketAddr) -> Builder {
-        self.udp = Some(addr);
+        self.udp = Some(Udp::Bind(addr));
+        self
+    }
+
+    /// Carries the endpoint's UDP datagrams over `io` instead of a socket of
+    /// its own.
+    ///
+    /// The endpoint treats the backend as its UDP socket, with the same
+    /// transactions, retransmissions, limits and reception policy. It sends
+    /// from and advertises [`DatagramIo::local_addr`], which must name one
+    /// address and port, and fails a write larger than the backend's
+    /// [`Capabilities::max_payload`](crate::transport::datagram::Capabilities::max_payload)
+    /// before offering it. A truncated datagram and a receive error are
+    /// discarded and counted in [`Endpoint::reception_stats`]. When the
+    /// endpoint stops it closes the backend as [`Endpoint::shutdown`]
+    /// describes. A backend dropped before that, such as by a failed `bind`,
+    /// is not closed.
+    ///
+    /// This replaces an address set with [`Builder::udp`]. See the
+    /// [`datagram`](crate::transport::datagram) module for the contract.
+    pub fn udp_io(mut self, io: impl DatagramIo) -> Builder {
+        self.udp = Some(Udp::Io(Box::new(io)));
         self
     }
 
@@ -358,11 +403,13 @@ impl Builder {
         self
     }
 
-    /// Sets outstanding write limits for the endpoint's UDP socket.
+    /// Sets outstanding write limits for the endpoint's UDP socket or
+    /// [backend](Builder::udp_io).
     ///
     /// The defaults are 1024 datagrams and 8 MiB of encoded bytes. A saturated
-    /// socket refuses new writes without waiting. Capacity is returned after
-    /// the local send attempt, including failures. These limits also apply
+    /// socket refuses new writes without waiting. A write counts from the
+    /// moment it is queued until its local write completes or fails, which
+    /// for a backend may be after the backend accepted it. These limits also apply
     /// to immediately writable sends, so a single datagram cannot exceed
     /// the byte budget. New client requests leave one quarter of both limits
     /// (rounded down) for existing transaction output and responses. These
@@ -646,8 +693,10 @@ impl Builder {
     /// `client_response_limits` or `client_response_budget`. Zero client
     /// transaction, table and transport limits are valid and refuse that work
     /// instead. [`Reception::Stateless`] without a UDP socket is invalid, and
-    /// with a TCP listener it is [`BindError::is_unsupported_config`]. Both
-    /// are refused before any socket is bound.
+    /// with a TCP listener it is [`BindError::is_unsupported_config`]. A
+    /// [backend](Builder::udp_io) whose local address or port is unspecified,
+    /// or whose maximum payload is zero, is invalid. These are refused before
+    /// any socket is bound.
     pub fn bind(mut self) -> Result<(Endpoint, Incoming), BindError> {
         if self.config.reception == Reception::Stateless {
             if self.tcp.is_some() {
@@ -658,6 +707,19 @@ impl Builder {
             if self.udp.is_none() {
                 return Err(BindError::invalid_config(
                     "stateless reception needs a UDP socket",
+                ));
+            }
+        }
+        if let Some(Udp::Io(io)) = &self.udp {
+            let local = io.local_addr();
+            if local.ip().is_unspecified() || local.port() == 0 {
+                return Err(BindError::invalid_config(
+                    "a UDP backend needs a specified local address and port",
+                ));
+            }
+            if io.capabilities().max_payload == 0 {
+                return Err(BindError::invalid_config(
+                    "a UDP backend must send a payload of at least one byte",
                 ));
             }
         }
@@ -719,7 +781,12 @@ impl Builder {
         let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
         let udp = self
             .udp
-            .map(udp::Socket::bind)
+            .map(|udp| match udp {
+                Udp::Bind(addr) => udp::Socket::bind(addr).map(|socket| {
+                    Box::new(udp::Io::new(socket)) as Box<dyn DatagramIo>
+                }),
+                Udp::Io(io) => Ok(io),
+            })
             .transpose()
             .map_err(BindError::io)?;
         let (tcp_tx, tcp_rx) = mpsc::channel(TCP_INBOUND);
@@ -737,7 +804,7 @@ impl Builder {
             .transpose()
             .map_err(BindError::io)?;
         let (commands, commands_rx) = mpsc::unbounded_channel();
-        let udp_addr = udp.as_ref().map(udp::Socket::local_addr);
+        let udp_addr = udp.as_ref().map(|io| io.local_addr());
         let tcp_addr = listener.as_ref().map(tcp::Listener::local_addr);
         self.config.tcp_listener = tcp_addr;
 
