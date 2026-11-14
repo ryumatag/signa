@@ -1366,7 +1366,11 @@ async fn mapped_ipv4_addresses_are_named_in_their_own_form() {
 }
 
 // A dual-stack socket sends to an IPv4 peer at its mapped address, so it
-// takes an IPv4 path too.
+// takes an IPv4 path from an address of this host too, where the platform
+// sends from a named source. Elsewhere, as on Windows, the kernel picks the
+// source of a wildcard socket, a path could not fix it, and the socket
+// refuses the path. A socket bound to the address takes it there too, see
+// `the_socket_takes_paths_from_its_own_address`.
 #[tokio::test]
 async fn a_dual_stack_socket_takes_ipv4_paths() {
     let Ok((endpoint, _incoming)) =
@@ -1379,10 +1383,18 @@ async fn a_dual_stack_socket_takes_ipv4_paths() {
     let port = endpoint.udp_addr().unwrap().port();
     let source = SocketAddr::new([127, 0, 0, 1].into(), port);
 
-    let path = endpoint
-        .prepare_path(PathSelection::new(source, peer_addr))
-        .await
-        .unwrap();
+    let prepared =
+        endpoint.prepare_path(PathSelection::new(source, peer_addr)).await;
+    let names_source = cfg!(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple"
+    ));
+    if !names_source {
+        assert!(prepared.unwrap_err().is_path_refused());
+        return;
+    }
+    let path = prepared.unwrap();
     endpoint
         .send_request(outgoing("dual"), Target::path(path), ViaMode::Fresh)
         .await
