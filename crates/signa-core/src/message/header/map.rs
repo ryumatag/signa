@@ -212,6 +212,18 @@ impl HeaderMap {
         Some(value)
     }
 
+    /// Removes the first row with `name` and returns its value, keeping the
+    /// rest. It undoes a [`HeaderMap::prepend`].
+    #[cfg(feature = "tokio")]
+    pub(crate) fn remove_first<K: AsHeaderName>(
+        &mut self,
+        name: K,
+    ) -> Option<HeaderValue> {
+        let name = name.to_header_name()?;
+        let first = self.position(&name)?;
+        Some(self.rows.remove(first).1)
+    }
+
     /// Returns an iterator over every row, in order.
     pub fn iter(&self) -> Iter<'_> {
         Iter(self.rows.iter())

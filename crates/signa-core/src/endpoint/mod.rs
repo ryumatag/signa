@@ -226,20 +226,24 @@ use self::{admission::ClientAdmission, driver::Command};
 use self::{builder::Config, driver::Driver};
 #[cfg(test)]
 use crate::transport::Transport;
-use crate::transport::{WriteLimits, budget::Budget};
 #[cfg(feature = "__bench")]
 use crate::{
     message::Request,
     transport::{tcp, udp},
+};
+use crate::{
+    transaction::Timers,
+    transport::{WriteLimits, budget::Budget, datagram::Binding},
 };
 
 pub use self::{
     builder::{Builder, Reception},
     client::{
         CancelError, CancelOutcome, ClientControl, ClientTransaction,
-        ClientTransactionId, Responses, Target,
+        ClientTransactionId, PreparedRequest, Responses, Target,
     },
     error::{BindError, Error},
+    path::{PathSelection, ReceiveInfo, SendPath},
     reply::{ReplyError, ReplyRoute},
     send::{Branch, InvalidBranch, SentRequest, ViaMode},
     server::{
@@ -257,6 +261,7 @@ mod client;
 mod datagram;
 mod driver;
 mod error;
+mod path;
 mod reply;
 mod routing;
 mod send;
@@ -297,6 +302,13 @@ pub struct Endpoint {
     reception: Reception,
     udp: Option<SocketAddr>,
     tcp: Option<SocketAddr>,
+    /// Names this endpoint to its prepared requests.
+    registration: u64,
+    /// Names this endpoint and its UDP port to the paths it prepares.
+    binding: Option<Binding>,
+    /// The context copies and prepared paths alive at once.
+    context_limits: Budget,
+    timers: Timers,
 }
 
 /// Cumulative connection-admission and ordinary fallback outcomes.
@@ -419,6 +431,18 @@ impl Endpoint {
     /// The address of the TCP listener, if one was bound.
     pub fn tcp_addr(&self) -> Option<SocketAddr> {
         self.tcp
+    }
+
+    /// The transaction timers the endpoint runs with, from
+    /// [`Builder::timers`].
+    ///
+    /// A layer above that runs timers of its own derives them from these,
+    /// such as the 64 T1 a UA core waits for the ACK of a 2xx
+    /// ([RFC 3261 section 13.3.1.4]).
+    ///
+    /// [RFC 3261 section 13.3.1.4]: https://www.rfc-editor.org/rfc/rfc3261.html#section-13.3.1.4
+    pub fn timers(&self) -> Timers {
+        self.timers
     }
 
     // See `client::compatibility`.
@@ -635,7 +659,7 @@ pub fn reply_driver(
         tcp::Tasks::new(),
     );
     let (request, route) =
-        driver.prepare_reply(request, Link { flow, writer })?;
+        driver.prepare_reply(request, Link { flow, writer, path: None })?;
 
     Ok((request, route, driver.run()))
 }
@@ -749,8 +773,10 @@ mod tests {
             let (endpoint, _incoming) =
                 Endpoint::builder().udp(LOCALHOST).bind().unwrap();
 
-            let transaction =
-                endpoint.start(request("OPTIONS"), target).await.unwrap();
+            let transaction = endpoint
+                .start(request("OPTIONS"), target.clone())
+                .await
+                .unwrap();
             let (control, mut responses) = transaction.into_parts();
             assert_eq!(control.flow().remote, target.address());
             assert_eq!(control.flow().transport, transport);
@@ -835,7 +861,7 @@ mod tests {
         let target = Target::new(Transport::Udp, server.udp_addr().unwrap());
 
         let (_control, mut responses) = client
-            .start(request("FROBNICATE"), target)
+            .start(request("FROBNICATE"), target.clone())
             .await
             .unwrap()
             .into_parts();
@@ -891,7 +917,7 @@ mod tests {
             Target::new(Transport::Udp, peer.socket.local_addr().unwrap());
 
         let (control, mut responses) = endpoint
-            .start(request("OPTIONS"), target)
+            .start(request("OPTIONS"), target.clone())
             .await
             .unwrap()
             .into_parts();
@@ -929,7 +955,7 @@ mod tests {
         drop(control);
         assert!(
             endpoint
-                .start(request("OPTIONS"), target)
+                .start(request("OPTIONS"), target.clone())
                 .await
                 .unwrap_err()
                 .is_busy()
@@ -956,10 +982,10 @@ mod tests {
         let target =
             Target::new(Transport::Udp, peer.socket.local_addr().unwrap());
 
-        drop(endpoint.start(request("OPTIONS"), target));
+        drop(endpoint.start(request("OPTIONS"), target.clone()));
         {
             let mut starting =
-                pin::pin!(endpoint.start(request("OPTIONS"), target));
+                pin::pin!(endpoint.start(request("OPTIONS"), target.clone()));
             future::poll_fn(|cx| {
                 assert!(starting.as_mut().poll(cx).is_pending());
                 Poll::Ready(())
@@ -970,7 +996,7 @@ mod tests {
         assert!(peer.recv().await.is_some());
         assert!(
             endpoint
-                .start(request("OPTIONS"), target)
+                .start(request("OPTIONS"), target.clone())
                 .await
                 .unwrap_err()
                 .is_busy()
@@ -996,7 +1022,7 @@ mod tests {
             .unwrap();
 
         let (control, mut responses) = endpoint
-            .start(request("OPTIONS"), target)
+            .start(request("OPTIONS"), target.clone())
             .await
             .unwrap()
             .into_parts();
@@ -1006,7 +1032,7 @@ mod tests {
         drop(responses);
         assert!(
             endpoint
-                .start(request("OPTIONS"), target)
+                .start(request("OPTIONS"), target.clone())
                 .await
                 .unwrap_err()
                 .is_busy()
@@ -1014,7 +1040,7 @@ mod tests {
 
         drop(control);
         let (control, mut responses) = endpoint
-            .start(request("OPTIONS"), target)
+            .start(request("OPTIONS"), target.clone())
             .await
             .unwrap()
             .into_parts();
@@ -1074,13 +1100,17 @@ mod tests {
                         );
                     }
 
-                    let error =
-                        endpoint.start(request, target).await.unwrap_err();
+                    let error = endpoint
+                        .start(request, target.clone())
+                        .await
+                        .unwrap_err();
                     assert!(error.is_unsupported_routing(), "{uri} {error}");
                 }
             }
-            let error =
-                endpoint.start(request("OPTIONS"), target).await.unwrap_err();
+            let error = endpoint
+                .start(request("OPTIONS"), target.clone())
+                .await
+                .unwrap_err();
             assert!(error.is_busy(), "{error}");
         }
 
@@ -1131,7 +1161,8 @@ mod tests {
                     .append("Route".parse().unwrap(), route.parse().unwrap());
             }
 
-            let control = endpoint.start(request, target).await.unwrap();
+            let control =
+                endpoint.start(request, target.clone()).await.unwrap();
             let (control, _responses) = control.into_parts();
 
             assert_eq!(control.flow().remote, target.address());
@@ -1163,7 +1194,7 @@ mod tests {
         let target =
             Target::new(Transport::Tcp, listener.local_addr().unwrap());
         let (control, mut responses) = endpoint
-            .start(request("OPTIONS"), target)
+            .start(request("OPTIONS"), target.clone())
             .await
             .unwrap()
             .into_parts();
@@ -1198,7 +1229,7 @@ mod tests {
         let listener = endpoint.tcp_addr().unwrap();
         let target = Target::new(Transport::Tcp, server.local_addr().unwrap());
         let (control, mut responses) = endpoint
-            .start(request("OPTIONS"), target)
+            .start(request("OPTIONS"), target.clone())
             .await
             .unwrap()
             .into_parts();
@@ -1245,7 +1276,7 @@ mod tests {
             .unwrap();
         let target = Target::new(Transport::Tcp, server.local_addr().unwrap());
         let (control, mut responses) = endpoint
-            .start(request("OPTIONS"), target)
+            .start(request("OPTIONS"), target.clone())
             .await
             .unwrap()
             .into_parts();
@@ -1377,14 +1408,14 @@ mod tests {
                                 envelope.transaction.into_parts();
                             (
                                 envelope.request,
-                                envelope.flow,
+                                envelope.received.flow(),
                                 Some(responder),
                                 None,
                             )
                         }
                         IncomingEvent::Untracked(envelope) => (
                             envelope.request,
-                            envelope.flow,
+                            envelope.received.flow(),
                             None,
                             Some(envelope.reply),
                         ),
@@ -1798,6 +1829,10 @@ mod tests {
             reception: Reception::Stateful,
             udp: Some(udp),
             tcp: None,
+            registration: super::path::next_id(),
+            binding: None,
+            context_limits: fixture.context_limits(),
+            timers: Timers::default(),
         }
     }
 
@@ -1830,6 +1865,7 @@ mod tests {
                 remote: peer,
             },
             writer: None,
+            path: None,
         }
     }
 
@@ -2903,6 +2939,7 @@ mod tests {
                 Link {
                     flow: inbound.flow,
                     writer: Some(inbound.writer.clone()),
+                    path: None,
                 },
             )
             .unwrap();
@@ -2974,6 +3011,7 @@ mod tests {
                 Link {
                     flow: inbound.flow,
                     writer: Some(inbound.writer.clone()),
+                    path: None,
                 },
             )
             .unwrap();
@@ -3272,8 +3310,11 @@ mod tests {
             let far = Far::new().await;
             let target = far.target(transport);
 
-            let (control, mut responses) =
-                endpoint.start(invite(), target).await.unwrap().into_parts();
+            let (control, mut responses) = endpoint
+                .start(invite(), target.clone())
+                .await
+                .unwrap()
+                .into_parts();
             let mut remote = far.remote(transport, &endpoint).await;
             let sent = into_request(remote.next().await.unwrap());
             assert_eq!(sent.headers().get(VIA), Some(control.via()));
@@ -3335,8 +3376,11 @@ mod tests {
             let far = Far::new().await;
             let target = far.target(transport);
 
-            let (control, mut responses) =
-                endpoint.start(invite(), target).await.unwrap().into_parts();
+            let (control, mut responses) = endpoint
+                .start(invite(), target.clone())
+                .await
+                .unwrap()
+                .into_parts();
             let mut remote = far.remote(transport, &endpoint).await;
             let sent = into_request(remote.next().await.unwrap());
 
@@ -3354,7 +3398,11 @@ mod tests {
 
             for ok in [&first, &second] {
                 let sent_ack = endpoint
-                    .send_request(ack_for(&sent, ok), target, ViaMode::Fresh)
+                    .send_request(
+                        ack_for(&sent, ok),
+                        target.clone(),
+                        ViaMode::Fresh,
+                    )
                     .await
                     .unwrap();
                 let ack =
@@ -3385,8 +3433,11 @@ mod tests {
             .unwrap();
         let far = Far::new().await;
         let target = far.target(Transport::Udp);
-        let (_control, mut responses) =
-            endpoint.start(invite(), target).await.unwrap().into_parts();
+        let (_control, mut responses) = endpoint
+            .start(invite(), target.clone())
+            .await
+            .unwrap()
+            .into_parts();
         let mut remote = far.remote(Transport::Udp, &endpoint).await;
         let sent = into_request(remote.next().await.unwrap());
 
@@ -3415,12 +3466,21 @@ mod tests {
         let far = Far::new().await;
         let target = far.target(Transport::Udp);
 
-        let (control, _responses) =
-            endpoint.start(invite(), target).await.unwrap().into_parts();
-        assert!(endpoint.start(invite(), target).await.unwrap_err().is_busy());
+        let (control, _responses) = endpoint
+            .start(invite(), target.clone())
+            .await
+            .unwrap()
+            .into_parts();
         assert!(
             endpoint
-                .start(request("OPTIONS"), target)
+                .start(invite(), target.clone())
+                .await
+                .unwrap_err()
+                .is_busy()
+        );
+        assert!(
+            endpoint
+                .start(request("OPTIONS"), target.clone())
                 .await
                 .unwrap_err()
                 .is_busy()
@@ -3737,8 +3797,11 @@ mod tests {
             for _ in 0..2 {
                 let far = Far::new().await;
                 let target = far.target(transport);
-                let (_control, responses) =
-                    proxy.start(invite(), target).await.unwrap().into_parts();
+                let (_control, responses) = proxy
+                    .start(invite(), target.clone())
+                    .await
+                    .unwrap()
+                    .into_parts();
                 let mut callee = far.remote(transport, &proxy).await;
                 let sent = into_request(callee.next().await.unwrap());
                 branches.push((callee, sent, responses));
@@ -3896,7 +3959,7 @@ mod tests {
             let IncomingEvent::Ack(ack) = event(&mut incoming).await else {
                 panic!("an ACK for the TU");
             };
-            assert_eq!(ack.flow.transport, Transport::Udp);
+            assert_eq!(ack.received.flow().transport, Transport::Udp);
         }
         let broken =
             raw("ACK", &via, Some("x")).replace("Call-ID: raw-call\r\n", "");
@@ -3935,7 +3998,7 @@ mod tests {
         let IncomingEvent::Cancel(cancel) = event(&mut incoming).await else {
             panic!("a matched CANCEL");
         };
-        assert_eq!(cancel.target, target);
+        assert_eq!(cancel.target, target.clone());
         let (responder, _) = cancel.transaction.into_parts();
         responder.respond(reply(&cancel.request, 200, "uas")).await.unwrap();
         assert_eq!(status_of(remote.next().await), 200);
@@ -4122,8 +4185,11 @@ mod tests {
         let (endpoint, _incoming) = invite_endpoint(Timers::default());
         let far = Far::new().await;
         let target = far.target(Transport::Udp);
-        let (control, mut responses) =
-            endpoint.start(invite(), target).await.unwrap().into_parts();
+        let (control, mut responses) = endpoint
+            .start(invite(), target.clone())
+            .await
+            .unwrap()
+            .into_parts();
         let mut remote = far.remote(Transport::Udp, &endpoint).await;
         let sent = into_request(remote.next().await.unwrap());
 
@@ -4186,8 +4252,11 @@ mod tests {
         let (endpoint, _incoming) = invite_endpoint(Timers::default());
         let far = Far::new().await;
         let target = far.target(Transport::Udp);
-        let (control, _responses) =
-            endpoint.start(invite(), target).await.unwrap().into_parts();
+        let (control, _responses) = endpoint
+            .start(invite(), target.clone())
+            .await
+            .unwrap()
+            .into_parts();
         let mut remote = far.remote(Transport::Udp, &endpoint).await;
         let sent = into_request(remote.next().await.unwrap());
 
@@ -4213,8 +4282,11 @@ mod tests {
         let (endpoint, _incoming) = invite_endpoint(short_timers());
         let far = Far::new().await;
         let target = far.target(Transport::Udp);
-        let (control, mut responses) =
-            endpoint.start(invite(), target).await.unwrap().into_parts();
+        let (control, mut responses) = endpoint
+            .start(invite(), target.clone())
+            .await
+            .unwrap()
+            .into_parts();
         let mut remote = far.remote(Transport::Udp, &endpoint).await;
         let sent = into_request(remote.next().await.unwrap());
         remote.send(&reply(&sent, 180, "a")).await;
@@ -4230,7 +4302,7 @@ mod tests {
         assert_eq!(next(&mut responses).await.status(), StatusCode::OK);
         assert!(remote.next_except("CANCEL").await.is_none());
         endpoint
-            .send_request(ack_for(&sent, &ok), target, ViaMode::Fresh)
+            .send_request(ack_for(&sent, &ok), target.clone(), ViaMode::Fresh)
             .await
             .unwrap();
         let ack = into_request(remote.next_except("CANCEL").await.unwrap());
@@ -4247,8 +4319,11 @@ mod tests {
         let (endpoint, _incoming) = invite_endpoint(short_timers());
         let far = Far::new().await;
         let target = far.target(Transport::Udp);
-        let (control, mut responses) =
-            endpoint.start(invite(), target).await.unwrap().into_parts();
+        let (control, mut responses) = endpoint
+            .start(invite(), target.clone())
+            .await
+            .unwrap()
+            .into_parts();
         let mut remote = far.remote(Transport::Udp, &endpoint).await;
         let sent = into_request(remote.next().await.unwrap());
         remote.send(&reply(&sent, 180, "a")).await;
@@ -4284,8 +4359,11 @@ mod tests {
         let (endpoint, _incoming) = invite_endpoint(short_timers());
         let far = Far::new().await;
         let target = far.target(Transport::Tcp);
-        let (control, mut responses) =
-            endpoint.start(invite(), target).await.unwrap().into_parts();
+        let (control, mut responses) = endpoint
+            .start(invite(), target.clone())
+            .await
+            .unwrap()
+            .into_parts();
         let (connection, _) = far.tcp.accept().await.unwrap();
         let mut first = Stream::new(connection);
         let sent = into_request(first.next().await);
@@ -4323,8 +4401,11 @@ mod tests {
         let (endpoint, _incoming) = invite_endpoint(short_timers());
         let far = Far::new().await;
         let target = far.target(Transport::Tcp);
-        let (control, mut responses) =
-            endpoint.start(invite(), target).await.unwrap().into_parts();
+        let (control, mut responses) = endpoint
+            .start(invite(), target.clone())
+            .await
+            .unwrap()
+            .into_parts();
         let (connection, _) = far.tcp.accept().await.unwrap();
         let mut first = Stream::new(connection);
         let sent = into_request(first.next().await);
@@ -4364,8 +4445,11 @@ mod tests {
             Endpoint::builder().udp(LOCALHOST).bind().unwrap();
         let far = Far::new().await;
         let target = far.target(Transport::Tcp);
-        let (_control, mut responses) =
-            endpoint.start(invite(), target).await.unwrap().into_parts();
+        let (_control, mut responses) = endpoint
+            .start(invite(), target.clone())
+            .await
+            .unwrap()
+            .into_parts();
         let (connection, _) = far.tcp.accept().await.unwrap();
         let mut first = Stream::new(connection);
         let sent = into_request(first.next().await);
@@ -4388,7 +4472,8 @@ mod tests {
         let (endpoint, _incoming) = invite_endpoint(Timers::default());
         let far = Far::new().await;
         let target = far.target(Transport::Udp);
-        let transaction = endpoint.start(invite(), target).await.unwrap();
+        let transaction =
+            endpoint.start(invite(), target.clone()).await.unwrap();
         let mut remote = far.remote(Transport::Udp, &endpoint).await;
         let sent = into_request(remote.next().await.unwrap());
 
@@ -4494,8 +4579,9 @@ mod tests {
                         let request = received.request;
                         let method = request.method().clone();
                         let via = ViaMode::Branch(stable_branch(&request));
-                        let sent =
-                            proxy.send_request(request, target, via).await;
+                        let sent = proxy
+                            .send_request(request, target.clone(), via)
+                            .await;
                         let _ = forwarded.send((method, sent.unwrap().via));
                     }
                     IncomingEvent::StatelessResponse(received) => {
@@ -4552,9 +4638,9 @@ mod tests {
         let mut peer = Peer::new().await;
         let target = Target::new(Transport::Udp, peer.addr());
         let (stateless, _incoming) = stateless_endpoint();
-        let error = stateless.start(request("OPTIONS"), target).await;
+        let error = stateless.start(request("OPTIONS"), target.clone()).await;
         assert!(error.unwrap_err().is_unsupported_reception());
-        let error = stateless.start(invite(), target).await;
+        let error = stateless.start(invite(), target.clone()).await;
         assert!(error.unwrap_err().is_unsupported_reception());
 
         let (stateful, _incoming) =
@@ -4605,8 +4691,8 @@ mod tests {
             let event = stateless_request(&mut incoming).await;
             let method = message.split(' ').next().unwrap();
             assert_eq!(event.request.method().as_str(), method);
-            assert_eq!(event.flow.remote, peer.addr());
-            assert_eq!(event.flow.local, to);
+            assert_eq!(event.received.flow().remote, peer.addr());
+            assert_eq!(event.received.flow().local, to);
             assert_eq!(
                 event.request.headers().get(VIA).unwrap(),
                 format!(
@@ -4676,9 +4762,12 @@ mod tests {
             let received = stateless_response(&mut incoming).await;
             assert_eq!(received.response.status().as_u16(), code);
             assert_eq!(received.response.to_bytes(), response.to_bytes());
-            assert_eq!(received.flow.remote, peer.addr());
-            assert_eq!(received.flow.local, stateless.udp_addr().unwrap());
-            assert_eq!(received.flow.transport, Transport::Udp);
+            assert_eq!(received.received.flow().remote, peer.addr());
+            assert_eq!(
+                received.received.flow().local,
+                stateless.udp_addr().unwrap()
+            );
+            assert_eq!(received.received.flow().transport, Transport::Udp);
         }
 
         let (stateful, mut incoming) =
@@ -4722,7 +4811,7 @@ mod tests {
         for _ in 0..2 {
             let mode = ViaMode::Branch(branch.clone());
             let result = endpoint
-                .send_request(request.clone(), target, mode)
+                .send_request(request.clone(), target.clone(), mode)
                 .await
                 .unwrap();
             assert_eq!(result.via(), top.as_str());
@@ -4737,11 +4826,11 @@ mod tests {
         assert_eq!(sent_rows, [top.as_str(), rows[0], rows[1]]);
 
         let first = endpoint
-            .send_request(request.clone(), target, ViaMode::Fresh)
+            .send_request(request.clone(), target.clone(), ViaMode::Fresh)
             .await
             .unwrap();
         let second = endpoint
-            .send_request(request, target, ViaMode::Fresh)
+            .send_request(request, target.clone(), ViaMode::Fresh)
             .await
             .unwrap();
         assert_ne!(first.via(), second.via());
@@ -4762,7 +4851,7 @@ mod tests {
 
         for method in ["OPTIONS", "INVITE", "BYE", "CANCEL", "FROBNICATE"] {
             let sent = endpoint
-                .send_request(request(method), target, ViaMode::Fresh)
+                .send_request(request(method), target.clone(), ViaMode::Fresh)
                 .await
                 .unwrap();
             let received = peer.message().await.unwrap();
@@ -4798,21 +4887,25 @@ mod tests {
             .headers_mut()
             .insert(CSEQ, HeaderValue::from_static("1 INVITE"));
         let error = stateless
-            .send_request(mismatched, udp, branch())
+            .send_request(mismatched, udp.clone(), branch())
             .await
             .unwrap_err();
         assert!(error.is_invalid_cseq(), "{error}");
 
         let mut missing = request("ACK");
         missing.headers_mut().remove(CSEQ);
-        let error =
-            stateless.send_request(missing, udp, branch()).await.unwrap_err();
+        let error = stateless
+            .send_request(missing, udp.clone(), branch())
+            .await
+            .unwrap_err();
         assert!(error.is_missing_header(), "{error}");
 
         let mut sips = request("OPTIONS");
         *sips.uri_mut() = "SIPS:bob@example.com".parse().unwrap();
-        let error =
-            stateless.send_request(sips, udp, branch()).await.unwrap_err();
+        let error = stateless
+            .send_request(sips, udp.clone(), branch())
+            .await
+            .unwrap_err();
         assert!(error.is_unsupported_routing(), "{error}");
 
         let tcp = Target::new(Transport::Tcp, peer.addr());
@@ -4831,8 +4924,10 @@ mod tests {
             HeaderValue::from_bytes("x".repeat(fill).as_bytes()).unwrap(),
         );
         assert!(large.to_bytes().len() <= 1300);
-        let error =
-            stateless.send_request(large, udp, branch()).await.unwrap_err();
+        let error = stateless
+            .send_request(large, udp.clone(), branch())
+            .await
+            .unwrap_err();
         assert!(error.is_too_large(), "{error}");
 
         assert!(peer.recv().await.is_none());
@@ -5081,7 +5176,11 @@ mod tests {
             .headers_mut()
             .append(VIA, HeaderValue::from_bytes(via.as_bytes()).unwrap());
 
-        drop(endpoint.send_request(request("OPTIONS"), target, branch()));
+        drop(endpoint.send_request(
+            request("OPTIONS"),
+            target.clone(),
+            branch(),
+        ));
         drop(endpoint.forward_response(response.clone()));
 
         let all = endpoint
@@ -5093,7 +5192,7 @@ mod tests {
         {
             let mut send = pin::pin!(endpoint.send_request(
                 request("OPTIONS"),
-                target,
+                target.clone(),
                 branch()
             ));
             poll_once(&mut send).await;
@@ -5107,7 +5206,7 @@ mod tests {
         {
             let mut send = pin::pin!(endpoint.send_request(
                 request("OPTIONS"),
-                target,
+                target.clone(),
                 branch()
             ));
             poll_once(&mut send).await;
@@ -5172,8 +5271,11 @@ mod tests {
         let target = Target::new(Transport::Udp, proxy_addr);
 
         // A non-INVITE round trip.
-        let (_, mut responses) =
-            uac.start(request("OPTIONS"), target).await.unwrap().into_parts();
+        let (_, mut responses) = uac
+            .start(request("OPTIONS"), target.clone())
+            .await
+            .unwrap()
+            .into_parts();
         let ServerRequest { request: options, transaction, .. } =
             server_request(&mut uas_incoming).await;
         let vias: Vec<_> = options.headers().get_all(VIA).collect();
@@ -5187,7 +5289,7 @@ mod tests {
 
         // An INVITE, cancelled after its 180.
         let (control, mut responses) =
-            uac.start(invite(), target).await.unwrap().into_parts();
+            uac.start(invite(), target.clone()).await.unwrap().into_parts();
         let ServerRequest { request: invite, transaction, .. } =
             server_request(&mut uas_incoming).await;
         let invite_id = transaction.id();
@@ -5359,8 +5461,11 @@ mod tests {
         let (endpoint, _incoming) = invite_endpoint(Timers::default());
         let far = Far::new().await;
         let target = far.target(Transport::Udp);
-        let (control, mut responses) =
-            endpoint.start(invite(), target).await.unwrap().into_parts();
+        let (control, mut responses) = endpoint
+            .start(invite(), target.clone())
+            .await
+            .unwrap()
+            .into_parts();
         let mut remote = far.remote(Transport::Udp, &endpoint).await;
         let sent = into_request(remote.arrival().await);
 
@@ -5370,7 +5475,13 @@ mod tests {
         drop(control);
         let other = endpoint.clone();
         let mut shutdown = Box::pin(endpoint.shutdown(Duration::MAX));
-        assert!(other.start(invite(), target).await.unwrap_err().is_closed());
+        assert!(
+            other
+                .start(invite(), target.clone())
+                .await
+                .unwrap_err()
+                .is_closed()
+        );
 
         sleep(Duration::from_secs(20)).await;
         remote.send(&reply(&sent, 200, "b")).await;
@@ -5692,8 +5803,10 @@ mod tests {
 
         assert!(endpoint.work_guard().unwrap_err().is_closed());
         let target = Target::new(Transport::Udp, LOCALHOST);
-        let err =
-            endpoint.start(request("OPTIONS"), target).await.unwrap_err();
+        let err = endpoint
+            .start(request("OPTIONS"), target.clone())
+            .await
+            .unwrap_err();
         assert!(err.is_closed(), "{err}");
         drop(guard);
     }

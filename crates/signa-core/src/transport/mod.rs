@@ -10,7 +10,8 @@ reach the driver; UDP datagrams already carry their boundaries.
 
 use std::{fmt, net::SocketAddr};
 
-#[cfg(feature = "tokio")]
+// Without tokio nothing takes a permit, but a kept path still names its type.
+#[cfg_attr(not(feature = "tokio"), allow(dead_code))]
 pub(crate) mod budget;
 pub mod datagram;
 

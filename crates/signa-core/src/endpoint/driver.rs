@@ -66,11 +66,12 @@ use crate::{
         admission::{AdmissionOwner, ClientAdmission, Permit},
         builder::{Config, Reception},
         client::{
-            CancelError, CancelHandle, CancelOutcome, Delivery, Intent,
-            Observation, Reserved, Starting, Target,
+            Admitted, CancelError, CancelHandle, CancelOutcome, Delivery,
+            Intent, Observation, Reserved, Starting, Target,
         },
         datagram::Port,
         error::Error,
+        path::{ReceiveInfo, retain, transient},
         reply::{Admission, Completion, ReplyError, ReplyRoute},
         routing::{
             Branches, Link, mark_via, reply_flow, sent_by, sent_by_is,
@@ -88,8 +89,8 @@ use crate::{
     message::{
         Message, Method, StatusCode,
         header::{
-            CALL_ID, CSEQ, FROM, HeaderMap, TO, Tag, VIA, address::has_tag,
-            cseq::CSeq, via::Via,
+            CALL_ID, CSEQ, FROM, HeaderMap, HeaderValue, TO, Tag, VIA,
+            address::has_tag, cseq::CSeq, via::Via,
         },
         request::Request,
         response::{Response, bare_response, reply_headers},
@@ -100,7 +101,9 @@ use crate::{
         non_invite::{ClientEvent, ClientTransaction, ServerTransaction},
     },
     transport::{
-        Flow, Transport, WriteLimits, budget::Budget, datagram::DatagramIo,
+        Flow, Transport, WriteLimits,
+        budget::Budget,
+        datagram::{DatagramIo, Path, TransportContext},
         tcp,
     },
 };
@@ -138,14 +141,23 @@ type Responder = Delivery;
 
 /// What the driver is told, by the handles and by its own tasks.
 pub(super) enum Command {
-    /// A client sends a request.
+    /// A client starts or prepares a request.
     Send {
         request: Request<Bytes>,
-        transport: Transport,
-        next_hop: SocketAddr,
+        target: Target,
+        admitted: Admitted,
+        permit: Permit,
+    },
+    /// A client starts a request it prepared, which has its Via.
+    Start {
+        request: Request<Bytes>,
+        via: HeaderValue,
+        link: Link,
         respond: Starting,
         permit: Permit,
     },
+    /// A client asks the backend to accept a path it is preparing.
+    CheckPath { path: Path, done: oneshot::Sender<Result<Path, Error>> },
     /// A route sends one response without a transaction.
     Reply { link: Link, bytes: Bytes, completion: Completion },
     /// A TU asks the driver to accept a response.
@@ -429,8 +441,9 @@ enum TcpState {
 
 /// Something waiting for a TCP connection to open.
 enum Pending {
-    /// A client's request, which starts a transaction once it can be sent.
-    Request(Request<Bytes>, Starting, Permit),
+    /// A client's request, which starts a transaction or is prepared once
+    /// it has a connection.
+    Request(Request<Bytes>, Admitted, Permit),
     /// A non-2xx ACK whose INVITE connection had closed. It goes to the
     /// INVITE's next hop (RFC 3261 section 17.1.1.3), not to where the final
     /// response came from.
@@ -470,7 +483,7 @@ struct CancelStart {
 /// Transport admission held while the driver commits a server response.
 enum PreparedServerOutput {
     Tcp(tcp::PreparedWrite, Option<crate::transport::budget::Permit>),
-    Udp(Bytes, Flow),
+    Udp(Bytes, Link),
     Waiting {
         remote: SocketAddr,
         bytes: Bytes,
@@ -540,7 +553,7 @@ enum Event {
     Timer(Key),
     Command(Command),
     Inbound(tcp::Inbound),
-    Datagram(Bytes, Flow),
+    Datagram(Bytes, Flow, TransportContext),
     /// Every handle is gone.
     Stop,
     /// A shutdown request, or the last work guard's drop.
@@ -772,6 +785,9 @@ pub(super) struct Driver {
     /// `event_admission` and `control_events`, which a stateless endpoint has
     /// no other use for.
     stateless_responses: Budget,
+    /// Received contexts and prepared paths, for as long as anything holds
+    /// them. See `Builder::context_limits`.
+    context_limits: Budget,
     pub(super) reception_counters: Arc<ReceptionCounters>,
 }
 
@@ -885,8 +901,14 @@ impl Driver {
             control_routes: Budget::new(config.control_event_limits),
             reserved_cancels: 0,
             stateless_responses: Budget::new(config.client_response_budget),
+            context_limits: Budget::new(config.context_limits),
             reception_counters,
         }
+    }
+
+    /// The context limits that prepared paths share with received contexts.
+    pub(super) fn context_limits(&self) -> Budget {
+        self.context_limits.clone()
     }
 
     /// The one-shot slots that reply routes and `send_request` share.
@@ -936,21 +958,27 @@ impl Driver {
                     let link = Link {
                         flow: inbound.flow,
                         writer: Some(inbound.writer),
+                        path: None,
                     };
                     if let Some(message) = inbound.message {
-                        self.on_message(message, link);
+                        self.on_message(
+                            message,
+                            link,
+                            &TransportContext::EMPTY,
+                        );
                     } else {
                         self.on_connection_closed(&link);
                     }
                 }
-                Event::Datagram(datagram, flow) => {
+                Event::Datagram(datagram, flow, context) => {
                     // A datagram that is not one whole message is dropped.
                     // That includes a request whose body is shorter than
                     // its `Content-Length`, which RFC 3261 section 18.3
                     // would answer with a 400, but the parse error keeps no
                     // head to answer with.
                     if let Ok(message) = Message::from_shared(datagram) {
-                        self.on_message(message, Link { flow, writer: None });
+                        let link = Link { flow, writer: None, path: None };
+                        self.on_message(message, link, &context);
                     }
                 }
                 Event::Abandon(shared, _route) => self.abandon(&shared),
@@ -1207,8 +1235,8 @@ impl Driver {
                 4 => {
                     let receive = if let Some(udp) = &mut self.udp {
                         udp.poll_flush(cx);
-                        udp.poll_recv(cx).map(|(bytes, flow)| {
-                            Some(Event::Datagram(bytes, flow))
+                        udp.poll_recv(cx).map(|(bytes, flow, context)| {
+                            Some(Event::Datagram(bytes, flow, context))
                         })
                     } else {
                         Poll::Pending
@@ -1294,14 +1322,21 @@ impl Driver {
             Command::Reply { link, bytes, completion } => {
                 self.on_reply(link, bytes, completion)
             }
-            Command::Send {
-                request,
-                transport,
-                next_hop,
-                respond,
-                permit,
-            } => {
-                self.on_send(request, transport, next_hop, respond, permit);
+            Command::Send { request, target, admitted, permit } => {
+                self.on_send(request, target, admitted, permit);
+            }
+            Command::Start { request, via, link, respond, permit } => {
+                self.on_start(request, via, link, respond, permit);
+            }
+            Command::CheckPath { path, done } => {
+                let result = match self.udp.as_mut() {
+                    Some(udp) => match udp.check_path(&path) {
+                        Ok(()) => Ok(path),
+                        Err(error) => Err(Error::path_refused(error)),
+                    },
+                    None => Err(Error::unsupported_routing()),
+                };
+                let _ = done.send(result);
             }
             Command::Submit(submission) => self.on_submission(submission),
             Command::Cancel { id, intent, done } => {
@@ -1519,59 +1554,76 @@ impl Driver {
     fn on_send(
         &mut self,
         request: Request<Bytes>,
-        transport: Transport,
-        next_hop: SocketAddr,
-        respond: Starting,
+        target: Target,
+        admitted: Admitted,
         permit: Permit,
     ) {
         if self.shutting_down {
             drop(request);
             drop(permit);
-            respond.send(Err(Error::closed()));
+            admitted.fail(Error::closed());
             return;
         }
 
-        match transport {
-            Transport::Udp => {
-                let Some(udp) = &self.udp else {
-                    let err = io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "the endpoint has no UDP socket",
-                    );
+        match target.transport() {
+            Transport::Udp => match self.udp_link(&target) {
+                Ok(link) => self.on_link(request, link, admitted, permit),
+                Err(error) => {
                     drop(request);
                     drop(permit);
-                    respond.send(Err(Error::transport(err)));
-                    return;
-                };
-                let port = udp.local_addr().port();
-                let source = match self.udp_source(next_hop) {
-                    Ok(source) => source,
-                    Err(err) => {
-                        drop(request);
-                        drop(permit);
-                        respond.send(Err(Error::transport(err)));
-                        return;
-                    }
-                };
-                let flow = Flow {
-                    transport,
-                    local: SocketAddr::new(source, port),
-                    remote: next_hop,
-                };
-                self.start_client(
-                    request,
-                    Link { flow, writer: None },
-                    respond,
-                    permit,
-                );
-            }
+                    admitted.fail(error);
+                }
+            },
             Transport::Tcp => {
                 self.send_over_tcp(
-                    next_hop,
-                    Pending::Request(request, respond, permit),
+                    target.address(),
+                    Pending::Request(request, admitted, permit),
                 );
             }
         }
+    }
+
+    /// Starts or prepares a request now that it has its link.
+    fn on_link(
+        &mut self,
+        request: Request<Bytes>,
+        link: Link,
+        admitted: Admitted,
+        permit: Permit,
+    ) {
+        match admitted {
+            Admitted::Start(respond) => {
+                self.start_client(request, link, respond, permit)
+            }
+            Admitted::Prepare(preparing) => {
+                let (request, via) = self.prepend_via(request, &link);
+                preparing.finish(request, via, link, permit);
+            }
+        }
+    }
+
+    /// Starts a prepared request, on the link it was prepared for.
+    fn on_start(
+        &mut self,
+        request: Request<Bytes>,
+        via: HeaderValue,
+        link: Link,
+        respond: Starting,
+        permit: Permit,
+    ) {
+        if self.shutting_down {
+            drop((request, permit));
+            respond.send(Err(Error::closed()));
+            return;
+        }
+        // A preparation is never sent another way than it was prepared. The
+        // size it reported and the Via it fixed belong to that connection.
+        if link.writer.as_ref().is_some_and(tcp::Writer::is_closed) {
+            drop((request, permit));
+            respond.send(Err(Error::stale_path()));
+            return;
+        }
+        self.commit_client(request, via, link, respond, permit);
     }
 
     /// Sends `pending` to `remote` over the connection the driver has to it,
@@ -1670,10 +1722,10 @@ impl Driver {
     fn reject_pending(&mut self, pending: Pending) {
         increment(&self.connection_stats.rejected);
         match pending {
-            Pending::Request(request, respond, permit) => {
+            Pending::Request(request, admitted, permit) => {
                 drop(request);
                 drop(permit);
-                respond.send(Err(Error::busy()));
+                admitted.fail(Error::busy());
             }
             Pending::Response(..) | Pending::Ack(_) => {}
             // Server output reserves its route and connection before commit
@@ -1699,9 +1751,9 @@ impl Driver {
     /// Sends `pending` on an open connection.
     fn deliver(&mut self, pending: Pending, flow: Flow, writer: tcp::Writer) {
         match pending {
-            Pending::Request(request, respond, permit) => {
-                let link = Link { flow, writer: Some(writer) };
-                self.start_client(request, link, respond, permit);
+            Pending::Request(request, admitted, permit) => {
+                let link = Link { flow, writer: Some(writer), path: None };
+                self.on_link(request, link, admitted, permit);
             }
             // A response that cannot be queued is lost. The connection is full
             // or gone again, and a server transaction over TCP has nothing to
@@ -1744,15 +1796,12 @@ impl Driver {
                 let _ = writer.send(bytes);
             }
             Pending::Cancel(start) => {
-                self.start_cancel(start, Link { flow, writer: Some(writer) });
+                let link = Link { flow, writer: Some(writer), path: None };
+                self.start_cancel(start, link);
             }
             Pending::OneShotRequest(request, via, completion) => {
-                self.send_oneshot(
-                    request,
-                    Link { flow, writer: Some(writer) },
-                    via,
-                    completion,
-                );
+                let link = Link { flow, writer: Some(writer), path: None };
+                self.send_oneshot(request, link, via, completion);
             }
         }
     }
@@ -1808,7 +1857,7 @@ impl Driver {
                 }
             }
         } else if let Some(udp) = self.udp.as_mut() {
-            udp.submit(bytes, link.flow, completion);
+            udp.submit(bytes, &link, completion);
         } else {
             drop(bytes);
             completion.finish(Err(ReplyError::Transport(io::Error::new(
@@ -1828,13 +1877,8 @@ impl Driver {
         completion: Completion,
     ) {
         match target.transport() {
-            Transport::Udp => match self.udp_flow(target.address()) {
-                Ok(flow) => self.send_oneshot(
-                    request,
-                    Link { flow, writer: None },
-                    via,
-                    completion,
-                ),
+            Transport::Udp => match self.udp_link(&target) {
+                Ok(link) => self.send_oneshot(request, link, via, completion),
                 Err(error) => completion.fail(error),
             },
             Transport::Tcp => {
@@ -1855,11 +1899,13 @@ impl Driver {
         completion: Completion,
     ) {
         match self.udp_flow(remote) {
-            Ok(flow) => self
-                .udp
-                .as_mut()
-                .expect("`udp_flow` found a socket")
-                .submit(bytes, flow, completion),
+            Ok(flow) => {
+                self.udp.as_mut().expect("`udp_flow` found a socket").submit(
+                    bytes,
+                    &Link { flow, writer: None, path: None },
+                    completion,
+                )
+            }
             Err(error) => completion.fail(error),
         }
     }
@@ -1879,6 +1925,28 @@ impl Driver {
         })
     }
 
+    /// The UDP link to `target`: its prepared path, or the flow from this
+    /// endpoint's socket to its address.
+    fn udp_link(&mut self, target: &Target) -> Result<Link, Error> {
+        if let Some(path) = target.send_path() {
+            if self.udp.is_none() {
+                return Err(Error::unsupported_routing());
+            }
+            let flow = Flow {
+                transport: Transport::Udp,
+                local: path.source(),
+                remote: path.destination(),
+            };
+            return Ok(Link {
+                flow,
+                writer: None,
+                path: Some(path.0.clone()),
+            });
+        }
+        let flow = self.udp_flow(target.address())?;
+        Ok(Link { flow, writer: None, path: None })
+    }
+
     /// Adds the Via that `via` asks for on `link` and writes the request once.
     fn send_oneshot(
         &mut self,
@@ -1887,7 +1955,7 @@ impl Driver {
         via: ViaMode,
         mut completion: Completion,
     ) {
-        let sent_by = sent_by(&link.flow, self.config.tcp_listener);
+        let sent_by = link.sent_by(self.config.tcp_listener);
         let via = match via {
             ViaMode::Fresh => {
                 via_value(link.flow.transport, sent_by, &mut self.branches)
@@ -1921,7 +1989,7 @@ impl Driver {
                 .udp
                 .as_mut()
                 .expect("a UDP link has a socket")
-                .submit(bytes, link.flow, completion),
+                .submit(bytes, &link, completion),
         }
     }
 
@@ -2001,7 +2069,36 @@ impl Driver {
     /// Adds the `Via`, starts the transaction, and sends the request.
     fn start_client(
         &mut self,
+        request: Request<Bytes>,
+        link: Link,
+        respond: Starting,
+        permit: Permit,
+    ) {
+        let (request, via) = self.prepend_via(request, &link);
+        self.commit_client(request, via, link, respond, permit);
+    }
+
+    /// Prepends the Via a new client request goes out with on `link`, with
+    /// the link's `sent-by` and a fresh branch.
+    fn prepend_via(
+        &mut self,
         mut request: Request<Bytes>,
+        link: &Link,
+    ) -> (Request<Bytes>, HeaderValue) {
+        let via = via_value(
+            link.flow.transport,
+            link.sent_by(self.config.tcp_listener),
+            &mut self.branches,
+        );
+        request.headers_mut().prepend(VIA, via.clone());
+        (request, via)
+    }
+
+    /// Starts the transaction of `request`, which has its Via, and sends it.
+    fn commit_client(
+        &mut self,
+        request: Request<Bytes>,
+        via: HeaderValue,
         link: Link,
         respond: Starting,
         permit: Permit,
@@ -2010,12 +2107,6 @@ impl Driver {
         debug_assert!(
             self.clients.len() < self.config.max_client_transactions
         );
-        let via = via_value(
-            link.flow.transport,
-            sent_by(&link.flow, self.config.tcp_listener),
-            &mut self.branches,
-        );
-        request.headers_mut().prepend(VIA, via.clone());
         let key = ClientKey::from_request(&request)
             .expect("the Via signa wrote has a branch");
         let bytes = request.to_bytes();
@@ -2137,14 +2228,14 @@ impl Driver {
 
                 for pending in pending {
                     match pending {
-                        Pending::Request(request, respond, permit) => {
+                        Pending::Request(request, admitted, permit) => {
                             let err = io::Error::new(
                                 source.kind(),
                                 Arc::clone(&source),
                             );
                             drop(request);
                             drop(permit);
-                            respond.send(Err(Error::transport(err)));
+                            admitted.fail(Error::transport(err));
                         }
                         // See `send_reply` and `Driver::send_ack`.
                         Pending::Response(..) | Pending::Ack(_) => {}
@@ -2272,19 +2363,29 @@ impl Driver {
         }
     }
 
-    fn on_message(&mut self, message: Message<Bytes>, link: Link) {
+    /// Handles a received message, with the context the UDP backend gave it.
+    /// The context is the backend's own bytes until a handler keeps a copy.
+    fn on_message(
+        &mut self,
+        message: Message<Bytes>,
+        link: Link,
+        context: &TransportContext,
+    ) {
         match (self.config.reception, message) {
             (Reception::Stateful, Message::Request(request)) => {
-                self.on_request(request, link)
+                self.on_request(request, link, context)
             }
+            // TODO: Deliver the context with the response, which client
+            // responses do not carry yet. The transaction sends on its own
+            // link, so nothing keeps it now.
             (Reception::Stateful, Message::Response(response)) => {
                 self.on_received_response(response)
             }
             (Reception::Stateless, Message::Request(request)) => {
-                self.on_stateless_request(request, link)
+                self.on_stateless_request(request, link, context)
             }
             (Reception::Stateless, Message::Response(response)) => {
-                self.on_stateless_response(response, link.flow)
+                self.on_stateless_response(response, link.flow, context)
             }
         }
     }
@@ -2323,10 +2424,7 @@ impl Driver {
         // on any connection, including one the server opened to the listener.
         let ours = response.headers().get(VIA).and_then(Via::top).is_some_and(
             |via| {
-                sent_by_is(
-                    &via,
-                    sent_by(&entry.link.flow, self.config.tcp_listener),
-                )
+                sent_by_is(&via, entry.link.sent_by(self.config.tcp_listener))
             },
         );
         if !ours {
@@ -2360,7 +2458,12 @@ impl Driver {
         }
     }
 
-    fn on_request(&mut self, mut request: Request<Bytes>, link: Link) {
+    fn on_request(
+        &mut self,
+        mut request: Request<Bytes>,
+        link: Link,
+        context: &TransportContext,
+    ) {
         // Without a readable top `Via` there is no way to answer, so there
         // is nothing to do with the request.
         let Some(value) = request.headers().get(VIA) else { return };
@@ -2389,13 +2492,15 @@ impl Driver {
         }
         // The envelope describes where the request came from. The link keeps
         // where the response goes, which differs in the port without `rport`.
+        // It gets the context once something keeps it, after the checks
+        // below that answer without keeping anything.
         let source = link.flow;
-        let link = Link { flow: reply, writer: link.writer };
+        let link = Link { flow: reply, writer: link.writer, path: None };
         let now = now();
 
         // No path below answers an ACK, including overload and shutdown.
         if method == Method::ACK {
-            self.on_ack(request, key.as_ref(), source, now);
+            self.on_ack(request, key.as_ref(), source, context, now);
             return;
         }
 
@@ -2413,7 +2518,7 @@ impl Driver {
         // retransmitting instead of waiting for Timer F. The 400 copies what
         // identity there is, and uses the same bounded reply path as the 503.
         if !has_identity(&request) {
-            self.stateless(&request, &link, BAD_REQUEST);
+            self.stateless(&request, &link, context, BAD_REQUEST);
             return;
         }
 
@@ -2425,7 +2530,9 @@ impl Driver {
             if let Some(key) = &key {
                 if let Some(target) = self.find_cancel_target(key, now) {
                     let key = key.clone();
-                    self.on_matched_cancel(request, key, target, source, link);
+                    self.on_matched_cancel(
+                        request, key, target, source, link, context,
+                    );
                     return;
                 }
             }
@@ -2443,7 +2550,7 @@ impl Driver {
             || self.shutting_down
             || (tracked && !self.server_room(entries))
         {
-            self.stateless(&request, &link, SERVICE_UNAVAILABLE);
+            self.stateless(&request, &link, context, SERVICE_UNAVAILABLE);
             return;
         }
 
@@ -2451,19 +2558,25 @@ impl Driver {
             return;
         };
         let Some(event_permit) = self.event_admission.acquire(bytes) else {
-            self.stateless(&request, &link, SERVICE_UNAVAILABLE);
+            self.stateless(&request, &link, context, SERVICE_UNAVAILABLE);
             return;
         };
         let Some(permit) = self.work.acquire(bytes) else {
-            self.stateless(&request, &link, SERVICE_UNAVAILABLE);
+            self.stateless(&request, &link, context, SERVICE_UNAVAILABLE);
             return;
         };
         let Some(route_permit) = identity_bytes(&request)
             .and_then(|bytes| self.routes_admission.acquire(bytes))
         else {
-            self.stateless(&request, &link, SERVICE_UNAVAILABLE);
+            self.stateless(&request, &link, context, SERVICE_UNAVAILABLE);
             return;
         };
+        let Some(path) = retain(context, &self.context_limits, false) else {
+            self.stateless(&request, &link, context, SERVICE_UNAVAILABLE);
+            return;
+        };
+        let link = Link { path: path.clone(), ..link };
+        let received = ReceiveInfo::new(source, path);
 
         let Some(commands) = self.command_sender.upgrade() else { return };
 
@@ -2506,7 +2619,7 @@ impl Driver {
 
                 IncomingEvent::Request(ServerRequest {
                     request,
-                    flow: source,
+                    received,
                     transaction,
                 })
             }
@@ -2523,7 +2636,7 @@ impl Driver {
                     Some(server::Work::new(permit)),
                 );
                 let received =
-                    ReceivedRequest { request, flow: source, reply: route };
+                    ReceivedRequest { request, received, reply: route };
                 if unmatched_cancel {
                     IncomingEvent::UnmatchedCancel(received)
                 } else {
@@ -2637,15 +2750,27 @@ impl Driver {
     }
 
     /// Sends a response the endpoint makes itself, without a transaction.
+    ///
+    /// `link` has no path of its own yet, so the response goes with a copy
+    /// of `context` that only this write keeps.
     fn stateless(
         &mut self,
         request: &Request<Bytes>,
         link: &Link,
+        context: &TransportContext,
         status: StatusCode,
     ) {
         let response =
             bare_response(&reply_headers(request.headers()), status);
-        let _ = self.send_reply(link, &response);
+        match transient(context) {
+            None => {
+                let _ = self.send_reply(link, &response);
+            }
+            Some(path) => {
+                let link = Link { path: Some(path), ..link.clone() };
+                let _ = self.send_reply(&link, &response);
+            }
+        }
     }
 
     fn prepare_server_output(
@@ -2657,7 +2782,7 @@ impl Driver {
             let udp = self.udp.as_ref().ok_or(SubmitError::Closed)?;
             udp.admit_response(bytes.len())
                 .map_err(|_| SubmitError::TransportBusy)?;
-            return Ok(PreparedServerOutput::Udp(bytes, link.flow));
+            return Ok(PreparedServerOutput::Udp(bytes, link.clone()));
         };
         match writer.prepare(bytes.clone()) {
             Ok(write) => return Ok(PreparedServerOutput::Tcp(write, None)),
@@ -2743,12 +2868,12 @@ impl Driver {
                     }
                 }
             }
-            PreparedServerOutput::Udp(bytes, flow) => {
+            PreparedServerOutput::Udp(bytes, link) => {
                 return self
                     .udp
                     .as_mut()
                     .expect("prepared UDP socket")
-                    .send_admitted(bytes, flow, observation);
+                    .send_admitted(bytes, &link, observation);
             }
             PreparedServerOutput::Waiting { remote, bytes, fallback } => {
                 let TcpState::Connecting(waiting) = &mut self
@@ -3158,7 +3283,7 @@ fn send_client(
             })
     } else {
         udp.expect("UDP link has a socket")
-            .submit_client(bytes, &link.flow, initial)
+            .submit_client(bytes, link, initial)
             .map(|receipt| receipt.map(ClientReceipt::Udp))
     }
 }
@@ -3186,9 +3311,9 @@ fn send_on(
         }),
         (None, Some(udp)) => {
             if new_request {
-                udp.send_request(bytes, &link.flow)
+                udp.send_request(bytes, link)
             } else {
-                udp.send(bytes, &link.flow)
+                udp.send(bytes, link)
             }
         }
         (None, None) => unreachable!("a UDP flow comes from the UDP socket"),
@@ -3431,7 +3556,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let link = Link { flow, writer: Some(writer) };
+        let link = Link { flow, writer: Some(writer), path: None };
         driver.routes.insert(
             remote,
             Route {
@@ -3549,7 +3674,7 @@ mod tests {
             Duration::from_secs(1),
             poll_fn(|cx| {
                 for _ in 0..12 {
-                    if let Poll::Ready(Event::Datagram(bytes, _)) =
+                    if let Poll::Ready(Event::Datagram(bytes, _, _)) =
                         driver.poll_event(cx)
                     {
                         return Poll::Ready(bytes);
@@ -3645,7 +3770,7 @@ mod tests {
         );
         let key = ServerKey::from_request(&first).unwrap();
         let link = udp_reply_link(local, "127.0.0.1:9".parse().unwrap());
-        driver.on_request(first, link.clone());
+        driver.on_request(first, link.clone(), &TransportContext::EMPTY);
         let id = driver.servers.find(&key).unwrap().0;
 
         driver.fail_server(id);
@@ -3656,6 +3781,7 @@ mod tests {
                 "SIP/2.0/UDP example.com:9;branch=z9hG4bKrefused;rport",
             ),
             link.clone(),
+            &TransportContext::EMPTY,
         );
         assert_eq!(driver.incoming.receiver.len(), 1);
         assert_eq!(driver.servers.len(), 0);
@@ -3667,6 +3793,7 @@ mod tests {
                 "SIP/2.0/UDP example.com:9;branch=z9hG4bKaccepted;rport",
             ),
             link,
+            &TransportContext::EMPTY,
         );
         assert_eq!(driver.incoming.receiver.len(), 1);
         assert_eq!(driver.servers.len(), 1);
@@ -3681,6 +3808,7 @@ mod tests {
                 "SIP/2.0/UDP example.com:9;branch=z9hG4bKsubmissions;rport",
             ),
             link,
+            &TransportContext::EMPTY,
         );
         let envelope = driver.take_request();
         let (responder, _) = envelope.transaction.into_parts();
@@ -3721,6 +3849,7 @@ mod tests {
                 "SIP/2.0/UDP example.com:9;branch=z9hG4bKfirst;rport",
             ),
             link.clone(),
+            &TransportContext::EMPTY,
         );
         let first = driver.take_request();
         driver.on_request(
@@ -3728,6 +3857,7 @@ mod tests {
                 "SIP/2.0/UDP example.com:9;branch=z9hG4bKother;rport",
             ),
             link,
+            &TransportContext::EMPTY,
         );
         let other = driver.take_request();
         let a = first.transaction.responder.shared.slot;
@@ -3779,6 +3909,7 @@ mod tests {
                 "SIP/2.0/UDP example.com:9;branch=z9hG4bKidentity;rport",
             ),
             link,
+            &TransportContext::EMPTY,
         );
         let envelope = driver.take_request();
         let original = &envelope.transaction.responder.shared;
@@ -3854,6 +3985,7 @@ mod tests {
                 "SIP/2.0/UDP example.com:9;branch=z9hG4bKwake;rport",
             ),
             link,
+            &TransportContext::EMPTY,
         );
         let envelope = driver.take_request();
         let (responder, _) = envelope.transaction.into_parts();
@@ -3890,6 +4022,7 @@ mod tests {
                 "SIP/2.0/UDP example.com:9;branch=z9hG4bKclosed;rport",
             ),
             link,
+            &TransportContext::EMPTY,
         );
 
         assert_eq!(driver.servers.len(), 0);
@@ -3922,7 +4055,8 @@ mod tests {
         .unwrap();
         driver.on_request(
             route_request("SIP/2.0/TCP example.com:9;branch=z9hG4bKfallback"),
-            Link { flow, writer: Some(writer) },
+            Link { flow, writer: Some(writer), path: None },
+            &TransportContext::EMPTY,
         );
         let envelope = driver.take_request();
         let shared = &envelope.transaction.responder.shared;
@@ -3985,7 +4119,11 @@ mod tests {
         );
         let link = udp_reply_link(local, "127.0.0.1:9".parse().unwrap());
 
-        driver.on_request(request.clone(), link.clone());
+        driver.on_request(
+            request.clone(),
+            link.clone(),
+            &TransportContext::EMPTY,
+        );
         let received = driver.take_request();
         let old = received.transaction.responder.shared.slot;
         let response = route_response(&received.request);
@@ -4002,7 +4140,7 @@ mod tests {
         driver.settle_server(old, Some(at));
         assert_eq!(driver.servers.len(), 0);
 
-        driver.on_request(request, link);
+        driver.on_request(request, link, &TransportContext::EMPTY);
         driver.on_timer(Key::Server(old));
 
         assert_eq!(driver.servers.len(), 1);
@@ -4025,7 +4163,11 @@ mod tests {
         let link = udp_reply_link(local, "127.0.0.1:9".parse().unwrap());
 
         for _ in 0..1000 {
-            driver.on_request(request.clone(), link.clone());
+            driver.on_request(
+                request.clone(),
+                link.clone(),
+                &TransportContext::EMPTY,
+            );
             let received = driver.take_request();
             let id = received.transaction.responder.shared.slot;
             driver.fail_server(id);
@@ -4539,7 +4681,11 @@ mod tests {
                 self.endpoint.udp_addr().unwrap(),
                 self.peer.local_addr().unwrap(),
             );
-            self.fixture.on_message(Message::Response(response), link);
+            self.fixture.on_message(
+                Message::Response(response),
+                link,
+                &TransportContext::EMPTY,
+            );
         }
 
         fn client(&self, sent: &Request<Bytes>) -> Option<Id> {
@@ -4715,7 +4861,11 @@ mod tests {
         *request.method_mut() = Method::INVITE;
         request.headers_mut().insert(CSEQ, "1 INVITE".parse().unwrap());
 
-        fixture.on_request(request.clone(), link.clone());
+        fixture.on_request(
+            request.clone(),
+            link.clone(),
+            &TransportContext::EMPTY,
+        );
         let received = fixture.take_request();
         let slot = received.transaction.responder.shared.slot;
         let first = now();
@@ -4732,13 +4882,17 @@ mod tests {
         }
 
         // The second advance reached L exactly, and no timer has run.
-        fixture.on_request(request.clone(), link.clone());
+        fixture.on_request(
+            request.clone(),
+            link.clone(),
+            &TransportContext::EMPTY,
+        );
         let fresh = fixture.take_request();
         assert_ne!(fresh.transaction.id(), received.transaction.id());
         assert!(fixture.servers.get(slot).is_none());
 
         advance(T1).await;
-        fixture.on_request(request, link);
+        fixture.on_request(request, link, &TransportContext::EMPTY);
         assert!(fixture.incoming.receiver.try_recv().is_err());
     }
 
@@ -4803,7 +4957,7 @@ mod tests {
         *request.method_mut() = Method::INVITE;
         request.headers_mut().insert(CSEQ, "1 INVITE".parse().unwrap());
 
-        fixture.on_request(request, link);
+        fixture.on_request(request, link, &TransportContext::EMPTY);
         let received = fixture.take_request();
         let slot = received.transaction.responder.shared.slot;
         let first = now();

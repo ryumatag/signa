@@ -160,7 +160,11 @@ async fn run_proxy(
 
                 let method = request.method().clone();
                 match proxy
-                    .send_request(request, target, ViaMode::Branch(branch))
+                    .send_request(
+                        request,
+                        target.clone(),
+                        ViaMode::Branch(branch),
+                    )
                     .await
                 {
                     Ok(sent) => {

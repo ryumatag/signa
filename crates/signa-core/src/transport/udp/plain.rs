@@ -31,6 +31,9 @@ pub(super) fn recv(
     Ok(Received { len, remote, local: None })
 }
 
+/// Whether `send` sends from the source it is given. Here the kernel picks.
+pub(super) const NAMES_SOURCE: bool = false;
+
 pub(super) fn send(
     socket: &UdpSocket,
     data: &[u8],

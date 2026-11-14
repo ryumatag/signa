@@ -21,13 +21,12 @@ use std::{
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot, watch};
 
-use super::{driver::Command, reply::ReplyRoute, table::Id};
+use super::{
+    driver::Command, path::ReceiveInfo, reply::ReplyRoute, table::Id,
+};
 use crate::{
     message::{Method, Request, Response},
-    transport::{
-        Flow,
-        budget::{Budget, Permit},
-    },
+    transport::budget::{Budget, Permit},
 };
 
 /// Receives owned incoming events from one endpoint.
@@ -198,8 +197,8 @@ pub struct ServerRequest {
     /// The received request, with `received` and `rport` filled in its top
     /// Via.
     pub request: Request<Bytes>,
-    /// Descriptive metadata for the original received flow.
-    pub flow: Flow,
+    /// How it arrived: the observed flow and the UDP backend's context.
+    pub received: ReceiveInfo,
     /// Response submission and independent transaction observation.
     pub transaction: ServerTransaction,
 }
@@ -221,8 +220,8 @@ pub struct IncomingCancel {
     /// The received CANCEL, with `received` and `rport` filled in its top
     /// Via.
     pub request: Request<Bytes>,
-    /// Descriptive metadata for the original received flow.
-    pub flow: Flow,
+    /// How it arrived: the observed flow and the UDP backend's context.
+    pub received: ReceiveInfo,
     /// The CANCEL's own non-INVITE server transaction.
     pub transaction: ServerTransaction,
     /// The transaction the CANCEL targets, as its [`Responder::id`] says.
@@ -244,8 +243,8 @@ pub struct IncomingCancel {
 pub struct ReceivedAck {
     /// The received ACK, with `received` and `rport` filled in its top Via.
     pub request: Request<Bytes>,
-    /// Descriptive metadata for the original received flow.
-    pub flow: Flow,
+    /// How it arrived: the observed flow and the UDP backend's context.
+    pub received: ReceiveInfo,
 }
 
 /// An owned request without a server transaction: one that could not be
@@ -257,8 +256,8 @@ pub struct ReceivedRequest {
     /// The received request, with `received` and `rport` filled in its top
     /// Via.
     pub request: Request<Bytes>,
-    /// Descriptive metadata for the original received flow.
-    pub flow: Flow,
+    /// How it arrived: the observed flow and the UDP backend's context.
+    pub received: ReceiveInfo,
     /// One-shot reply capability retaining the received route.
     pub reply: ReplyRoute,
 }
@@ -274,8 +273,8 @@ pub struct ReceivedRequest {
 pub struct ReceivedResponse {
     /// The received response, as it arrived.
     pub response: Response<Bytes>,
-    /// Descriptive metadata for the flow it arrived on.
-    pub flow: Flow,
+    /// How it arrived: the observed flow and the UDP backend's context.
+    pub received: ReceiveInfo,
 }
 
 /// Identifies a server transaction within this process.
@@ -1300,7 +1299,10 @@ mod integration {
             let IncomingEvent::Untracked(envelope) = event else {
                 panic!("untracked request");
             };
-            assert_eq!(envelope.flow.remote, peer.local_addr().unwrap());
+            assert_eq!(
+                envelope.received.flow().remote,
+                peer.local_addr().unwrap()
+            );
             drop(envelope);
         }
 

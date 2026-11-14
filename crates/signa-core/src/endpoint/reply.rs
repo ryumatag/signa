@@ -503,6 +503,7 @@ mod tests {
                 remote: "127.0.0.1:9".parse().unwrap(),
             },
             writer: None,
+            path: None,
         };
 
         (

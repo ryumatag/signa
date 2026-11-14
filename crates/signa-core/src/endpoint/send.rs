@@ -246,6 +246,8 @@ impl Endpoint {
     /// * [`Error::is_unsupported_routing`] for a `sips:` Request-URI, a
     ///   multicast target, a UDP target on an endpoint without a UDP socket,
     ///   or a TCP target on a stateless endpoint.
+    /// * [`Error::is_stale_path`] for a target on a path another endpoint
+    ///   prepared.
     /// * [`Error::is_too_large`] for a UDP request over 1300 bytes.
     /// * [`Error::is_busy`] when the one-shot byte budget,
     ///   [`Builder::max_reply_bytes`], the transport's output or the
@@ -300,6 +302,11 @@ impl Endpoint {
             };
             if target.address().ip().is_multicast() || unavailable {
                 return Err(Error::unsupported_routing());
+            }
+            if let Some(path) = target.send_path() {
+                if Some(path.binding()) != self.binding {
+                    return Err(Error::stale_path());
+                }
             }
             if self.commands.is_closed() {
                 return Err(Error::closed());

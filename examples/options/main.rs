@@ -74,7 +74,7 @@ async fn main() -> Result<(), BoxError> {
             if let IncomingEvent::Request(envelope) = event {
                 tokio::spawn(answer(
                     envelope.request,
-                    envelope.flow,
+                    envelope.received.flow(),
                     envelope.transaction,
                 ));
             }
@@ -101,7 +101,7 @@ async fn main() -> Result<(), BoxError> {
             .body(Bytes::new())?;
 
         let (_control, mut responses) =
-            client_end.start(request, target).await?.into_parts();
+            client_end.start(request, target.clone()).await?.into_parts();
         let mut response =
             responses.next().await.expect("transaction outcome")?;
         while response.status().is_provisional() {

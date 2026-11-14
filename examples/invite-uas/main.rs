@@ -117,7 +117,7 @@ async fn main() -> Result<(), BoxError> {
 
     // Call 1, acknowledged.
     let target = Target::new(Transport::Udp, uas.udp_addr().expect("UDP"));
-    let (first, responses) = invite(&caller, target, "acked").await?;
+    let (first, responses) = invite(&caller, target.clone(), "acked").await?;
     acknowledge(&caller, target, &first).await?;
     println!("caller: acknowledged the 2xx of call 1");
     // The stream stays open until Timer M. A UAS that stopped retransmitting
@@ -485,7 +485,7 @@ async fn invite(
         .body(Bytes::new())?;
 
     let (_control, mut responses) =
-        caller.start(request, target).await?.into_parts();
+        caller.start(request, target.clone()).await?.into_parts();
     loop {
         let response = responses.next().await.ok_or("no final response")??;
         println!("caller: {call_id}: {}", response.status());
@@ -517,7 +517,7 @@ async fn acknowledge(
         .header("Max-Forwards", "70")
         .body(Bytes::new())?;
     let target = Target::new(target.transport(), remote);
-    caller.send_request(ack, target, ViaMode::Fresh).await?;
+    caller.send_request(ack, target.clone(), ViaMode::Fresh).await?;
     Ok(())
 }
 

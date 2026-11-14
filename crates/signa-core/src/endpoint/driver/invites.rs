@@ -27,12 +27,13 @@ use crate::{
     endpoint::{
         admission::request_bytes,
         error::Error,
+        path::{ReceiveInfo, retain},
         server::{self, IncomingEvent, ReceivedAck},
         table::Id,
     },
     message::{request::Request, response::Response},
     transaction::{invite, key::ServerKey},
-    transport::{Flow, tcp},
+    transport::{Flow, datagram::TransportContext, tcp},
 };
 
 impl Driver {
@@ -264,6 +265,7 @@ impl Driver {
         request: Request<Bytes>,
         key: Option<&ServerKey>,
         flow: Flow,
+        context: &TransportContext,
         now: Instant,
     ) {
         if let Some(id) = key.and_then(|key| self.find_server(key, now)) {
@@ -287,8 +289,13 @@ impl Driver {
             increment(&self.reception_counters.acks);
             return;
         };
+        let Some(path) = retain(context, &self.context_limits, true) else {
+            increment(&self.reception_counters.acks);
+            return;
+        };
+        let received = ReceiveInfo::new(flow, path);
         let _ = self.incoming.send(server::Queued {
-            event: IncomingEvent::Ack(ReceivedAck { request, flow }),
+            event: IncomingEvent::Ack(ReceivedAck { request, received }),
             _permit: permit,
         });
     }

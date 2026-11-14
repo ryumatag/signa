@@ -26,6 +26,7 @@ use crate::{
         admission::request_bytes,
         client::{CancelError, CancelOutcome, Intent, Reserved},
         error::Error,
+        path::{ReceiveInfo, retain},
         server::{self, IncomingCancel, IncomingEvent},
         table::Id,
     },
@@ -34,7 +35,7 @@ use crate::{
         key::{ClientKey, ServerKey},
         non_invite::{ClientTransaction, ServerTransaction},
     },
-    transport::Flow,
+    transport::{Flow, datagram::TransportContext},
 };
 
 impl Driver {
@@ -255,6 +256,7 @@ impl Driver {
         target: Id,
         flow: Flow,
         link: Link,
+        context: &TransportContext,
     ) {
         let entry = self.servers.get(target).expect("a live target");
         let (target_id, reserved) = (entry.id, entry.tx.cancel_reserved());
@@ -267,12 +269,14 @@ impl Driver {
                 self.control_events.acquire(bytes)?,
                 self.control_work.acquire(bytes)?,
                 self.control_routes.acquire(identity_bytes(&request)?)?,
+                retain(context, &self.context_limits, true)?,
             ))
         });
-        let Some(Some((event, work, route))) = permits else {
-            self.stateless(&request, &link, SERVICE_UNAVAILABLE);
+        let Some(Some((event, work, route, path))) = permits else {
+            self.stateless(&request, &link, context, SERVICE_UNAVAILABLE);
             return;
         };
+        let link = Link { path: path.clone(), ..link };
         let Some(commands) = self.command_sender.upgrade() else { return };
 
         if reserved {
@@ -301,7 +305,7 @@ impl Driver {
         let _ = self.incoming.send(server::Queued {
             event: IncomingEvent::Cancel(IncomingCancel {
                 request,
-                flow,
+                received: ReceiveInfo::new(flow, path),
                 transaction,
                 target: target_id,
             }),

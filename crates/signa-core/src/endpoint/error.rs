@@ -72,6 +72,8 @@ enum Kind {
     UnsupportedMethod,
     UnsupportedRouting,
     UnsupportedReception,
+    StalePath,
+    PathRefused(io::Error),
     Busy,
     Closed,
 }
@@ -119,6 +121,14 @@ impl Error {
 
     pub(super) fn unsupported_reception() -> Error {
         Error { kind: Kind::UnsupportedReception }
+    }
+
+    pub(super) fn stale_path() -> Error {
+        Error { kind: Kind::StalePath }
+    }
+
+    pub(super) fn path_refused(err: io::Error) -> Error {
+        Error { kind: Kind::PathRefused(err) }
     }
 
     pub(super) fn busy() -> Error {
@@ -226,6 +236,27 @@ impl Error {
         matches!(self.kind, Kind::UnsupportedReception)
     }
 
+    /// Returns `true` if a [`SendPath`] or a [`PreparedRequest`] belongs to
+    /// another endpoint, or a prepared TCP request's connection has closed
+    /// since. Nothing was sent. Prepare it again on this endpoint, as it is
+    /// never sent another way in its place.
+    ///
+    /// [`SendPath`]: super::SendPath
+    /// [`PreparedRequest`]: super::PreparedRequest
+    pub fn is_stale_path(&self) -> bool {
+        matches!(self.kind, Kind::StalePath)
+    }
+
+    /// Returns `true` if the UDP backend refused a path, as
+    /// [`DatagramIo::check_path`] does for a source address it may not send
+    /// from or a context it cannot read. [`Error::source`] has its I/O error.
+    ///
+    /// [`DatagramIo::check_path`]: crate::transport::datagram::DatagramIo::check_path
+    /// [`Error::source`]: error::Error::source
+    pub fn is_path_refused(&self) -> bool {
+        matches!(self.kind, Kind::PathRefused(_))
+    }
+
     /// Returns `true` if request or connection admission is exhausted.
     ///
     /// Request count and logical-byte limits refuse before command enqueue.
@@ -263,6 +294,10 @@ impl fmt::Debug for Error {
             Kind::UnsupportedMethod => debug.field(&"UnsupportedMethod"),
             Kind::UnsupportedRouting => debug.field(&"UnsupportedRouting"),
             Kind::UnsupportedReception => debug.field(&"UnsupportedReception"),
+            Kind::StalePath => debug.field(&"StalePath"),
+            Kind::PathRefused(err) => {
+                debug.field(&format_args!("PathRefused({err:?})"))
+            }
             Kind::Busy => debug.field(&"Busy"),
             Kind::Closed => debug.field(&"Closed"),
         };
@@ -302,6 +337,13 @@ impl fmt::Display for Error {
             Kind::UnsupportedReception => f.write_str(
                 "the endpoint's reception mode does not offer this operation",
             ),
+            Kind::StalePath => f.write_str(
+                "the path or prepared request belongs to another endpoint or \
+                 connection",
+            ),
+            Kind::PathRefused(err) => {
+                write!(f, "the UDP backend refused the path: {err}")
+            }
             Kind::Busy => {
                 f.write_str("client admission capacity is exhausted")
             }
@@ -313,7 +355,7 @@ impl fmt::Display for Error {
 impl error::Error for Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match &self.kind {
-            Kind::Transport(err) => Some(err),
+            Kind::Transport(err) | Kind::PathRefused(err) => Some(err),
             _ => None,
         }
     }

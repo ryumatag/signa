@@ -109,9 +109,9 @@ async fn main() -> Result<(), BoxError> {
     let (uac, _uac_incoming) = bind(timers)?;
     let next_hop = Target::new(Transport::Udp, proxy.udp_addr().expect("UDP"));
 
-    let answers = call(&uac, next_hop, "answer", false).await?;
+    let answers = call(&uac, next_hop.clone(), "answer", false).await?;
     assert_eq!(answers, [200, 200], "both forks' 2xx reach the UAC");
-    let cancelled = call(&uac, next_hop, "ring", true).await?;
+    let cancelled = call(&uac, next_hop.clone(), "ring", true).await?;
     assert_eq!(cancelled, [487]);
     let refused = call(&uac, next_hop, "refuse", false).await?;
     assert_eq!(refused, [480], "the lower of 486 and 480");
@@ -181,6 +181,7 @@ async fn run_proxy(
                 });
                 let forks = forks.clone();
                 let proxy = proxy.clone();
+                let branches = branches.clone();
                 tokio::spawn(async move {
                     fork(
                         &proxy,
@@ -247,7 +248,7 @@ async fn fork(
     let (arrivals, mut arrived) = mpsc::unbounded_channel();
     let mut branches = Vec::new();
     for (index, target) in targets.into_iter().enumerate() {
-        match proxy.start(downstream.clone(), target).await {
+        match proxy.start(downstream.clone(), target.clone()).await {
             Ok(transaction) => {
                 let (control, responses) = transaction.into_parts();
                 tokio::spawn(relay(index, responses, arrivals.clone()));
@@ -498,7 +499,7 @@ async fn call(
             .header("Max-Forwards", "70")
             .body(Bytes::new())?;
         let target = Target::new(Transport::Udp, remote);
-        uac.send_request(ack, target, ViaMode::Fresh).await?;
+        uac.send_request(ack, target.clone(), ViaMode::Fresh).await?;
     }
     Ok(finals)
 }

@@ -217,7 +217,11 @@ async fn stateless_proxy(
                         .parse()
                         .unwrap();
                 proxy
-                    .send_request(request, target, ViaMode::Branch(branch))
+                    .send_request(
+                        request,
+                        target.clone(),
+                        ViaMode::Branch(branch),
+                    )
                     .await
                     .unwrap();
             }
@@ -378,7 +382,7 @@ pub(super) fn invite(c: &mut Criterion) {
             b.iter(|| {
                 rt.block_on(async {
                     let (_control, mut responses) = uac
-                        .start(bb(request.clone()), target)
+                        .start(bb(request.clone()), target.clone())
                         .await
                         .unwrap()
                         .into_parts();
@@ -391,7 +395,7 @@ pub(super) fn invite(c: &mut Criterion) {
                     };
                     uac.send_request(
                         ack_for(&request, &ok),
-                        target,
+                        target.clone(),
                         ViaMode::Fresh,
                     )
                     .await
@@ -410,7 +414,7 @@ pub(super) fn invite(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 let (_control, mut responses) = uac
-                    .start(bb(request.clone()), target)
+                    .start(bb(request.clone()), target.clone())
                     .await
                     .unwrap()
                     .into_parts();
@@ -433,7 +437,7 @@ pub(super) fn invite(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 let (control, mut responses) = uac
-                    .start(bb(request.clone()), target)
+                    .start(bb(request.clone()), target.clone())
                     .await
                     .unwrap()
                     .into_parts();
@@ -496,7 +500,7 @@ pub(super) fn invite_udp(c: &mut Criterion) {
         invite_uas(incoming);
         server
     };
-    let target = Target::new(Transport::Udp, server.udp_addr().unwrap());
+    let target = &Target::new(Transport::Udp, server.udp_addr().unwrap());
     let uac = || {
         Endpoint::builder()
             .udp(LOCALHOST)
@@ -513,7 +517,7 @@ pub(super) fn invite_udp(c: &mut Criterion) {
         b.iter_custom(|iters| {
             rt.block_on(rotating(iters, &uac, |uac| async move {
                 let (_control, mut responses) = uac
-                    .start(bb(request.clone()), target)
+                    .start(bb(request.clone()), target.clone())
                     .await
                     .unwrap()
                     .into_parts();
@@ -536,7 +540,7 @@ pub(super) fn invite_udp(c: &mut Criterion) {
         b.iter_custom(|iters| {
             rt.block_on(rotating(iters, &uac, |uac| async move {
                 let (control, mut responses) = uac
-                    .start(bb(request.clone()), target)
+                    .start(bb(request.clone()), target.clone())
                     .await
                     .unwrap()
                     .into_parts();
@@ -770,7 +774,7 @@ pub(super) fn client_admission(c: &mut Criterion) {
         .body(Bytes::new())
         .unwrap();
     let target = Target::new(Transport::Tcp, LOCALHOST);
-    let mut pending = pin!(endpoint.start(request.clone(), target));
+    let mut pending = pin!(endpoint.start(request.clone(), target.clone()));
     let mut cx = Context::from_waker(Waker::noop());
     assert!(pending.as_mut().poll(&mut cx).is_pending());
     let len = request.to_bytes().len() as u64;
@@ -780,7 +784,7 @@ pub(super) fn client_admission(c: &mut Criterion) {
     benchmark(c, "reject/endpoint/client_admission", len, |b| {
         b.iter(|| {
             let mut response =
-                pin!(endpoint.start(bb(request.clone()), target));
+                pin!(endpoint.start(bb(request.clone()), target.clone()));
             let Poll::Ready(Err(error)) =
                 Pin::new(&mut response).poll(&mut cx)
             else {
@@ -795,7 +799,7 @@ pub(super) fn client_admission(c: &mut Criterion) {
     benchmark(c, "reject/endpoint/client_cseq", len, |b| {
         b.iter(|| {
             let mut response =
-                pin!(endpoint.start(bb(invalid.clone()), target));
+                pin!(endpoint.start(bb(invalid.clone()), target.clone()));
             let Poll::Ready(Err(error)) =
                 Pin::new(&mut response).poll(&mut cx)
             else {
@@ -994,8 +998,11 @@ impl Client {
         &mut self,
         request: Request<Bytes>,
     ) -> Result<Response<Bytes>, Error> {
-        let (_control, mut responses) =
-            self.endpoint.start(request, self.target).await?.into_parts();
+        let (_control, mut responses) = self
+            .endpoint
+            .start(request, self.target.clone())
+            .await?
+            .into_parts();
         loop {
             let response =
                 responses.next().await.expect("transaction outcome")?;

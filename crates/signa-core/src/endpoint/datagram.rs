@@ -33,12 +33,17 @@ use tokio::sync::oneshot;
 
 use super::{
     driver::{ReceptionCounters, increment},
+    path::canonical,
     reply::{Completion, ReplyError},
+    routing::Link,
     server::{Shared, WriteObservation},
 };
 use crate::transport::{
     Flow, Transport, WriteLimits,
-    datagram::{DatagramIo, DatagramWrite, RecvError, Submit, WriteId},
+    datagram::{
+        DatagramIo, DatagramWrite, Path, RecvError, Submit, TransportContext,
+        WriteId,
+    },
 };
 
 /// How many writes, completions or datagrams one poll handles before it lets
@@ -167,7 +172,7 @@ impl Port {
     fn start(
         &mut self,
         bytes: Bytes,
-        flow: &Flow,
+        link: &Link,
         limits: WriteLimits,
     ) -> Started {
         let len = bytes.len();
@@ -185,7 +190,15 @@ impl Port {
         self.next_id += 1;
         self.writes += 1;
         self.bytes += len;
-        let write = DatagramWrite::new(id, bytes, flow.local, flow.remote);
+        // Cloning the path is a reference count, and only for a backend that
+        // gave context. The socket's links have none.
+        let write = DatagramWrite::new(
+            id,
+            bytes,
+            link.flow.local,
+            link.flow.remote,
+            link.path.clone(),
+        );
         if !self.backlog.is_empty() {
             self.backlog
                 .push_back(Queued { write, outcome: Outcome::Unobserved });
@@ -240,7 +253,7 @@ impl Port {
         self.bytes -= len;
     }
 
-    /// Sends `bytes` on `flow`, or queues it until the backend takes it.
+    /// Sends `bytes` on `link`, or queues it until the backend takes it.
     ///
     /// Only an error known now is returned. A write that waits and then fails
     /// is dropped. UDP loses datagrams anyway, and the transactions
@@ -248,9 +261,9 @@ impl Port {
     pub(super) fn send(
         &mut self,
         bytes: &Bytes,
-        flow: &Flow,
+        link: &Link,
     ) -> io::Result<()> {
-        match self.start(bytes.clone(), flow, self.limits) {
+        match self.start(bytes.clone(), link, self.limits) {
             Started::Done(result) => result,
             Started::Waiting(_) => Ok(()),
         }
@@ -261,10 +274,10 @@ impl Port {
     pub(super) fn send_request(
         &mut self,
         bytes: &Bytes,
-        flow: &Flow,
+        link: &Link,
     ) -> io::Result<()> {
         let limits = crate::transport::budget::request_limits(self.limits);
-        match self.start(bytes.clone(), flow, limits) {
+        match self.start(bytes.clone(), link, limits) {
             Started::Done(result) => result,
             Started::Waiting(_) => Ok(()),
         }
@@ -275,7 +288,7 @@ impl Port {
     pub(super) fn submit_client(
         &mut self,
         bytes: &Bytes,
-        flow: &Flow,
+        link: &Link,
         initial: bool,
     ) -> io::Result<Option<oneshot::Receiver<io::Result<()>>>> {
         let limits = if initial {
@@ -283,7 +296,7 @@ impl Port {
         } else {
             self.limits
         };
-        match self.start(bytes.clone(), flow, limits) {
+        match self.start(bytes.clone(), link, limits) {
             Started::Done(result) => result.map(|()| None),
             Started::Waiting(id) => {
                 let (done, receipt) = oneshot::channel();
@@ -297,10 +310,10 @@ impl Port {
     pub(super) fn submit(
         &mut self,
         bytes: Bytes,
-        flow: Flow,
+        link: &Link,
         completion: Completion,
     ) {
-        match self.start(bytes, &flow, self.limits) {
+        match self.start(bytes, link, self.limits) {
             Started::Done(result) => {
                 completion.finish(result.map_err(|error| {
                     if error.kind() == io::ErrorKind::WouldBlock {
@@ -324,11 +337,11 @@ impl Port {
     pub(super) fn send_admitted(
         &mut self,
         bytes: Bytes,
-        flow: Flow,
+        link: &Link,
         observation: WriteObservation,
     ) -> bool {
         debug_assert!(self.admit_response(bytes.len()).is_ok());
-        match self.start(bytes, &flow, self.limits) {
+        match self.start(bytes, link, self.limits) {
             Started::Done(result) => {
                 let success = result.is_ok();
                 observation.complete(result);
@@ -442,7 +455,11 @@ impl Port {
         }
     }
 
-    /// Polls for the next datagram, with the flow it arrived on.
+    /// Polls for the next datagram, with the flow it arrived on and the
+    /// backend's context.
+    ///
+    /// The context is the backend's own bytes, which may slice a capture
+    /// buffer. The driver copies it where it keeps it, see `path::retain`.
     ///
     /// A truncated datagram and a receive error are counted and discarded. An
     /// error also yields to the driver's other sources, so that a backend
@@ -450,21 +467,21 @@ impl Port {
     pub(super) fn poll_recv(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<(Bytes, Flow)> {
+    ) -> Poll<(Bytes, Flow, TransportContext)> {
         for _ in 0..BATCH {
             match ready!(self.io.poll_recv(cx)) {
                 Ok(datagram) => {
-                    // TODO: Keep the context with the request's reply route,
-                    // so that a backend can send the response along the path
-                    // its request came by.
-                    let (payload, source, destination, _context) =
+                    let (payload, source, destination, context) =
                         datagram.into_parts();
+                    // An IPv4 peer is named in its own form, as a Via names
+                    // it, whichever backend reported it. The socket already
+                    // does, and for it this is a match on the family.
                     let flow = Flow {
                         transport: Transport::Udp,
-                        local: destination,
-                        remote: source,
+                        local: canonical(destination),
+                        remote: canonical(source),
                     };
-                    return Poll::Ready((payload, flow));
+                    return Poll::Ready((payload, flow, context));
                 }
                 Err(RecvError::Truncated) => {
                     increment(&self.counters.truncated_datagrams);
@@ -478,6 +495,16 @@ impl Port {
 
         cx.waker().wake_by_ref();
         Poll::Pending
+    }
+
+    /// Asks the backend whether it can send along `path`, a prepared one.
+    pub(super) fn check_path(&mut self, path: &Path) -> io::Result<()> {
+        let prepared = path.prepared.as_deref().expect("a prepared path");
+        self.io.check_path(
+            prepared.source,
+            prepared.destination,
+            &path.context,
+        )
     }
 
     /// Offers the backlog and collects completions until no write is left,
@@ -570,6 +597,7 @@ mod tests {
     );
     const FLOW: Flow =
         Flow { transport: Transport::Udp, local: LOCAL, remote: PEER };
+    const LINK: Link = Link { flow: FLOW, writer: None, path: None };
 
     /// What the scripted backend does with the next submission.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -739,7 +767,7 @@ mod tests {
         else {
             panic!("expected reply command");
         };
-        port.submit(bytes, link.flow, completion);
+        port.submit(bytes, &link, completion);
     }
 
     #[test]
@@ -747,7 +775,7 @@ mod tests {
         let script = Script::default();
         let mut port = port(&script, WriteLimits::default());
 
-        port.send(&Bytes::from_static(b"hello"), &FLOW).unwrap();
+        port.send(&Bytes::from_static(b"hello"), &LINK).unwrap();
 
         assert!(port.is_idle());
         assert_eq!(script.0.lock().unwrap().accepted[0].1, "hello");
@@ -759,11 +787,11 @@ mod tests {
         let mut port = port(&script, WriteLimits { messages: 2, bytes: 10 });
         script.mode(Mode::Hold);
 
-        port.send(&Bytes::from_static(b"first"), &FLOW).unwrap();
-        port.send(&Bytes::from_static(b"second"), &FLOW).unwrap_err();
-        port.send(&Bytes::from_static(b"two"), &FLOW).unwrap();
+        port.send(&Bytes::from_static(b"first"), &LINK).unwrap();
+        port.send(&Bytes::from_static(b"second"), &LINK).unwrap_err();
+        port.send(&Bytes::from_static(b"two"), &LINK).unwrap();
         assert_eq!(
-            port.send(&Bytes::new(), &FLOW).unwrap_err().kind(),
+            port.send(&Bytes::new(), &LINK).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
 
@@ -791,17 +819,17 @@ mod tests {
         let mut port = port(&script, WriteLimits { messages: 4, bytes: 8 });
         script.mode(Mode::Hold);
 
-        port.send(&Bytes::from_static(b"123456"), &FLOW).unwrap();
+        port.send(&Bytes::from_static(b"123456"), &LINK).unwrap();
         assert_eq!(
-            port.send_request(&Bytes::from_static(b"7"), &FLOW)
+            port.send_request(&Bytes::from_static(b"7"), &LINK)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::WouldBlock
         );
-        port.send(&Bytes::from_static(b"78"), &FLOW).unwrap();
-        port.send_request(&Bytes::new(), &FLOW).unwrap_err();
-        port.send(&Bytes::new(), &FLOW).unwrap();
-        port.send(&Bytes::new(), &FLOW).unwrap();
+        port.send(&Bytes::from_static(b"78"), &LINK).unwrap();
+        port.send_request(&Bytes::new(), &LINK).unwrap_err();
+        port.send(&Bytes::new(), &LINK).unwrap();
+        port.send(&Bytes::new(), &LINK).unwrap();
 
         assert_eq!(port.backlog.len(), 4);
     }
@@ -812,7 +840,7 @@ mod tests {
         let mut port = port(&script, WriteLimits { messages: 1, bytes: 2 });
 
         assert_eq!(
-            port.send(&Bytes::from_static(b"abc"), &FLOW).unwrap_err().kind(),
+            port.send(&Bytes::from_static(b"abc"), &LINK).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
 
@@ -825,7 +853,7 @@ mod tests {
         let script = Script::default();
         let mut port = port(&script, WriteLimits::default());
 
-        let error = port.send(&Bytes::from(vec![0; 1001]), &FLOW).unwrap_err();
+        let error = port.send(&Bytes::from(vec![0; 1001]), &LINK).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(script.accepted().is_empty());
@@ -838,7 +866,7 @@ mod tests {
         let mut port = port(&script, WriteLimits { messages: 1, bytes: 8 });
         script.mode(Mode::Reject);
 
-        let error = port.send(&Bytes::from_static(b"abc"), &FLOW).unwrap_err();
+        let error = port.send(&Bytes::from_static(b"abc"), &LINK).unwrap_err();
 
         assert_eq!(error.raw_os_error(), Some(5));
         assert!(port.is_idle());
@@ -851,7 +879,7 @@ mod tests {
         script.mode(Mode::Hold);
 
         let receipt = port
-            .submit_client(&Bytes::from_static(b"request"), &FLOW, true)
+            .submit_client(&Bytes::from_static(b"request"), &LINK, true)
             .unwrap()
             .unwrap();
         script.mode(Mode::Accept);
@@ -877,7 +905,7 @@ mod tests {
         let mut port = port(&script, WriteLimits::default());
 
         let receipt = port
-            .submit_client(&Bytes::from_static(b"request"), &FLOW, true)
+            .submit_client(&Bytes::from_static(b"request"), &LINK, true)
             .unwrap();
 
         assert!(receipt.is_none());
@@ -953,7 +981,7 @@ mod tests {
         let script = Script::default();
         let mut port = port(&script, WriteLimits::default());
         script.mode(Mode::Accept);
-        port.send(&Bytes::from_static(b"abc"), &FLOW).unwrap();
+        port.send(&Bytes::from_static(b"abc"), &LINK).unwrap();
         let id = script.accepted()[0];
 
         script.complete(WriteId::new(99), Ok(()));
@@ -970,16 +998,16 @@ mod tests {
         let mut port = port(&script, WriteLimits::default());
         script.mode(Mode::Accept);
         let accepted = port
-            .submit_client(&Bytes::from_static(b"accepted"), &FLOW, false)
+            .submit_client(&Bytes::from_static(b"accepted"), &LINK, false)
             .unwrap()
             .unwrap();
         let unreported = port
-            .submit_client(&Bytes::from_static(b"unreported"), &FLOW, false)
+            .submit_client(&Bytes::from_static(b"unreported"), &LINK, false)
             .unwrap()
             .unwrap();
         script.mode(Mode::Hold);
         let held = port
-            .submit_client(&Bytes::from_static(b"held"), &FLOW, false)
+            .submit_client(&Bytes::from_static(b"held"), &LINK, false)
             .unwrap()
             .unwrap();
         script.0.lock().unwrap().on_close = vec![(
@@ -1007,7 +1035,7 @@ mod tests {
         let script = Script::default();
         let mut port = port(&script, WriteLimits::default());
         script.mode(Mode::Accept);
-        port.send(&Bytes::from_static(b"accepted"), &FLOW).unwrap();
+        port.send(&Bytes::from_static(b"accepted"), &LINK).unwrap();
         script.0.lock().unwrap().on_close =
             vec![(script.accepted()[0], Ok(()))];
 
@@ -1028,7 +1056,7 @@ mod tests {
             port(&script, WriteLimits { messages: 1024, bytes: 1 << 20 });
         script.mode(Mode::Accept);
         for _ in 0..100 {
-            port.send(&Bytes::from_static(b"abc"), &FLOW).unwrap();
+            port.send(&Bytes::from_static(b"abc"), &LINK).unwrap();
         }
 
         for id in script.accepted().into_iter().skip(1) {
@@ -1063,7 +1091,7 @@ mod tests {
         let mut cx = Context::from_waker(&waker);
 
         script.mode(Mode::Hold);
-        port.send(&Bytes::from_static(b"held"), &FLOW).unwrap();
+        port.send(&Bytes::from_static(b"held"), &LINK).unwrap();
         assert!(
             !script
                 .0
@@ -1088,7 +1116,7 @@ mod tests {
 
         script.mode(Mode::Accept);
         port.poll_flush(&mut cx);
-        port.send(&Bytes::from_static(b"accepted"), &FLOW).unwrap();
+        port.send(&Bytes::from_static(b"accepted"), &LINK).unwrap();
         assert!(
             !script
                 .0
@@ -1126,11 +1154,13 @@ mod tests {
         )));
         script.receive(Err(RecvError::Io(io::Error::from_raw_os_error(5))));
 
-        let Poll::Ready((payload, flow)) = port.poll_recv(&mut cx) else {
+        let Poll::Ready((payload, flow, context)) = port.poll_recv(&mut cx)
+        else {
             panic!("expected a datagram");
         };
         assert_eq!(payload, "whole");
         assert_eq!(flow, FLOW);
+        assert!(context.is_empty());
         assert!(port.poll_recv(&mut cx).is_pending());
         assert!(port.poll_recv(&mut cx).is_pending());
 

@@ -20,13 +20,14 @@ use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 
 use super::{
-    Endpoint, Error, admission, builder::Reception, driver::Command, table::Id,
+    Endpoint, Error, admission, builder::Reception, driver::Command,
+    path::SendPath, routing::Link, table::Id,
 };
 use crate::{
     message::{
         Method,
         header::{
-            CALL_ID, CSEQ, FROM, HeaderName, HeaderValue, TO, address,
+            CALL_ID, CSEQ, FROM, HeaderName, HeaderValue, TO, VIA, address,
             cseq::CSeq,
         },
         request::Request,
@@ -39,31 +40,76 @@ use crate::{
     },
 };
 
-/// An explicit next-hop address and transport.
+/// An explicit next hop: a transport and an address, or a prepared path.
 ///
 /// The caller picks it after its own routing and RFC 3263 resolution.
 /// [`Endpoint::start`] sends to it without comparing it with the request's
 /// URIs. Its Routing section says what that leaves to the caller.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Target {
     transport: Transport,
     address: SocketAddr,
+    path: Option<SendPath>,
 }
 
 impl Target {
     /// Selects a transport and next hop without URI resolution.
+    ///
+    /// Over UDP the endpoint sends from its own address, as its backend
+    /// chooses, and names that address in the Via.
     pub fn new(transport: Transport, address: SocketAddr) -> Target {
-        Target { transport, address }
+        Target { transport, address, path: None }
+    }
+
+    /// Sends over UDP on a path the endpoint prepared, to its destination,
+    /// from its source and with the `sent-by` it advertises. See
+    /// [`Endpoint::prepare_path`].
+    pub fn path(path: SendPath) -> Target {
+        Target {
+            transport: Transport::Udp,
+            address: path.destination(),
+            path: Some(path),
+        }
     }
 
     /// The selected transport.
-    pub fn transport(self) -> Transport {
+    pub fn transport(&self) -> Transport {
         self.transport
     }
 
     /// The selected next hop.
-    pub fn address(self) -> SocketAddr {
+    pub fn address(&self) -> SocketAddr {
         self.address
+    }
+
+    /// The prepared path, if the target names one.
+    pub fn send_path(&self) -> Option<&SendPath> {
+        self.path.as_ref()
+    }
+}
+
+impl PartialEq for Target {
+    // Two targets on paths are equal only on the same path, not on two paths
+    // that happen to select the same addresses.
+    fn eq(&self, other: &Target) -> bool {
+        self.transport == other.transport
+            && self.address == other.address
+            && match (&self.path, &other.path) {
+                (None, None) => true,
+                (Some(left), Some(right)) => Arc::ptr_eq(&left.0, &right.0),
+                _ => false,
+            }
+    }
+}
+
+impl Eq for Target {}
+
+impl Hash for Target {
+    // Hashes what `eq` compares, the path by its identity.
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.transport.hash(state);
+        self.address.hash(state);
+        self.path.as_ref().map(|path| Arc::as_ptr(&path.0)).hash(state);
     }
 }
 
@@ -603,6 +649,131 @@ pub(super) struct Starting {
     cancel: Option<Reserved>,
 }
 
+/// The handles of a start before it has its answer channel.
+struct Unanswered {
+    observation: Observing,
+    cancel: Option<Reserved>,
+}
+
+impl Unanswered {
+    fn answer(
+        self,
+        accepted: oneshot::Sender<Result<ClientTransaction, Error>>,
+    ) -> Starting {
+        let Unanswered { observation, cancel } = self;
+        Starting { accepted, observation, cancel }
+    }
+}
+
+/// What the driver does with a request once it has a link to send it on.
+pub(super) enum Admitted {
+    /// Starts its transaction, for [`Endpoint::start`].
+    Start(Starting),
+    /// Prepends its Via and hands it back, for [`Endpoint::prepare`].
+    Prepare(Preparing),
+}
+
+impl Admitted {
+    /// Refuses the request, with the admission it holds.
+    pub(super) fn fail(self, error: Error) {
+        match self {
+            Admitted::Start(respond) => respond.send(Err(error)),
+            Admitted::Prepare(preparing) => {
+                let _ = preparing.done.send(Err(error));
+            }
+        }
+    }
+}
+
+/// A queued preparation.
+pub(super) struct Preparing {
+    done: oneshot::Sender<Result<PreparedRequest, Error>>,
+    cancel: Option<admission::Permit>,
+    registration: u64,
+}
+
+impl Preparing {
+    /// Hands back `request`, which has its Via, ready to start on `link`.
+    pub(super) fn finish(
+        self,
+        request: Request<Bytes>,
+        via: HeaderValue,
+        link: Link,
+        permit: admission::Permit,
+    ) {
+        let Preparing { done, cancel, registration } = self;
+        let Some(len) = request.encoded_len() else {
+            let _ = done.send(Err(Error::too_large(usize::MAX)));
+            return;
+        };
+        let _ = done.send(Ok(PreparedRequest {
+            request,
+            via,
+            link,
+            len,
+            registration,
+            permit,
+            cancel,
+        }));
+    }
+}
+
+/// A request ready to start, with its Via, source and connection fixed.
+///
+/// [`Endpoint::prepare`] makes one and [`Endpoint::start_prepared`] sends it.
+/// It holds the request's place in client admission until either happens or
+/// it drops.
+pub struct PreparedRequest {
+    request: Request<Bytes>,
+    via: HeaderValue,
+    link: Link,
+    len: usize,
+    registration: u64,
+    permit: admission::Permit,
+    cancel: Option<admission::Permit>,
+}
+
+impl PreparedRequest {
+    /// The exact size of the request as it will be sent, with its Via.
+    pub fn encoded_len(&self) -> usize {
+        self.len
+    }
+
+    /// The Via the endpoint prepended, with its `sent-by` and fresh branch.
+    pub fn via(&self) -> &HeaderValue {
+        &self.via
+    }
+
+    /// The flow the request will go out on, with the selected local address.
+    pub fn flow(&self) -> Flow {
+        self.link.flow
+    }
+
+    /// The request as it will be sent, Via included.
+    pub fn request(&self) -> &Request<Bytes> {
+        &self.request
+    }
+
+    /// Gives the request back without the Via the endpoint prepended, and
+    /// releases its admission.
+    pub fn into_request(self) -> Request<Bytes> {
+        let mut request = self.request;
+        request.headers_mut().remove_first(VIA);
+        request
+    }
+}
+
+impl fmt::Debug for PreparedRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreparedRequest")
+            .field("method", self.request.method())
+            .field("len", &self.len)
+            .field("via", &self.via)
+            .field("flow", &self.link.flow)
+            .finish()
+    }
+}
+
 /// The handles of a transaction before the driver installs it.
 pub(super) struct Observing {
     commands: mpsc::UnboundedSender<Command>,
@@ -769,6 +940,8 @@ impl Endpoint {
     /// * [`Error::is_unsupported_routing`] for a `sips:` Request-URI, a
     ///   multicast target, or a UDP target on an endpoint without a UDP
     ///   socket. Route is not checked, as Routing above explains.
+    /// * [`Error::is_stale_path`] for a target on a path another endpoint
+    ///   prepared.
     /// * [`Error::is_too_large`] for a UDP request over 1300 bytes.
     /// * [`Error::is_busy`] when client admission, handle capacity or
     ///   transport output is full.
@@ -835,37 +1008,194 @@ impl Endpoint {
     ) -> impl Future<Output = Result<ClientTransaction, Error>> + Send + '_
     {
         async move {
-            let response = self.enqueue(request, target)?;
+            let (permit, cancel) = self.admit(&request, &target)?;
+            let starting = self.starting(cancel)?;
+
+            let (accepted, response) = oneshot::channel();
+            self.commands
+                .send(Command::Send {
+                    request,
+                    target,
+                    admitted: Admitted::Start(starting.answer(accepted)),
+                    permit,
+                })
+                .map_err(|_| Error::closed())?;
             response.await.unwrap_or_else(|_| Err(Error::closed()))
         }
     }
 
-    fn enqueue(
+    /// Prepares `request` for [`Endpoint::start_prepared`] toward `target`,
+    /// and tells its exact size.
+    ///
+    /// Preparing does everything [`Endpoint::start`] does before the request
+    /// goes out. It checks the request, takes its place in client admission,
+    /// selects the source, opens or picks the TCP connection, and prepends the
+    /// Via with its `sent-by` and a fresh branch. [`PreparedRequest::encoded_len`]
+    /// is then the size of the bytes that starting it sends, Via included, so
+    /// a caller can pick TCP for a request over 1300 bytes
+    /// ([RFC 3261 section 18.1.1]) without encoding it to guess. Nothing is
+    /// written to the network.
+    ///
+    /// A preparation holds its admission until it is started or dropped.
+    /// [`PreparedRequest::into_request`] gives the request back without the
+    /// Via, to prepare it for another target.
+    ///
+    /// # Cancellation
+    ///
+    /// As for [`Endpoint::start`], except that nothing is sent. A prepared
+    /// request whose future is dropped is dropped with it.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Endpoint::start`] that come before sending, including
+    /// [`Error::is_stale_path`], except [`Error::is_too_large`], which
+    /// [`Endpoint::start_prepared`] reports.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bytes::Bytes;
+    /// use signa_core::{
+    ///     endpoint::{ClientTransaction, Endpoint, Error, Target},
+    ///     transport::Transport,
+    ///     Request,
+    /// };
+    ///
+    /// // RFC 3261 section 18.1.1 sends a request over 1300 bytes over a
+    /// // congestion-controlled transport.
+    /// async fn start(
+    ///     endpoint: &Endpoint,
+    ///     request: Request<Bytes>,
+    ///     next_hop: std::net::SocketAddr,
+    /// ) -> Result<ClientTransaction, Error> {
+    ///     let udp = Target::new(Transport::Udp, next_hop);
+    ///     let prepared = endpoint.prepare(request, udp).await?;
+    ///     if prepared.encoded_len() <= 1300 {
+    ///         return endpoint.start_prepared(prepared).await;
+    ///     }
+    ///     let tcp = Target::new(Transport::Tcp, next_hop);
+    ///     let prepared = endpoint.prepare(prepared.into_request(), tcp).await?;
+    ///     endpoint.start_prepared(prepared).await
+    /// }
+    /// ```
+    ///
+    /// [RFC 3261 section 18.1.1]: https://www.rfc-editor.org/rfc/rfc3261.html#section-18.1.1
+    #[allow(clippy::manual_async_fn)] // State the Send guarantee.
+    pub fn prepare(
         &self,
         request: Request<Bytes>,
         target: Target,
-    ) -> Result<oneshot::Receiver<Result<ClientTransaction, Error>>, Error>
+    ) -> impl Future<Output = Result<PreparedRequest, Error>> + Send + '_ {
+        async move {
+            let (permit, cancel) = self.admit(&request, &target)?;
+
+            let (done, response) = oneshot::channel();
+            self.commands
+                .send(Command::Send {
+                    request,
+                    target,
+                    admitted: Admitted::Prepare(Preparing {
+                        done,
+                        cancel,
+                        registration: self.registration,
+                    }),
+                    permit,
+                })
+                .map_err(|_| Error::closed())?;
+            response.await.unwrap_or_else(|_| Err(Error::closed()))
+        }
+    }
+
+    /// Starts a request [`Endpoint::prepare`] prepared, with the Via and on
+    /// the source and connection it fixed.
+    ///
+    /// The request goes out as [`Endpoint::start`] sends it, byte for byte
+    /// what [`PreparedRequest::encoded_len`] measured. A preparation is never
+    /// sent another way in its place. One of another endpoint, or one whose
+    /// TCP connection has closed since, fails with [`Error::is_stale_path`].
+    ///
+    /// # Cancellation
+    ///
+    /// As for [`Endpoint::start`]. The preparation is consumed either way.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::is_stale_path`] as above.
+    /// * [`Error::is_too_large`] for a UDP request over 1300 bytes.
+    /// * The rest of those of [`Endpoint::start`] that come after preparing:
+    ///   [`Error::is_busy`] for handle capacity or transport output,
+    ///   [`Error::is_transport`] and [`Error::is_closed`].
+    #[allow(clippy::manual_async_fn)] // State the Send guarantee.
+    pub fn start_prepared(
+        &self,
+        prepared: PreparedRequest,
+    ) -> impl Future<Output = Result<ClientTransaction, Error>> + Send + '_
     {
+        async move {
+            if prepared.registration != self.registration {
+                return Err(Error::stale_path());
+            }
+            if self.commands.is_closed() {
+                return Err(Error::closed());
+            }
+            let PreparedRequest { request, via, link, permit, cancel, .. } =
+                prepared;
+            let starting = self.starting(cancel)?;
+
+            let (accepted, response) = oneshot::channel();
+            self.commands
+                .send(Command::Start {
+                    request,
+                    via,
+                    link,
+                    respond: starting.answer(accepted),
+                    permit,
+                })
+                .map_err(|_| Error::closed())?;
+            response.await.unwrap_or_else(|_| Err(Error::closed()))
+        }
+    }
+
+    /// Checks `request` and `target` and takes the request's admission, and
+    /// for an INVITE its CANCEL's.
+    fn admit(
+        &self,
+        request: &Request<Bytes>,
+        target: &Target,
+    ) -> Result<(admission::Permit, Option<admission::Permit>), Error> {
         if self.reception == Reception::Stateless {
             return Err(Error::unsupported_reception());
         }
         if self.commands.is_closed() {
             return Err(Error::closed());
         }
-        validate(&request)?;
+        validate(request)?;
         if target.address.ip().is_multicast()
             || (target.transport == Transport::Udp && self.udp.is_none())
         {
             return Err(Error::unsupported_routing());
         }
+        if let Some(path) = &target.path {
+            if Some(path.binding()) != self.binding {
+                return Err(Error::stale_path());
+            }
+        }
 
-        let (permit, cancel) = if request.method() == Method::INVITE {
+        if request.method() == Method::INVITE {
             let (permit, cancel) =
-                self.client_admission.acquire_invite(&request)?;
-            (permit, Some(cancel))
+                self.client_admission.acquire_invite(request)?;
+            Ok((permit, Some(cancel)))
         } else {
-            (self.client_admission.acquire(&request)?, None)
-        };
+            Ok((self.client_admission.acquire(request)?, None))
+        }
+    }
+
+    /// Reserves the response streams of a start, and of the CANCEL that
+    /// `cancel` reserved for an INVITE.
+    fn starting(
+        &self,
+        cancel: Option<admission::Permit>,
+    ) -> Result<Unanswered, Error> {
         let observation = self.observing()?;
         let cancel = match cancel {
             Some(permit) => {
@@ -873,18 +1203,7 @@ impl Endpoint {
             }
             None => None,
         };
-
-        let (accepted, response) = oneshot::channel();
-        self.commands
-            .send(Command::Send {
-                request,
-                transport: target.transport,
-                next_hop: target.address,
-                respond: Starting { accepted, observation, cancel },
-                permit,
-            })
-            .map_err(|_| Error::closed())?;
-        Ok(response)
+        Ok(Unanswered { observation, cancel })
     }
 
     /// Reserves one `max_client_handles` slot for a response stream.
@@ -1055,9 +1374,8 @@ pub(super) mod compatibility {
             };
             let command = Command::Send {
                 request,
-                transport: self.transport,
-                next_hop: self.next_hop,
-                respond,
+                target: Target::new(self.transport, self.next_hop),
+                admitted: Admitted::Start(respond),
                 permit,
             };
             let state = match self.commands.send(command) {

@@ -95,8 +95,8 @@ async fn main() -> Result<(), BoxError> {
     let script = FarSide::bind().await?.run();
     let target = Target::new(Transport::Udp, script.addr);
 
-    forked_answers(&uac, target).await?;
-    cancelled(&uac, target).await?;
+    forked_answers(&uac, target.clone()).await?;
+    cancelled(&uac, target.clone()).await?;
     cancel_loses_the_race(&uac, target).await?;
     script.handle.await??;
 
@@ -154,7 +154,7 @@ impl Call {
             .header("Max-Forwards", "70")
             .body(Bytes::new())?;
         let (control, responses) =
-            uac.start(invite.clone(), target).await?.into_parts();
+            uac.start(invite.clone(), target.clone()).await?.into_parts();
         let call = Call {
             invite,
             target,
@@ -187,7 +187,7 @@ impl Call {
             self.kept.get_or_insert_with(|| tag.clone());
         }
         let (ack, target) = &self.acks[&tag];
-        uac.send_request(ack.clone(), *target, ViaMode::Fresh).await?;
+        uac.send_request(ack.clone(), target.clone(), ViaMode::Fresh).await?;
         println!(
             "uac: ACK for the 2xx with tag {tag}{}",
             if new { "" } else { ", again for its retransmission" }
@@ -209,7 +209,8 @@ impl Call {
         let bye = self.in_dialog("BYE", cseq, ok, remote)?;
         let target = Target::new(self.target.transport(), remote);
 
-        let (_, mut responses) = uac.start(bye, target).await?.into_parts();
+        let (_, mut responses) =
+            uac.start(bye, target.clone()).await?.into_parts();
         let status = final_status(&mut responses).await?;
         println!("uac: BYE got {status}");
         Ok(())
