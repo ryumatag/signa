@@ -38,7 +38,7 @@ use super::{
     Flow, Transport,
     datagram::{
         Capabilities, Datagram, DatagramIo, DatagramWrite, RecvError, Submit,
-        WriteId,
+        TransportContext, WriteId,
     },
 };
 
@@ -321,6 +321,53 @@ impl DatagramIo for Io {
 
         cx.waker().wake_by_ref();
         Submit::Pending(write)
+    }
+
+    /// Accepts a unicast source on the socket's port, at its own IP address,
+    /// or at any address when the socket is bound to a wildcard and names the
+    /// source of each datagram it sends. The check cannot prove that such an
+    /// address belongs to this host. That shows when the kernel refuses a
+    /// write from it. Where the socket cannot name a source, only its own
+    /// address is accepted, since the kernel would pick another. A path
+    /// context means nothing to a socket, so one is refused.
+    fn check_path(
+        &mut self,
+        source: SocketAddr,
+        destination: SocketAddr,
+        context: &TransportContext,
+    ) -> io::Result<()> {
+        let local = self.socket.local_addr();
+        // A dual-stack IPv6 socket sends to an IPv4 peer at its mapped
+        // address, see `Socket::addresses`, so the families are those of the
+        // addresses with the mapping undone.
+        let source_ip = source.ip().to_canonical();
+        let destination_ip = destination.ip().to_canonical();
+        let family = match local {
+            SocketAddr::V4(_) => {
+                source_ip.is_ipv4() && destination_ip.is_ipv4()
+            }
+            SocketAddr::V6(_) => {
+                source_ip.is_ipv4() == destination_ip.is_ipv4()
+            }
+        };
+        let own = source_ip == local.ip().to_canonical()
+            || (sys::NAMES_SOURCE && local.ip().is_unspecified());
+        let unicast = !source_ip.is_unspecified()
+            && !source_ip.is_multicast()
+            && !matches!(source_ip, IpAddr::V4(ip) if ip.is_broadcast());
+        if source.port() != local.port() || !family || !own || !unicast {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "the socket cannot send from that address",
+            ));
+        }
+        if !context.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a socket takes no path context",
+            ));
+        }
+        Ok(())
     }
 
     // The endpoint collects completions right after each submission, so an

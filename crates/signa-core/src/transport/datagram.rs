@@ -101,10 +101,13 @@ use std::{
     error::Error,
     fmt, io,
     net::SocketAddr,
+    sync::Arc,
     task::{Context, Poll},
 };
 
 use bytes::Bytes;
+
+use super::budget::Permit;
 
 /// The most bytes a [`TransportContext`] holds.
 ///
@@ -172,6 +175,41 @@ pub trait DatagramIo: Send + 'static {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<(WriteId, io::Result<()>)>;
+
+    /// Checks that the backend can send from `source` to `destination` along
+    /// `context`, before the endpoint makes a path of them.
+    ///
+    /// The endpoint calls it on its driver's task when the application
+    /// prepares a path, and offers that path's writes as
+    /// [`WritePath::Prepared`] later. It must not block. The backend refuses
+    /// a source address it may not send from, a context it cannot read, or a
+    /// destination it cannot reach. A path that turns stale afterwards, such as
+    /// one over a session that has ended, is the backend's to refuse in
+    /// [`DatagramIo::poll_submit`].
+    ///
+    /// The default accepts the backend's own [`DatagramIo::local_addr`] as the
+    /// source, without context.
+    fn check_path(
+        &mut self,
+        source: SocketAddr,
+        destination: SocketAddr,
+        context: &TransportContext,
+    ) -> io::Result<()> {
+        let _ = destination;
+        if source != self.local_addr() {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "the backend sends from its own address only",
+            ));
+        }
+        if !context.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the backend takes no path context",
+            ));
+        }
+        Ok(())
+    }
 
     /// Polls the backend to close.
     ///
@@ -295,6 +333,9 @@ impl fmt::Debug for Datagram {
 pub struct TransportContext(Bytes);
 
 impl TransportContext {
+    #[cfg(feature = "tokio")]
+    pub(crate) const EMPTY: TransportContext = TransportContext(Bytes::new());
+
     /// Wraps the backend's bytes.
     ///
     /// # Errors
@@ -320,6 +361,13 @@ impl TransportContext {
     /// Returns `true` if there are no bytes.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// A copy in an allocation of its own, which keeps no capture buffer
+    /// alive however the backend made the bytes.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn detached(&self) -> TransportContext {
+        TransportContext(Bytes::copy_from_slice(&self.0))
     }
 }
 
@@ -373,6 +421,7 @@ pub struct DatagramWrite {
     payload: Bytes,
     source: SocketAddr,
     destination: SocketAddr,
+    path: Option<Arc<Path>>,
 }
 
 impl DatagramWrite {
@@ -382,8 +431,9 @@ impl DatagramWrite {
         payload: Bytes,
         source: SocketAddr,
         destination: SocketAddr,
+        path: Option<Arc<Path>>,
     ) -> DatagramWrite {
-        DatagramWrite { id, payload, source, destination }
+        DatagramWrite { id, payload, source, destination, path }
     }
 
     /// The ID to report the write's outcome by.
@@ -398,9 +448,14 @@ impl DatagramWrite {
 
     /// The address to send from.
     ///
-    /// A reply goes out from the address its request came to, and a request
-    /// from [`DatagramIo::local_addr`]. The endpoint's own socket may get an
+    /// A reply goes out from the address its request came to, a request on a
+    /// prepared path from that path's source, and any other request from
+    /// [`DatagramIo::local_addr`]. The endpoint's own socket may get an
     /// unspecified IP address here, where it lets the kernel choose.
+    ///
+    /// A reply's source is the destination the backend reported for the
+    /// request, which the endpoint does not check. A backend that intercepts
+    /// traffic for other hosts decides itself whether it may send from it.
     pub fn source(&self) -> SocketAddr {
         self.source
     }
@@ -410,7 +465,18 @@ impl DatagramWrite {
         self.destination
     }
 
-    /// Takes the payload, once the ID and addresses have been read.
+    /// The way the datagram goes beyond its addresses.
+    pub fn path(&self) -> WritePath<'_> {
+        match self.path.as_deref() {
+            None => WritePath::Default,
+            Some(path) if path.prepared.is_some() => {
+                WritePath::Prepared(&path.context)
+            }
+            Some(path) => WritePath::Reply(&path.context),
+        }
+    }
+
+    /// Takes the payload, once the ID, addresses and path have been read.
     pub fn into_payload(self) -> Bytes {
         self.payload
     }
@@ -424,7 +490,85 @@ impl fmt::Debug for DatagramWrite {
             .field("len", &self.payload.len())
             .field("source", &self.source)
             .field("destination", &self.destination)
+            .field("path", &self.path())
             .finish()
+    }
+}
+
+/// How a [`DatagramWrite`] goes beyond its source and destination.
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub enum WritePath<'a> {
+    /// Nothing more. The backend sends from the source to the destination
+    /// the way it would choose itself. A request to a plain address goes this
+    /// way, and so does a response to a request that arrived without context.
+    Default,
+    /// A response, with the context its request arrived with.
+    ///
+    /// The destination is where SIP sends the response, which need not be
+    /// the address the request came from. Without `rport` it is the port of
+    /// the request's `Via` ([RFC 3261 section 18.2.2]). The backend works out
+    /// the way back to that destination from the context. It must not swap
+    /// the request's addresses, and refuses the write if it cannot reach the
+    /// destination that way.
+    ///
+    /// [RFC 3261 section 18.2.2]: https://www.rfc-editor.org/rfc/rfc3261.html#section-18.2.2
+    Reply(&'a TransportContext),
+    /// A path the application prepared, with the context it named, which
+    /// [`DatagramIo::check_path`] accepted. A request on it, its
+    /// retransmissions and an INVITE's ACK and CANCEL all go this way.
+    Prepared(&'a TransportContext),
+}
+
+/// Context the endpoint keeps for writes it makes later: a received request's,
+/// for its responses, or a prepared path's, for its requests.
+///
+/// The context is a copy of its own, see `TransportContext::detached`, and
+/// the permit charges it to the endpoint's context limits for as long as
+/// anything holds the path.
+#[derive(Debug)]
+#[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+pub(crate) struct Path {
+    pub(crate) context: TransportContext,
+    /// Set on a prepared path. It is boxed, so that the many received
+    /// contexts do not pay for its room.
+    pub(crate) prepared: Option<Box<Prepared>>,
+    pub(crate) _permit: Option<Permit>,
+}
+
+/// What a prepared path fixes besides its context.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+pub(crate) struct Prepared {
+    /// The port and endpoint registration that prepared it. Any other one
+    /// refuses the path.
+    pub(crate) binding: Binding,
+    pub(crate) source: SocketAddr,
+    pub(crate) destination: SocketAddr,
+    /// The address a request on the path names in its `Via`, which need not
+    /// be its source.
+    pub(crate) sent_by: SocketAddr,
+}
+
+/// Names one port and one endpoint registration on it. Both numbers come
+/// from counters that never repeat within the process, so a capability of a
+/// closed port or registration never matches a later one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+pub(crate) struct Binding {
+    pub(crate) port: u64,
+    pub(crate) registration: u64,
+}
+
+#[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+impl Path {
+    /// The bytes a path holds as the context limits count them: its shared
+    /// allocation, the prepared part of a prepared one, and the context's own.
+    pub(crate) fn charge(context: &TransportContext, prepared: bool) -> usize {
+        // Two reference counts precede the value in an `Arc`.
+        let shared = 2 * size_of::<usize>() + size_of::<Path>();
+        let prepared = if prepared { size_of::<Prepared>() } else { 0 };
+        shared + prepared + context.len()
     }
 }
 

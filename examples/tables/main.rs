@@ -182,11 +182,12 @@ async fn main() {
     let mut tasks = Vec::new();
     for _ in 0..in_flight {
         let client = client_end.clone();
+        let target = target.clone();
         tasks.push(tokio::spawn(async move {
             let mut kept = Vec::new();
             for _ in 0..total / in_flight {
                 let (control, mut responses) = client
-                    .start(request(mode.method()), target)
+                    .start(request(mode.method()), target.clone())
                     .await
                     .unwrap()
                     .into_parts();
@@ -199,7 +200,7 @@ async fn main() {
                     client
                         .send_request(
                             ack_for(&response),
-                            target,
+                            target.clone(),
                             ViaMode::Fresh,
                         )
                         .await

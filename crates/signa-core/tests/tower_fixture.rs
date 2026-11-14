@@ -84,7 +84,8 @@ pub struct Exchange<R> {
 
 impl Exchange<Responder> {
     fn new(request: ServerRequest) -> Exchange<Responder> {
-        let ServerRequest { request, flow, transaction } = request;
+        let ServerRequest { request, received, transaction } = request;
+        let flow = received.flow();
         let transaction_id = transaction.id();
         let (responder, events) = transaction.into_parts();
         // The route is cloned before the responder is wrapped, so no wrapper
@@ -448,7 +449,7 @@ where
                             target: cancel.target,
                             exchange: Exchange::new(ServerRequest {
                                 request: cancel.request,
-                                flow: cancel.flow,
+                                received: cancel.received,
                                 transaction: cancel.transaction,
                             }),
                         },

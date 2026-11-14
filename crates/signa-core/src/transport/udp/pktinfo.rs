@@ -167,6 +167,9 @@ fn destination(hdr: &libc::msghdr) -> Option<IpAddr> {
 }
 
 /// Sends `data` to `remote`, from `source` when one is given.
+/// Whether `send` sends from the source it is given, which packet info does.
+pub(super) const NAMES_SOURCE: bool = true;
+
 pub(super) fn send(
     socket: &UdpSocket,
     data: &[u8],

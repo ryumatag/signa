@@ -9,12 +9,15 @@ use tokio::sync::mpsc;
 use super::{
     BindError, Endpoint, Incoming,
     driver::{Driver, TCP_INBOUND},
+    path::next_id,
 };
 use crate::{
     transaction::Timers,
     transport::{
-        MessageLimits, WriteLimits, budget::Budget, datagram::DatagramIo, tcp,
-        udp,
+        MessageLimits, WriteLimits,
+        budget::Budget,
+        datagram::{Binding, DatagramIo},
+        tcp, udp,
     },
 };
 
@@ -103,6 +106,7 @@ pub(super) struct Config {
     pub(super) max_server_response_bytes: usize,
     pub(super) max_responder_bytes: usize,
     pub(super) max_responder_handles: usize,
+    pub(super) context_limits: WriteLimits,
     pub(super) max_outbound_connections: usize,
     pub(super) max_pending_connects: usize,
     pub(super) max_routes: usize,
@@ -145,6 +149,10 @@ impl Default for Config {
             max_server_response_bytes: 64 * 1024 * 1024,
             max_responder_bytes: 64 * 1024 * 1024,
             max_responder_handles: 4096,
+            context_limits: WriteLimits {
+                messages: 8192,
+                bytes: 4 * 1024 * 1024,
+            },
             max_outbound_connections: 1024,
             max_pending_connects: 64,
             max_routes: 4096,
@@ -496,6 +504,38 @@ impl Builder {
         self
     }
 
+    /// Bounds the transport contexts and prepared paths the endpoint keeps.
+    ///
+    /// A UDP backend other than the endpoint's own socket may hand each
+    /// datagram a [`TransportContext`]. The endpoint keeps a copy of a
+    /// request's context for its responses, from admission until the last of
+    /// its envelope, reply route and server transaction drops, and of each
+    /// [`SendPath`] until the last clone and the last transaction sent on it
+    /// drop. A received context counts as one message, and as its length plus
+    /// about 80 bytes of bookkeeping. A path counts about 110 bytes more for
+    /// its addresses. A datagram without context, which is all the socket
+    /// gives, counts nothing. A clone of a context's bytes that the
+    /// application keeps is its own, and is not counted.
+    ///
+    /// New requests and paths leave one quarter of both limits (rounded down)
+    /// for ACKs and matched CANCELs, as new client requests do with the write
+    /// limits. A request whose context does not fit is refused as when
+    /// [`Builder::max_pending_requests`] is full. A stateful endpoint answers
+    /// it with a stateless 503, and a stateless one discards it. An ACK that
+    /// does not fit is discarded and counted, and [`Endpoint::prepare_path`]
+    /// fails with [`Error::is_busy`].
+    ///
+    /// The default is 8192 messages and 4 MiB. Both must be positive.
+    ///
+    /// [`TransportContext`]: crate::transport::datagram::TransportContext
+    /// [`SendPath`]: super::SendPath
+    /// [`Endpoint::prepare_path`]: super::Endpoint::prepare_path
+    /// [`Error::is_busy`]: super::Error::is_busy
+    pub fn context_limits(mut self, limits: WriteLimits) -> Builder {
+        self.config.context_limits = limits;
+        self
+    }
+
     /// Sets how many server transactions may be retained at once.
     ///
     /// The default is 4096. Each tracked request holds an entry until its
@@ -757,6 +797,14 @@ impl Builder {
                 self.config.max_client_handles,
             ),
             (
+                "context_limits.messages must be positive",
+                self.config.context_limits.messages,
+            ),
+            (
+                "context_limits.bytes must be positive",
+                self.config.context_limits.bytes,
+            ),
+            (
                 "client_response_limits.messages must be positive",
                 self.config.client_response_limits.messages,
             ),
@@ -805,6 +853,7 @@ impl Builder {
             .map_err(BindError::io)?;
         let (commands, commands_rx) = mpsc::unbounded_channel();
         let udp_addr = udp.as_ref().map(|io| io.local_addr());
+        let registration = next_id();
         let tcp_addr = listener.as_ref().map(tcp::Listener::local_addr);
         self.config.tcp_listener = tcp_addr;
 
@@ -842,6 +891,11 @@ impl Builder {
             commands,
             udp: udp_addr,
             tcp: tcp_addr,
+            registration,
+            binding: udp_addr
+                .map(|_| Binding { port: next_id(), registration }),
+            context_limits: driver.context_limits(),
+            timers: self.config.timers,
         };
         let incoming = Incoming::new(
             incoming_rx,

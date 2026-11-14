@@ -1049,7 +1049,8 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
     }
 
     fn on_invite(&mut self, request: ServerRequest) {
-        let ServerRequest { request, transaction, flow } = request;
+        let ServerRequest { request, transaction, received } = request;
+        let flow = received.flow();
         // TODO: Watch the server events, for a failed write of the first 2xx
         // and for the end of the transaction. The end would also bound how
         // long a merged INVITE is detected, which is now only while the UA
@@ -1183,7 +1184,8 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
     /// The answer to a BYE in a dialog the UA keeps goes first, see
     /// [`Lane`].
     fn on_other(&mut self, request: ServerRequest) {
-        let ServerRequest { request, transaction, flow } = request;
+        let ServerRequest { request, transaction, received } = request;
+        let flow = received.flow();
         let (responder, _events) = transaction.into_parts();
         let responder = Arc::new(responder);
         let lane = if *request.method() == Method::BYE
@@ -1464,7 +1466,9 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
                 // ran, and nothing is left to record then.
                 if let Some(ack) = self.acks.get_mut(&replay) {
                     ack.sending = false;
-                    ack.target = ack.target.or(target);
+                    if ack.target.is_none() {
+                        ack.target = target;
+                    }
                 }
                 self.model.ack_written(replay, written);
             }
@@ -1899,8 +1903,8 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             return;
         }
 
-        let route = match ack.target {
-            Some(target) => AckRoute::Resend(target),
+        let route = match &ack.target {
+            Some(target) => AckRoute::Resend(target.clone()),
             None => {
                 AckRoute::Resolve(query(ack.next_hop.clone(), &ack.request))
             }
@@ -2292,7 +2296,7 @@ impl Job {
             Job::Ack { replay, route, .. } => Done::Acked {
                 replay: *replay,
                 target: match route {
-                    AckRoute::Resend(target) => Some(*target),
+                    AckRoute::Resend(target) => Some(target.clone()),
                     AckRoute::Resolve(_) => None,
                 },
                 written: false,
@@ -2434,7 +2438,7 @@ impl Job {
                 let via = ViaMode::Branch(branch);
                 let sent = tokio::time::timeout(
                     write,
-                    endpoint.send_request(request, target, via),
+                    endpoint.send_request(request, target.clone(), via),
                 )
                 .await;
                 let written = matches!(sent, Ok(Ok(_)));

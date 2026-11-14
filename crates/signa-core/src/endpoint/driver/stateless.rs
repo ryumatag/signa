@@ -32,6 +32,7 @@ use super::{Driver, Link, identity_bytes, increment};
 use crate::{
     endpoint::{
         admission::request_bytes,
+        path::{ReceiveInfo, retain},
         reply::ReplyRoute,
         routing::{mark_via, reply_flow},
         server::{self, IncomingEvent, ReceivedRequest, ReceivedResponse},
@@ -42,7 +43,7 @@ use crate::{
         request::Request,
         response::Response,
     },
-    transport::Flow,
+    transport::{Flow, datagram::TransportContext},
 };
 
 impl Driver {
@@ -51,6 +52,7 @@ impl Driver {
         &mut self,
         mut request: Request<Bytes>,
         link: Link,
+        context: &TransportContext,
     ) {
         // A request without a readable top Via has no reply path, and one with
         // `maddr` would be answered to a multicast group, which signa does not
@@ -67,7 +69,6 @@ impl Driver {
             *request.headers_mut().get_mut(VIA).expect("found above") = marked;
         }
         let source = link.flow;
-        let link = Link { flow: reply, writer: link.writer };
 
         if self.incoming.is_closed() {
             return;
@@ -97,6 +98,12 @@ impl Driver {
             increment(dropped);
             return;
         };
+        let Some(path) = retain(context, &self.context_limits, control) else {
+            increment(dropped);
+            return;
+        };
+        let link =
+            Link { flow: reply, writer: link.writer, path: path.clone() };
 
         let Some(commands) = self.command_sender.upgrade() else { return };
         let route = if ack {
@@ -119,7 +126,7 @@ impl Driver {
 
         let event = IncomingEvent::StatelessRequest(ReceivedRequest {
             request,
-            flow: source,
+            received: ReceiveInfo::new(source, path),
             reply: route,
         });
         let _ = self
@@ -133,6 +140,7 @@ impl Driver {
         &mut self,
         response: Response<Bytes>,
         flow: Flow,
+        context: &TransportContext,
     ) {
         if self.incoming.is_closed() {
             return;
@@ -142,10 +150,14 @@ impl Driver {
             increment(&self.reception_counters.stateless_responses);
             return;
         };
+        let Some(path) = retain(context, &self.context_limits, false) else {
+            increment(&self.reception_counters.stateless_responses);
+            return;
+        };
 
         let event = IncomingEvent::StatelessResponse(ReceivedResponse {
             response,
-            flow,
+            received: ReceiveInfo::new(flow, path),
         });
         let _ = self.incoming.send(server::Queued { event, _permit: permit });
     }

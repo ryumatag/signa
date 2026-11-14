@@ -22,22 +22,39 @@ use std::{
     hash::{BuildHasher, Hasher},
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
 };
 
 use super::Error;
 use crate::{
     message::header::{HeaderValue, VIA, via::Via},
-    transport::{Flow, Transport, tcp},
+    transport::{Flow, Transport, datagram::Path, tcp},
 };
 
 /// The port `sent-by` means when it names none (RFC 3261 section 18.2.2).
 const DEFAULT_PORT: u16 = 5060;
 
-/// A way to send: the flow, and the connection when the flow is TCP.
+/// A way to send: the flow, the connection when the flow is TCP, and the
+/// backend's path when one was received or prepared.
+///
+/// The path is `None` for TCP and for every datagram of the endpoint's own
+/// socket, so cloning a link costs those nothing more than before.
 #[derive(Clone)]
 pub(super) struct Link {
     pub(super) flow: Flow,
     pub(super) writer: Option<tcp::Writer>,
+    pub(super) path: Option<Arc<Path>>,
+}
+
+impl Link {
+    /// The `sent-by` a request on this link advertises: its prepared path's,
+    /// or [`sent_by`] of its flow.
+    pub(super) fn sent_by(&self, listener: Option<SocketAddr>) -> SocketAddr {
+        match self.path.as_deref().and_then(|path| path.prepared.as_deref()) {
+            Some(prepared) => prepared.sent_by,
+            None => sent_by(&self.flow, listener),
+        }
+    }
 }
 
 /// Makes branches. Each is the magic cookie, a random prefix taken once, and
