@@ -1161,7 +1161,8 @@ mod integration {
         let envelope = request(&mut incoming).await;
         let (responder, mut events) = envelope.transaction.into_parts();
         let mut reply = route_response(&envelope.request);
-        // This fits the byte quotas but exceeds the UDP payload maximum.
+        // This fits the byte quotas but exceeds the UDP payload maximum, so
+        // the port fails it before the socket sees it.
         *reply.body_mut() = Bytes::from(vec![0; 80 * 1024]);
         let submission = responder.respond(reply);
         let operation = submission.id();
@@ -1174,7 +1175,7 @@ mod integration {
             panic!("write failure");
         };
         assert_eq!(failed, Some(operation));
-        assert!(error.raw_os_error().is_some());
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(matches!(
             observe(&mut events).await,
             Some(ServerEvent::Terminated)

@@ -2,8 +2,9 @@
 Transport metadata and message/write limits.
 
 [`Flow`], [`Transport`], [`MessageLimits`] and [`WriteLimits`] are runtime
-independent. Socket I/O and stream framing remain implementation details used
-by the endpoint. TCP connections are framed by Content-Length before messages
+independent, and so is the [`datagram`] contract that lets another backend
+carry an endpoint's UDP datagrams. Socket I/O and stream framing remain
+implementation details used by the endpoint. TCP connections are framed by Content-Length before messages
 reach the driver; UDP datagrams already carry their boundaries.
 */
 
@@ -11,6 +12,7 @@ use std::{fmt, net::SocketAddr};
 
 #[cfg(feature = "tokio")]
 pub(crate) mod budget;
+pub mod datagram;
 
 #[cfg(all(feature = "tokio", feature = "__bench"))]
 #[doc(hidden)]

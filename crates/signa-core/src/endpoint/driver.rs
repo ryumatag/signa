@@ -29,10 +29,13 @@ at the same instant, as input does.
 
 Stopping has two steps. The driver first drops itself apart from what the
 second step needs, which drops the transactions, answers the waiting futures
-with a closed error and closes the sockets. It then moves its TCP tasks to
-[`tcp::Phase::Closing`], or to [`tcp::Phase::Abort`] when it was forced, and
-waits for them all to end, still bounded by the deadline. Only then does it
-publish the [`ShutdownOutcome`]. Waiting there is fine, since nothing else is
+with a closed error and closes the TCP listener. It then moves its TCP tasks
+to [`tcp::Phase::Closing`], or to [`tcp::Phase::Abort`] when it was forced,
+and waits for them all to end. The UDP port meanwhile writes what it holds,
+then closes its backend, which fails what it still has. Both are bounded by
+the deadline, which aborts the TCP tasks and drops the UDP writes the backend
+never took. A backend still closing then gets one more poll and is dropped.
+Only then does it publish the [`ShutdownOutcome`]. Waiting there is fine, since nothing else is
 left for the driver to do.
 */
 
@@ -66,7 +69,7 @@ use crate::{
             CancelError, CancelHandle, CancelOutcome, Delivery, Intent,
             Observation, Reserved, Starting, Target,
         },
-        datagram::Datagram,
+        datagram::Port,
         error::Error,
         reply::{Admission, Completion, ReplyError, ReplyRoute},
         routing::{
@@ -96,7 +99,10 @@ use crate::{
         key::{ClientKey, ServerKey},
         non_invite::{ClientEvent, ClientTransaction, ServerTransaction},
     },
-    transport::{Flow, Transport, WriteLimits, budget::Budget, tcp, udp},
+    transport::{
+        Flow, Transport, WriteLimits, budget::Budget, datagram::DatagramIo,
+        tcp,
+    },
 };
 
 mod cancels;
@@ -486,13 +492,16 @@ pub(super) struct ConnectionCounters {
     pub(super) dropped: AtomicU64,
 }
 
-/// Messages the receive path discarded for want of capacity, shared with
-/// endpoint handles. See `Endpoint::reception_stats`.
+/// Messages the receive path discarded for want of capacity, and datagrams
+/// the UDP backend could not deliver whole, shared with endpoint handles. See
+/// `Endpoint::reception_stats`.
 #[derive(Default, Debug)]
 pub(super) struct ReceptionCounters {
     pub(super) acks: AtomicU64,
     pub(super) stateless_requests: AtomicU64,
     pub(super) stateless_responses: AtomicU64,
+    pub(super) truncated_datagrams: AtomicU64,
+    pub(super) receive_errors: AtomicU64,
 }
 
 pub(super) fn increment(counter: &AtomicU64) {
@@ -566,19 +575,62 @@ struct Stopping {
     /// once every handle that could make one is gone.
     control: Option<mpsc::Receiver<()>>,
     sleep: Option<Pin<Box<Sleep>>>,
+    /// The UDP backend until it has closed.
+    udp: Option<Port>,
+    /// Set once the UDP writes have drained or been aborted, and the backend
+    /// is closing.
+    udp_closing: bool,
+    /// Set once the deadline has passed. A backend still closing then gets
+    /// one more poll before it is dropped.
+    udp_overdue: bool,
+    /// Set when shutdown lost a UDP write, or dropped a backend that had not
+    /// finished closing.
+    udp_lost: bool,
 }
 
 impl Stopping {
-    /// Waits for the transport tasks to end, aborting them at the deadline.
+    /// Waits for the transport tasks to end and the UDP backend to close,
+    /// aborting both at the deadline.
     ///
-    /// The tasks are checked before the deadline, so tasks that have ended by
-    /// the poll that sees the deadline are not aborted.
+    /// They are checked before the deadline, so work that has ended by the
+    /// poll that sees the deadline is not aborted.
     async fn join(&mut self) {
-        let Stopping { tasks, shutdown, control, sleep, .. } = self;
+        let Stopping {
+            tasks,
+            shutdown,
+            control,
+            sleep,
+            udp,
+            udp_closing,
+            udp_overdue,
+            udp_lost,
+            ..
+        } = self;
         let mut finished = pin!(tasks.finished());
+        let mut tasks_done = false;
         poll_fn(|cx| {
             loop {
-                if finished.as_mut().poll(cx).is_ready() {
+                if !tasks_done && finished.as_mut().poll(cx).is_ready() {
+                    tasks_done = true;
+                }
+                if let Some(port) = udp {
+                    if !*udp_closing && port.poll_drain(cx).is_ready() {
+                        *udp_closing = true;
+                    }
+                    if *udp_closing {
+                        if port.poll_close(cx).is_ready() {
+                            *udp_lost |= port.lost();
+                            *udp = None;
+                        } else if *udp_overdue {
+                            // Waiting longer would let a stuck backend hold
+                            // the shutdown forever. Dropping it is the last
+                            // say the endpoint has over its tasks.
+                            *udp_lost = true;
+                            *udp = None;
+                        }
+                    }
+                }
+                if tasks_done && udp.is_none() {
                     return Poll::Ready(());
                 }
                 if let Some(receiver) = control {
@@ -604,6 +656,13 @@ impl Stopping {
                 if let Some(deadline) = sleep {
                     if deadline.as_mut().poll(cx).is_ready() {
                         tasks.advance(tcp::Phase::Abort);
+                        if let Some(port) = udp {
+                            if !*udp_closing {
+                                port.abort();
+                                *udp_closing = true;
+                            }
+                        }
+                        *udp_overdue = true;
                         *sleep = None;
                         continue;
                     }
@@ -653,7 +712,7 @@ pub(super) struct Driver {
     /// holds the sender for them.
     internal: mpsc::UnboundedReceiver<Command>,
     internal_tx: mpsc::UnboundedSender<Command>,
-    udp: Option<Datagram>,
+    udp: Option<Port>,
     tcp: mpsc::Receiver<tcp::Inbound>,
     /// For the connections the driver opens.
     tcp_tx: mpsc::Sender<tcp::Inbound>,
@@ -722,7 +781,7 @@ impl Driver {
     pub(super) fn new(
         incoming: mpsc::UnboundedSender<server::Queued>,
         config: Config,
-        udp: Option<udp::Socket>,
+        udp: Option<Box<dyn DatagramIo>>,
         tcp: mpsc::Receiver<tcp::Inbound>,
         tcp_tx: mpsc::Sender<tcp::Inbound>,
         commands: mpsc::UnboundedReceiver<Command>,
@@ -730,6 +789,7 @@ impl Driver {
         tasks: tcp::Tasks,
     ) -> Driver {
         let (internal_tx, internal) = mpsc::unbounded_channel();
+        let reception_counters = Arc::<ReceptionCounters>::default();
         let (control, control_rx) = mpsc::channel(32);
         let (drop_sender, drops) = mpsc::unbounded_channel();
 
@@ -775,8 +835,13 @@ impl Driver {
             commands,
             internal,
             internal_tx,
-            udp: udp
-                .map(|socket| Datagram::new(socket, config.udp_write_limits)),
+            udp: udp.map(|io| {
+                Port::new(
+                    io,
+                    config.udp_write_limits,
+                    reception_counters.clone(),
+                )
+            }),
             tcp,
             tcp_tx,
             config,
@@ -820,7 +885,7 @@ impl Driver {
             control_routes: Budget::new(config.control_event_limits),
             reserved_cancels: 0,
             stateless_responses: Budget::new(config.client_response_budget),
-            reception_counters: Arc::default(),
+            reception_counters,
         }
     }
 
@@ -950,14 +1015,21 @@ impl Driver {
             End::Drained | End::Expired => self.timers.shutdown_deadline(),
         };
         let mut stopping = self.into_stopping(deadline);
+        if let (End::Expired, Some(port)) = (&end, &mut stopping.udp) {
+            port.abort();
+            stopping.udp_closing = true;
+            stopping.udp_overdue = true;
+        }
 
         stopping.join().await;
 
         // The deadline can stop a task that was still closing. That is still
         // a drain unless it dropped output, which only a writer has. A writer
-        // aborted with reservations out records it in `discarded`.
-        let drained =
-            matches!(end, End::Drained) && !stopping.tasks.discarded();
+        // aborted with reservations out records it in `discarded`, and the
+        // UDP port in `udp_lost`.
+        let drained = matches!(end, End::Drained)
+            && !stopping.tasks.discarded()
+            && !stopping.udp_lost;
         stopping.done.send_replace(Some(if drained {
             ShutdownOutcome::Drained
         } else {
@@ -973,6 +1045,7 @@ impl Driver {
             shutdown_control,
             control_rx,
             mut sleep,
+            udp,
             ..
         } = self;
         if let Some(at) = deadline {
@@ -985,6 +1058,10 @@ impl Driver {
             shutdown: shutdown_control,
             control: Some(control_rx),
             sleep: deadline.map(|_| sleep),
+            udp,
+            udp_closing: false,
+            udp_overdue: false,
+            udp_lost: false,
         }
     }
 
@@ -1130,22 +1207,15 @@ impl Driver {
                 4 => {
                     let receive = if let Some(udp) = &mut self.udp {
                         udp.poll_flush(cx);
-                        match udp.poll_recv(cx) {
-                            Poll::Ready(Ok((bytes, flow))) => {
-                                Poll::Ready(Some(Event::Datagram(bytes, flow)))
-                            }
-                            Poll::Ready(Err(_)) => {
-                                cx.waker().wake_by_ref();
-                                Poll::Pending
-                            }
-                            Poll::Pending => Poll::Pending,
-                        }
+                        udp.poll_recv(cx).map(|(bytes, flow)| {
+                            Some(Event::Datagram(bytes, flow))
+                        })
                     } else {
                         Poll::Pending
                     };
 
                     while let Some(shared) =
-                        self.udp.as_mut().and_then(Datagram::take_failure)
+                        self.udp.as_mut().and_then(Port::take_failure)
                     {
                         self.fail_observed(&shared);
                     }
@@ -3068,7 +3138,7 @@ impl ClientReceipt {
 /// Sends a client request and returns a receipt when its write is queued.
 /// A full TCP queue is reported as `WouldBlock`.
 fn send_client(
-    udp: Option<&mut Datagram>,
+    udp: Option<&mut Port>,
     link: &Link,
     bytes: &Bytes,
     initial: bool,
@@ -3096,7 +3166,7 @@ fn send_client(
 /// Over TCP a full write queue is an error here. The connection is in trouble,
 /// and a transaction that retransmits will try again.
 fn send_on(
-    udp: Option<&mut Datagram>,
+    udp: Option<&mut Port>,
     link: &Link,
     bytes: &Bytes,
     new_request: bool,

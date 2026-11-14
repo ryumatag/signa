@@ -77,3 +77,8 @@ required-features = ["tokio"]
 [[test]]
 name = "reply_routing"
 required-features = ["tokio"]
+
+# An endpoint on an in-memory UDP backend, through the public API.
+[[test]]
+name = "external_datagram"
+required-features = ["tokio"]

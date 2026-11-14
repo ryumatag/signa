@@ -19,9 +19,12 @@ The datagrams signa sends are small enough to fragment rather than to refuse.
 Nothing here sets the don't-fragment bit, and a datagram above the MTU goes out
 in pieces, as RFC 3261 section 18.1.1 allows for the replies that have no other
 way back.
+
+[`Io`] is the socket as the endpoint's [`DatagramIo`] backend.
 */
 
 use std::{
+    collections::VecDeque,
     future::poll_fn,
     io,
     net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6},
@@ -31,7 +34,13 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use tokio::{io::Interest, net::UdpSocket};
 
-use super::{Flow, Transport};
+use super::{
+    Flow, Transport,
+    datagram::{
+        Capabilities, Datagram, DatagramIo, DatagramWrite, RecvError, Submit,
+        WriteId,
+    },
+};
 
 #[cfg(any(
     target_os = "linux",
@@ -231,6 +240,103 @@ impl Socket {
         };
 
         (remote, source)
+    }
+}
+
+/// The socket as a [`DatagramIo`] backend.
+///
+/// A send happens in [`DatagramIo::poll_submit`]. One the kernel takes is
+/// accepted and complete, and one it refuses is rejected with its error, so
+/// [`DatagramIo::poll_complete`] only hands back what the last submissions
+/// accepted. Nothing is ever outstanding when the endpoint closes it.
+#[derive(Debug)]
+pub struct Io {
+    socket: Socket,
+    buf: BytesMut,
+    done: VecDeque<WriteId>,
+}
+
+impl Io {
+    /// Wraps a bound socket.
+    pub fn new(socket: Socket) -> Io {
+        Io { socket, buf: BytesMut::new(), done: VecDeque::new() }
+    }
+}
+
+impl DatagramIo for Io {
+    fn local_addr(&self) -> SocketAddr {
+        self.socket.local_addr()
+    }
+
+    /// The largest UDP payload of the socket's address family: 65507 bytes
+    /// over IPv4 and 65527 over IPv6 without jumbograms.
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::new(match self.socket.local_addr() {
+            SocketAddr::V4(_) => 65_507,
+            SocketAddr::V6(_) => 65_527,
+        })
+    }
+
+    // The read buffer always has room for `MAX_DATAGRAM` bytes, more than any
+    // UDP payload, so a datagram is never truncated.
+    fn poll_recv(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Datagram, RecvError>> {
+        let (payload, flow) =
+            ready!(self.socket.poll_recv(cx, &mut self.buf))?;
+        Poll::Ready(Ok(Datagram::new(payload, flow.remote, flow.local)))
+    }
+
+    fn poll_submit(
+        &mut self,
+        cx: &mut Context<'_>,
+        write: DatagramWrite,
+    ) -> Submit {
+        let flow = Flow {
+            transport: Transport::Udp,
+            local: write.source(),
+            remote: write.destination(),
+        };
+        // `try_send` fails at once until the reactor has seen the socket
+        // writable, and a send can race readiness being cleared. A second
+        // round settles both. A third would only spin.
+        for _ in 0..2 {
+            match self.socket.try_send(write.payload(), &flow) {
+                Ok(()) => {
+                    self.done.push_back(write.id());
+                    return Submit::Accepted;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Submit::Rejected(write, error),
+            }
+            match self.socket.poll_send_ready(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => {
+                    return Submit::Rejected(write, error);
+                }
+                Poll::Pending => return Submit::Pending(write),
+            }
+        }
+
+        cx.waker().wake_by_ref();
+        Submit::Pending(write)
+    }
+
+    // The endpoint collects completions right after each submission, so an
+    // empty queue stays empty until the next one and needs no waker.
+    fn poll_complete(
+        &mut self,
+        _cx: &mut Context<'_>,
+    ) -> Poll<(WriteId, io::Result<()>)> {
+        match self.done.pop_front() {
+            Some(id) => Poll::Ready((id, Ok(()))),
+            None => Poll::Pending,
+        }
+    }
+
+    fn poll_close(&mut self, _cx: &mut Context<'_>) -> Poll<()> {
+        Poll::Ready(())
     }
 }
 
