@@ -21,7 +21,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
-    task::{Context, Poll, Waker, ready},
+    task::{Context, Poll, ready},
     time::Duration,
 };
 
@@ -49,6 +49,11 @@ use crate::{
         udp, unmap,
     },
 };
+
+mod writes;
+
+pub(super) use writes::WritePermit;
+use writes::{Admission, WriteAdmission};
 
 /// How many commands or datagrams the port's task handles before it lets
 /// the runtime run other tasks.
@@ -291,8 +296,7 @@ impl PortBuilder {
             max_registrations: self.max_registrations,
             phase: AtomicU8::new(OPEN),
             lifecycle: Mutex::new(0),
-            writes: Budget::new(self.write_limits),
-            waiters: Mutex::new(HashMap::new()),
+            writes: WriteAdmission::new(self.write_limits),
             ingress: Budget::new(self.ingress_limits),
             context_limits: Budget::new(self.context_limits),
             stats: Counters::default(),
@@ -435,6 +439,11 @@ fn open(backend: Option<Backend>) -> Result<Box<dyn DatagramIo>, BindError> {
 ///   port's limits full waits. A raw send is refused once three quarters of
 ///   them are taken, so that endpoints keep room for their responses.
 ///
+/// The endpoints waiting for room are woken together as it frees up, and race
+/// for it. The limits bound how much they contend for, but the port promises
+/// no endpoint a share of them or a bound on its wait, and the quarter that
+/// raw sends leave is the endpoints' together, not each one's.
+///
 /// # Shutdown
 ///
 /// Stopping takes three steps, in this order:
@@ -484,11 +493,9 @@ struct Shared {
     /// The registered endpoints. A registration checks the phase and joins
     /// under this lock, so that none slips past a quiesce or a close.
     lifecycle: Mutex<usize>,
-    /// The port-wide write limits, which endpoints and raw sends share.
-    writes: Budget,
-    /// Endpoints whose write found `writes` full, by registration, to wake
-    /// when a write ends. One waker each, the latest.
-    waiters: Mutex<HashMap<u64, Waker>>,
+    /// The port-wide write limits, which endpoints and raw sends share, with
+    /// the endpoints waiting for room in them.
+    writes: WriteAdmission,
     ingress: Budget,
     context_limits: Budget,
     stats: Counters,
@@ -505,46 +512,17 @@ impl Shared {
         self.phase() == CLOSING
     }
 
+    /// Moves the port on to `phase`, never back. Closing also closes the
+    /// write limits, which wakes the endpoints waiting for room.
     fn set_phase(&self, phase: u8) {
-        let _lifecycle = self.lifecycle.lock().expect("not poisoned");
-        if self.phase() < phase {
-            self.phase.store(phase, Ordering::Release);
-        }
-    }
-
-    /// Takes a share of the port's write limits, or leaves `waker` to be
-    /// woken when a write ends.
-    fn admit(
-        &self,
-        registration: u64,
-        len: usize,
-        waker: &Waker,
-    ) -> Option<Permit> {
-        if let Some(permit) = self.writes.acquire(len) {
-            return Some(permit);
-        }
-        // The waker goes in, and the budget is tried again, under the lock
-        // that a release takes before it wakes anyone. A release either
-        // comes before the second try, which then sees its room, or wakes
-        // this waker after. A flag read outside the lock could miss it, as
-        // the budget's counters are relaxed.
-        let mut waiters = self.waiters.lock().expect("not poisoned");
-        match self.writes.acquire(len) {
-            Some(permit) => Some(permit),
-            None => {
-                waiters.insert(registration, waker.clone());
-                None
+        {
+            let _lifecycle = self.lifecycle.lock().expect("not poisoned");
+            if self.phase() < phase {
+                self.phase.store(phase, Ordering::Release);
             }
         }
-    }
-
-    /// Wakes every endpoint waiting for room in the port's write limits.
-    /// Fairness among them is not promised. Each tries again when it runs.
-    fn wake_waiters(&self) {
-        let waiters =
-            mem::take(&mut *self.waiters.lock().expect("not poisoned"));
-        for waker in waiters.into_values() {
-            waker.wake();
+        if phase == CLOSING {
+            self.writes.close();
         }
     }
 }
@@ -573,13 +551,13 @@ enum Command {
     Write {
         registration: u64,
         write: DatagramWrite,
-        permit: Permit,
+        permit: WritePermit,
     },
     Raw {
         payload: Bytes,
         path: Arc<Path>,
         done: oneshot::Sender<io::Result<()>>,
-        permit: Permit,
+        permit: WritePermit,
     },
     CheckPath {
         path: Path,
@@ -855,7 +833,11 @@ fn submit_raw(
     // that a busy forwarder cannot hold back their responses and
     // retransmissions. This is my policy, as the endpoint's own reserve for
     // transaction output is.
-    let permit = shared.writes.acquire_request(len).ok_or_else(Error::busy)?;
+    let permit = match shared.writes.admit_raw(len) {
+        Admission::Admitted(permit) => permit,
+        Admission::Full => return Err(Error::busy()),
+        Admission::Closed => return Err(Error::closed()),
+    };
 
     let (done, receipt) = oneshot::channel();
     commands
@@ -963,13 +945,16 @@ impl DatagramIo for Proxy {
         if self.shared.closing() || self.state.closed.load(Ordering::Acquire) {
             return Submit::Rejected(write, closing_error());
         }
-        let Some(permit) = self.shared.admit(
-            self.registration,
-            write.payload().len(),
-            cx.waker(),
-        ) else {
-            return Submit::Pending(write);
-        };
+        let len = write.payload().len();
+        let permit =
+            match self.shared.writes.admit(self.registration, len, cx.waker())
+            {
+                Admission::Admitted(permit) => permit,
+                Admission::Full => return Submit::Pending(write),
+                Admission::Closed => {
+                    return Submit::Rejected(write, closing_error());
+                }
+            };
         let command =
             Command::Write { registration: self.registration, write, permit };
         match self.commands.send(command) {
@@ -1130,11 +1115,10 @@ impl PortTask {
                 let _ = done.send(());
             }
             Command::Write { registration, write, permit } => {
+                // The permit of a write whose endpoint has gone returns its
+                // room as it drops.
                 if self.registrations.contains_key(&registration) {
                     self.port.submit_routed(write, registration, permit);
-                } else {
-                    drop(permit);
-                    self.shared.wake_waiters();
                 }
             }
             Command::Raw { payload, path, done, permit } => {
@@ -1160,11 +1144,7 @@ impl PortTask {
         if self.registrations.remove(&registration).is_some() {
             *self.shared.lifecycle.lock().expect("not poisoned") -= 1;
         }
-        self.shared
-            .waiters
-            .lock()
-            .expect("not poisoned")
-            .remove(&registration);
+        self.shared.writes.forget(registration);
     }
 
     /// Passes the outcomes of finished writes to their endpoints. An
@@ -1176,9 +1156,6 @@ impl PortTask {
             if let Some(completions) = self.registrations.get(&registration) {
                 let _ = completions.send((local, result));
             }
-        }
-        if self.port.take_released() {
-            self.shared.wake_waiters();
         }
     }
 
@@ -1219,11 +1196,10 @@ impl PortTask {
     /// Drains what the port admitted until `deadline`, then closes the
     /// backend, as an endpoint's driver closes its own.
     async fn close(&mut self, deadline: Instant) -> ShutdownOutcome {
+        // An endpoint waiting for room in the limits is woken, tries again
+        // and finds the port closing.
         self.shared.set_phase(CLOSING);
         self.ingress = None;
-        // An endpoint waiting for room in the limits tries again and finds
-        // the port closing.
-        self.shared.wake_waiters();
         let mut sleep = Box::pin(sleep_until(deadline));
         let mut closing = false;
         let mut overdue = false;
@@ -1287,7 +1263,6 @@ impl PortTask {
             }
         }
         self.route();
-        self.shared.wake_waiters();
 
         if lost {
             ShutdownOutcome::DeadlineExpired
@@ -1308,7 +1283,6 @@ impl PortTask {
             }
             Command::Write { registration, write, permit } => {
                 drop(permit);
-                self.shared.wake_waiters();
                 if let Some(completions) =
                     self.registrations.get(&registration)
                 {

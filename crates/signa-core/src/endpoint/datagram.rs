@@ -33,13 +33,13 @@ use tokio::sync::oneshot;
 
 use super::{
     driver::{ReceptionCounters, increment},
+    port::WritePermit,
     reply::{Completion, ReplyError},
     routing::Link,
     server::WriteObservation,
 };
 use crate::transport::{
     Flow, Transport, WriteLimits,
-    budget::Permit,
     datagram::{
         DatagramIo, DatagramWrite, Path, RecvError, Submit, TransportContext,
         WriteId,
@@ -79,9 +79,6 @@ pub(super) struct Port {
     /// Outcomes of shared port writes for the port task to pass on to their
     /// registrations, see [`Outcome::Registration`].
     routed: VecDeque<(u64, WriteId, io::Result<()>)>,
-    /// Set when a write that held a share of a shared port's write limits
-    /// ended, so that the port task wakes the endpoints waiting for one.
-    released: bool,
 }
 
 /// A write waiting for the backend to accept it.
@@ -107,10 +104,11 @@ enum Outcome {
     /// A client request whose failure ends its transaction.
     Client(oneshot::Sender<io::Result<()>>),
     /// A write of an endpoint registered on a shared port, by its own ID.
-    /// The permit is its share of the port's write limits.
-    Registration { registration: u64, local: WriteId, _permit: Permit },
+    /// The permit is its share of the port's write limits, which returns its
+    /// room and wakes the endpoints waiting for it when the outcome drops.
+    Registration { registration: u64, local: WriteId, _permit: WritePermit },
     /// A raw send through a shared port.
-    Raw { done: oneshot::Sender<io::Result<()>>, _permit: Permit },
+    Raw { done: oneshot::Sender<io::Result<()>>, _permit: WritePermit },
 }
 
 /// How a write went when [`Port::start`] returned.
@@ -144,7 +142,6 @@ impl Port {
             counters,
             lost: false,
             routed: VecDeque::new(),
-            released: false,
         }
     }
 
@@ -463,11 +460,9 @@ impl Port {
             }
             Outcome::Registration { registration, local, _permit } => {
                 self.routed.push_back((registration, local, result));
-                self.released = true;
             }
             Outcome::Raw { done, _permit } => {
                 let _ = done.send(result);
-                self.released = true;
             }
         }
     }
@@ -482,7 +477,7 @@ impl Port {
         &mut self,
         write: DatagramWrite,
         registration: u64,
-        permit: Permit,
+        permit: WritePermit,
     ) {
         let (local, bytes, source, destination, path) = write.into_parts();
         let outcome =
@@ -499,7 +494,7 @@ impl Port {
         bytes: Bytes,
         path: Arc<Path>,
         done: oneshot::Sender<io::Result<()>>,
-        permit: Permit,
+        permit: WritePermit,
     ) {
         let prepared = path.prepared.as_deref().expect("a prepared path");
         let (source, destination) = (prepared.source, prepared.destination);
@@ -527,12 +522,6 @@ impl Port {
         &mut self,
     ) -> Option<(u64, WriteId, io::Result<()>)> {
         self.routed.pop_front()
-    }
-
-    /// Returns `true`, once, after a write that held a share of a shared
-    /// port's write limits ended.
-    pub(super) fn take_released(&mut self) -> bool {
-        mem::take(&mut self.released)
     }
 
     /// Fails the writes of `registration` the backend has not accepted, as
@@ -650,11 +639,9 @@ impl Port {
         match outcome {
             Outcome::Registration { registration, local, _permit } => {
                 self.routed.push_back((registration, local, Err(error())));
-                self.released = true;
             }
             Outcome::Raw { done, _permit } if !offered => {
                 let _ = done.send(Err(error()));
-                self.released = true;
             }
             outcome => drop(outcome),
         }

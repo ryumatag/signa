@@ -2590,6 +2590,41 @@ async fn endpoints_wait_for_room_in_the_port_s_limits() {
     assert!(from_b.await.unwrap().is_ok());
 }
 
+// A raw send refused for room takes none of it, not even for a moment. An
+// endpoint waiting while one is refused goes out as soon as the write ahead
+// of it ends, with no other traffic to wake it.
+#[tokio::test]
+async fn a_refused_raw_send_does_not_hold_back_a_waiting_endpoint() {
+    let wire = Wire::default();
+    let (port, _ingress) = DatagramPort::builder()
+        .udp_io(wire.clone())
+        .write_limits(WriteLimits { messages: 1, bytes: 1472 })
+        .intercept()
+        .unwrap();
+    let (a, _a_incoming) = Endpoint::builder().port(&port).bind().unwrap();
+    let (b, _b_incoming) = Endpoint::builder().port(&port).bind().unwrap();
+    let upstream = upstream(&port).await;
+    // Over the three quarters of 1472 bytes that raw sends may take.
+    let large = Bytes::from(vec![b'x'; 1200]);
+
+    let refused = port.send_bytes(large.clone(), &upstream);
+    assert!(refused.unwrap_err().is_busy());
+    wire.writes(Writes::Delay);
+    let from_a = send_options(&a, "a");
+    wire.sent(1).await;
+    let from_b = send_options(&b, "b");
+    sleep(Duration::from_millis(20)).await;
+    let refused = port.send_bytes(large, &upstream);
+    assert!(refused.unwrap_err().is_busy());
+    assert_eq!(wire.count(), 1);
+
+    wire.finish(Ok(()));
+    wire.sent(2).await;
+    wire.finish(Ok(()));
+    assert!(from_a.await.unwrap().is_ok());
+    assert!(from_b.await.unwrap().is_ok());
+}
+
 // The same with endpoints on several threads at once, where a waiter and a
 // release race. Every write still goes out and reports back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
