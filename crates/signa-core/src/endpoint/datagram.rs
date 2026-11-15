@@ -33,6 +33,7 @@ use tokio::sync::oneshot;
 
 use super::{
     driver::{ReceptionCounters, increment, now},
+    observe::{self, Note, Tap, WriteResult},
     port::{Withdrawal, WritePermit},
     reply::{Completion, ReplyError},
     routing::Link,
@@ -74,6 +75,10 @@ pub(super) struct Port {
     awaited_result: Option<WriteOutcome>,
     counters: Arc<ReceptionCounters>,
     stamps: Stamps,
+    /// The observer's tap, while one is attached.
+    tap: Option<Tap>,
+    /// Names this port's writes in observation records.
+    domain: u64,
     /// Set when shutdown lost a write: one the backend never took, one it
     /// failed while closing, or one it left unreported.
     lost: bool,
@@ -160,6 +165,8 @@ impl Port {
             awaited_result: None,
             counters,
             stamps,
+            tap: None,
+            domain: crate::transport::next_id(),
             lost: false,
             routed: VecDeque::new(),
         }
@@ -172,6 +179,48 @@ impl Port {
     /// Returns `true` when no write is queued or outstanding.
     pub(super) fn is_idle(&self) -> bool {
         self.writes == 0
+    }
+
+    /// Records this port's writes into `tap` from now on.
+    pub(super) fn observe(&mut self, tap: Tap) {
+        self.tap = Some(tap);
+    }
+
+    /// Records the start of write `id` from `source` to `destination`.
+    fn started(
+        &mut self,
+        id: WriteId,
+        source: SocketAddr,
+        destination: SocketAddr,
+        note: Option<Note>,
+        bytes: &Bytes,
+    ) {
+        let (Some(note), Some(tap)) = (note, observe::attached(&mut self.tap))
+        else {
+            return;
+        };
+        let flow = Flow {
+            transport: Transport::Udp,
+            local: source,
+            remote: destination,
+        };
+        let write = observe::datagram_write(self.domain, id);
+        tap.started(write, flow, note, bytes);
+    }
+
+    /// Records that the backend took write `id`.
+    fn accepted(&mut self, id: WriteId) {
+        if let Some(tap) = observe::attached(&mut self.tap) {
+            tap.accepted(observe::datagram_write(self.domain, id));
+        }
+    }
+
+    /// Records how write `id` ended.
+    fn ended(&mut self, id: WriteId, result: &WriteOutcome, accepted: bool) {
+        if let Some(tap) = observe::attached(&mut self.tap) {
+            let write = observe::datagram_write(self.domain, id);
+            tap.ended(write, WriteResult::from(result), accepted);
+        }
     }
 
     // Only the driver owns this quota. It does not await between checking
@@ -203,6 +252,7 @@ impl Port {
         bytes: Bytes,
         link: &Link,
         limits: WriteLimits,
+        note: Note,
     ) -> Started {
         // Cloning the path is a reference count, and only for a backend that
         // gave context. The socket's links have none.
@@ -213,13 +263,20 @@ impl Port {
             link.path.clone(),
             limits,
             None,
+            Some(note),
         )
     }
 
     /// As [`Port::start`], for a write named by its addresses and path.
     ///
     /// A write of an endpoint on a shared port passes `gate`, so that it
-    /// does not reach the backend once the endpoint has withdrawn.
+    /// does not reach the backend once the endpoint has withdrawn. A write
+    /// with a `note` is recorded for an attached observer.
+    ///
+    /// The write takes its ID before the checks, so that one they refuse is
+    /// recorded under an ID of its own. The backend sees a gap in the IDs,
+    /// which it never relies on.
+    #[allow(clippy::too_many_arguments)]
     fn start_parts(
         &mut self,
         bytes: Bytes,
@@ -228,20 +285,26 @@ impl Port {
         path: Option<Arc<Path>>,
         limits: WriteLimits,
         gate: Option<&Withdrawal>,
+        note: Option<Note>,
     ) -> Started {
-        let len = bytes.len();
-        if len > self.max_payload {
-            return Started::Done(WriteOutcome::NotWritten(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "the datagram is larger than the UDP backend sends",
-            )));
-        }
-        if let Err(error) = self.admit(len, limits) {
-            return Started::Done(WriteOutcome::NotWritten(error));
-        }
-
         let id = WriteId::new(self.next_id);
         self.next_id += 1;
+        self.started(id, source, destination, note, &bytes);
+        let len = bytes.len();
+        let refused = if len > self.max_payload {
+            Some(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the datagram is larger than the UDP backend sends",
+            ))
+        } else {
+            self.admit(len, limits).err()
+        };
+        if let Some(error) = refused {
+            let outcome = WriteOutcome::NotWritten(error);
+            self.ended(id, &outcome, false);
+            return Started::Done(outcome);
+        }
+
         self.writes += 1;
         self.bytes += len;
         let write = DatagramWrite::new(id, bytes, source, destination, path);
@@ -254,10 +317,13 @@ impl Port {
         let mut cx = Context::from_waker(Waker::noop());
         let Some(submitted) = self.offer(&mut cx, write, gate) else {
             self.release(len);
-            return Started::Done(WriteOutcome::NotWritten(withdrawn()));
+            let outcome = WriteOutcome::NotWritten(withdrawn());
+            self.ended(id, &outcome, false);
+            return Started::Done(outcome);
         };
         match submitted {
             Submit::Accepted => {
+                self.accepted(id);
                 self.awaited = Some((id, len));
                 self.collect(&mut cx);
                 if let Some(result) = self.awaited_result.take() {
@@ -278,7 +344,9 @@ impl Port {
             Submit::Rejected(write, error) => {
                 drop(write);
                 self.release(len);
-                Started::Done(WriteOutcome::NotWritten(error))
+                let outcome = WriteOutcome::NotWritten(error);
+                self.ended(id, &outcome, false);
+                Started::Done(outcome)
             }
         }
     }
@@ -313,8 +381,9 @@ impl Port {
         &mut self,
         bytes: &Bytes,
         link: &Link,
+        note: Note,
     ) -> io::Result<()> {
-        match self.start(bytes.clone(), link, self.limits) {
+        match self.start(bytes.clone(), link, self.limits, note) {
             Started::Done(outcome) => failure(outcome),
             Started::Waiting(_) => Ok(()),
         }
@@ -326,9 +395,10 @@ impl Port {
         &mut self,
         bytes: &Bytes,
         link: &Link,
+        note: Note,
     ) -> io::Result<()> {
         let limits = crate::transport::budget::request_limits(self.limits);
-        match self.start(bytes.clone(), link, limits) {
+        match self.start(bytes.clone(), link, limits, note) {
             Started::Done(outcome) => failure(outcome),
             Started::Waiting(_) => Ok(()),
         }
@@ -341,13 +411,14 @@ impl Port {
         bytes: &Bytes,
         link: &Link,
         initial: bool,
+        note: Note,
     ) -> io::Result<Option<oneshot::Receiver<WriteOutcome>>> {
         let limits = if initial {
             crate::transport::budget::request_limits(self.limits)
         } else {
             self.limits
         };
-        match self.start(bytes.clone(), link, limits) {
+        match self.start(bytes.clone(), link, limits, note) {
             Started::Done(outcome) => failure(outcome).map(|()| None),
             Started::Waiting(id) => {
                 let (done, receipt) = oneshot::channel();
@@ -363,8 +434,9 @@ impl Port {
         bytes: Bytes,
         link: &Link,
         completion: Completion,
+        note: Note,
     ) {
-        match self.start(bytes, link, self.limits) {
+        match self.start(bytes, link, self.limits, note) {
             // Only the endpoint's own write limits refuse with `WouldBlock`.
             Started::Done(WriteOutcome::NotWritten(error))
                 if error.kind() == io::ErrorKind::WouldBlock =>
@@ -388,9 +460,10 @@ impl Port {
         bytes: Bytes,
         link: &Link,
         observation: WriteObservation,
+        note: Note,
     ) {
         debug_assert!(self.admit_response(bytes.len()).is_ok());
-        match self.start(bytes, link, self.limits) {
+        match self.start(bytes, link, self.limits, note) {
             Started::Done(outcome) => observation.complete(outcome),
             Started::Waiting(id) => {
                 self.attach(id, Outcome::Server(observation));
@@ -419,11 +492,14 @@ impl Port {
             // again, since the endpoint may have stopped while it waited.
             let Some(submitted) = self.offer(cx, write, gate(&outcome)) else {
                 self.release(len);
-                self.finish(outcome, WriteOutcome::NotWritten(withdrawn()));
+                let result = WriteOutcome::NotWritten(withdrawn());
+                self.ended(id, &result, false);
+                self.finish(outcome, result);
                 continue;
             };
             match submitted {
                 Submit::Accepted => {
+                    self.accepted(id);
                     self.in_flight.insert(id, InFlight { len, outcome });
                 }
                 Submit::Pending(write) => {
@@ -433,7 +509,9 @@ impl Port {
                 Submit::Rejected(write, error) => {
                     drop(write);
                     self.release(len);
-                    self.finish(outcome, WriteOutcome::NotWritten(error));
+                    let result = WriteOutcome::NotWritten(error);
+                    self.ended(id, &result, false);
+                    self.finish(outcome, result);
                 }
             }
         }
@@ -490,6 +568,7 @@ impl Port {
             if awaited == id {
                 self.awaited = None;
                 self.release(len);
+                self.ended(id, &result, true);
                 self.awaited_result = Some(result);
                 return;
             }
@@ -499,6 +578,7 @@ impl Port {
             return;
         };
         self.release(len);
+        self.ended(id, &result, true);
         self.finish(outcome, result);
     }
 
@@ -542,6 +622,7 @@ impl Port {
             path,
             self.limits,
             Some(&withdrawal),
+            None,
         );
         let outcome = Outcome::Registration {
             registration,
@@ -569,6 +650,7 @@ impl Port {
             destination,
             Some(path),
             self.limits,
+            None,
             None,
         );
         self.settle(started, Outcome::Raw { done, _permit: permit });
@@ -603,10 +685,9 @@ impl Port {
             );
             if ours {
                 self.release(queued.write.payload().len());
-                self.finish(
-                    queued.outcome,
-                    WriteOutcome::NotWritten(withdrawn()),
-                );
+                let result = WriteOutcome::NotWritten(withdrawn());
+                self.ended(queued.write.id(), &result, false);
+                self.finish(queued.outcome, result);
             } else {
                 self.backlog.push_back(queued);
             }
@@ -691,7 +772,7 @@ impl Port {
         for Queued { write, outcome } in mem::take(&mut self.backlog) {
             self.lost = true;
             self.release(write.payload().len());
-            self.abandon(outcome, false);
+            self.abandon(write.id(), outcome, false);
         }
     }
 
@@ -701,7 +782,7 @@ impl Port {
     /// A shared port tells its endpoints and raw senders instead, since they
     /// outlive it. A write it never offered did not go out. One the backend
     /// took and never reported may have, so its outcome is unknown.
-    fn abandon(&mut self, outcome: Outcome, offered: bool) {
+    fn abandon(&mut self, id: WriteId, outcome: Outcome, offered: bool) {
         let outcome_now = || {
             if offered {
                 WriteOutcome::Unknown(io::Error::new(
@@ -715,6 +796,7 @@ impl Port {
                 ))
             }
         };
+        self.ended(id, &outcome_now(), offered);
         match outcome {
             Outcome::Registration { registration, local, .. } => {
                 self.routed.push_back((registration, local, outcome_now()));
@@ -759,10 +841,10 @@ impl Port {
     /// Ends the writes the backend took and has not reported, as lost, when
     /// it closed without reporting them or is dropped before it closes.
     pub(super) fn give_up(&mut self) {
-        for (_, InFlight { len, outcome }) in mem::take(&mut self.in_flight) {
+        for (id, InFlight { len, outcome }) in mem::take(&mut self.in_flight) {
             self.lost = true;
             self.release(len);
-            self.abandon(outcome, true);
+            self.abandon(id, outcome, true);
         }
     }
 
@@ -821,6 +903,7 @@ mod tests {
     use crate::{
         endpoint::{
             driver::Command,
+            observe::WriteOrigin,
             reply::ReplyRoute,
             tests::{REPLY_LOCAL, route_request, route_response},
         },
@@ -830,6 +913,9 @@ mod tests {
             datagram::{Capabilities, Datagram},
         },
     };
+
+    /// What the port's writes are noted as, which no test observes.
+    const NOTE: Note = Note { origin: WriteOrigin::Send, cause: None };
 
     const LOCAL: SocketAddr = SocketAddr::new(
         std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1)),
@@ -1026,7 +1112,7 @@ mod tests {
         else {
             panic!("expected reply command");
         };
-        port.submit(bytes, &link, completion);
+        port.submit(bytes, &link, completion, NOTE);
     }
 
     #[test]
@@ -1034,7 +1120,7 @@ mod tests {
         let script = Script::default();
         let mut port = port(&script, WriteLimits::default());
 
-        port.send(&Bytes::from_static(b"hello"), &LINK).unwrap();
+        port.send(&Bytes::from_static(b"hello"), &LINK, NOTE).unwrap();
 
         assert!(port.is_idle());
         assert_eq!(script.0.lock().unwrap().accepted[0].1, "hello");
@@ -1046,11 +1132,11 @@ mod tests {
         let mut port = port(&script, WriteLimits { messages: 2, bytes: 10 });
         script.mode(Mode::Hold);
 
-        port.send(&Bytes::from_static(b"first"), &LINK).unwrap();
-        port.send(&Bytes::from_static(b"second"), &LINK).unwrap_err();
-        port.send(&Bytes::from_static(b"two"), &LINK).unwrap();
+        port.send(&Bytes::from_static(b"first"), &LINK, NOTE).unwrap();
+        port.send(&Bytes::from_static(b"second"), &LINK, NOTE).unwrap_err();
+        port.send(&Bytes::from_static(b"two"), &LINK, NOTE).unwrap();
         assert_eq!(
-            port.send(&Bytes::new(), &LINK).unwrap_err().kind(),
+            port.send(&Bytes::new(), &LINK, NOTE).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
 
@@ -1078,17 +1164,17 @@ mod tests {
         let mut port = port(&script, WriteLimits { messages: 4, bytes: 8 });
         script.mode(Mode::Hold);
 
-        port.send(&Bytes::from_static(b"123456"), &LINK).unwrap();
+        port.send(&Bytes::from_static(b"123456"), &LINK, NOTE).unwrap();
         assert_eq!(
-            port.send_request(&Bytes::from_static(b"7"), &LINK)
+            port.send_request(&Bytes::from_static(b"7"), &LINK, NOTE)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::WouldBlock
         );
-        port.send(&Bytes::from_static(b"78"), &LINK).unwrap();
-        port.send_request(&Bytes::new(), &LINK).unwrap_err();
-        port.send(&Bytes::new(), &LINK).unwrap();
-        port.send(&Bytes::new(), &LINK).unwrap();
+        port.send(&Bytes::from_static(b"78"), &LINK, NOTE).unwrap();
+        port.send_request(&Bytes::new(), &LINK, NOTE).unwrap_err();
+        port.send(&Bytes::new(), &LINK, NOTE).unwrap();
+        port.send(&Bytes::new(), &LINK, NOTE).unwrap();
 
         assert_eq!(port.backlog.len(), 4);
     }
@@ -1099,7 +1185,9 @@ mod tests {
         let mut port = port(&script, WriteLimits { messages: 1, bytes: 2 });
 
         assert_eq!(
-            port.send(&Bytes::from_static(b"abc"), &LINK).unwrap_err().kind(),
+            port.send(&Bytes::from_static(b"abc"), &LINK, NOTE)
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::WouldBlock
         );
 
@@ -1112,7 +1200,8 @@ mod tests {
         let script = Script::default();
         let mut port = port(&script, WriteLimits::default());
 
-        let error = port.send(&Bytes::from(vec![0; 1001]), &LINK).unwrap_err();
+        let error =
+            port.send(&Bytes::from(vec![0; 1001]), &LINK, NOTE).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(script.accepted().is_empty());
@@ -1125,7 +1214,8 @@ mod tests {
         let mut port = port(&script, WriteLimits { messages: 1, bytes: 8 });
         script.mode(Mode::Reject);
 
-        let error = port.send(&Bytes::from_static(b"abc"), &LINK).unwrap_err();
+        let error =
+            port.send(&Bytes::from_static(b"abc"), &LINK, NOTE).unwrap_err();
 
         assert_eq!(error.raw_os_error(), Some(5));
         assert!(port.is_idle());
@@ -1138,7 +1228,7 @@ mod tests {
         script.mode(Mode::Hold);
 
         let receipt = port
-            .submit_client(&Bytes::from_static(b"request"), &LINK, true)
+            .submit_client(&Bytes::from_static(b"request"), &LINK, true, NOTE)
             .unwrap()
             .unwrap();
         script.mode(Mode::Accept);
@@ -1167,7 +1257,7 @@ mod tests {
         let mut port = port(&script, WriteLimits::default());
         script.mode(Mode::Accept);
         let receipt = port
-            .submit_client(&Bytes::from_static(b"request"), &LINK, true)
+            .submit_client(&Bytes::from_static(b"request"), &LINK, true, NOTE)
             .unwrap()
             .unwrap();
         let id = script.accepted()[0];
@@ -1182,7 +1272,7 @@ mod tests {
         assert!(matches!(receipt.await.unwrap(), WriteOutcome::Unknown(_)));
         assert!(port.is_idle());
         assert_eq!(port.bytes, 0);
-        port.send(&Bytes::from_static(b"next"), &LINK).unwrap();
+        port.send(&Bytes::from_static(b"next"), &LINK, NOTE).unwrap();
         assert_eq!(port.writes, 1);
     }
 
@@ -1192,7 +1282,7 @@ mod tests {
         let mut port = port(&script, WriteLimits::default());
 
         let receipt = port
-            .submit_client(&Bytes::from_static(b"request"), &LINK, true)
+            .submit_client(&Bytes::from_static(b"request"), &LINK, true, NOTE)
             .unwrap();
 
         assert!(receipt.is_none());
@@ -1268,7 +1358,7 @@ mod tests {
         let script = Script::default();
         let mut port = port(&script, WriteLimits::default());
         script.mode(Mode::Accept);
-        port.send(&Bytes::from_static(b"abc"), &LINK).unwrap();
+        port.send(&Bytes::from_static(b"abc"), &LINK, NOTE).unwrap();
         let id = script.accepted()[0];
 
         script.complete(WriteId::new(99), Ok(()));
@@ -1285,16 +1375,26 @@ mod tests {
         let mut port = port(&script, WriteLimits::default());
         script.mode(Mode::Accept);
         let accepted = port
-            .submit_client(&Bytes::from_static(b"accepted"), &LINK, false)
+            .submit_client(
+                &Bytes::from_static(b"accepted"),
+                &LINK,
+                false,
+                NOTE,
+            )
             .unwrap()
             .unwrap();
         let unreported = port
-            .submit_client(&Bytes::from_static(b"unreported"), &LINK, false)
+            .submit_client(
+                &Bytes::from_static(b"unreported"),
+                &LINK,
+                false,
+                NOTE,
+            )
             .unwrap()
             .unwrap();
         script.mode(Mode::Hold);
         let held = port
-            .submit_client(&Bytes::from_static(b"held"), &LINK, false)
+            .submit_client(&Bytes::from_static(b"held"), &LINK, false, NOTE)
             .unwrap()
             .unwrap();
         script.0.lock().unwrap().on_close = vec![(
@@ -1325,7 +1425,7 @@ mod tests {
         let script = Script::default();
         let mut port = port(&script, WriteLimits::default());
         script.mode(Mode::Accept);
-        port.send(&Bytes::from_static(b"accepted"), &LINK).unwrap();
+        port.send(&Bytes::from_static(b"accepted"), &LINK, NOTE).unwrap();
         script.0.lock().unwrap().on_close =
             vec![(script.accepted()[0], WriteOutcome::Written)];
 
@@ -1346,7 +1446,7 @@ mod tests {
             port(&script, WriteLimits { messages: 1024, bytes: 1 << 20 });
         script.mode(Mode::Accept);
         for _ in 0..100 {
-            port.send(&Bytes::from_static(b"abc"), &LINK).unwrap();
+            port.send(&Bytes::from_static(b"abc"), &LINK, NOTE).unwrap();
         }
 
         for id in script.accepted().into_iter().skip(1) {
@@ -1381,7 +1481,7 @@ mod tests {
         let mut cx = Context::from_waker(&waker);
 
         script.mode(Mode::Hold);
-        port.send(&Bytes::from_static(b"held"), &LINK).unwrap();
+        port.send(&Bytes::from_static(b"held"), &LINK, NOTE).unwrap();
         assert!(
             !script
                 .0
@@ -1406,7 +1506,7 @@ mod tests {
 
         script.mode(Mode::Accept);
         port.poll_flush(&mut cx);
-        port.send(&Bytes::from_static(b"accepted"), &LINK).unwrap();
+        port.send(&Bytes::from_static(b"accepted"), &LINK, NOTE).unwrap();
         assert!(
             !script
                 .0

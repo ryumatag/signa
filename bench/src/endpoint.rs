@@ -17,8 +17,8 @@ use signa_core::{
     bench::{Flow, reply_driver, tcp, udp},
     endpoint::{
         Branch, Builder, CancelOutcome, DatagramPort, Endpoint, Error,
-        Incoming, IncomingEvent, PathSelection, Reception, ReplyRoute,
-        Responder, Target, ViaMode,
+        Incoming, IncomingEvent, ObservationConfig, PathSelection, Reception,
+        ReplyRoute, Responder, Target, ViaMode,
     },
     message::header::{CSEQ, HeaderValue, VIA},
     transaction::Timers,
@@ -138,6 +138,79 @@ pub(super) fn round_trip(c: &mut Criterion) {
             });
         });
     });
+}
+
+// The round trip of `round_trip` with an observer on each endpoint, so the
+// difference is what observation costs: metadata records, records with the
+// first 512 bytes of each message copied, and records an observer has no room
+// for, which are counted and dropped. A task of its own drains each observer,
+// as an application's would.
+pub(super) fn observed_round_trip(c: &mut Criterion) {
+    let rt = runtime();
+    let request = Request::builder()
+        .method("OPTIONS")
+        .uri("sip:bob@biloxi.example.com")
+        .header("From", "Alice <sip:alice@atlanta.example.com>;tag=1928301774")
+        .header("To", "Bob <sip:bob@biloxi.example.com>")
+        .header("Call-ID", "a84b4c76e66710@pc33.atlanta.example.com")
+        .header("CSeq", "314159 OPTIONS")
+        .header("Max-Forwards", "70")
+        .body(Bytes::new())
+        .unwrap();
+    let len = request.to_bytes().len() as u64;
+    let variants = [
+        ("observed", ObservationConfig::new()),
+        ("captured", ObservationConfig::new().payload(512)),
+        ("full_observer", ObservationConfig::new().records(0)),
+    ];
+
+    for (variant, config) in variants {
+        let (server, client_end) = {
+            let _guard = rt.enter();
+            let server = Endpoint::builder()
+                .udp(LOCALHOST)
+                .tcp(LOCALHOST)
+                .timers(short_timers())
+                .max_server_transactions(1 << 20)
+                .serve(Ok200)
+                .unwrap();
+            let client_end = Endpoint::builder()
+                .udp(LOCALHOST)
+                .timers(short_timers())
+                .max_client_transactions(1 << 20)
+                .serve(Ok200)
+                .unwrap();
+            (server, client_end)
+        };
+        rt.block_on(async {
+            for endpoint in [&server, &client_end] {
+                let mut observer = endpoint.observe(config).await.unwrap();
+                tokio::spawn(async move {
+                    while let Some(record) = observer.recv().await {
+                        bb(record);
+                    }
+                });
+            }
+        });
+
+        for (transport, addr) in [
+            (Transport::Udp, server.udp_addr().unwrap()),
+            (Transport::Tcp, server.tcp_addr().unwrap()),
+        ] {
+            let name = transport.to_string().to_lowercase();
+            let mut client = client_end.client(transport, addr);
+            let id = format!("endpoint/{name}/round_trip/{variant}");
+            benchmark(c, id, len, |b| {
+                b.iter(|| {
+                    rt.block_on(async {
+                        let response =
+                            client.call(bb(request.clone())).await.unwrap();
+                        assert_eq!(response.status(), StatusCode::OK);
+                    });
+                });
+            });
+        }
+    }
 }
 
 // The round trip of `round_trip` over UDP with a stateless proxy between the

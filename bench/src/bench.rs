@@ -44,6 +44,7 @@ criterion::criterion_group! {
         // The same round trips between two endpoints, which adds the
         // transactions, the service, and the message layer on both sides.
         endpoint::round_trip,
+        endpoint::observed_round_trip,
         // The UDP round trip through a stateless proxy between them.
         endpoint::stateless_forward,
         // The UDP round trip with the server on a shared port, whose

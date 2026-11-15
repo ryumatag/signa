@@ -30,6 +30,14 @@ pub(super) struct Id {
     generation: u32,
 }
 
+impl Id {
+    /// The id as one number, which names the entry within its table until
+    /// the slot's generation wraps after 2^32 reuses.
+    pub(super) fn number(self) -> u64 {
+        u64::from(self.slot) << 32 | u64::from(self.generation)
+    }
+}
+
 /// A table of transactions, keyed by what matches a message to one.
 pub(super) struct Table<K, E> {
     /// The slot number of each entry, by the hash of its key.
@@ -124,6 +132,18 @@ impl<K: Hash + Eq, E> Table<K, E> {
         }
 
         self.slots[id.slot as usize].as_mut().map(|(_, entry)| entry)
+    }
+
+    /// The id the next [`Table::insert`] returns, if nothing else changes
+    /// the table first.
+    pub(super) fn next_id(&self) -> Id {
+        match self.free.last() {
+            Some(&slot) => {
+                Id { slot, generation: self.generations[slot as usize] }
+            }
+            // `insert` refuses a slot number past `u32::MAX`.
+            None => Id { slot: self.slots.len() as u32, generation: 0 },
+        }
     }
 
     /// Adds `entry` under `key`, which must not be in the table, and returns

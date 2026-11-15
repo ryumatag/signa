@@ -950,6 +950,7 @@ impl Builder {
             ingress,
             context_limits: driver.context_limits(),
             timers: self.config.timers,
+            observing: Default::default(),
         };
         let incoming = Incoming::new(
             incoming_rx,

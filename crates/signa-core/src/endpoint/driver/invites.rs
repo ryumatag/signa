@@ -21,12 +21,13 @@ use bytes::Bytes;
 
 use super::{
     Arrival, Cancel, ClientEntry, ClientMachine, Driver, Link, Pending,
-    ServerMachine, has_identity, increment, send_on,
+    ServerMachine, has_identity, increment, send_on, tcp_write,
 };
 use crate::{
     endpoint::{
         admission::request_bytes,
         error::Error,
+        observe::WriteOrigin,
         path::{ReceiveInfo, retain},
         server::{self, IncomingEvent, ReceivedAck},
         table::Id,
@@ -197,27 +198,37 @@ impl Driver {
     /// [RFC 3261 section 17.1.1.3]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17.1.1.3
     /// [RFC 3261 section 18.2.2]: https://www.rfc-editor.org/rfc/rfc3261.html#section-18.2.2
     fn send_ack(&mut self, id: Id, link: &Link, ack: Bytes) {
+        let note = self.note(WriteOrigin::Ack { transaction: id.number() });
+        let tap = self.tap.as_ref();
         let error = match &link.writer {
             Some(writer) => {
                 let reconnect = writer.is_closed()
                     || matches!(
-                        writer.send(ack.clone()),
+                        tcp_write(tap, link.flow, note, &ack, |hook| {
+                            writer.send_hooked(ack.clone(), hook)
+                        }),
                         Err(tcp::SendError::Closed)
                     );
                 if reconnect {
                     // A refused or failed connection loses this ACK as UDP
                     // would. A reliable INVITE has already ended, and the
                     // server's Timer H covers it.
-                    self.send_over_tcp(link.flow.remote, Pending::Ack(ack));
+                    let pending = Pending::Ack(ack, note);
+                    self.send_over_tcp(link.flow.remote, pending);
                 }
                 None
             }
-            None => match send_on(self.udp.as_mut(), link, &ack, false) {
-                Err(error) if error.kind() != io::ErrorKind::WouldBlock => {
-                    Some(error)
+            None => {
+                match send_on(self.udp.as_mut(), tap, link, &ack, false, note)
+                {
+                    Err(error)
+                        if error.kind() != io::ErrorKind::WouldBlock =>
+                    {
+                        Some(error)
+                    }
+                    _ => None,
                 }
-                _ => None,
-            },
+            }
         };
 
         // The final was delivered already. A failed ACK ends Completed early,
@@ -246,7 +257,10 @@ impl Driver {
             // datagram, and G or the request's retransmission repeats it.
             invite::ServerEvent::Send(bytes) => {
                 let link = entry.link.clone();
-                self.send_generated(&link, bytes, &shared);
+                let origin = WriteOrigin::ResponseRetransmission {
+                    transaction: shared.id,
+                };
+                self.send_generated(&link, bytes, &shared, origin);
             }
             invite::ServerEvent::Timeout => shared.ack_timeout(),
             _ => {}

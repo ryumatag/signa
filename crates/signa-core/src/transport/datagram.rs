@@ -467,8 +467,9 @@ impl From<io::Result<()>> for WriteOutcome {
 
 /// Names one write from its submission to its completion.
 ///
-/// The endpoint numbers its writes in the order it makes them. A backend
-/// reports the outcome of an accepted write by its ID.
+/// The endpoint numbers its writes in the order it makes them. A write it
+/// refuses before offering it takes a number too, so a backend can see gaps.
+/// A backend reports the outcome of an accepted write by its ID.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct WriteId(u64);
 
@@ -476,6 +477,11 @@ impl WriteId {
     #[cfg(feature = "tokio")]
     pub(crate) fn new(n: u64) -> WriteId {
         WriteId(n)
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) fn get(self) -> u64 {
+        self.0
     }
 }
 

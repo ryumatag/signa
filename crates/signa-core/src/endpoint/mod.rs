@@ -141,6 +141,15 @@ quarter of output capacity for transaction output and responses. See
 [`Builder::tcp_write_limits`], [`Builder::udp_write_limits`] and
 [`Builder::fallback_limits`].
 
+# Observation
+
+[`Endpoint::observe`] attaches one [`Observer`], a lossy and bounded view of
+what the endpoint receives, before it parses it, and of each stage of every
+write it makes, its automatic and retransmitted output included. Records copy
+what they show and carry no capability. Every received envelope and client
+response carries its [`ReceiveInfo`] whether or not an observer is attached,
+and nothing a TU acts on depends on one.
+
 # Shutdown
 
 [`Endpoint::shutdown`] closes new admission and drains current work until the
@@ -221,7 +230,10 @@ while let Some(event) = incoming.recv().await {
 use std::{
     fmt,
     net::SocketAddr,
-    sync::{Arc, atomic::Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -253,6 +265,10 @@ pub use self::{
         ClientTransactionId, PreparedRequest, Responses, Target,
     },
     error::{BindError, Error},
+    observe::{
+        ObservationConfig, Observed, Observer, ObserverStats, Record,
+        WriteOrigin, WriteRef, WriteResult,
+    },
     path::{PathSelection, ReceiveInfo, SendPath},
     port::{
         Capture, CapturedDatagram, DatagramPort, EndpointIngress, Ingress,
@@ -275,6 +291,7 @@ mod client;
 mod datagram;
 mod driver;
 mod error;
+mod observe;
 mod path;
 mod port;
 mod reply;
@@ -328,6 +345,8 @@ pub struct Endpoint {
     /// The context copies and prepared paths alive at once.
     context_limits: Budget,
     timers: Timers,
+    /// Set while an [`Observer`] of the endpoint is alive.
+    observing: Arc<AtomicBool>,
 }
 
 /// Cumulative connection-admission and ordinary fallback outcomes.
@@ -723,9 +742,10 @@ mod tests {
     use crate::{
         endpoint::{
             Branch, Builder, CancelError, CancelOutcome, Endpoint, Incoming,
-            IncomingEvent, ReceivedRequest, ReceivedResponse, Reception,
-            ReplyError, Responses, ServerEvent, ServerEvents, ServerRequest,
-            ShutdownOutcome, SubmitError, Target, ViaMode, WorkGuard,
+            IncomingEvent, ObservationConfig, Observed, ReceivedRequest,
+            ReceivedResponse, Reception, ReplyError, Responses, ServerEvent,
+            ServerEvents, ServerRequest, ShutdownOutcome, SubmitError, Target,
+            ViaMode, WorkGuard, WriteOrigin, WriteResult,
             builder::Config,
             driver::{Command, Driver, TCP_INBOUND},
             error::Error,
@@ -1877,6 +1897,7 @@ mod tests {
             ingress: None,
             context_limits: fixture.context_limits(),
             timers: Timers::default(),
+            observing: Default::default(),
         }
     }
 
@@ -6137,5 +6158,82 @@ mod tests {
         assert_ne!(d.id().domain(), a.id().domain());
         assert_eq!(d.id().sequence(), 0);
         assert_eq!(d.transport(), Transport::Tcp);
+    }
+
+    // Over TCP an observer sees framed messages, as they arrived, however
+    // the segments split them, and each write once started and once ended.
+    // A queued TCP write has no separate acceptance.
+    #[tokio::test]
+    async fn an_observer_sees_tcp_messages_and_writes() {
+        let (endpoint, mut incoming) =
+            Endpoint::builder().tcp(LOCALHOST).bind().unwrap();
+        let config = ObservationConfig::new().payload(4096);
+        let mut observer = endpoint.observe(config).await.unwrap();
+        let mut next = async || {
+            timeout(Duration::from_secs(1), observer.recv())
+                .await
+                .expect("a record within a second")
+                .expect("an attached observer")
+        };
+        let options = |branch: &str| {
+            format!(
+                "OPTIONS sip:bob@example.com SIP/2.0\r\n\
+                 v: SIP/2.0/TCP 127.0.0.1:9;branch=z9hG4bK{branch}\r\n\
+                 f: <sip:alice@example.com>;tag=1\r\n\
+                 t: <sip:bob@example.com>\r\n\
+                 i: tcp-observed-{branch}\r\n\
+                 CSeq:   1 OPTIONS\r\n\
+                 l: 4\r\n\r\nbody"
+            )
+        };
+        let (a, b) = (options("a"), options("b"));
+        let mut stream =
+            TcpStream::connect(endpoint.tcp_addr().unwrap()).await.unwrap();
+
+        // Two messages in one write, then the first half of a third.
+        let mut first = format!("{a}{b}").into_bytes();
+        let c = options("c");
+        first.extend_from_slice(&c.as_bytes()[..10]);
+        stream.write_all(&first).await.unwrap();
+        sleep(Duration::from_millis(20)).await;
+        stream.write_all(&c.as_bytes()[10..]).await.unwrap();
+
+        let mut requests = Vec::new();
+        for text in [&a, &b, &c] {
+            let record = next().await;
+            let Observed::Received { id, flow } = *record.observed() else {
+                panic!("an arrival, got {record:?}");
+            };
+            assert_eq!(flow.transport, Transport::Tcp);
+            assert_eq!(record.payload().unwrap(), text.as_bytes());
+            let request = server_request(&mut incoming).await;
+            assert_eq!(request.received.id(), id);
+            requests.push(request);
+        }
+
+        let request = requests.remove(0);
+        let (responder, _) = request.transaction.into_parts();
+        let response = Response::reply_to(&request.request)
+            .status(StatusCode::OK)
+            .to_tag(Tag::random())
+            .body(Bytes::new())
+            .unwrap();
+        responder.respond(response).await.unwrap();
+        let started = next().await;
+        let Observed::WriteStarted { write, origin, .. } = *started.observed()
+        else {
+            panic!("a started write, got {started:?}");
+        };
+        assert!(write.datagram().is_none());
+        assert!(matches!(origin, WriteOrigin::Response { .. }));
+        assert!(started.payload().unwrap().starts_with(b"SIP/2.0 200 OK"));
+        let ended = next().await;
+        let Observed::WriteEnded { write: same, result, accepted } =
+            *ended.observed()
+        else {
+            panic!("an ended write, got {ended:?}");
+        };
+        assert_eq!(same, write);
+        assert_eq!((result, accepted), (WriteResult::Written, true));
     }
 }

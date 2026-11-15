@@ -71,6 +71,7 @@ use crate::{
         },
         datagram::{Port, Received},
         error::Error,
+        observe::{self, Note, Tap, WriteOrigin, WriteResult},
         path::{ReceiveInfo, retain, transient},
         reply::{Admission, Completion, ReplyError, ReplyRoute},
         routing::{
@@ -101,7 +102,7 @@ use crate::{
         non_invite::{ClientEvent, ClientTransaction, ServerTransaction},
     },
     transport::{
-        Flow, Stamp, Stamps, Transport, WriteLimits,
+        Flow, ReceiveId, Stamp, Stamps, Transport, WriteLimits,
         budget::Budget,
         datagram::{DatagramIo, Path, TransportContext, WriteOutcome},
         tcp,
@@ -179,6 +180,9 @@ pub(super) enum Command {
     /// A stateless TU forwards an encoded response to the address its top
     /// Via names.
     Forward { bytes: Bytes, remote: SocketAddr, completion: Completion },
+    /// An observer attaches, replacing any earlier one. `attached` learns
+    /// that the driver records from now on.
+    Observe { tap: Tap, attached: oneshot::Sender<()> },
     /// A connection the driver asked for is open, or could not be opened.
     Connected {
         remote: SocketAddr,
@@ -434,7 +438,7 @@ enum Pending {
     /// A non-2xx ACK whose INVITE connection had closed. It goes to the
     /// INVITE's next hop (RFC 3261 section 17.1.1.3), not to where the final
     /// response came from.
-    Ack(Bytes),
+    Ack(Bytes, Note),
     /// A CANCEL whose INVITE connection had closed.
     Cancel(CancelStart),
     /// A request sent once, which gets its Via when the connection is open.
@@ -442,9 +446,14 @@ enum Pending {
     /// An encoded response whose request came on a connection that has closed
     /// since. It goes to `sent-by` on a new connection
     /// (RFC 3261 section 18.2.2).
-    Response(Bytes, Fallback),
-    OneShot(Bytes, Completion),
-    Server(Bytes, server::WriteObservation, crate::transport::budget::Permit),
+    Response(Bytes, Fallback, Note),
+    OneShot(Bytes, Completion, Note),
+    Server(
+        Bytes,
+        server::WriteObservation,
+        crate::transport::budget::Permit,
+        Note,
+    ),
 }
 
 impl Pending {
@@ -469,7 +478,7 @@ struct CancelStart {
 
 /// Transport admission held while the driver commits a server response.
 enum PreparedServerOutput {
-    Tcp(tcp::PreparedWrite, Option<crate::transport::budget::Permit>),
+    Tcp(tcp::PreparedWrite, Option<crate::transport::budget::Permit>, Flow),
     Udp(Bytes, Link),
     Waiting {
         remote: SocketAddr,
@@ -804,6 +813,11 @@ pub(super) struct Driver {
     /// them. See `Builder::context_limits`.
     context_limits: Budget,
     pub(super) reception_counters: Arc<ReceptionCounters>,
+    /// The observer's tap, while one is attached.
+    tap: Option<Tap>,
+    /// The received message the driver is handling, which output written
+    /// meanwhile answers. See `Note`.
+    cause: Option<ReceiveId>,
 }
 
 impl Driver {
@@ -919,6 +933,8 @@ impl Driver {
             stateless_responses: Budget::new(config.client_response_budget),
             context_limits: Budget::new(config.context_limits),
             reception_counters,
+            tap: None,
+            cause: None,
         }
     }
 
@@ -980,8 +996,16 @@ impl Driver {
                     if let Some(message) = inbound.message {
                         let stamp = inbound.stamp.expect("a message's stamp");
                         let context = &TransportContext::EMPTY;
+                        if let Some(tap) = &self.tap {
+                            let body = message_body(&message);
+                            let parts = [&inbound.head[..], &body[..]];
+                            tap.received(stamp, flow, parts, context);
+                        }
+                        drop(inbound.head);
                         let arrival = Arrival { flow, context, stamp };
+                        self.cause = Some(stamp.id);
                         self.on_message(message, link, arrival, now());
+                        self.cause = None;
                     } else {
                         self.on_connection_closed(&link);
                     }
@@ -989,6 +1013,12 @@ impl Driver {
                 Event::Datagram(received) => {
                     let Received { payload, flow, context, stamp, fresh } =
                         received;
+                    // Before parsing, so that what does not parse is seen
+                    // too, with the bytes as they arrived.
+                    if let Some(tap) = &self.tap {
+                        let parts = [&payload[..], &[][..]];
+                        tap.received(stamp, flow, parts, &context);
+                    }
                     // A datagram that is not one whole message is dropped.
                     // That includes a request whose body is shorter than
                     // its `Content-Length`, which RFC 3261 section 18.3
@@ -1003,7 +1033,9 @@ impl Driver {
                         let link = Link { flow, writer: None, path: None };
                         let context = &context;
                         let arrival = Arrival { flow, context, stamp };
+                        self.cause = Some(stamp.id);
                         self.on_message(message, link, arrival, now);
+                        self.cause = None;
                     }
                 }
                 Event::Abandon(shared, _route) => self.abandon(&shared),
@@ -1126,6 +1158,9 @@ impl Driver {
         if let Poll::Ready(Some(())) = self.control_rx.poll_recv(cx) {
             return Poll::Ready(Event::Control);
         }
+        // A dropped observer's tap goes at the next turn, so the write paths
+        // can take it as it is.
+        observe::attached(&mut self.tap);
 
         let servers = &self.servers;
         let clients = &self.clients;
@@ -1369,6 +1404,13 @@ impl Driver {
             Command::Connected { remote, result, _attempt } => {
                 self.on_connected(remote, result);
             }
+            Command::Observe { tap, attached } => {
+                if let Some(udp) = self.udp.as_mut() {
+                    udp.observe(tap.clone());
+                }
+                self.tap = Some(tap);
+                let _ = attached.send(());
+            }
         }
     }
 
@@ -1403,7 +1445,13 @@ impl Driver {
                                 .as_ref()
                                 .expect("TU transaction")
                                 .clone();
-                            self.send_generated(&link, trying, &shared);
+                            let origin = WriteOrigin::Response {
+                                transaction: shared.id,
+                                operation: None,
+                            };
+                            self.send_generated(
+                                &link, trying, &shared, origin,
+                            );
                         }
                     }
                     ServerMachine::Invite(_) => {
@@ -1463,16 +1511,19 @@ impl Driver {
         request: &Bytes,
     ) -> Option<io::Error> {
         let entry = self.clients.get(id).expect("a live client entry");
+        let transaction = id.number();
+        let note =
+            self.note(WriteOrigin::RequestRetransmission { transaction });
+        let (udp, tap) = (self.udp.as_mut(), self.tap.as_ref());
         // Without room for another receipt the retransmission goes out
         // unobserved. Its failure would be one lost datagram, which the next
         // retransmission or the transaction timeout covers.
         let result = if self.client_writes.len()
             < self.config.max_client_transactions
         {
-            send_client(self.udp.as_mut(), &entry.link, request, false)
+            send_client(udp, tap, &entry.link, request, false, note)
         } else {
-            send_on(self.udp.as_mut(), &entry.link, request, false)
-                .map(|()| None)
+            send_on(udp, tap, &entry.link, request, false, note).map(|()| None)
         };
         match result {
             Ok(receipt) => {
@@ -1745,12 +1796,12 @@ impl Driver {
                 drop(permit);
                 admitted.fail(Error::busy());
             }
-            Pending::Response(..) | Pending::Ack(_) => {}
+            Pending::Response(..) | Pending::Ack(..) => {}
             // Server output reserves its route and connection before commit
             // and never passes through `send_over_tcp`. Refusing it here
             // would be a rejection, not a transport failure.
-            Pending::Server(_, observation, _) => observation.reject(),
-            Pending::OneShot(bytes, completion) => {
+            Pending::Server(_, observation, _, _) => observation.reject(),
+            Pending::OneShot(bytes, completion, _) => {
                 drop(bytes);
                 completion.finish(Err(ReplyError::Busy));
             }
@@ -1776,8 +1827,11 @@ impl Driver {
             // A response that cannot be queued is lost. The connection is full
             // or gone again, and a server transaction over TCP has nothing to
             // retransmit it with.
-            Pending::OneShot(bytes, completion) => {
-                match writer.submit(bytes) {
+            Pending::OneShot(bytes, completion, note) => {
+                let tap = self.tap.as_ref();
+                match tcp_write(tap, flow, note, &bytes, |hook| {
+                    writer.submit_hooked(bytes.clone(), hook)
+                }) {
                     Ok(receipt) => self.writes.push((receipt, completion)),
                     Err(error) => completion.finish(Err(match error {
                         tcp::SendError::Full => ReplyError::Busy,
@@ -1787,8 +1841,11 @@ impl Driver {
                     })),
                 }
             }
-            Pending::Server(bytes, observation, permit) => {
-                match writer.submit(bytes) {
+            Pending::Server(bytes, observation, permit, note) => {
+                let tap = self.tap.as_ref();
+                match tcp_write(tap, flow, note, &bytes, |hook| {
+                    writer.submit_hooked(bytes.clone(), hook)
+                }) {
                     Ok(receipt) => self.server_writes.push((
                         receipt,
                         observation,
@@ -1801,15 +1858,23 @@ impl Driver {
                     }
                 }
             }
-            Pending::Response(bytes, permit) => {
-                if let Ok(receipt) = writer.submit(bytes) {
+            Pending::Response(bytes, permit, note) => {
+                let tap = self.tap.as_ref();
+                if let Ok(receipt) =
+                    tcp_write(tap, flow, note, &bytes, |hook| {
+                        writer.submit_hooked(bytes.clone(), hook)
+                    })
+                {
                     self.fallback_writes.push((receipt, permit));
                 }
             }
             // A lost ACK over TCP is like one lost over UDP. The server
             // retransmits its final response until Timer H.
-            Pending::Ack(bytes) => {
-                let _ = writer.send(bytes);
+            Pending::Ack(bytes, note) => {
+                let _ =
+                    tcp_write(self.tap.as_ref(), flow, note, &bytes, |hook| {
+                        writer.send_hooked(bytes.clone(), hook)
+                    });
             }
             Pending::Cancel(start) => {
                 let link = Link { flow, writer: Some(writer), path: None };
@@ -1858,8 +1923,12 @@ impl Driver {
     }
 
     fn on_reply(&mut self, link: Link, bytes: Bytes, completion: Completion) {
+        let note = self.note(WriteOrigin::Reply);
         if let Some(writer) = &link.writer {
-            match writer.submit(bytes.clone()) {
+            let tap = self.tap.as_ref();
+            match tcp_write(tap, link.flow, note, &bytes, |hook| {
+                writer.submit_hooked(bytes.clone(), hook)
+            }) {
                 Ok(receipt) => self.writes.push((receipt, completion)),
                 Err(tcp::SendError::Full) => {
                     drop(bytes);
@@ -1868,12 +1937,12 @@ impl Driver {
                 Err(tcp::SendError::Closed) => {
                     self.send_over_tcp(
                         link.flow.remote,
-                        Pending::OneShot(bytes, completion),
+                        Pending::OneShot(bytes, completion, note),
                     );
                 }
             }
         } else if let Some(udp) = self.udp.as_mut() {
-            udp.submit(bytes, &link, completion);
+            udp.submit(bytes, &link, completion, note);
         } else {
             drop(bytes);
             completion.finish(Err(ReplyError::Transport(io::Error::new(
@@ -1914,12 +1983,14 @@ impl Driver {
         remote: SocketAddr,
         completion: Completion,
     ) {
+        let note = self.note(WriteOrigin::Send);
         match self.udp_flow(remote) {
             Ok(flow) => {
                 self.udp.as_mut().expect("`udp_flow` found a socket").submit(
                     bytes,
                     &Link { flow, writer: None, path: None },
                     completion,
+                    note,
                 )
             }
             Err(error) => completion.fail(error),
@@ -1994,8 +2065,15 @@ impl Driver {
         }
 
         completion.sent(via, link.flow);
+        let note = self.note(WriteOrigin::Send);
         match &link.writer {
-            Some(writer) => match writer.submit(bytes) {
+            Some(writer) => match tcp_write(
+                self.tap.as_ref(),
+                link.flow,
+                note,
+                &bytes,
+                |hook| writer.submit_hooked(bytes.clone(), hook),
+            ) {
                 Ok(receipt) => self.writes.push((receipt, completion)),
                 Err(tcp::SendError::Full) => {
                     completion.finish(Err(ReplyError::Busy));
@@ -2010,7 +2088,7 @@ impl Driver {
                 .udp
                 .as_mut()
                 .expect("a UDP link has a socket")
-                .submit(bytes, &link, completion),
+                .submit(bytes, &link, completion, note),
         }
     }
 
@@ -2022,8 +2100,14 @@ impl Driver {
     /// server SHOULD. The target is in `link` already, see [`reply_flow`].
     /// If that connection cannot be opened the response is lost. The RFC then
     /// asks for RFC 3263 to find another address, which is out of scope.
-    fn send_reply(&mut self, link: &Link, bytes: &Bytes) -> io::Result<()> {
-        match send_on(self.udp.as_mut(), link, bytes, false) {
+    fn send_reply(
+        &mut self,
+        link: &Link,
+        bytes: &Bytes,
+        note: Note,
+    ) -> io::Result<()> {
+        let tap = self.tap.as_ref();
+        match send_on(self.udp.as_mut(), tap, link, bytes, false, note) {
             Err(err)
                 if err.kind() == io::ErrorKind::BrokenPipe
                     && link.writer.is_some() =>
@@ -2045,6 +2129,7 @@ impl Driver {
                             stats: self.connection_stats.clone(),
                             written: false,
                         },
+                        note,
                     ),
                 ) {
                     Ok(())
@@ -2183,8 +2268,19 @@ impl Driver {
         };
         drop(request);
 
-        let receipt = match send_client(self.udp.as_mut(), &link, &bytes, true)
-        {
+        // The transaction is numbered by the table entry it gets below,
+        // which nothing between here and there changes.
+        let transaction = self.clients.next_id().number();
+        let note = self.note(WriteOrigin::Request { transaction });
+        let tap = self.tap.as_ref();
+        let receipt = match send_client(
+            self.udp.as_mut(),
+            tap,
+            &link,
+            &bytes,
+            true,
+            note,
+        ) {
             Ok(receipt) => receipt,
             Err(err) => {
                 drop((tx, permit));
@@ -2211,6 +2307,7 @@ impl Driver {
         let entry = ClientEntry { tx, link, respond: Some(delivery), permit };
         let deadline = entry.deadline();
         let id = self.clients.insert(key, entry);
+        debug_assert_eq!(id.number(), transaction);
         if let Some(receipt) = receipt {
             self.client_writes.push((receipt, id, observation));
         }
@@ -2220,7 +2317,12 @@ impl Driver {
         self.unanswered += 1;
 
         let cancel = intent.map(|intent| CancelHandle::new(id, intent));
-        let _ = accepted.send(Ok(observing.finish(via, flow, cancel)));
+        let _ = accepted.send(Ok(observing.finish(
+            via,
+            flow,
+            cancel,
+            id.number(),
+        )));
     }
 
     fn on_connected(
@@ -2259,7 +2361,7 @@ impl Driver {
                             admitted.fail(Error::transport(err));
                         }
                         // See `send_reply` and `Driver::send_ack`.
-                        Pending::Response(..) | Pending::Ack(_) => {}
+                        Pending::Response(..) | Pending::Ack(..) => {}
                         Pending::Cancel(start) => {
                             if let Some(done) = start.done {
                                 let _ = done.send(Err(
@@ -2278,12 +2380,12 @@ impl Driver {
                                 ),
                             )));
                         }
-                        Pending::Server(_, observation, _) => {
+                        Pending::Server(_, observation, _, _) => {
                             observation.complete(WriteOutcome::NotWritten(
                                 io::Error::new(source.kind(), source.clone()),
                             ));
                         }
-                        Pending::OneShot(_, completion) => {
+                        Pending::OneShot(_, completion, _) => {
                             completion.finish(Err(ReplyError::Transport(
                                 io::Error::new(
                                     source.kind(),
@@ -2639,7 +2741,11 @@ impl Driver {
                     let link = entry.link.clone();
                     let shared =
                         entry.shared.clone().expect("a new TU transaction");
-                    self.send_generated(&link, trying, &shared);
+                    let origin = WriteOrigin::Response {
+                        transaction: shared.id,
+                        operation: None,
+                    };
+                    self.send_generated(&link, trying, &shared, origin);
                 }
 
                 IncomingEvent::Request(ServerRequest {
@@ -2679,14 +2785,16 @@ impl Driver {
         let entry = self.servers.get(id).expect("a live server entry");
         let Some(response) = entry.tx.on_retransmission() else { return };
         let link = entry.link.clone();
+        let origin =
+            WriteOrigin::ResponseRetransmission { transaction: entry.id };
         if let Some(shared) = entry.shared.clone() {
-            self.send_generated(&link, response, &shared);
+            self.send_generated(&link, response, &shared, origin);
         } else {
             // An unobserved Completed entry has no observer to tell. Whether
             // this copy is refused now or fails later, the transaction keeps
             // its state until its timer, as in `send_generated` (RFC 6026
             // section 8.8).
-            let _ = self.send_reply(&link, &response);
+            let _ = self.send_reply(&link, &response, self.note(origin));
         }
     }
 
@@ -2784,13 +2892,14 @@ impl Driver {
     ) {
         let response =
             bare_response(&reply_headers(request.headers()), status);
+        let note = self.note(WriteOrigin::Stateless);
         match transient(context) {
             None => {
-                let _ = self.send_reply(link, &response);
+                let _ = self.send_reply(link, &response, note);
             }
             Some(path) => {
                 let link = Link { path: Some(path), ..link.clone() };
-                let _ = self.send_reply(&link, &response);
+                let _ = self.send_reply(&link, &response, note);
             }
         }
     }
@@ -2807,7 +2916,9 @@ impl Driver {
             return Ok(PreparedServerOutput::Udp(bytes, link.clone()));
         };
         match writer.prepare(bytes.clone()) {
-            Ok(write) => return Ok(PreparedServerOutput::Tcp(write, None)),
+            Ok(write) => {
+                return Ok(PreparedServerOutput::Tcp(write, None, link.flow));
+            }
             Err(tcp::SendError::Full) => {
                 return Err(SubmitError::TransportBusy);
             }
@@ -2826,12 +2937,12 @@ impl Driver {
         }
 
         match &self.routes.entry(remote).or_default().tcp {
-            TcpState::Open(_, writer) if !writer.is_closed() => {
+            TcpState::Open(flow, writer) if !writer.is_closed() => {
                 let write = writer
                     .prepare(bytes)
                     .map_err(|_| SubmitError::TransportBusy)?;
 
-                Ok(PreparedServerOutput::Tcp(write, Some(fallback)))
+                Ok(PreparedServerOutput::Tcp(write, Some(fallback), *flow))
             }
             TcpState::Connecting(_) => {
                 Ok(PreparedServerOutput::Waiting { remote, bytes, fallback })
@@ -2866,16 +2977,21 @@ impl Driver {
         output: PreparedServerOutput,
         shared: &Arc<server::Shared>,
         operation: Option<server::ResponseId>,
+        note: Note,
     ) {
         let observation = shared.write(operation);
         match output {
-            PreparedServerOutput::Tcp(write, fallback) => {
+            PreparedServerOutput::Tcp(write, fallback, flow) => {
                 let observation = if fallback.is_some() {
                     observation.fallback(self.connection_stats.clone())
                 } else {
                     observation
                 };
-                match write.submit() {
+                let bytes = write.bytes().clone();
+                let tap = self.tap.as_ref();
+                match tcp_write(tap, flow, note, &bytes, |hook| {
+                    write.submit(hook)
+                }) {
                     Ok(receipt) => self.server_writes.push((
                         receipt,
                         observation,
@@ -2893,6 +3009,7 @@ impl Driver {
                     bytes,
                     &link,
                     observation,
+                    note,
                 );
             }
             PreparedServerOutput::Waiting { remote, bytes, fallback } => {
@@ -2910,6 +3027,7 @@ impl Driver {
                     bytes,
                     observation.fallback(self.connection_stats.clone()),
                     fallback,
+                    note,
                 ));
             }
             PreparedServerOutput::Connect {
@@ -2924,6 +3042,7 @@ impl Driver {
                         bytes,
                         observation.fallback(self.connection_stats.clone()),
                         fallback,
+                        note,
                     )]);
                 self.spawn_connect(remote, connection, attempt);
             }
@@ -2944,11 +3063,15 @@ impl Driver {
         link: &Link,
         bytes: Bytes,
         shared: &Arc<server::Shared>,
+        origin: WriteOrigin,
     ) {
         let fallback =
             link.writer.as_ref().is_some_and(tcp::Writer::is_closed);
+        let note = self.note(origin);
         match self.prepare_server_output(link, bytes) {
-            Ok(output) => self.commit_server_output(output, shared, None),
+            Ok(output) => {
+                self.commit_server_output(output, shared, None, note);
+            }
             Err(_) => {
                 if fallback {
                     increment(&self.connection_stats.dropped);
@@ -2956,6 +3079,12 @@ impl Driver {
                 shared.rejected();
             }
         }
+    }
+
+    /// Why a write is made, and the received message it answers if the
+    /// driver is handling one.
+    fn note(&self, origin: WriteOrigin) -> Note {
+        Note::new(origin, self.cause)
     }
 
     fn live_work_is_drained(&self) -> bool {
@@ -3126,7 +3255,10 @@ impl Driver {
 
         // A write that fails, now or later, reaches the TU through its
         // observation, and the machine keeps the state it just entered.
-        self.commit_server_output(output, &shared, operation);
+        let origin =
+            WriteOrigin::Response { transaction: shared.id, operation };
+        let note = self.note(origin);
+        self.commit_server_output(output, &shared, operation, note);
         self.settle_server(id, before);
         Ok(())
     }
@@ -3269,26 +3401,29 @@ impl ClientReceipt {
 /// A full TCP queue is reported as `WouldBlock`.
 fn send_client(
     udp: Option<&mut Port>,
+    tap: Option<&Tap>,
     link: &Link,
     bytes: &Bytes,
     initial: bool,
+    note: Note,
 ) -> io::Result<Option<ClientReceipt>> {
     if let Some(writer) = &link.writer {
-        writer
-            .submit_request(bytes.clone())
-            .map(|receipt| Some(ClientReceipt::Tcp(receipt)))
-            .map_err(|error| {
-                io::Error::new(
-                    match error {
-                        tcp::SendError::Full => io::ErrorKind::WouldBlock,
-                        tcp::SendError::Closed => io::ErrorKind::BrokenPipe,
-                    },
-                    error,
-                )
-            })
+        tcp_write(tap, link.flow, note, bytes, |hook| {
+            writer.submit_request(bytes.clone(), hook)
+        })
+        .map(|receipt| Some(ClientReceipt::Tcp(receipt)))
+        .map_err(|error| {
+            io::Error::new(
+                match error {
+                    tcp::SendError::Full => io::ErrorKind::WouldBlock,
+                    tcp::SendError::Closed => io::ErrorKind::BrokenPipe,
+                },
+                error,
+            )
+        })
     } else {
         udp.expect("UDP link has a socket")
-            .submit_client(bytes, link, initial)
+            .submit_client(bytes, link, initial, note)
             .map(|receipt| receipt.map(ClientReceipt::Udp))
     }
 }
@@ -3297,15 +3432,19 @@ fn send_client(
 /// and a transaction that retransmits will try again.
 fn send_on(
     udp: Option<&mut Port>,
+    tap: Option<&Tap>,
     link: &Link,
     bytes: &Bytes,
     new_request: bool,
+    note: Note,
 ) -> io::Result<()> {
     match (&link.writer, udp) {
-        (Some(writer), _) => (if new_request {
-            writer.send_request(bytes.clone())
-        } else {
-            writer.send(bytes.clone())
+        (Some(writer), _) => tcp_write(tap, link.flow, note, bytes, |hook| {
+            if new_request {
+                writer.send_request(bytes.clone(), hook)
+            } else {
+                writer.send_hooked(bytes.clone(), hook)
+            }
         })
         .map_err(|err| {
             let kind = match err {
@@ -3316,12 +3455,42 @@ fn send_on(
         }),
         (None, Some(udp)) => {
             if new_request {
-                udp.send_request(bytes, link)
+                udp.send_request(bytes, link, note)
             } else {
-                udp.send(bytes, link)
+                udp.send(bytes, link, note)
             }
         }
         (None, None) => unreachable!("a UDP flow comes from the UDP socket"),
+    }
+}
+
+/// Writes on a TCP connection with `write`, recording the write for `tap`.
+///
+/// The connection's writer task finishes the write, so its end is recorded
+/// from there, through the hook. A TCP write has no `WriteAccepted` record,
+/// since a queued write might still go out partly. Its `WriteEnded` says
+/// whether the queue took it.
+fn tcp_write<T>(
+    tap: Option<&Tap>,
+    flow: Flow,
+    note: Note,
+    bytes: &Bytes,
+    write: impl FnOnce(Option<tcp::Hook>) -> Result<T, tcp::SendError>,
+) -> Result<T, tcp::SendError> {
+    let Some(tap) = tap else { return write(None) };
+    let id = tap.tcp_write();
+    tap.started(id, flow, note, bytes);
+    let tap = tap.clone();
+    write(Some(tcp::Hook::new(move |result, queued| {
+        tap.ended(id, WriteResult::from(result), queued);
+    })))
+}
+
+/// The body of a received message, for its receive record.
+fn message_body(message: &Message<Bytes>) -> &Bytes {
+    match message {
+        Message::Request(request) => request.body(),
+        Message::Response(response) => response.body(),
     }
 }
 
@@ -3352,6 +3521,9 @@ mod tests {
         },
         transaction::Timers,
     };
+
+    /// What tests' writes are noted as.
+    const NOTE: Note = Note { origin: WriteOrigin::Send, cause: None };
 
     impl Driver {
         /// Receives `request` on `link` as it arrives now, with `context`.
@@ -3390,6 +3562,7 @@ mod tests {
                 stats: driver.connection_stats.clone(),
                 written: false,
             },
+            NOTE,
         )
     }
 
@@ -3598,17 +3771,17 @@ mod tests {
             },
         );
 
-        driver.send_reply(&link, &Bytes::from_static(b"abc")).unwrap();
+        driver.send_reply(&link, &Bytes::from_static(b"abc"), NOTE).unwrap();
         assert_eq!(
             driver
-                .send_reply(&link, &Bytes::from_static(b"d"))
+                .send_reply(&link, &Bytes::from_static(b"d"), NOTE)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::WouldBlock
         );
-        driver.send_reply(&link, &Bytes::new()).unwrap();
+        driver.send_reply(&link, &Bytes::new(), NOTE).unwrap();
         assert_eq!(
-            driver.send_reply(&link, &Bytes::new()).unwrap_err().kind(),
+            driver.send_reply(&link, &Bytes::new(), NOTE).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
         let TcpState::Connecting(waiting) = &driver.routes[&remote].tcp else {
@@ -3630,7 +3803,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             driver
-                .send_reply(&link, &Bytes::from_static(b"abc"))
+                .send_reply(&link, &Bytes::from_static(b"abc"), NOTE)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::WouldBlock

@@ -216,6 +216,9 @@ pub struct Inbound {
     pub message: Option<Message<Bytes>>,
     /// The message's receive stamp, made as the connection framed it.
     pub(crate) stamp: Option<Stamp>,
+    /// The message's head as it arrived, for an observer. The message's
+    /// header values share its buffer, so it keeps nothing more alive.
+    pub(crate) head: Bytes,
     /// The connection it arrived on.
     pub flow: Flow,
     /// The way to send on that connection.
@@ -267,38 +270,39 @@ impl Writer {
 
     /// Queues `bytes` to be written. Returns at once.
     pub fn send(&self, bytes: Bytes) -> Result<(), SendError> {
-        let permit = self.reserve(bytes.len())?;
-        self.enqueue(Write::reserved(bytes, permit, None))
+        self.send_hooked(bytes, None)
+    }
+
+    /// As [`Writer::send`], with a hook that learns how the write ends once
+    /// it is queued.
+    pub(crate) fn send_hooked(
+        &self,
+        bytes: Bytes,
+        mut hook: Option<Hook>,
+    ) -> Result<(), SendError> {
+        let permit = refuse(self.reserve(bytes.len()), &mut hook)?;
+        self.enqueue(Write::reserved(bytes, permit, None, hook))
     }
 
     /// Queues a new client request without consuming protocol headroom.
-    pub(crate) fn send_request(&self, bytes: Bytes) -> Result<(), SendError> {
-        if self.is_closed() {
-            return Err(SendError::Closed);
-        }
-        let permit = self
-            .0
-            .capacity
-            .acquire_request(bytes.len())
-            .ok_or(SendError::Full)?;
-        self.enqueue(Write::reserved(bytes, permit, None))
+    pub(crate) fn send_request(
+        &self,
+        bytes: Bytes,
+        mut hook: Option<Hook>,
+    ) -> Result<(), SendError> {
+        let permit = refuse(self.reserve_request(bytes.len()), &mut hook)?;
+        self.enqueue(Write::reserved(bytes, permit, None, hook))
     }
 
     /// Queues a client request with reserved protocol headroom and a receipt.
     pub(crate) fn submit_request(
         &self,
         bytes: Bytes,
+        mut hook: Option<Hook>,
     ) -> Result<Receipt, SendError> {
-        if self.is_closed() {
-            return Err(SendError::Closed);
-        }
-        let permit = self
-            .0
-            .capacity
-            .acquire_request(bytes.len())
-            .ok_or(SendError::Full)?;
+        let permit = refuse(self.reserve_request(bytes.len()), &mut hook)?;
         let (done, result) = oneshot::channel();
-        self.enqueue(Write::reserved(bytes, permit, Some(done)))?;
+        self.enqueue(Write::reserved(bytes, permit, Some(done), hook))?;
         Ok(Receipt(result))
     }
 
@@ -319,10 +323,29 @@ impl Writer {
     /// a partial write. Connection teardown fails outstanding receipts.
     #[allow(dead_code)] // Used by the reply-route integration.
     pub fn submit(&self, bytes: Bytes) -> Result<Receipt, SendError> {
-        let permit = self.reserve(bytes.len())?;
+        self.submit_hooked(bytes, None)
+    }
+
+    /// As [`Writer::submit`], with a hook that learns how the write ends
+    /// once it is queued.
+    pub(crate) fn submit_hooked(
+        &self,
+        bytes: Bytes,
+        mut hook: Option<Hook>,
+    ) -> Result<Receipt, SendError> {
+        let permit = refuse(self.reserve(bytes.len()), &mut hook)?;
         let (done, result) = oneshot::channel();
-        self.enqueue(Write::reserved(bytes, permit, Some(done)))?;
+        self.enqueue(Write::reserved(bytes, permit, Some(done), hook))?;
         Ok(Receipt(result))
+    }
+
+    /// Reserves room for a new request, which leaves headroom for protocol
+    /// output.
+    fn reserve_request(&self, bytes: usize) -> Result<Permit, SendError> {
+        if self.is_closed() {
+            return Err(SendError::Closed);
+        }
+        self.0.capacity.acquire_request(bytes).ok_or(SendError::Full)
     }
 
     fn reserve(&self, bytes: usize) -> Result<Permit, SendError> {
@@ -334,9 +357,84 @@ impl Writer {
         })
     }
 
+    /// Queues `write`. A write the queue refuses was never queued, so its
+    /// hook learns nothing.
+    /// Queues `write`. A write the queue refuses was never queued, and its
+    /// hook learns so.
     fn enqueue(&self, write: Write) -> Result<(), SendError> {
-        self.0.queue.send(write).map_err(|_| SendError::Closed)
+        self.0.queue.send(write).map_err(
+            |mpsc::error::SendError(mut write)| {
+                if let Some(hook) = write.hook.take() {
+                    hook.fire(&Err(refusal(SendError::Closed)), false);
+                }
+                SendError::Closed
+            },
+        )
     }
+}
+
+/// Learns once how a write ended, and whether it was queued first: when the
+/// writer finished it, when the connection dropped it unwritten, or when the
+/// connection refused it. The endpoint hooks writes only while an observer
+/// records them.
+pub(crate) struct Hook(Option<HookFn>);
+
+/// What a [`Hook`] calls, with the write's result and whether it was queued.
+type HookFn = Box<dyn FnOnce(&io::Result<()>, bool) + Send>;
+
+impl Hook {
+    pub(crate) fn new(
+        hook: impl FnOnce(&io::Result<()>, bool) + Send + 'static,
+    ) -> Hook {
+        Hook(Some(Box::new(hook)))
+    }
+
+    fn fire(mut self, result: &io::Result<()>, queued: bool) {
+        if let Some(hook) = self.0.take() {
+            hook(result, queued);
+        }
+    }
+}
+
+/// A hook dropped before its write was queued, such as with a prepared write
+/// that was never submitted, learns that the write did not go out.
+impl Drop for Hook {
+    fn drop(&mut self) {
+        if let Some(hook) = self.0.take() {
+            let error = io::Error::new(
+                io::ErrorKind::Interrupted,
+                "the write was dropped before it was queued",
+            );
+            hook(&Err(error), false);
+        }
+    }
+}
+
+impl fmt::Debug for Hook {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Hook")
+    }
+}
+
+/// Passes on a reservation, and tells `hook` when it was refused that its
+/// write was not queued.
+fn refuse(
+    reserved: Result<Permit, SendError>,
+    hook: &mut Option<Hook>,
+) -> Result<Permit, SendError> {
+    if let (Err(error), Some(hook)) = (&reserved, hook.take()) {
+        hook.fire(&Err(refusal(*error)), false);
+    }
+    reserved
+}
+
+/// The I/O error a refused write reports.
+fn refusal(error: SendError) -> io::Error {
+    let kind = match error {
+        SendError::Full => io::ErrorKind::WouldBlock,
+        SendError::Closed => io::ErrorKind::BrokenPipe,
+    };
+    io::Error::new(kind, error)
 }
 
 /// A reserved write that has not yet been committed to the socket queue.
@@ -348,13 +446,19 @@ pub(crate) struct PreparedWrite {
 }
 
 impl PreparedWrite {
-    pub(crate) fn submit(self) -> Result<Receipt, SendError> {
+    /// The message the write holds.
+    pub(crate) fn bytes(&self) -> &Bytes {
+        &self.bytes
+    }
+
+    /// Queues the write, with `hook` to learn how it ends.
+    pub(crate) fn submit(
+        self,
+        hook: Option<Hook>,
+    ) -> Result<Receipt, SendError> {
+        let PreparedWrite { writer, bytes, permit } = self;
         let (done, result) = oneshot::channel();
-        self.writer.enqueue(Write::reserved(
-            self.bytes,
-            self.permit,
-            Some(done),
-        ))?;
+        writer.enqueue(Write::reserved(bytes, permit, Some(done), hook))?;
         Ok(Receipt(result))
     }
 }
@@ -390,6 +494,7 @@ struct Write {
     bytes: Bytes,
     permit: Option<Permit>,
     done: Option<oneshot::Sender<io::Result<()>>>,
+    hook: Option<Hook>,
     /// Marks the end of the queue. See [`run_connection`].
     close: bool,
 }
@@ -400,15 +505,22 @@ impl Write {
         bytes: Bytes,
         permit: Permit,
         done: Option<oneshot::Sender<io::Result<()>>>,
+        hook: Option<Hook>,
     ) -> Write {
-        Write { bytes, permit: Some(permit), done, close: false }
+        Write { bytes, permit: Some(permit), done, hook, close: false }
     }
 
     /// The marker that tells the writer to close its queue once it gets here.
     /// It carries nothing and holds no reservation, and only a connection's
     /// supervisor sends one, once.
     fn close() -> Write {
-        Write { bytes: Bytes::new(), permit: None, done: None, close: true }
+        Write {
+            bytes: Bytes::new(),
+            permit: None,
+            done: None,
+            hook: None,
+            close: true,
+        }
     }
 
     fn complete(&mut self, result: io::Result<()>) {
@@ -416,15 +528,32 @@ impl Write {
         // buffer and its reservation before making that next write possible.
         self.bytes = Bytes::new();
         drop(self.permit.take());
+        if let Some(hook) = self.hook.take() {
+            hook.fire(&result, true);
+        }
         if let Some(done) = self.done.take() {
             let _ = done.send(result);
         }
     }
 }
 
+/// A queued write the connection drops unwritten, as it ends or its writer
+/// is aborted, tells its hook so, as its receipt does.
+impl Drop for Write {
+    fn drop(&mut self) {
+        if let Some(hook) = self.hook.take() {
+            let error = io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "connection ended before write completion",
+            );
+            hook.fire(&Err(error), true);
+        }
+    }
+}
+
 impl From<Bytes> for Write {
     fn from(bytes: Bytes) -> Write {
-        Write { bytes, done: None, permit: None, close: false }
+        Write { bytes, done: None, permit: None, hook: None, close: false }
     }
 }
 
@@ -646,6 +775,7 @@ fn start(
                 .send(Inbound {
                     message: None,
                     stamp: None,
+                    head: Bytes::new(),
                     flow,
                     writer: Writer(writer),
                 })
@@ -769,6 +899,7 @@ async fn read_loop(
                     let inbound_message = Inbound {
                         message: Some(message),
                         stamp: Some(stamps.stamp(at)),
+                        head: decoder.take_head(),
                         flow,
                         writer: writer.clone(),
                     };
@@ -1021,9 +1152,9 @@ mod tests {
     #[test]
     fn new_requests_leave_output_capacity_for_protocol_messages() {
         let (writer, mut pending) = test_writer(4, 8);
-        writer.send_request(Bytes::from_static(b"123456")).unwrap();
+        writer.send_request(Bytes::from_static(b"123456"), None).unwrap();
         assert_eq!(
-            writer.send_request(Bytes::from_static(b"7")),
+            writer.send_request(Bytes::from_static(b"7"), None),
             Err(SendError::Full)
         );
         writer.send(Bytes::from_static(b"78")).unwrap();
@@ -1034,9 +1165,12 @@ mod tests {
         drop(pending.try_recv().unwrap());
         drop(pending.try_recv().unwrap());
         for _ in 0..3 {
-            writer.send_request(Bytes::new()).unwrap();
+            writer.send_request(Bytes::new(), None).unwrap();
         }
-        assert_eq!(writer.send_request(Bytes::new()), Err(SendError::Full));
+        assert_eq!(
+            writer.send_request(Bytes::new(), None),
+            Err(SendError::Full)
+        );
         writer.send(Bytes::new()).unwrap();
     }
 
@@ -1339,7 +1473,7 @@ mod tests {
         assert!(writer.0.capacity.acquire(3).is_some());
 
         let prepared = writer.prepare(Bytes::from_static(b"abc")).unwrap();
-        let receipt = prepared.submit().unwrap();
+        let receipt = prepared.submit(None).unwrap();
 
         assert_eq!(writer.send(Bytes::new()), Err(SendError::Full));
         drop(pending.try_recv().unwrap());
@@ -1349,7 +1483,7 @@ mod tests {
         let prepared = writer.prepare(Bytes::from_static(b"abc")).unwrap();
         drop(pending);
 
-        assert_eq!(prepared.submit().unwrap_err(), SendError::Closed);
+        assert_eq!(prepared.submit(None).unwrap_err(), SendError::Closed);
         assert!(writer.0.capacity.acquire(3).is_some());
     }
 

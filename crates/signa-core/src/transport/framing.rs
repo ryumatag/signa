@@ -41,6 +41,8 @@ pub struct Decoder {
     role: Role,
     limits: MessageLimits,
     state: State,
+    /// The head of the last message returned, as it arrived.
+    head: Bytes,
 }
 
 /// Which end of the connection a decoder is on.
@@ -91,14 +93,28 @@ enum State {
     /// search skips that much. It is zero at a message boundary, where
     /// keepalives are checked for first.
     Head { scanned: usize },
-    /// The head is parsed. Waiting for `len` bytes of body.
-    Body { head: Head, len: usize },
+    /// The head is parsed. Waiting for `len` bytes of body. `raw` is the
+    /// head as it arrived, which the parsed one shares.
+    Body { head: Head, raw: Bytes, len: usize },
 }
 
 impl Decoder {
     /// Creates a decoder for one connection.
     pub fn new(role: Role, limits: MessageLimits) -> Decoder {
-        Decoder { role, limits, state: State::Head { scanned: 0 } }
+        Decoder {
+            role,
+            limits,
+            state: State::Head { scanned: 0 },
+            head: Bytes::new(),
+        }
+    }
+
+    /// Takes the head of the message [`Decoder::decode`] returned last, as
+    /// it arrived, before the message's own header values were sliced out
+    /// of it. Empty after a keepalive, or when taken already.
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    pub fn take_head(&mut self) -> Bytes {
+        mem::take(&mut self.head)
     }
 
     /// Returns the next frame from the start of `buf`, taking its bytes out
@@ -148,8 +164,8 @@ impl Decoder {
                     }
 
                     // The head is frozen first, so the parts can share it.
-                    let head = buf.split_to(head_end).freeze();
-                    let head = match parse::head(&head)? {
+                    let raw = buf.split_to(head_end).freeze();
+                    let head = match parse::head(&raw)? {
                         Status::Complete((head, end)) => {
                             debug_assert_eq!(end, head_end);
                             head
@@ -173,19 +189,22 @@ impl Decoder {
                     if len > self.limits.body {
                         return Err(DecodeError::BodyTooLarge);
                     }
-                    self.state = State::Body { head, len };
+                    self.state = State::Body { head, raw, len };
                 }
                 State::Body { len, .. } => {
                     if buf.len() < *len {
                         return Ok(None);
                     }
                     let next = State::Head { scanned: 0 };
-                    let State::Body { head, len } =
+                    let State::Body { head, raw, len } =
                         mem::replace(&mut self.state, next)
                     else {
                         unreachable!("the state was checked above");
                     };
                     let body = buf.split_to(len).freeze();
+                    // Keeping the raw head costs no reference count of its
+                    // own. It moves here instead of dropping after the parse.
+                    self.head = raw;
                     return Ok(Some(Frame::Message(head.into_message(body))));
                 }
             }

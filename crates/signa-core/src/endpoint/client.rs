@@ -164,6 +164,7 @@ impl ClientTransaction {
 #[derive(Debug)]
 pub struct ClientControl {
     id: ClientTransactionId,
+    number: u64,
     via: HeaderValue,
     flow: Flow,
     cancel: Option<CancelHandle>,
@@ -174,6 +175,17 @@ impl ClientControl {
     /// The identity of this transaction.
     pub fn id(&self) -> ClientTransactionId {
         self.id.clone()
+    }
+
+    /// The number the endpoint's observation records name this transaction
+    /// by, in [`WriteOrigin`](super::WriteOrigin).
+    ///
+    /// It names the transaction among the endpoint's own, not across
+    /// endpoints. A number names one transaction at a time, and comes round
+    /// again only after billions of transactions have used its table slot.
+    /// It is a name, not a handle, and keeps nothing alive.
+    pub fn number(&self) -> u64 {
+        self.number
     }
 
     /// The generated top Via, including its fresh branch.
@@ -845,6 +857,7 @@ impl Observing {
         via: HeaderValue,
         flow: Flow,
         cancel: Option<CancelHandle>,
+        number: u64,
     ) -> ClientTransaction {
         let handle = self
             .responses
@@ -857,6 +870,7 @@ impl Observing {
         ClientTransaction {
             control: ClientControl {
                 id: ClientTransactionId(handle),
+                number,
                 via,
                 flow,
                 cancel,
