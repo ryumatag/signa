@@ -14,7 +14,10 @@ use std::{
     io,
     net::{Ipv6Addr, SocketAddr, SocketAddrV6},
     pin::pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -2427,6 +2430,177 @@ async fn a_port_close_gives_up_at_its_deadline() {
     let error = raw.await.unwrap_err();
     assert!(error.is_outcome_unknown());
     assert!(!error.is_transport() && !error.is_closed());
+}
+
+/// A backend over a [`Wire`] whose `Drop` holds until the test opens its
+/// gate, so that a test can watch what a close does while the backend is
+/// being dropped.
+struct Gated {
+    wire: Wire,
+    dropping: Arc<Notify>,
+    gate: std::sync::mpsc::Receiver<()>,
+    dropped: Arc<AtomicBool>,
+}
+
+/// The test's side of a [`Gated`] backend.
+struct Gate {
+    dropping: Arc<Notify>,
+    open: std::sync::mpsc::Sender<()>,
+    dropped: Arc<AtomicBool>,
+}
+
+fn gated(wire: Wire) -> (Gated, Gate) {
+    let dropping = Arc::new(Notify::new());
+    let (open, gate) = std::sync::mpsc::channel();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let backend = Gated {
+        wire,
+        dropping: dropping.clone(),
+        gate,
+        dropped: dropped.clone(),
+    };
+    (backend, Gate { dropping, open, dropped })
+}
+
+impl Drop for Gated {
+    // The task that drops the backend waits here. `block_in_place` hands the
+    // worker's other duties to another thread first. A worker blocked
+    // outright can be the one that drives the timers, and then no timeout in
+    // the test would fire. A test that dropped its gate has opened it too.
+    fn drop(&mut self) {
+        self.dropping.notify_one();
+        tokio::task::block_in_place(|| {
+            let _ = self.gate.recv();
+        });
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+impl DatagramIo for Gated {
+    fn local_addr(&self) -> SocketAddr {
+        self.wire.local_addr()
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.wire.capabilities()
+    }
+
+    fn poll_recv(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Datagram, RecvError>> {
+        self.wire.poll_recv(cx)
+    }
+
+    fn poll_submit(
+        &mut self,
+        cx: &mut Context<'_>,
+        write: DatagramWrite,
+    ) -> Submit {
+        self.wire.poll_submit(cx, write)
+    }
+
+    fn poll_complete(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<(WriteId, WriteOutcome)> {
+        self.wire.poll_complete(cx)
+    }
+
+    fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        self.wire.poll_close(cx)
+    }
+}
+
+/// Checks that `closing` resolves only once the gated backend has dropped,
+/// and returns its outcome.
+async fn resolves_after_drop(
+    gate: Gate,
+    mut closing: JoinHandle<ShutdownOutcome>,
+    case: &str,
+) -> ShutdownOutcome {
+    timeout(Duration::from_secs(2), gate.dropping.notified())
+        .await
+        .unwrap_or_else(|_| panic!("{case}: the backend is dropped"));
+    let early = timeout(Duration::from_millis(50), &mut closing).await.ok();
+    // Opened before any assertion, so that a failure cannot leave the task
+    // that drops the backend blocked.
+    gate.open.send(()).unwrap();
+    let resolved_early = early.is_some();
+    let outcome = match early {
+        Some(outcome) => outcome,
+        None => timeout(Duration::from_secs(2), closing).await.unwrap(),
+    };
+
+    assert!(
+        !resolved_early,
+        "{case}: resolved while the backend was dropping"
+    );
+    assert!(gate.dropped.load(Ordering::SeqCst), "{case}");
+    outcome.unwrap()
+}
+
+// A port's close resolves only once its backend has dropped. The backend's
+// `Drop` is the last thing that stops its tasks when it does not finish
+// closing in time, and a socket is released only as it drops, so a closer
+// told the outcome before could rebind the address or count on silence too
+// early. An endpoint's shutdown and a capture's close keep the same order.
+// Each closes in time with a wire that closes, and at the deadline with one
+// that never does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_close_resolves_after_its_backend_has_dropped() {
+    for stuck in [false, true] {
+        let expected = if stuck {
+            ShutdownOutcome::DeadlineExpired
+        } else {
+            ShutdownOutcome::Drained
+        };
+        let backend = || {
+            let wire = Wire::default();
+            wire.state.lock().unwrap().stuck = stuck;
+            gated(wire)
+        };
+
+        let (gated, gate) = backend();
+        let (port, _ingress) =
+            DatagramPort::builder().udp_io(gated).intercept().unwrap();
+        let closing = tokio::spawn(port.close(Duration::from_millis(50)));
+        let case = format!("port {stuck}");
+        assert_eq!(resolves_after_drop(gate, closing, &case).await, expected);
+
+        let (gated, gate) = backend();
+        let (endpoint, _incoming) =
+            Endpoint::builder().udp_io(gated).bind().unwrap();
+        let closing =
+            tokio::spawn(endpoint.shutdown(Duration::from_millis(50)));
+        let case = format!("endpoint {stuck}");
+        assert_eq!(resolves_after_drop(gate, closing, &case).await, expected);
+
+        let (gated, gate) = backend();
+        let capture = DatagramPort::builder().udp_io(gated).capture().unwrap();
+        let closing = tokio::spawn(capture.close(Duration::from_millis(50)));
+        let case = format!("capture {stuck}");
+        assert_eq!(resolves_after_drop(gate, closing, &case).await, expected);
+    }
+}
+
+// A port on a socket of its own has released its address once its close
+// resolves, so another socket can bind it at once. A few rounds give a close
+// that published early more chances to lose the race.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_closed_port_s_address_can_be_bound_again() {
+    for _ in 0..20 {
+        let (port, _ingress) = DatagramPort::builder()
+            .udp("127.0.0.1:0".parse().unwrap())
+            .intercept()
+            .unwrap();
+        let addr = port.local_addr();
+
+        let outcome = port.close(Duration::from_secs(1)).await;
+
+        assert_eq!(outcome, ShutdownOutcome::Drained);
+        std::net::UdpSocket::bind(addr).unwrap();
+    }
 }
 
 // A capture only receives. Its datagrams carry no disposition and it has no

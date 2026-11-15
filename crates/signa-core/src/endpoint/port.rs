@@ -713,7 +713,9 @@ impl DatagramPort {
     }
 
     /// Closes the port, with `timeout` to drain its writes, and resolves with
-    /// the outcome once the backend has closed.
+    /// the outcome once the backend has closed and been dropped. A port on a
+    /// socket of its own has released its address by then, so it can be
+    /// bound again at once.
     ///
     /// Reception stops, the datagrams the application holds and every path
     /// of the port turn invalid, and new writes are refused at once. The
@@ -1060,7 +1062,21 @@ impl PortTask {
     async fn run(mut self) {
         let deadline = poll_fn(|cx| self.poll_serve(cx)).await;
         let outcome = self.close(deadline).await;
-        self.shared.done.send_replace(Some(outcome));
+
+        // A closer that sees the outcome may rebind the address at once, or
+        // count on the backend's tasks having stopped. The backend's `Drop`
+        // is the last thing that stops them when `poll_close` did not
+        // finish, and the built-in socket closes only as it drops. So the
+        // task drops everything it owns, the backend through `Port` with it,
+        // before it publishes. `Port` is the backend's only owner, and the
+        // handles keep only `Shared`.
+        //
+        // This orders the outcome after what the port owns. It does not join
+        // a task the backend spawned and left running. That stays the
+        // backend's to stop, as `DatagramIo::poll_close` says.
+        let shared = self.shared.clone();
+        drop(self);
+        shared.done.send_replace(Some(outcome));
     }
 
     /// Serves until a close or until every handle is gone, and returns the
