@@ -17,8 +17,8 @@ use bytes::Bytes;
 use tokio::sync::oneshot;
 
 use super::{
-    Cancel, CancelStart, ClientEntry, ClientMachine, Driver, Key, Link,
-    Pending, SERVICE_UNAVAILABLE, ServerMachine, identity_bytes, now,
+    Arrival, Cancel, CancelStart, ClientEntry, ClientMachine, Driver, Key,
+    Link, Pending, SERVICE_UNAVAILABLE, ServerMachine, identity_bytes, now,
     send_client, send_on,
 };
 use crate::{
@@ -35,7 +35,6 @@ use crate::{
         key::{ClientKey, ServerKey},
         non_invite::{ClientTransaction, ServerTransaction},
     },
-    transport::{Flow, datagram::TransportContext},
 };
 
 impl Driver {
@@ -254,10 +253,11 @@ impl Driver {
         request: Request<Bytes>,
         key: ServerKey,
         target: Id,
-        flow: Flow,
         link: Link,
-        context: &TransportContext,
+        arrival: Arrival<'_>,
+        now: Instant,
     ) {
+        let context = arrival.context;
         let entry = self.servers.get(target).expect("a live target");
         let (target_id, reserved) = (entry.id, entry.tx.cancel_reserved());
 
@@ -291,7 +291,7 @@ impl Driver {
             &request,
             reliable,
             &self.config.timers,
-            now(),
+            now,
         );
         let (_, transaction) = self.install_server(
             key,
@@ -305,7 +305,7 @@ impl Driver {
         let _ = self.incoming.send(server::Queued {
             event: IncomingEvent::Cancel(IncomingCancel {
                 request,
-                received: ReceiveInfo::new(flow, path),
+                received: ReceiveInfo::new(arrival.flow, arrival.stamp, path),
                 transaction,
                 target: target_id,
             }),

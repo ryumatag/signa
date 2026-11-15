@@ -28,8 +28,9 @@ use signa_core::{
     Message, Request, Response,
     endpoint::{
         DatagramPort, Endpoint, Error, Incoming, IncomingEvent, Ingress,
-        PathSelection, PortStats, RawPath, ReceivedDatagram, Reception,
-        ServerEvent, ServerRequest, ShutdownOutcome, Target, ViaMode,
+        PathSelection, PortStats, RawPath, ReceivedDatagram, ReceivedResponse,
+        Reception, ServerEvent, ServerRequest, ShutdownOutcome, Target,
+        ViaMode,
     },
     message::header::{Tag, VIA},
     transaction::Timers,
@@ -490,7 +491,8 @@ async fn a_client_transaction_runs_over_the_wire() {
         .await
         .unwrap()
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .response;
     assert_eq!(response.status().as_u16(), 200);
 }
 
@@ -606,7 +608,8 @@ async fn an_unknown_write_outcome_is_not_a_failure() {
         .await
         .unwrap()
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .response;
     assert_eq!(response.status().as_u16(), 200);
 
     wire.writes(Writes::Complete);
@@ -1178,7 +1181,8 @@ async fn a_prepared_path_carries_a_whole_transaction() {
         .await
         .unwrap()
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .response;
     assert_eq!(response.status().as_u16(), 180);
     assert_eq!(response.headers().get(VIA), Some(&via));
 
@@ -1692,7 +1696,8 @@ async fn a_scoped_path_keeps_its_scope_and_advertises_none() {
         .await
         .unwrap()
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .response;
     assert_eq!(response.status().as_u16(), 200);
 }
 
@@ -2897,7 +2902,8 @@ async fn a_socket_port_carries_a_round_trip() {
         .await
         .unwrap()
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .response;
     assert_eq!(response.status().as_u16(), 200);
 }
 
@@ -3225,5 +3231,166 @@ async fn raw_sends_leave_endpoints_room() {
     assert!(from_endpoint.await.unwrap().is_ok());
     for write in raw {
         write.await.unwrap();
+    }
+}
+
+// A datagram on a shared port gets its ID and time when the port's task
+// takes it from the backend. The endpoint it is delivered to keeps both,
+// however long the application held it before deciding.
+#[tokio::test(start_paused = true)]
+async fn a_held_datagram_keeps_its_id_and_arrival_time() {
+    let wire = Wire::default();
+    let (port, mut ingress) = intercept(&wire);
+    let (endpoint, mut incoming) =
+        Endpoint::builder().port(&port).bind().unwrap();
+    let to_endpoint = endpoint.ingress().unwrap();
+
+    wire.deliver(arriving(options("held"), "nic0"));
+    let datagram = next(&mut ingress).await;
+    let (id, arrived) = (datagram.receive_id(), datagram.received_at());
+    assert_eq!(datagram.deadline(), arrived + Duration::from_secs(1));
+    advance(Duration::from_millis(300)).await;
+    datagram.try_deliver(&to_endpoint).unwrap();
+
+    let request = request(&mut incoming).await;
+    assert_eq!(request.received.id(), id);
+    assert_eq!(request.received.received_at(), arrived);
+    assert_eq!(request.received.context().as_bytes(), "nic0");
+    let held = tokio::time::Instant::now().into_std() - arrived;
+    assert!(held >= Duration::from_millis(300), "{held:?}");
+
+    wire.deliver(arriving(options("after"), "nic0"));
+    let after = next(&mut ingress).await;
+    assert_eq!(after.receive_id().domain(), id.domain());
+    assert_eq!(after.receive_id().sequence(), id.sequence() + 1);
+}
+
+/// A second peer of the wire, which a response may come from.
+const OTHER_PEER: SocketAddr = SocketAddr::new(
+    std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 21)),
+    5070,
+);
+
+// Each response of a client transaction comes with its own arrival, not the
+// transaction's: the address and context it came with, its ID and its time.
+// The responses of two forks, and of one fork along two ways, keep theirs
+// apart, and the transaction still sends the way it chose.
+#[tokio::test]
+async fn each_response_keeps_how_it_arrived() {
+    let wire = Wire::default();
+    let (endpoint, _incoming) = bind(&wire);
+    let target = Target::new(Transport::Udp, PEER);
+    let (_control, mut responses) = endpoint
+        .start(outgoing_invite("forks"), target)
+        .await
+        .unwrap()
+        .into_parts();
+    let sent = wire.sent(1).await;
+    let invite = Request::from_bytes(&sent[0].payload).unwrap();
+    let reply = |status: u16, tag: &str| {
+        Response::reply_to(&invite)
+            .status(status)
+            .to_tag(tag)
+            .body(Bytes::new())
+            .unwrap()
+            .to_bytes()
+    };
+    let arrivals = [
+        (180, "a", PEER, "nic0"),
+        (183, "a", OTHER_PEER, "nic1"),
+        (200, "a", PEER, "nic0"),
+        (200, "b", OTHER_PEER, "nic2"),
+    ];
+
+    for (status, tag, source, on) in arrivals {
+        let datagram = Datagram::new(reply(status, tag), source, LOCAL)
+            .with_context(context(on));
+        wire.deliver(Ok(datagram));
+    }
+
+    let mut ids = Vec::new();
+    for (status, tag, source, on) in arrivals {
+        let ReceivedResponse { response, received } =
+            timeout(Duration::from_secs(2), responses.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        assert_eq!(response.status().as_u16(), status);
+        let to = response.headers().get("To").unwrap().as_str();
+        assert!(to.ends_with(&format!(";tag={tag}")), "{to}");
+        assert_eq!(
+            (received.source(), received.destination()),
+            (source, LOCAL)
+        );
+        assert_eq!(received.context().as_bytes(), on);
+        ids.push((received.id(), received.received_at()));
+    }
+    for pair in ids.windows(2) {
+        let ((before, at), (after, then)) = (pair[0], pair[1]);
+        assert_eq!(after.domain(), before.domain());
+        assert_eq!(after.sequence(), before.sequence() + 1);
+        assert!(at <= then);
+    }
+    assert!(wire.sent(1).await.iter().all(|sent| sent.path == Way::Default));
+}
+
+// A response's context counts against its stream's limits with its bytes.
+// One that cannot keep its context ends the stream with the overflow error,
+// after the responses already queued, rather than arriving without it.
+#[tokio::test]
+async fn a_response_never_arrives_without_its_context() {
+    const LIMIT: usize = 500;
+    let wire = Wire::default();
+    let (endpoint, _incoming) = Endpoint::builder()
+        .udp_io(wire.clone())
+        .client_response_limits(WriteLimits { messages: 8, bytes: LIMIT })
+        .bind()
+        .unwrap();
+    let large =
+        TransportContext::new(Bytes::from(vec![b'x'; MAX_CONTEXT_LEN]))
+            .unwrap();
+
+    for (call, context) in [("small", None), ("large", Some(large))] {
+        let target = Target::new(Transport::Udp, PEER);
+        let (_control, mut responses) =
+            endpoint.start(outgoing(call), target).await.unwrap().into_parts();
+        let sent = wire.sent(wire.count() + 1).await;
+        let request =
+            Request::from_bytes(&sent.last().unwrap().payload).unwrap();
+        let trying = Response::reply_to(&request)
+            .status(100)
+            .body(Bytes::new())
+            .unwrap()
+            .to_bytes();
+        let ok = ok(&request).to_bytes();
+        // Both fit without the context and not with it.
+        assert!(trying.len() + ok.len() <= LIMIT);
+        assert!(trying.len() + ok.len() + MAX_CONTEXT_LEN > LIMIT);
+
+        wire.deliver(Ok(Datagram::new(trying, PEER, LOCAL)));
+        let mut final_response = Datagram::new(ok, PEER, LOCAL);
+        if let Some(context) = context.clone() {
+            final_response = final_response.with_context(context);
+        }
+        wire.deliver(Ok(final_response));
+        // Both wait in the stream before it is read.
+        sleep(Duration::from_millis(100)).await;
+
+        let mut next = async || {
+            timeout(Duration::from_secs(2), responses.next())
+                .await
+                .unwrap()
+                .unwrap()
+        };
+        let first = next().await.unwrap();
+        assert_eq!(first.response.status().as_u16(), 100);
+        let second = next().await;
+        match context {
+            None => {
+                assert_eq!(second.unwrap().response.status().as_u16(), 200)
+            }
+            Some(_) => assert!(second.unwrap_err().is_delivery_overflow()),
+        }
     }
 }

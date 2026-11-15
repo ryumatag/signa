@@ -389,7 +389,7 @@ pub(super) fn invite(c: &mut Criterion) {
                         .into_parts();
                     let ok = loop {
                         let response =
-                            responses.next().await.unwrap().unwrap();
+                            responses.next().await.unwrap().unwrap().response;
                         if response.status() == StatusCode::OK {
                             break response;
                         }
@@ -420,7 +420,8 @@ pub(super) fn invite(c: &mut Criterion) {
                     .unwrap()
                     .into_parts();
                 let busy = loop {
-                    let response = responses.next().await.unwrap().unwrap();
+                    let response =
+                        responses.next().await.unwrap().unwrap().response;
                     if response.status().is_final() {
                         break response;
                     }
@@ -443,7 +444,8 @@ pub(super) fn invite(c: &mut Criterion) {
                     .unwrap()
                     .into_parts();
                 loop {
-                    let response = responses.next().await.unwrap().unwrap();
+                    let response =
+                        responses.next().await.unwrap().unwrap().response;
                     if response.status().as_u16() == 180 {
                         break;
                     }
@@ -455,13 +457,15 @@ pub(super) fn invite(c: &mut Criterion) {
                 };
                 let (_, mut cancel_responses) = cancel.into_parts();
                 let terminated = loop {
-                    let response = responses.next().await.unwrap().unwrap();
+                    let response =
+                        responses.next().await.unwrap().unwrap().response;
                     if response.status().is_final() {
                         break response;
                     }
                 };
                 assert_eq!(terminated.status().as_u16(), 487);
-                let ok = cancel_responses.next().await.unwrap().unwrap();
+                let ok =
+                    cancel_responses.next().await.unwrap().unwrap().response;
                 assert_eq!(ok.status(), StatusCode::OK);
             });
         });
@@ -523,7 +527,8 @@ pub(super) fn invite_udp(c: &mut Criterion) {
                     .unwrap()
                     .into_parts();
                 let busy = loop {
-                    let response = responses.next().await.unwrap().unwrap();
+                    let response =
+                        responses.next().await.unwrap().unwrap().response;
                     if response.status().is_final() {
                         break response;
                     }
@@ -546,7 +551,8 @@ pub(super) fn invite_udp(c: &mut Criterion) {
                     .unwrap()
                     .into_parts();
                 loop {
-                    let response = responses.next().await.unwrap().unwrap();
+                    let response =
+                        responses.next().await.unwrap().unwrap().response;
                     if response.status().as_u16() == 180 {
                         break;
                     }
@@ -558,13 +564,15 @@ pub(super) fn invite_udp(c: &mut Criterion) {
                 };
                 let (_, mut cancel_responses) = cancel.into_parts();
                 let terminated = loop {
-                    let response = responses.next().await.unwrap().unwrap();
+                    let response =
+                        responses.next().await.unwrap().unwrap().response;
                     if response.status().is_final() {
                         break response;
                     }
                 };
                 assert_eq!(terminated.status().as_u16(), 487);
-                let ok = cancel_responses.next().await.unwrap().unwrap();
+                let ok =
+                    cancel_responses.next().await.unwrap().unwrap().response;
                 assert_eq!(ok.status(), StatusCode::OK);
             }))
         });
@@ -1006,7 +1014,7 @@ impl Client {
             .into_parts();
         loop {
             let response =
-                responses.next().await.expect("transaction outcome")?;
+                responses.next().await.expect("transaction outcome")?.response;
             if response.status().as_u16() >= 200 {
                 return Ok(response);
             }

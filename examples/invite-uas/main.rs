@@ -487,7 +487,8 @@ async fn invite(
     let (_control, mut responses) =
         caller.start(request, target.clone()).await?.into_parts();
     loop {
-        let response = responses.next().await.ok_or("no final response")??;
+        let response =
+            responses.next().await.ok_or("no final response")??.response;
         println!("caller: {call_id}: {}", response.status());
         if response.status().is_success() {
             return Ok((response, responses));
@@ -539,8 +540,12 @@ async fn count_2xx(
             None => next.await,
         };
         match response {
-            Some(Ok(response)) if response.status().is_success() => {
-                arrivals.push(started.elapsed())
+            // When the 2xx arrived, not when this loop got to it.
+            Some(Ok(received)) if received.response.status().is_success() => {
+                let arrived = received.received.received_at();
+                arrivals.push(
+                    arrived.saturating_duration_since(started.into_std()),
+                )
             }
             Some(_) => {}
             None => break,

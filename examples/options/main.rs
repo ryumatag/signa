@@ -103,10 +103,11 @@ async fn main() -> Result<(), BoxError> {
         let (_control, mut responses) =
             client_end.start(request, target.clone()).await?.into_parts();
         let mut response =
-            responses.next().await.expect("transaction outcome")?;
+            responses.next().await.expect("transaction outcome")?.response;
         while response.status().is_provisional() {
             println!("client: {} over {transport}", response.status());
-            response = responses.next().await.expect("final outcome")?;
+            response =
+                responses.next().await.expect("final outcome")?.response;
         }
         println!("client: {} over {transport}", response.status());
         assert_eq!(response.status().as_u16(), 200);

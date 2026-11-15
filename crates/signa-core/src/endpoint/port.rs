@@ -33,14 +33,14 @@ use tokio::{
 
 use super::{
     BindError, Error, ShutdownOutcome,
-    datagram::Port,
+    datagram::{Port, Received},
     driver::{ABANDONED_FLUSH, ReceptionCounters, increment},
     path::{self, PathSelection},
 };
 use crate::{
     message::{Message, error::InvalidMessage},
     transport::{
-        Flow, Transport, WriteLimits,
+        Flow, ReceiveId, Stamp, Stamps, Transport, WriteLimits,
         budget::{Budget, Permit},
         datagram::{
             Binding, Capabilities, Datagram, DatagramIo, DatagramWrite, Owner,
@@ -292,13 +292,15 @@ impl PortBuilder {
         }
 
         let reception = Arc::<ReceptionCounters>::default();
+        let id = crate::transport::next_id();
         let port = Port::new(
             io,
             WriteLimits { messages: usize::MAX, bytes: usize::MAX },
             reception.clone(),
+            Stamps::in_domain(id),
         );
         let shared = Arc::new(Shared {
-            id: path::next_id(),
+            id,
             local,
             capabilities,
             deadline: self.decision_deadline,
@@ -796,7 +798,7 @@ impl DatagramPort {
 
     /// Registers an endpoint, for [`Builder::bind`](super::Builder::bind).
     pub(super) fn register(&self) -> Result<Registration, BindError> {
-        let registration = path::next_id();
+        let registration = crate::transport::next_id();
         let (completions, completions_rx) = mpsc::unbounded_channel();
         let withdrawal = Arc::new(Withdrawal::default());
         {
@@ -980,9 +982,11 @@ impl DatagramIo for Proxy {
     ) -> Poll<Result<Datagram, RecvError>> {
         match ready!(self.deliveries.poll_recv(cx)) {
             Some(datagram) => {
-                let (payload, flow, context) = datagram.into_delivered();
+                let (payload, flow, context, stamp) =
+                    datagram.into_delivered();
                 let datagram = Datagram::new(payload, flow.remote, flow.local)
-                    .with_context(context);
+                    .with_context(context)
+                    .with_stamp(stamp);
                 Poll::Ready(Ok(datagram))
             }
             // Nothing can deliver to the endpoint any more.
@@ -1175,8 +1179,8 @@ impl PortTask {
         let mut received = 0;
         while received < BATCH {
             match self.port.poll_recv(cx) {
-                Poll::Ready((payload, flow, context)) => {
-                    self.on_datagram(payload, flow, context);
+                Poll::Ready(datagram) => {
+                    self.on_datagram(datagram);
                     received += 1;
                 }
                 Poll::Pending => break,
@@ -1273,12 +1277,8 @@ impl PortTask {
         }
     }
 
-    fn on_datagram(
-        &mut self,
-        payload: Bytes,
-        flow: Flow,
-        context: TransportContext,
-    ) {
+    fn on_datagram(&mut self, datagram: Received) {
+        let Received { payload, flow, context, stamp, .. } = datagram;
         let stats = &self.shared.stats;
         increment(&stats.received);
         let Some(permit) =
@@ -1293,7 +1293,10 @@ impl PortTask {
             // A backend may slice its context out of a capture buffer, which
             // a held datagram would keep alive. See `path::retain`.
             context: context.detached(),
-            deadline: Instant::now() + self.shared.deadline,
+            stamp,
+            // The deadline counts from when the datagram arrived, the time
+            // `Port::poll_recv` stamped it with.
+            deadline: Instant::from_std(stamp.at) + self.shared.deadline,
             held: Some(Held {
                 shared: self.shared.clone(),
                 commands: self.weak.clone(),
@@ -1529,6 +1532,7 @@ pub struct ReceivedDatagram {
     payload: Bytes,
     flow: Flow,
     context: TransportContext,
+    stamp: Stamp,
     deadline: Instant,
     /// The disposition, until one is made.
     held: Option<Held>,
@@ -1568,7 +1572,23 @@ impl ReceivedDatagram {
         &self.context
     }
 
-    /// When the datagram stops being deliverable or forwardable.
+    /// The datagram's ID, which the endpoint it is delivered to keeps in
+    /// the [`ReceiveInfo`] of what it makes of it.
+    ///
+    /// [`ReceiveInfo`]: super::ReceiveInfo
+    pub fn receive_id(&self) -> ReceiveId {
+        self.stamp.id
+    }
+
+    /// When the port's task took the datagram from the backend, before the
+    /// application held it. The endpoint it is delivered to keeps this
+    /// time too.
+    pub fn received_at(&self) -> std::time::Instant {
+        self.stamp.at
+    }
+
+    /// When the datagram stops being deliverable or forwardable, the
+    /// decision deadline after [`ReceivedDatagram::received_at`].
     pub fn deadline(&self) -> std::time::Instant {
         self.deadline.into_std()
     }
@@ -1699,9 +1719,10 @@ impl ReceivedDatagram {
 
     /// Takes the parts an endpoint's driver receives, ending the datagram
     /// without counting it again.
-    fn into_delivered(mut self) -> (Bytes, Flow, TransportContext) {
+    fn into_delivered(mut self) -> (Bytes, Flow, TransportContext, Stamp) {
         self.held = None;
-        (mem::take(&mut self.payload), self.flow, mem::take(&mut self.context))
+        let payload = mem::take(&mut self.payload);
+        (payload, self.flow, mem::take(&mut self.context), self.stamp)
     }
 }
 
@@ -1724,6 +1745,8 @@ impl fmt::Debug for ReceivedDatagram {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ReceivedDatagram")
             .field("len", &self.payload.len())
+            .field("receive_id", &self.stamp.id)
+            .field("received_at", &self.stamp.at)
             .field("flow", &self.flow)
             .field("context", &self.context)
             .finish()
@@ -1927,7 +1950,7 @@ impl Capture {
         for _ in 0..BATCH {
             match ready!(self.io.poll_recv(cx)) {
                 Ok(datagram) => {
-                    let (payload, source, destination, context) =
+                    let (payload, source, destination, context, _) =
                         datagram.into_parts();
                     let flow = Flow {
                         transport: Transport::Udp,

@@ -200,7 +200,8 @@ pub struct ServerRequest {
     /// The received request, with `received` and `rport` filled in its top
     /// Via.
     pub request: Request<Bytes>,
-    /// How it arrived: the observed flow and the UDP backend's context.
+    /// How it arrived: its ID and time, the observed flow and the UDP
+    /// backend's context.
     pub received: ReceiveInfo,
     /// Response submission and independent transaction observation.
     pub transaction: ServerTransaction,
@@ -223,7 +224,8 @@ pub struct IncomingCancel {
     /// The received CANCEL, with `received` and `rport` filled in its top
     /// Via.
     pub request: Request<Bytes>,
-    /// How it arrived: the observed flow and the UDP backend's context.
+    /// How it arrived: its ID and time, the observed flow and the UDP
+    /// backend's context.
     pub received: ReceiveInfo,
     /// The CANCEL's own non-INVITE server transaction.
     pub transaction: ServerTransaction,
@@ -246,7 +248,8 @@ pub struct IncomingCancel {
 pub struct ReceivedAck {
     /// The received ACK, with `received` and `rport` filled in its top Via.
     pub request: Request<Bytes>,
-    /// How it arrived: the observed flow and the UDP backend's context.
+    /// How it arrived: its ID and time, the observed flow and the UDP
+    /// backend's context.
     pub received: ReceiveInfo,
 }
 
@@ -259,24 +262,28 @@ pub struct ReceivedRequest {
     /// The received request, with `received` and `rport` filled in its top
     /// Via.
     pub request: Request<Bytes>,
-    /// How it arrived: the observed flow and the UDP backend's context.
+    /// How it arrived: its ID and time, the observed flow and the UDP
+    /// backend's context.
     pub received: ReceiveInfo,
     /// One-shot reply capability retaining the received route.
     pub reply: ReplyRoute,
 }
 
-/// An owned response received by a stateless endpoint.
+/// An owned received response: one a stateless endpoint received, or one a
+/// client transaction's [`Responses`] yields.
 ///
-/// It has no reply capability. Forwarding it is
+/// It has no reply capability. A stateless proxy forwards it with
 /// [`Endpoint::forward_response`], once the TU has checked and removed its own
 /// Via value. Dropping it sends nothing.
 ///
 /// [`Endpoint::forward_response`]: super::Endpoint::forward_response
+/// [`Responses`]: super::Responses
 #[derive(Debug)]
 pub struct ReceivedResponse {
     /// The received response, as it arrived.
     pub response: Response<Bytes>,
-    /// How it arrived: the observed flow and the UDP backend's context.
+    /// How it arrived: its ID and time, the observed flow and the UDP
+    /// backend's context.
     pub received: ReceiveInfo,
 }
 

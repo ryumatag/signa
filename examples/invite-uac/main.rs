@@ -67,8 +67,8 @@ use bytes::Bytes;
 use signa::{
     Method, Request, Response,
     endpoint::{
-        CancelOutcome, ClientControl, Endpoint, Responses, ShutdownOutcome,
-        Target, ViaMode,
+        CancelOutcome, ClientControl, Endpoint, ReceivedResponse, Responses,
+        ShutdownOutcome, Target, ViaMode,
     },
     message::{
         header::{
@@ -250,8 +250,9 @@ async fn forked_answers(
     // A real UAC reads until Timer M ends the stream. The far side sends
     // three 2xx here, so the example stops after them.
     while answers < 3 {
-        let response = responses.next().await.ok_or("stream ended")??;
-        println!("uac: {}", response.status());
+        let ReceivedResponse { response, received } =
+            responses.next().await.ok_or("stream ended")??;
+        println!("uac: {} from {}", response.status(), received.source());
         if response.status().is_success() {
             answers += 1;
             let created = call.acknowledge(uac, &response).await?;
@@ -268,7 +269,7 @@ async fn forked_answers(
 async fn cancelled(uac: &Endpoint, target: Target) -> Result<(), BoxError> {
     let (_call, control, mut responses) =
         Call::start(uac, target, "cancelled").await?;
-    let ringing = responses.next().await.ok_or("stream ended")??;
+    let ringing = responses.next().await.ok_or("stream ended")??.response;
     println!("uac: {}", ringing.status());
 
     let (_, mut cancel_responses) =
@@ -289,13 +290,13 @@ async fn cancel_loses_the_race(
 ) -> Result<(), BoxError> {
     let (mut call, control, mut responses) =
         Call::start(uac, target, "race").await?;
-    let ringing = responses.next().await.ok_or("stream ended")??;
+    let ringing = responses.next().await.ok_or("stream ended")??.response;
     println!("uac: {}", ringing.status());
 
     // The CANCEL goes out, but the INVITE's own stream decides the outcome.
     let cancel = cancel(&control).await?;
     let ok = loop {
-        let response = responses.next().await.ok_or("stream ended")??;
+        let response = responses.next().await.ok_or("stream ended")??.response;
         println!("uac: {}", response.status());
         if response.status().is_final() {
             break response;
@@ -333,7 +334,7 @@ async fn cancel(
 /// Reads up to the final response and returns its status.
 async fn final_status(responses: &mut Responses) -> Result<u16, BoxError> {
     loop {
-        let response = responses.next().await.ok_or("stream ended")??;
+        let response = responses.next().await.ok_or("stream ended")??.response;
         if response.status().is_final() {
             return Ok(response.status().as_u16());
         }

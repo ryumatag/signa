@@ -331,6 +331,7 @@ async fn relay(
     arrivals: mpsc::UnboundedSender<Arrival>,
 ) {
     while let Some(arrival) = responses.next().await {
+        let arrival = arrival.map(|received| received.response);
         if arrivals.send((index, arrival)).is_err() {
             return;
         }
@@ -349,10 +350,10 @@ fn cancel_pending(branches: &mut [Branch]) {
             match control.cancel().await {
                 Ok(CancelOutcome::Sent(cancel)) => {
                     let (_, mut responses) = cancel.into_parts();
-                    if let Some(Ok(response)) = responses.next().await {
+                    if let Some(Ok(received)) = responses.next().await {
                         println!(
                             "proxy: CANCEL of branch {index} got {}",
-                            response.status()
+                            received.response.status()
                         );
                     }
                 }
@@ -462,7 +463,7 @@ async fn call(
     // the two 2xx it expects, or after its one non-2xx final.
     while finals.len() < 2 {
         let Some(response) = responses.next().await else { break };
-        let response = response?;
+        let response = response?.response;
         let status = response.status().as_u16();
         println!("uac: {user}: {status}");
         if response.status().is_provisional() {

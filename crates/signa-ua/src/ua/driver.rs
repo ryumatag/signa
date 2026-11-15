@@ -78,9 +78,10 @@ use signa_core::{
     endpoint::{
         Branch, CancelError, CancelOutcome, ClientControl, ClientTransaction,
         Endpoint, Error as CoreError, Incoming, IncomingCancel, IncomingEvent,
-        ReceivedRequest, ReplyRoute, Responder, Responses, ServerRequest,
-        ServerTransactionId, Shutdown, ShutdownOutcome as CoreOutcome,
-        SubmitError, Target, ViaMode, WorkGuard,
+        ReceivedRequest, ReceivedResponse, ReplyRoute, Responder, Responses,
+        ServerRequest, ServerTransactionId, Shutdown,
+        ShutdownOutcome as CoreOutcome, SubmitError, Target, ViaMode,
+        WorkGuard,
     },
     message::{
         header::{
@@ -128,8 +129,9 @@ impl Random for OsRandom {
     }
 }
 
-/// A response read from a client transaction, or `None` at its end.
-type ResponseItem = Option<Result<Response<Bytes>, CoreError>>;
+/// A response read from a client transaction, with how it arrived, or `None`
+/// at its end.
+type ResponseItem = Option<Result<ReceivedResponse, CoreError>>;
 
 /// The INVITE whose client transaction a reader reads.
 #[derive(Clone, Copy, Debug)]
@@ -1497,7 +1499,10 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         item: ResponseItem,
     ) {
         match item {
-            Some(Ok(response)) => {
+            // TODO: Publish `received` with the response's progress, so that
+            // the application learns where and when the response arrived.
+            // The model keeps its own processing time apart from it.
+            Some(Ok(ReceivedResponse { response, received: _ })) => {
                 let description = Body::description(
                     response.headers(),
                     response.body(),
@@ -1524,7 +1529,9 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
 
     fn on_response(&mut self, attempt: AttemptKey, item: ResponseItem) {
         match item {
-            Some(Ok(response)) => {
+            // TODO: Publish `received` with the response's progress, as for
+            // a re-INVITE's.
+            Some(Ok(ReceivedResponse { response, received: _ })) => {
                 let status = response.status();
                 // An error here is a response the UA keeps no session for.
                 // The model has queued what the wire still needs, such as
@@ -2015,7 +2022,8 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         let fallback = Done::ByeAnswered { bye, result: Err(Error::Internal) };
         let handle = self.watchers.spawn(async move {
             let result = loop {
-                match responses.next().await {
+                let item = responses.next().await;
+                match item.map(|item| item.map(|received| received.response)) {
                     Some(Ok(response)) if response.status().is_success() => {
                         break Ok(());
                     }

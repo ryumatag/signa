@@ -170,7 +170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         responder.respond(response).await?;
     }
 
-    let response = responses.next().await.expect("a final response")?;
+    let response = responses.next().await.expect("a final response")?.response;
     assert_eq!(response.status(), StatusCode::OK);
 
     // Over TCP both transactions end with the final response. Over UDP the

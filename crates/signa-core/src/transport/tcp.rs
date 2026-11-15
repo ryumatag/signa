@@ -51,7 +51,7 @@ use tokio::{
 };
 
 use super::{
-    Flow, MessageLimits, Transport, WriteLimits,
+    Flow, MessageLimits, Stamp, Stamps, Transport, WriteLimits,
     budget::{Budget, Permit},
     framing::{Decoder, Frame, Role},
 };
@@ -214,6 +214,8 @@ impl Default for Config {
 pub struct Inbound {
     /// The message, or `None` once this connection has closed.
     pub message: Option<Message<Bytes>>,
+    /// The message's receive stamp, made as the connection framed it.
+    pub(crate) stamp: Option<Stamp>,
     /// The connection it arrived on.
     pub flow: Flow,
     /// The way to send on that connection.
@@ -641,7 +643,12 @@ fn start(
         .await;
         if let Some(writer) = closed_writer.upgrade() {
             let _ = closed_inbound
-                .send(Inbound { message: None, flow, writer: Writer(writer) })
+                .send(Inbound {
+                    message: None,
+                    stamp: None,
+                    flow,
+                    writer: Writer(writer),
+                })
                 .await;
         }
         drop(closed_permit);
@@ -745,6 +752,9 @@ async fn read_loop(
     writer: Writer,
 ) -> End {
     let mut decoder = Decoder::new(role, limits);
+    // Each connection is a receive domain of its own, numbered in the order
+    // it frames messages.
+    let mut stamps = Stamps::new();
     let mut buf = BytesMut::with_capacity(READ_SIZE);
     // Resolves when the endpoint drops its receiver, so an idle connection
     // closes with the endpoint instead of at the idle timeout.
@@ -753,9 +763,15 @@ async fn read_loop(
         loop {
             match decoder.decode(&mut buf) {
                 Ok(Some(Frame::Message(message))) => {
-                    let writer = writer.clone();
-                    let inbound_message =
-                        Inbound { message: Some(message), flow, writer };
+                    // A message arrives when it is framed whole, which can be
+                    // well after its first segment.
+                    let at = tokio::time::Instant::now().into_std();
+                    let inbound_message = Inbound {
+                        message: Some(message),
+                        stamp: Some(stamps.stamp(at)),
+                        flow,
+                        writer: writer.clone(),
+                    };
                     if inbound.send(inbound_message).await.is_err() {
                         return End::Endpoint;
                     }

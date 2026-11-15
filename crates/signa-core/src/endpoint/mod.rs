@@ -844,7 +844,14 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(
-                    responses.next().await.unwrap().unwrap().status().as_u16(),
+                    responses
+                        .next()
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .response
+                        .status()
+                        .as_u16(),
                     100
                 );
             }
@@ -859,7 +866,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                responses.next().await.unwrap().unwrap().status(),
+                responses.next().await.unwrap().unwrap().response.status(),
                 StatusCode::OK
             );
             assert!(responses.next().await.is_none());
@@ -914,7 +921,7 @@ mod tests {
 
         // RFC 4320's 100 may come first, at 70 ms.
         let last = loop {
-            let response = responses.next().await.unwrap().unwrap();
+            let response = responses.next().await.unwrap().unwrap().response;
             if response.status().is_final() {
                 break response;
             }
@@ -966,7 +973,14 @@ mod tests {
         // the queued responses without requiring an application read.
         assert!(peer.recv().await.is_some());
         assert_eq!(
-            responses.next().await.unwrap().unwrap().status().as_u16(),
+            responses
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .response
+                .status()
+                .as_u16(),
             100
         );
         assert!(
@@ -1283,7 +1297,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .response;
         assert_eq!(response.status(), StatusCode::OK);
         assert!(responses.next().await.is_none());
 
@@ -1856,7 +1871,7 @@ mod tests {
             reception: Reception::Stateful,
             udp: Some(udp),
             tcp: None,
-            registration: super::path::next_id(),
+            registration: crate::transport::next_id(),
             binding: None,
             port: None,
             ingress: None,
@@ -3317,6 +3332,7 @@ mod tests {
             .expect("a response within a second")
             .expect("an open stream")
             .unwrap()
+            .response
     }
 
     fn invite_endpoint(timers: Timers) -> (Endpoint, Incoming) {
@@ -3613,7 +3629,11 @@ mod tests {
     }
 
     async fn arrived(responses: &mut Responses) -> Response<Bytes> {
-        still(responses.next()).await.expect("an open stream").unwrap()
+        still(responses.next())
+            .await
+            .expect("an open stream")
+            .unwrap()
+            .response
     }
 
     async fn arrived_event(incoming: &mut Incoming) -> IncomingEvent {
@@ -6039,5 +6059,83 @@ mod tests {
             timeout(Duration::from_millis(1), proxy.shutdown(Duration::MAX))
                 .await;
         assert_eq!(outcome.unwrap(), ShutdownOutcome::Drained);
+    }
+
+    // A datagram gets its ID where it arrives, before it is parsed. Two
+    // copies of the same bytes are two arrivals, and one that does not parse
+    // still takes its place in the sequence.
+    #[tokio::test]
+    async fn every_datagram_gets_an_id_of_its_own_as_it_arrives() {
+        let (endpoint, mut incoming) = stateless_endpoint();
+        let to = endpoint.udp_addr().unwrap();
+        let peer = Peer::new().await;
+        let via =
+            format!("SIP/2.0/UDP {};branch=z9hG4bKids;rport", peer.addr());
+        let options = peer.request("OPTIONS", &via);
+        let before = Instant::now();
+
+        peer.send(to, &options).await;
+        let first = stateless_request(&mut incoming).await.received;
+        peer.send(to, "not SIP\r\n\r\n").await;
+        peer.send(to, &options).await;
+        let second = stateless_request(&mut incoming).await.received;
+
+        assert_eq!(first.id().domain(), second.id().domain());
+        assert_eq!(second.id().sequence(), first.id().sequence() + 2);
+        assert!(before <= first.received_at());
+        assert!(first.received_at() <= second.received_at());
+        assert_eq!(second.source(), peer.addr());
+        assert_eq!(second.destination(), to);
+    }
+
+    // A TCP message arrives when its connection has framed it whole, which
+    // is after its last segment, not its first. Each connection numbers its
+    // own messages.
+    #[tokio::test]
+    async fn tcp_messages_arrive_as_they_are_framed() {
+        let (endpoint, mut incoming) =
+            Endpoint::builder().tcp(LOCALHOST).bind().unwrap();
+        let addr = endpoint.tcp_addr().unwrap();
+        // ACKs that match nothing reach the TU and get no response.
+        let ack = |branch: &str| {
+            format!(
+                "ACK sip:bob@example.com SIP/2.0\r\n\
+                 Via: SIP/2.0/TCP 127.0.0.1:9;branch=z9hG4bK{branch}\r\n\
+                 From: <sip:alice@example.com>;tag=1\r\n\
+                 To: <sip:bob@example.com>;tag=2\r\n\
+                 Call-ID: tcp-stamps\r\n\
+                 CSeq: 1 ACK\r\n\
+                 Content-Length: 0\r\n\r\n"
+            )
+        };
+        let mut next = async || match event(&mut incoming).await {
+            IncomingEvent::Ack(ack) => ack.received,
+            other => panic!("an ACK, got {other:?}"),
+        };
+
+        let mut first = TcpStream::connect(addr).await.unwrap();
+        let both = format!("{}{}", ack("a"), ack("b"));
+        first.write_all(both.as_bytes()).await.unwrap();
+        let a = next().await;
+        let b = next().await;
+        assert_eq!(a.id().domain(), b.id().domain());
+        assert_eq!(b.id().sequence(), a.id().sequence() + 1);
+
+        let split = ack("c");
+        let (head, tail) = split.split_at(split.len() / 2);
+        first.write_all(head.as_bytes()).await.unwrap();
+        sleep(Duration::from_millis(50)).await;
+        let tail_sent = Instant::now();
+        first.write_all(tail.as_bytes()).await.unwrap();
+        let c = next().await;
+        assert!(c.received_at() >= tail_sent);
+        assert_eq!(c.id().sequence(), b.id().sequence() + 1);
+
+        let mut second = TcpStream::connect(addr).await.unwrap();
+        second.write_all(ack("d").as_bytes()).await.unwrap();
+        let d = next().await;
+        assert_ne!(d.id().domain(), a.id().domain());
+        assert_eq!(d.id().sequence(), 0);
+        assert_eq!(d.transport(), Transport::Tcp);
     }
 }

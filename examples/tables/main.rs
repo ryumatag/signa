@@ -191,9 +191,11 @@ async fn main() {
                     .await
                     .unwrap()
                     .into_parts();
-                let mut response = responses.next().await.unwrap().unwrap();
+                let mut response =
+                    responses.next().await.unwrap().unwrap().response;
                 while response.status().is_provisional() {
-                    response = responses.next().await.unwrap().unwrap();
+                    response =
+                        responses.next().await.unwrap().unwrap().response;
                 }
                 assert_eq!(response.status(), mode.status());
                 if mode == Mode::Invite {

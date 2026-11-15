@@ -20,8 +20,8 @@ use std::{io, time::Instant};
 use bytes::Bytes;
 
 use super::{
-    Cancel, ClientEntry, ClientMachine, Driver, Link, Pending, ServerMachine,
-    has_identity, increment, send_on,
+    Arrival, Cancel, ClientEntry, ClientMachine, Driver, Link, Pending,
+    ServerMachine, has_identity, increment, send_on,
 };
 use crate::{
     endpoint::{
@@ -33,7 +33,7 @@ use crate::{
     },
     message::{request::Request, response::Response},
     transaction::{invite, key::ServerKey},
-    transport::{Flow, datagram::TransportContext, tcp},
+    transport::tcp,
 };
 
 impl Driver {
@@ -48,6 +48,7 @@ impl Driver {
         &mut self,
         id: Id,
         response: Response<Bytes>,
+        arrival: Arrival<'_>,
         before: Option<Instant>,
         now: Instant,
     ) {
@@ -66,7 +67,7 @@ impl Driver {
                 // The machine stopped retransmitting and dropped the request.
                 permit.release_bytes();
                 if let Some(delivery) = respond {
-                    delivery.response(response);
+                    delivery.response(arrival.response(response));
                 }
                 cancel = matches!(invite.cancel, Cancel::Waiting(..));
             }
@@ -77,7 +78,8 @@ impl Driver {
                 if invite.mark_answered() {
                     self.unanswered -= 1;
                 }
-                if response.status().is_success() {
+                let response = arrival.response(response);
+                if response.response.status().is_success() {
                     if let Some(delivery) = respond {
                         delivery.response(response);
                     }
@@ -264,8 +266,7 @@ impl Driver {
         &mut self,
         request: Request<Bytes>,
         key: Option<&ServerKey>,
-        flow: Flow,
-        context: &TransportContext,
+        arrival: Arrival<'_>,
         now: Instant,
     ) {
         if let Some(id) = key.and_then(|key| self.find_server(key, now)) {
@@ -289,11 +290,12 @@ impl Driver {
             increment(&self.reception_counters.acks);
             return;
         };
-        let Some(path) = retain(context, &self.context_limits, true) else {
+        let Some(path) = retain(arrival.context, &self.context_limits, true)
+        else {
             increment(&self.reception_counters.acks);
             return;
         };
-        let received = ReceiveInfo::new(flow, path);
+        let received = ReceiveInfo::new(arrival.flow, arrival.stamp, path);
         let _ = self.incoming.send(server::Queued {
             event: IncomingEvent::Ack(ReceivedAck { request, received }),
             _permit: permit,

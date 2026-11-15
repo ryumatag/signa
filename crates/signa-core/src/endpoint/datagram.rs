@@ -32,14 +32,14 @@ use bytes::Bytes;
 use tokio::sync::oneshot;
 
 use super::{
-    driver::{ReceptionCounters, increment},
+    driver::{ReceptionCounters, increment, now},
     port::{Withdrawal, WritePermit},
     reply::{Completion, ReplyError},
     routing::Link,
     server::WriteObservation,
 };
 use crate::transport::{
-    Flow, Transport, WriteLimits,
+    Flow, Stamp, Stamps, Transport, WriteLimits,
     datagram::{
         DatagramIo, DatagramWrite, Path, RecvError, Submit, TransportContext,
         WriteId, WriteOutcome,
@@ -73,12 +73,24 @@ pub(super) struct Port {
     awaited: Option<(WriteId, usize)>,
     awaited_result: Option<WriteOutcome>,
     counters: Arc<ReceptionCounters>,
+    stamps: Stamps,
     /// Set when shutdown lost a write: one the backend never took, one it
     /// failed while closing, or one it left unreported.
     lost: bool,
     /// Outcomes of shared port writes for the port task to pass on to their
     /// registrations, see [`Outcome::Registration`].
     routed: VecDeque<(u64, WriteId, WriteOutcome)>,
+}
+
+/// A datagram the backend received.
+pub(super) struct Received {
+    pub(super) payload: Bytes,
+    pub(super) flow: Flow,
+    pub(super) context: TransportContext,
+    pub(super) stamp: Stamp,
+    /// Set when [`Port::poll_recv`] stamped it, so that its time is the
+    /// current time too.
+    pub(super) fresh: bool,
 }
 
 /// A write waiting for the backend to accept it.
@@ -130,6 +142,7 @@ impl Port {
         io: Box<dyn DatagramIo>,
         limits: WriteLimits,
         counters: Arc<ReceptionCounters>,
+        stamps: Stamps,
     ) -> Port {
         let local = io.local_addr();
         let max_payload = io.capabilities().max_payload;
@@ -146,6 +159,7 @@ impl Port {
             awaited: None,
             awaited_result: None,
             counters,
+            stamps,
             lost: false,
             routed: VecDeque::new(),
         }
@@ -599,11 +613,14 @@ impl Port {
         }
     }
 
-    /// Polls for the next datagram, with the flow it arrived on and the
-    /// backend's context.
+    /// Polls for the next datagram, with the flow it arrived on, the
+    /// backend's context and its receive stamp.
     ///
     /// The context is the backend's own bytes, which may slice a capture
     /// buffer. The driver copies it where it keeps it, see `path::retain`.
+    ///
+    /// A datagram a shared port delivered keeps the stamp the port gave it.
+    /// Any other is stamped here, now, which is where it arrives.
     ///
     /// A truncated datagram and a receive error are counted and discarded. An
     /// error also yields to the driver's other sources, so that a backend
@@ -611,12 +628,16 @@ impl Port {
     pub(super) fn poll_recv(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<(Bytes, Flow, TransportContext)> {
+    ) -> Poll<Received> {
         for _ in 0..BATCH {
             match ready!(self.io.poll_recv(cx)) {
                 Ok(datagram) => {
-                    let (payload, source, destination, context) =
+                    let (payload, source, destination, context, stamp) =
                         datagram.into_parts();
+                    let (stamp, fresh) = match stamp {
+                        Some(stamp) => (stamp, false),
+                        None => (self.stamps.stamp(now()), true),
+                    };
                     // An IPv4 peer is named in its own form, as a Via names
                     // it, whichever backend reported it. The socket already
                     // does. A native IPv6 address keeps its scope.
@@ -625,7 +646,13 @@ impl Port {
                         local: unmap(destination),
                         remote: unmap(source),
                     };
-                    return Poll::Ready((payload, flow, context));
+                    return Poll::Ready(Received {
+                        payload,
+                        flow,
+                        context,
+                        stamp,
+                        fresh,
+                    });
                 }
                 Err(RecvError::Truncated) => {
                     increment(&self.counters.truncated_datagrams);
@@ -944,7 +971,12 @@ mod tests {
     }
 
     fn port(script: &Script, limits: WriteLimits) -> Port {
-        Port::new(Box::new(script.clone()), limits, Arc::default())
+        Port::new(
+            Box::new(script.clone()),
+            limits,
+            Arc::default(),
+            Stamps::new(),
+        )
     }
 
     fn flush(port: &mut Port) {
@@ -1412,7 +1444,8 @@ mod tests {
         )));
         script.receive(Err(RecvError::Io(io::Error::from_raw_os_error(5))));
 
-        let Poll::Ready((payload, flow, context)) = port.poll_recv(&mut cx)
+        let Poll::Ready(Received { payload, flow, context, .. }) =
+            port.poll_recv(&mut cx)
         else {
             panic!("expected a datagram");
         };

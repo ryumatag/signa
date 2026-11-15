@@ -1,9 +1,9 @@
 /*!
 Transport metadata and message/write limits.
 
-[`Flow`], [`Transport`], [`MessageLimits`] and [`WriteLimits`] are runtime
-independent, and so is the [`datagram`] contract that lets another backend
-carry an endpoint's UDP datagrams. Socket I/O and stream framing remain
+[`Flow`], [`Transport`], [`ReceiveId`], [`MessageLimits`] and [`WriteLimits`]
+are runtime independent, and so is the [`datagram`] contract that lets
+another backend carry an endpoint's UDP datagrams. Socket I/O and stream framing remain
 implementation details used by the endpoint. TCP connections are framed by Content-Length before messages
 reach the driver; UDP datagrams already carry their boundaries.
 */
@@ -11,6 +11,8 @@ reach the driver; UDP datagrams already carry their boundaries.
 use std::{
     fmt,
     net::{SocketAddr, SocketAddrV4},
+    sync::atomic::{AtomicU64, Ordering},
+    time::Instant,
 };
 
 // Without tokio nothing takes a permit, but a kept path still names its type.
@@ -132,6 +134,89 @@ pub struct Flow {
     pub local: SocketAddr,
     /// The other end.
     pub remote: SocketAddr,
+}
+
+/// Names one received message within the process.
+///
+/// The endpoint numbers each message where it first arrives: a datagram as
+/// the endpoint's backend or a shared port's task takes it, and a TCP message
+/// as its connection frames it. The ID stays the same however far the message
+/// travels, through an application's decision on a shared port included.
+///
+/// The [`domain`](ReceiveId::domain) names where it arrived: an endpoint's
+/// own UDP backend, a shared port or one TCP connection. No two of them in a
+/// process get the same domain, and none is reused. The
+/// [`sequence`](ReceiveId::sequence) counts the messages of that domain from
+/// zero, in the order they arrived. Two datagrams with the same bytes, such as
+/// a retransmission, get two IDs.
+///
+/// It is a name, not a capability. Nothing sends with it.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ReceiveId {
+    domain: u64,
+    sequence: u64,
+}
+
+impl ReceiveId {
+    /// The backend, port or connection the message arrived on.
+    pub fn domain(&self) -> u64 {
+        self.domain
+    }
+
+    /// The message's place among those of its domain, from zero.
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+}
+
+/// A received message's ID and the time it arrived, made once where it
+/// arrived and carried unchanged from there.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+pub(crate) struct Stamp {
+    pub(crate) id: ReceiveId,
+    pub(crate) at: Instant,
+}
+
+/// Stamps the messages of one receive point, which one task owns.
+///
+/// The sequence is a plain counter, since only that task stamps. It cannot
+/// wrap in practice. At a billion messages a second that would take 584
+/// years.
+#[derive(Debug)]
+#[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+pub(crate) struct Stamps {
+    domain: u64,
+    next: u64,
+}
+
+#[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+impl Stamps {
+    /// Stamps for a new domain.
+    pub(crate) fn new() -> Stamps {
+        Stamps::in_domain(next_id())
+    }
+
+    /// Stamps for `domain`, a number from [`next_id`] that names something
+    /// else too, such as an endpoint's binding.
+    pub(crate) fn in_domain(domain: u64) -> Stamps {
+        Stamps { domain, next: 0 }
+    }
+
+    /// Stamps the next message, which arrived `at`.
+    pub(crate) fn stamp(&mut self, at: Instant) -> Stamp {
+        let sequence = self.next;
+        self.next = self.next.wrapping_add(1);
+        Stamp { id: ReceiveId { domain: self.domain, sequence }, at }
+    }
+}
+
+/// A number that nothing else in this process gets: for a port, an endpoint
+/// registration or a receive domain.
+#[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+pub(crate) fn next_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// `addr` with an IPv4-mapped IPv6 address in its IPv4 form, and any other

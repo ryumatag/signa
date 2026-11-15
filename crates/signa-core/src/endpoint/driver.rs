@@ -69,7 +69,7 @@ use crate::{
             Admitted, CancelError, CancelHandle, CancelOutcome, Delivery,
             Intent, Observation, Reserved, Starting, Target,
         },
-        datagram::Port,
+        datagram::{Port, Received},
         error::Error,
         path::{ReceiveInfo, retain, transient},
         reply::{Admission, Completion, ReplyError, ReplyRoute},
@@ -79,8 +79,8 @@ use crate::{
         },
         send::ViaMode,
         server::{
-            self, IncomingEvent, ReceivedRequest, ServerRequest,
-            ServerTransactionId, SubmitError,
+            self, IncomingEvent, ReceivedRequest, ReceivedResponse,
+            ServerRequest, ServerTransactionId, SubmitError,
         },
         shutdown::{self, ShutdownOutcome},
         table::{Id, Table},
@@ -101,7 +101,7 @@ use crate::{
         non_invite::{ClientEvent, ClientTransaction, ServerTransaction},
     },
     transport::{
-        Flow, Transport, WriteLimits,
+        Flow, Stamp, Stamps, Transport, WriteLimits,
         budget::Budget,
         datagram::{DatagramIo, Path, TransportContext, WriteOutcome},
         tcp,
@@ -334,8 +334,8 @@ impl ClientEntry {
     /// final can wake a new call while its last slot is still charged.
     fn answer(
         &mut self,
-        result: Result<Response<Bytes>, Error>,
-    ) -> Option<(Responder, Result<Response<Bytes>, Error>)> {
+        result: Result<ReceivedResponse, Error>,
+    ) -> Option<(Responder, Result<ReceivedResponse, Error>)> {
         let respond = self.respond.take()?;
         self.permit.release_bytes();
         Some((respond, result))
@@ -540,7 +540,7 @@ enum Event {
     Timer(Key),
     Command(Command),
     Inbound(tcp::Inbound),
-    Datagram(Bytes, Flow, TransportContext),
+    Datagram(Received),
     /// Every handle is gone.
     Stop,
     /// A shutdown request, or the last work guard's drop.
@@ -549,6 +549,34 @@ enum Event {
     Drained,
     /// A responder was dropped before an accepted final response.
     Abandon(Arc<server::Shared>, ReplyRoute),
+}
+
+/// How a received message arrived: the flow it was observed on, the
+/// backend's context and its receive stamp.
+#[derive(Clone, Copy)]
+pub(super) struct Arrival<'a> {
+    pub(super) flow: Flow,
+    /// The backend's own bytes. Whatever keeps them copies them, see
+    /// `path::retain`.
+    pub(super) context: &'a TransportContext,
+    pub(super) stamp: Stamp,
+}
+
+impl Arrival<'_> {
+    /// The facts an envelope keeps, with a copy of the context charged to
+    /// nothing. A client response charges it to its stream instead, see
+    /// `Delivery::response`.
+    pub(super) fn info(&self) -> ReceiveInfo {
+        ReceiveInfo::new(self.flow, self.stamp, transient(self.context))
+    }
+
+    /// A client transaction's envelope of `response`, which arrived this way.
+    pub(super) fn response(
+        &self,
+        response: Response<Bytes>,
+    ) -> ReceivedResponse {
+        ReceivedResponse { response, received: self.info() }
+    }
 }
 
 /// Why [`Driver::serve`] returned.
@@ -843,6 +871,7 @@ impl Driver {
                     io,
                     config.udp_write_limits,
                     reception_counters.clone(),
+                    Stamps::new(),
                 )
             }),
             tcp,
@@ -942,30 +971,39 @@ impl Driver {
                 Event::Timer(key) => self.on_timer(key),
                 Event::Command(command) => self.on_command(command),
                 Event::Inbound(inbound) => {
+                    let flow = inbound.flow;
                     let link = Link {
-                        flow: inbound.flow,
+                        flow,
                         writer: Some(inbound.writer),
                         path: None,
                     };
                     if let Some(message) = inbound.message {
-                        self.on_message(
-                            message,
-                            link,
-                            &TransportContext::EMPTY,
-                        );
+                        let stamp = inbound.stamp.expect("a message's stamp");
+                        let context = &TransportContext::EMPTY;
+                        let arrival = Arrival { flow, context, stamp };
+                        self.on_message(message, link, arrival, now());
                     } else {
                         self.on_connection_closed(&link);
                     }
                 }
-                Event::Datagram(datagram, flow, context) => {
+                Event::Datagram(received) => {
+                    let Received { payload, flow, context, stamp, fresh } =
+                        received;
                     // A datagram that is not one whole message is dropped.
                     // That includes a request whose body is shorter than
                     // its `Content-Length`, which RFC 3261 section 18.3
                     // would answer with a 400, but the parse error keeps no
                     // head to answer with.
-                    if let Ok(message) = Message::from_shared(datagram) {
+                    if let Ok(message) = Message::from_shared(payload) {
+                        // A datagram the endpoint's own backend gave just now
+                        // was stamped with the current time. One a shared
+                        // port delivered arrived earlier, and timers run on
+                        // the endpoint's own clock, never on that time.
+                        let now = if fresh { stamp.at } else { now() };
                         let link = Link { flow, writer: None, path: None };
-                        self.on_message(message, link, &context);
+                        let context = &context;
+                        let arrival = Arrival { flow, context, stamp };
+                        self.on_message(message, link, arrival, now);
                     }
                 }
                 Event::Abandon(shared, _route) => self.abandon(&shared),
@@ -1224,9 +1262,8 @@ impl Driver {
                 4 => {
                     if let Some(udp) = &mut self.udp {
                         udp.poll_flush(cx);
-                        udp.poll_recv(cx).map(|(bytes, flow, context)| {
-                            Some(Event::Datagram(bytes, flow, context))
-                        })
+                        udp.poll_recv(cx)
+                            .map(|received| Some(Event::Datagram(received)))
                     } else {
                         Poll::Pending
                     }
@@ -2347,27 +2384,27 @@ impl Driver {
 
     /// Handles a received message, with the context the UDP backend gave it.
     /// The context is the backend's own bytes until a handler keeps a copy.
+    /// Handles a received message. `now` is the driver's current time,
+    /// which its timers use, and not necessarily when the message arrived.
     fn on_message(
         &mut self,
         message: Message<Bytes>,
         link: Link,
-        context: &TransportContext,
+        arrival: Arrival<'_>,
+        now: Instant,
     ) {
         match (self.config.reception, message) {
             (Reception::Stateful, Message::Request(request)) => {
-                self.on_request(request, link, context)
+                self.on_request(request, link, arrival, now)
             }
-            // TODO: Deliver the context with the response, which client
-            // responses do not carry yet. The transaction sends on its own
-            // link, so nothing keeps it now.
             (Reception::Stateful, Message::Response(response)) => {
-                self.on_received_response(response)
+                self.on_received_response(response, arrival, now)
             }
             (Reception::Stateless, Message::Request(request)) => {
-                self.on_stateless_request(request, link, context)
+                self.on_stateless_request(request, link, arrival)
             }
             (Reception::Stateless, Message::Response(response)) => {
-                self.on_stateless_response(response, link.flow, context)
+                self.on_stateless_response(response, arrival)
             }
         }
     }
@@ -2396,9 +2433,13 @@ impl Driver {
     /// is stray and discarded ([RFC 6026 section 8.9]).
     ///
     /// [RFC 6026 section 8.9]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.9
-    fn on_received_response(&mut self, response: Response<Bytes>) {
+    fn on_received_response(
+        &mut self,
+        response: Response<Bytes>,
+        arrival: Arrival<'_>,
+        now: Instant,
+    ) {
         let Some(key) = ClientKey::from_response(&response) else { return };
-        let now = now();
         let Some(id) = self.find_client(&key, now) else { return };
         let entry = self.clients.get_mut(id).expect("found above");
         // RFC 3261 section 18.1.2 discards a response whose top `Via` names
@@ -2415,15 +2456,17 @@ impl Driver {
 
         let before = entry.deadline();
         let ClientMachine::NonInvite(tx) = &mut entry.tx else {
-            self.on_invite_response(id, response, before, now);
+            self.on_invite_response(id, response, arrival, before, now);
             return;
         };
         let completion =
             match tx.on_response(response, &self.config.timers, now) {
-                ClientEvent::Final(response) => entry.answer(Ok(response)),
+                ClientEvent::Final(response) => {
+                    entry.answer(Ok(arrival.response(response)))
+                }
                 ClientEvent::Provisional(response) => {
                     if let Some(delivery) = &entry.respond {
-                        delivery.response(response);
+                        delivery.response(arrival.response(response));
                     }
                     None
                 }
@@ -2444,8 +2487,10 @@ impl Driver {
         &mut self,
         mut request: Request<Bytes>,
         link: Link,
-        context: &TransportContext,
+        arrival: Arrival<'_>,
+        now: Instant,
     ) {
+        let context = arrival.context;
         // Without a readable top `Via` there is no way to answer, so there
         // is nothing to do with the request.
         let Some(value) = request.headers().get(VIA) else { return };
@@ -2476,13 +2521,11 @@ impl Driver {
         // where the response goes, which differs in the port without `rport`.
         // It gets the context once something keeps it, after the checks
         // below that answer without keeping anything.
-        let source = link.flow;
         let link = Link { flow: reply, writer: link.writer, path: None };
-        let now = now();
 
         // No path below answers an ACK, including overload and shutdown.
         if method == Method::ACK {
-            self.on_ack(request, key.as_ref(), source, context, now);
+            self.on_ack(request, key.as_ref(), arrival, now);
             return;
         }
 
@@ -2513,7 +2556,7 @@ impl Driver {
                 if let Some(target) = self.find_cancel_target(key, now) {
                     let key = key.clone();
                     self.on_matched_cancel(
-                        request, key, target, source, link, context,
+                        request, key, target, link, arrival, now,
                     );
                     return;
                 }
@@ -2558,7 +2601,7 @@ impl Driver {
             return;
         };
         let link = Link { path: path.clone(), ..link };
-        let received = ReceiveInfo::new(source, path);
+        let received = ReceiveInfo::new(arrival.flow, arrival.stamp, path);
 
         let Some(commands) = self.command_sender.upgrade() else { return };
 
@@ -3161,7 +3204,7 @@ fn identity_bytes(request: &Request<Bytes>) -> Option<usize> {
 }
 
 /// The current time, as the transactions and tokio's timer both see it.
-fn now() -> Instant {
+pub(super) fn now() -> Instant {
     tokio::time::Instant::now().into_std()
 }
 
@@ -3309,6 +3352,34 @@ mod tests {
         },
         transaction::Timers,
     };
+
+    impl Driver {
+        /// Receives `request` on `link` as it arrives now, with `context`.
+        fn on_test_request(
+            &mut self,
+            request: Request<Bytes>,
+            link: Link,
+            context: &TransportContext,
+        ) {
+            let flow = link.flow;
+            let stamp = Stamps::new().stamp(now());
+            let arrival = Arrival { flow, context, stamp };
+            self.on_request(request, link, arrival, now());
+        }
+
+        /// Receives `response` over UDP as it arrives now.
+        fn on_test_response(&mut self, response: Response<Bytes>) {
+            let flow = Flow {
+                transport: Transport::Udp,
+                local: REPLY_LOCAL,
+                remote: "127.0.0.1:9".parse().unwrap(),
+            };
+            let context = &TransportContext::EMPTY;
+            let stamp = Stamps::new().stamp(now());
+            let arrival = Arrival { flow, context, stamp };
+            self.on_received_response(response, arrival, now());
+        }
+    }
 
     fn fallback(driver: &Driver, bytes: Bytes) -> Pending {
         let permit = driver.fallback.acquire(bytes.len()).unwrap();
@@ -3636,10 +3707,10 @@ mod tests {
             Duration::from_secs(1),
             poll_fn(|cx| {
                 for _ in 0..12 {
-                    if let Poll::Ready(Event::Datagram(bytes, _, _)) =
+                    if let Poll::Ready(Event::Datagram(received)) =
                         driver.poll_event(cx)
                     {
-                        return Poll::Ready(bytes);
+                        return Poll::Ready(received.payload);
                     }
                 }
                 cx.waker().wake_by_ref();
@@ -3739,13 +3810,13 @@ mod tests {
         );
         let key = ServerKey::from_request(&first).unwrap();
         let link = udp_reply_link(local, "127.0.0.1:9".parse().unwrap());
-        driver.on_request(first, link.clone(), &TransportContext::EMPTY);
+        driver.on_test_request(first, link.clone(), &TransportContext::EMPTY);
         let id = driver.servers.find(&key).unwrap().0;
 
         end_server(&mut driver, id);
         assert!(driver.work.is_idle());
         assert!(!driver.event_admission.is_idle());
-        driver.on_request(
+        driver.on_test_request(
             route_request(
                 "SIP/2.0/UDP example.com:9;branch=z9hG4bKrefused;rport",
             ),
@@ -3757,7 +3828,7 @@ mod tests {
 
         let _expired = driver.take_request();
         assert!(driver.event_admission.is_idle());
-        driver.on_request(
+        driver.on_test_request(
             route_request(
                 "SIP/2.0/UDP example.com:9;branch=z9hG4bKaccepted;rport",
             ),
@@ -3772,7 +3843,7 @@ mod tests {
     async fn queued_submissions_keep_their_count_after_waiters_drop() {
         let (mut driver, _commands, local) = reply_driver();
         let link = udp_reply_link(local, "127.0.0.1:9".parse().unwrap());
-        driver.on_request(
+        driver.on_test_request(
             route_request(
                 "SIP/2.0/UDP example.com:9;branch=z9hG4bKsubmissions;rport",
             ),
@@ -3813,7 +3884,7 @@ mod tests {
     async fn retained_response_bytes_are_reserved_before_machine_transition() {
         let (mut driver, _commands, local) = reply_driver();
         let link = udp_reply_link(local, "127.0.0.1:9".parse().unwrap());
-        driver.on_request(
+        driver.on_test_request(
             route_request(
                 "SIP/2.0/UDP example.com:9;branch=z9hG4bKfirst;rport",
             ),
@@ -3821,7 +3892,7 @@ mod tests {
             &TransportContext::EMPTY,
         );
         let first = driver.take_request();
-        driver.on_request(
+        driver.on_test_request(
             route_request(
                 "SIP/2.0/UDP example.com:9;branch=z9hG4bKother;rport",
             ),
@@ -3873,7 +3944,7 @@ mod tests {
     async fn a_reused_numeric_slot_cannot_redirect_a_tu_capability() {
         let (mut driver, _commands, local) = reply_driver();
         let link = udp_reply_link(local, "127.0.0.1:9".parse().unwrap());
-        driver.on_request(
+        driver.on_test_request(
             route_request(
                 "SIP/2.0/UDP example.com:9;branch=z9hG4bKidentity;rport",
             ),
@@ -3948,7 +4019,7 @@ mod tests {
         driver.submissions =
             Budget::new(WriteLimits { messages: 1, bytes: usize::MAX });
         let link = udp_reply_link(local, "127.0.0.1:9".parse().unwrap());
-        driver.on_request(
+        driver.on_test_request(
             route_request(
                 "SIP/2.0/UDP example.com:9;branch=z9hG4bKwake;rport",
             ),
@@ -3985,7 +4056,7 @@ mod tests {
         let link = udp_reply_link(local, "127.0.0.1:9".parse().unwrap());
         drop(commands);
 
-        driver.on_request(
+        driver.on_test_request(
             route_request(
                 "SIP/2.0/UDP example.com:9;branch=z9hG4bKclosed;rport",
             ),
@@ -4021,7 +4092,7 @@ mod tests {
         })
         .await
         .unwrap();
-        driver.on_request(
+        driver.on_test_request(
             route_request("SIP/2.0/TCP example.com:9;branch=z9hG4bKfallback"),
             Link { flow, writer: Some(writer), path: None },
             &TransportContext::EMPTY,
@@ -4087,7 +4158,7 @@ mod tests {
         );
         let link = udp_reply_link(local, "127.0.0.1:9".parse().unwrap());
 
-        driver.on_request(
+        driver.on_test_request(
             request.clone(),
             link.clone(),
             &TransportContext::EMPTY,
@@ -4108,7 +4179,7 @@ mod tests {
         driver.settle_server(old, Some(at));
         assert_eq!(driver.servers.len(), 0);
 
-        driver.on_request(request, link, &TransportContext::EMPTY);
+        driver.on_test_request(request, link, &TransportContext::EMPTY);
         driver.on_timer(Key::Server(old));
 
         assert_eq!(driver.servers.len(), 1);
@@ -4131,7 +4202,7 @@ mod tests {
         let link = udp_reply_link(local, "127.0.0.1:9".parse().unwrap());
 
         for _ in 0..1000 {
-            driver.on_request(
+            driver.on_test_request(
                 request.clone(),
                 link.clone(),
                 &TransportContext::EMPTY,
@@ -4337,7 +4408,7 @@ mod tests {
         let request = Request::from_bytes(&buf[..n]).unwrap();
         let key = ClientKey::from_request(&request).unwrap();
         let (id, _) = driver.clients.find(&key).unwrap();
-        driver.on_received_response(route_response(&request));
+        driver.on_test_response(route_response(&request));
 
         assert!(response.await.is_ok());
         assert_eq!(driver.clients.len(), 1);
@@ -4502,7 +4573,7 @@ mod tests {
                 .poll(&mut Context::from_waker(&waker))
                 .is_pending()
         );
-        driver.on_received_response(route_response(&wire_request));
+        driver.on_test_response(route_response(&wire_request));
 
         assert!(response.await.is_ok());
         assert_eq!(driver.clients.len(), 0);
@@ -4649,10 +4720,16 @@ mod tests {
                 self.endpoint.udp_addr().unwrap(),
                 self.peer.local_addr().unwrap(),
             );
+            let arrival = Arrival {
+                flow: link.flow,
+                context: &TransportContext::EMPTY,
+                stamp: Stamps::new().stamp(now()),
+            };
             self.fixture.on_message(
                 Message::Response(response),
                 link,
-                &TransportContext::EMPTY,
+                arrival,
+                now(),
             );
         }
 
@@ -4705,7 +4782,7 @@ mod tests {
 
     fn observed(responses: &mut Responses) -> Option<Option<u16>> {
         now_or_never(responses.next())
-            .map(|item| item.map(|r| r.unwrap().status().as_u16()))
+            .map(|item| item.map(|r| r.unwrap().response.status().as_u16()))
     }
 
     // RFC 6026 section 8.4. M starts at the first 2xx, a later 2xx does not
@@ -4829,7 +4906,7 @@ mod tests {
         *request.method_mut() = Method::INVITE;
         request.headers_mut().insert(CSEQ, "1 INVITE".parse().unwrap());
 
-        fixture.on_request(
+        fixture.on_test_request(
             request.clone(),
             link.clone(),
             &TransportContext::EMPTY,
@@ -4850,7 +4927,7 @@ mod tests {
         }
 
         // The second advance reached L exactly, and no timer has run.
-        fixture.on_request(
+        fixture.on_test_request(
             request.clone(),
             link.clone(),
             &TransportContext::EMPTY,
@@ -4860,7 +4937,7 @@ mod tests {
         assert!(fixture.servers.get(slot).is_none());
 
         advance(T1).await;
-        fixture.on_request(request, link, &TransportContext::EMPTY);
+        fixture.on_test_request(request, link, &TransportContext::EMPTY);
         assert!(fixture.incoming.receiver.try_recv().is_err());
     }
 
@@ -4925,7 +5002,7 @@ mod tests {
         *request.method_mut() = Method::INVITE;
         request.headers_mut().insert(CSEQ, "1 INVITE".parse().unwrap());
 
-        fixture.on_request(request, link, &TransportContext::EMPTY);
+        fixture.on_test_request(request, link, &TransportContext::EMPTY);
         let received = fixture.take_request();
         let slot = received.transaction.responder.shared.slot;
         let first = now();

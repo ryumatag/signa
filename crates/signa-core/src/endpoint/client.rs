@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::{
     Endpoint, Error, admission, builder::Reception, driver::Command,
-    path::SendPath, routing::Link, table::Id,
+    path::SendPath, routing::Link, server::ReceivedResponse, table::Id,
 };
 use crate::{
     message::{
@@ -31,7 +31,6 @@ use crate::{
             cseq::CSeq,
         },
         request::Request,
-        response::Response,
         uri::{InvalidSipUriKind, SipUri},
     },
     transport::{
@@ -262,7 +261,8 @@ impl ClientControl {
     ///     });
     ///
     ///     let mut status = None;
-    ///     while let Some(Ok(response)) = responses.next().await {
+    ///     while let Some(Ok(received)) = responses.next().await {
+    ///         let response = received.response;
     ///         if response.status().is_final() && status.is_none() {
     ///             status = Some(response.status().as_u16());
     ///             // Aborting cannot withdraw a cancellation already
@@ -387,6 +387,12 @@ impl CancelHandle {
 
 /// Responses accepted by the transaction machine, in arrival order.
 ///
+/// Each comes as a [`ReceivedResponse`], with the [`ReceiveInfo`] of its own
+/// arrival: its ID, when it arrived, its flow and the UDP backend's context.
+/// Those are the response's, not the transaction's. A response from another
+/// address than the request went to, or with another context, says so, and
+/// the transaction still sends on the way it chose.
+///
 /// Every accepted provisional response is observable. A non-INVITE final, or
 /// a non-2xx INVITE final, ends observation even while the machine stays to
 /// absorb retransmissions and, for the INVITE, to acknowledge them. See
@@ -404,8 +410,10 @@ impl CancelHandle {
 /// # Overflow
 ///
 /// Each stream is bounded by [`Builder::client_response_limits`] and shares
-/// [`Builder::client_response_budget`] with the others. Overflow preserves
-/// queued responses and then yields one explicit error. The machine goes on,
+/// [`Builder::client_response_budget`] with the others. A response counts its
+/// encoded bytes and the copy of its context. Overflow preserves queued
+/// responses and then yields one explicit error, so a response never arrives
+/// without its context. The machine goes on,
 /// acknowledging a non-2xx and keeping an INVITE in Accepted until Timer M,
 /// but nothing more is observed. A truncated set of 2xx is never presented
 /// as a complete one.
@@ -436,8 +444,8 @@ impl CancelHandle {
 ///     endpoint: &Endpoint,
 ///     mut responses: Responses,
 /// ) -> Result<(), Error> {
-///     while let Some(response) = responses.next().await {
-///         let response = response?;
+///     while let Some(received) = responses.next().await {
+///         let response = received?.response;
 ///         if response.status().is_success() {
 ///             // A retransmission and another fork's 2xx need an ACK as
 ///             // well. It goes without a client transaction.
@@ -454,6 +462,7 @@ impl CancelHandle {
 /// [RFC 6026 section 8.4]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.4
 /// [`Builder::client_response_limits`]: super::Builder::client_response_limits
 /// [`Builder::client_response_budget`]: super::Builder::client_response_budget
+/// [`ReceiveInfo`]: super::ReceiveInfo
 pub struct Responses {
     shared: Arc<Mutex<State>>,
 }
@@ -482,7 +491,7 @@ impl Responses {
     #[allow(clippy::should_implement_trait)] // A stream, not an Iterator.
     pub fn next(
         &mut self,
-    ) -> impl Future<Output = Option<Result<Response<Bytes>, Error>>> + Send + '_
+    ) -> impl Future<Output = Option<Result<ReceivedResponse, Error>>> + Send + '_
     {
         poll_fn(|cx| self.poll_next(cx))
     }
@@ -490,7 +499,7 @@ impl Responses {
     fn poll_next(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Response<Bytes>, Error>>> {
+    ) -> Poll<Option<Result<ReceivedResponse, Error>>> {
         let mut state =
             self.shared.lock().expect("response state is not poisoned");
         if let Some(queued) = state.queue.pop_front() {
@@ -547,7 +556,7 @@ struct State {
 
 /// An unread response and its share of the endpoint-wide budget.
 struct Queued {
-    response: Response<Bytes>,
+    response: ReceivedResponse,
     _permit: Permit,
     bytes: usize,
 }
@@ -566,13 +575,24 @@ impl Delivery {
         Observation(Arc::downgrade(&self.0))
     }
 
-    pub(super) fn response(&self, response: Response<Bytes>) {
+    /// Queues `response`, or ends the stream with an overflow if it does not
+    /// fit.
+    ///
+    /// The copy of its context counts with its encoded bytes, so a response
+    /// never arrives without the context it came with.
+    pub(super) fn response(&self, response: ReceivedResponse) {
         self.update(|state| {
             if state.ended || state.detached {
                 return;
             }
 
-            let bytes = response.encoded_len().unwrap_or(usize::MAX);
+            let bytes = response
+                .response
+                .encoded_len()
+                .and_then(|len| {
+                    len.checked_add(response.received.retained_len())
+                })
+                .unwrap_or(usize::MAX);
             let permit = if state.queue.len() < state.limits.messages
                 && bytes <= state.limits.bytes.saturating_sub(state.bytes)
             {
@@ -594,7 +614,7 @@ impl Delivery {
         });
     }
 
-    pub(super) fn send(self, result: Result<Response<Bytes>, Error>) {
+    pub(super) fn send(self, result: Result<ReceivedResponse, Error>) {
         match result {
             Ok(response) => self.response(response),
             Err(error) => self.update(|state| {
@@ -992,8 +1012,13 @@ impl Endpoint {
     ///     let (control, mut responses) =
     ///         endpoint.start(request, target).await?.into_parts();
     ///     println!("sent from {}", control.flow().local);
-    ///     while let Some(response) = responses.next().await {
-    ///         println!("{}", response?.status());
+    ///     while let Some(received) = responses.next().await {
+    ///         let received = received?;
+    ///         println!(
+    ///             "{} from {}",
+    ///             received.response.status(),
+    ///             received.received.source(),
+    ///         );
     ///     }
     ///     Ok(())
     /// }
@@ -1318,7 +1343,9 @@ pub(super) mod compatibility {
     use tower_service::Service;
 
     use super::*;
-    use crate::endpoint::admission::ClientAdmission;
+    use crate::{
+        endpoint::admission::ClientAdmission, message::response::Response,
+    };
 
     #[derive(Clone, Debug)]
     pub(in crate::endpoint) struct Client {
@@ -1400,7 +1427,7 @@ pub(super) mod compatibility {
                     let (control, mut responses) = transaction.into_parts();
                     drop(control);
                     while let Some(response) = responses.next().await {
-                        let response = response?;
+                        let response = response?.response;
                         if response.status().as_u16() >= 200 {
                             return Ok(response);
                         }
@@ -1461,6 +1488,10 @@ pub(super) mod compatibility {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        endpoint::path::ReceiveInfo, message::response::Response,
+        transport::Stamps,
+    };
 
     // These stream tests need an executor but no I/O driver.
     fn run(future: impl Future<Output = ()>) {
@@ -1478,8 +1509,21 @@ mod tests {
         (Delivery(responses.shared.clone()), responses)
     }
 
-    fn response(status: u16) -> Response<Bytes> {
-        Response::builder().status(status).body(Bytes::new()).unwrap()
+    /// A response with `status`, as it arrives over UDP now.
+    fn response(status: u16) -> ReceivedResponse {
+        let flow = Flow {
+            transport: Transport::Udp,
+            local: "192.0.2.1:5060".parse().unwrap(),
+            remote: "192.0.2.2:5060".parse().unwrap(),
+        };
+        let stamp = Stamps::new().stamp(std::time::Instant::now());
+        ReceivedResponse {
+            response: Response::builder()
+                .status(status)
+                .body(Bytes::new())
+                .unwrap(),
+            received: ReceiveInfo::new(flow, stamp, None),
+        }
     }
 
     fn budget() -> Budget {
@@ -1493,7 +1537,7 @@ mod tests {
                 WriteLimits { messages: 1, bytes: 4096 },
                 WriteLimits {
                     messages: 10,
-                    bytes: response(100).encoded_len().unwrap(),
+                    bytes: response(100).response.encoded_len().unwrap(),
                 },
             ] {
                 let (delivery, mut responses) = stream(limits, budget());
@@ -1503,7 +1547,14 @@ mod tests {
                 delivery.send(Err(Error::timeout()));
 
                 assert_eq!(
-                    responses.next().await.unwrap().unwrap().status().as_u16(),
+                    responses
+                        .next()
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .response
+                        .status()
+                        .as_u16(),
                     100
                 );
                 assert!(
@@ -1564,7 +1615,14 @@ mod tests {
             drop(delivery);
 
             assert_eq!(
-                responses.next().await.unwrap().unwrap().status().as_u16(),
+                responses
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .response
+                    .status()
+                    .as_u16(),
                 100
             );
             assert!(responses.next().await.unwrap().unwrap_err().is_closed());

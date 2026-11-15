@@ -31,21 +31,14 @@ all the socket ever gives, take none of it.
 */
 
 use std::{
-    fmt,
-    future::Future,
-    io,
-    net::SocketAddr,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    fmt, future::Future, io, net::SocketAddr, sync::Arc, time::Instant,
 };
 
 use tokio::sync::oneshot;
 
 use super::{Endpoint, Error, driver::Command, routing::advertised};
 use crate::transport::{
-    Flow, Transport,
+    Flow, ReceiveId, Stamp, Transport,
     budget::Budget,
     datagram::{Binding, Path, Prepared, TransportContext},
     unmap,
@@ -176,8 +169,21 @@ impl fmt::Debug for SendPath {
     }
 }
 
-/// How a message arrived: the flow it was observed on and the backend's
-/// context.
+/// How a message arrived: its ID, when it arrived, the flow it was observed on
+/// and the backend's context.
+///
+/// The ID and the time are made once, where the message first arrived, and
+/// stay the same however long it took to reach the envelope:
+///
+/// * A datagram of the endpoint's own UDP backend arrives when the endpoint
+///   takes it from the backend.
+/// * A datagram on a shared port arrives when the port's task takes it from
+///   the backend, before the application decides about it.
+/// * A TCP message arrives when its connection has read all of it and framed
+///   it, which is later than its first segment.
+///
+/// None of them is a kernel or hardware timestamp. The time is the endpoint's
+/// clock, the one its timers use.
 ///
 /// These are observed addresses. For an intercepting backend the destination
 /// need not be an address of this host. Holding them lets nothing send. A
@@ -186,12 +192,29 @@ impl fmt::Debug for SendPath {
 #[derive(Clone)]
 pub struct ReceiveInfo {
     flow: Flow,
+    stamp: Stamp,
     path: Option<Arc<Path>>,
 }
 
 impl ReceiveInfo {
-    pub(super) fn new(flow: Flow, path: Option<Arc<Path>>) -> ReceiveInfo {
-        ReceiveInfo { flow, path }
+    pub(super) fn new(
+        flow: Flow,
+        stamp: Stamp,
+        path: Option<Arc<Path>>,
+    ) -> ReceiveInfo {
+        ReceiveInfo { flow, stamp, path }
+    }
+
+    /// The message's ID, which no other message received in this process
+    /// has.
+    pub fn id(&self) -> ReceiveId {
+        self.stamp.id
+    }
+
+    /// When the message arrived. See the [type docs](ReceiveInfo) for where
+    /// that is on each transport.
+    pub fn received_at(&self) -> Instant {
+        self.stamp.at
     }
 
     /// The flow the message arrived on, with the address it came from as its
@@ -224,11 +247,21 @@ impl ReceiveInfo {
         static EMPTY: TransportContext = TransportContext::EMPTY;
         self.path.as_deref().map_or(&EMPTY, |path| &path.context)
     }
+
+    /// The bytes the copy of the context takes, as the context limits would
+    /// count them, for a budget that charges it instead.
+    pub(super) fn retained_len(&self) -> usize {
+        self.path
+            .as_deref()
+            .map_or(0, |path| Path::charge(&path.context, false))
+    }
 }
 
 impl fmt::Debug for ReceiveInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ReceiveInfo")
+            .field("id", &self.stamp.id)
+            .field("received_at", &self.stamp.at)
             .field("flow", &self.flow)
             .field("context", self.context())
             .finish()
@@ -243,13 +276,6 @@ fn unicast(addr: SocketAddr) -> bool {
         && !ip.is_unspecified()
         && !ip.is_multicast()
         && !matches!(ip, std::net::IpAddr::V4(ip) if ip.is_broadcast())
-}
-
-/// A number for a port or an endpoint registration that no other one in this
-/// process gets. See [`Binding`].
-pub(super) fn next_id() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Keeps a received context for a reply route or a server transaction.

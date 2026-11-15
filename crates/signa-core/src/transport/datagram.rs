@@ -109,7 +109,7 @@ use std::{
 
 use bytes::Bytes;
 
-use super::budget::Permit;
+use super::{Stamp, budget::Permit};
 
 /// The most bytes a [`TransportContext`] holds.
 ///
@@ -267,6 +267,11 @@ pub struct Datagram {
     source: SocketAddr,
     destination: SocketAddr,
     context: TransportContext,
+    /// Set only by a shared port, which stamped the datagram when its own
+    /// backend received it. A backend cannot set it, so what it reports and
+    /// what the port stamped never mix.
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    stamp: Option<Stamp>,
 }
 
 impl Datagram {
@@ -286,7 +291,16 @@ impl Datagram {
             source,
             destination,
             context: TransportContext::default(),
+            stamp: None,
         }
+    }
+
+    /// Carries the receive stamp of a shared port to the endpoint it
+    /// delivers to.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn with_stamp(mut self, stamp: Stamp) -> Datagram {
+        self.stamp = Some(stamp);
+        self
     }
 
     /// Attaches the backend's own description of how the datagram arrived.
@@ -318,8 +332,9 @@ impl Datagram {
     #[cfg(feature = "tokio")]
     pub(crate) fn into_parts(
         self,
-    ) -> (Bytes, SocketAddr, SocketAddr, TransportContext) {
-        (self.payload, self.source, self.destination, self.context)
+    ) -> (Bytes, SocketAddr, SocketAddr, TransportContext, Option<Stamp>) {
+        let Datagram { payload, source, destination, context, stamp } = self;
+        (payload, source, destination, context, stamp)
     }
 }
 

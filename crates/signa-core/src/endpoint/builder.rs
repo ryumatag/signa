@@ -9,7 +9,6 @@ use tokio::sync::mpsc;
 use super::{
     BindError, DatagramPort, Endpoint, Incoming,
     driver::{Driver, TCP_INBOUND},
-    path::next_id,
     port::Registration,
 };
 use crate::{
@@ -18,7 +17,7 @@ use crate::{
         MessageLimits, WriteLimits,
         budget::Budget,
         datagram::{Binding, DatagramIo, Owner},
-        tcp, udp,
+        next_id, tcp, udp,
     },
 };
 
