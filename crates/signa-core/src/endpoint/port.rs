@@ -27,7 +27,7 @@ use std::{
 
 use bytes::Bytes;
 use tokio::{
-    sync::{mpsc, oneshot, watch},
+    sync::{Notify, futures::OwnedNotified, mpsc, oneshot, watch},
     time::{Instant, sleep_until},
 };
 
@@ -311,12 +311,15 @@ impl PortBuilder {
             context_limits: Budget::new(self.context_limits),
             stats: Counters::default(),
             reception,
+            close: Mutex::new(None),
+            closer: Arc::new(Notify::new()),
             done: watch::channel(None).0,
         });
         let (commands, commands_rx) = mpsc::unbounded_channel();
         let (ingress, ingress_rx) = mpsc::unbounded_channel();
         let task = PortTask {
             port,
+            close_requested: Box::pin(shared.closer.clone().notified_owned()),
             shared: shared.clone(),
             commands: commands_rx,
             weak: commands.downgrade(),
@@ -512,6 +515,13 @@ struct Shared {
     context_limits: Budget,
     stats: Counters,
     reception: Arc<ReceptionCounters>,
+    /// The earliest deadline any close asked for, once one has.
+    close: Mutex<Option<Instant>>,
+    /// Wakes the port's task for a close request. Only that task waits on
+    /// it, and its one stored permit stands for every request since the task
+    /// last looked, so requests keep no more than this and `close`.
+    closer: Arc<Notify>,
+    /// The close's outcome, for every caller of `close`.
     done: watch::Sender<Option<ShutdownOutcome>>,
 }
 
@@ -536,6 +546,27 @@ impl Shared {
         if phase == CLOSING {
             self.writes.close();
         }
+    }
+
+    /// Asks the port's task to close by `deadline`, or sooner if another
+    /// request asked for sooner.
+    ///
+    /// The deadline is kept here rather than in a message, so that however
+    /// many times `close` is called, the request holds one deadline and one
+    /// wakeup. `notify_one` keeps a permit when the task is not waiting, so
+    /// a request made before the task looks is not lost.
+    fn request_close(&self, deadline: Instant) {
+        {
+            let mut close = self.close.lock().expect("not poisoned");
+            *close =
+                Some(close.map_or(deadline, |earlier| earlier.min(deadline)));
+        }
+        self.closer.notify_one();
+    }
+
+    /// The earliest deadline asked for so far.
+    fn close_deadline(&self) -> Option<Instant> {
+        *self.close.lock().expect("not poisoned")
     }
 }
 
@@ -575,9 +606,6 @@ enum Command {
     CheckPath {
         path: Path,
         done: oneshot::Sender<Result<Path, Error>>,
-    },
-    Close {
-        deadline: Instant,
     },
 }
 
@@ -738,8 +766,15 @@ impl DatagramPort {
     /// registered endpoints, which see their writes end the same way. Stop
     /// them first.
     ///
-    /// Another call can bring the deadline forward. Every caller gets the
-    /// same outcome.
+    /// Another call can bring the deadline forward, even while the port is
+    /// already draining or closing its backend, and never pushes it back.
+    /// Every caller gets the same outcome, and a call after the close
+    /// finished gets it at once.
+    ///
+    /// # Cancellation
+    ///
+    /// The close starts when this is called, not when the future is first
+    /// polled, and dropping the future does not stop it.
     #[allow(clippy::manual_async_fn)] // State the Send guarantee.
     pub fn close(
         &self,
@@ -747,7 +782,7 @@ impl DatagramPort {
     ) -> impl Future<Output = ShutdownOutcome> + Send + 'static {
         let deadline = Instant::now() + timeout;
         self.shared.set_phase(CLOSING);
-        let _ = self.commands.send(Command::Close { deadline });
+        self.shared.request_close(deadline);
         let mut done = self.shared.done.subscribe();
         async move {
             match done.wait_for(Option::is_some).await {
@@ -1067,6 +1102,8 @@ impl Drop for Proxy {
 struct PortTask {
     port: Port,
     shared: Arc<Shared>,
+    /// Ready once a close has been asked for since the task last looked.
+    close_requested: Pin<Box<OwnedNotified>>,
     commands: mpsc::UnboundedReceiver<Command>,
     /// For the datagrams it hands out, which forward through it while it
     /// runs but do not keep it running.
@@ -1107,14 +1144,24 @@ impl PortTask {
     /// Serves until a close or until every handle is gone, and returns the
     /// close's deadline.
     fn poll_serve(&mut self, cx: &mut Context<'_>) -> Poll<Instant> {
+        if let Some(deadline) = self.poll_close_request(cx) {
+            // The writes queued here were admitted before the port started
+            // closing, since admission refuses once it has, and they get
+            // until the deadline like those already offered. A close request
+            // reaches the task apart from the queue, so the queue is taken
+            // as it stands rather than refused from here on. Admission bounds
+            // what it can hold.
+            while let Ok(command) = self.commands.try_recv() {
+                self.on_command(command);
+            }
+            return Poll::Ready(deadline);
+        }
+
         // A source that stopped at its batch, rather than at `Pending`, has
         // registered no waker, so the task wakes itself for it.
         let mut more = true;
         for _ in 0..BATCH {
             match self.commands.poll_recv(cx) {
-                Poll::Ready(Some(Command::Close { deadline })) => {
-                    return Poll::Ready(deadline);
-                }
                 Poll::Ready(Some(command)) => self.on_command(command),
                 Poll::Ready(None) => {
                     return Poll::Ready(Instant::now() + ABANDONED_FLUSH);
@@ -1147,6 +1194,27 @@ impl PortTask {
             cx.waker().wake_by_ref();
         }
         Poll::Pending
+    }
+
+    /// Returns the earliest deadline asked for, once a close request has
+    /// come since the task last looked, and arms the next look.
+    ///
+    /// `None` leaves the task's waker with the request. After `Some` it is
+    /// not left yet, so a caller that goes on to wait polls again until
+    /// `None`.
+    fn poll_close_request(&mut self, cx: &mut Context<'_>) -> Option<Instant> {
+        if self.close_requested.as_mut().poll(cx).is_pending() {
+            return None;
+        }
+        let closer = self.shared.closer.clone();
+        self.close_requested.set(closer.notified_owned());
+        // The request stored its deadline before it notified, so the read
+        // sees it, and any request since.
+        Some(
+            self.shared
+                .close_deadline()
+                .expect("a request stores its deadline before it notifies"),
+        )
     }
 
     fn on_command(&mut self, command: Command) {
@@ -1185,7 +1253,6 @@ impl PortTask {
                 };
                 let _ = done.send(result);
             }
-            Command::Close { .. } => unreachable!("handled by the caller"),
         }
         self.route();
     }
@@ -1261,13 +1328,16 @@ impl PortTask {
 
         let lost = poll_fn(|cx| {
             loop {
+                // A later request can only bring the deadline forward, while
+                // draining or closing alike. Looking until there is none
+                // leaves the waker for the next.
+                while let Some(deadline) = self.poll_close_request(cx) {
+                    if deadline < sleep.deadline() {
+                        sleep.as_mut().reset(deadline);
+                    }
+                }
                 while commands_open {
                     match self.commands.poll_recv(cx) {
-                        Poll::Ready(Some(Command::Close { deadline })) => {
-                            if deadline < sleep.deadline() {
-                                sleep.as_mut().reset(deadline);
-                            }
-                        }
                         Poll::Ready(Some(command)) => {
                             self.on_closing_command(command);
                         }
@@ -1311,10 +1381,7 @@ impl PortTask {
         // task, and an endpoint would wait for a write's outcome forever.
         self.commands.close();
         while let Ok(command) = self.commands.try_recv() {
-            match command {
-                Command::Close { .. } => {}
-                command => self.on_closing_command(command),
-            }
+            self.on_closing_command(command);
         }
         self.route();
 
@@ -1353,7 +1420,6 @@ impl PortTask {
             Command::CheckPath { done, .. } => {
                 let _ = done.send(Err(Error::closed()));
             }
-            Command::Close { .. } => unreachable!("handled by the caller"),
         }
     }
 }
@@ -2080,6 +2146,51 @@ mod tests {
         let mut cx = Context::from_waker(Waker::noop());
         assert!(registration.io.poll_close(&mut cx).is_pending());
         drop(registration);
+    }
+
+    // However many times `close` is called before the task looks, and
+    // whether or not its futures are dropped, the request holds one deadline
+    // and one wakeup, and nothing goes into the command queue. The earliest
+    // deadline wins, and the task closes by it.
+    #[test]
+    fn close_requests_keep_one_deadline_and_one_wakeup() {
+        let backend = Backend::default();
+        let (port, _ingress, mut task) = port(&backend);
+
+        for _ in 0..10_000 {
+            drop(port.close(Duration::from_secs(10)));
+        }
+        drop(port.close(Duration::from_secs(1)));
+        let by = Instant::now() + Duration::from_secs(1);
+        for _ in 0..10_000 {
+            drop(port.close(Duration::from_secs(5)));
+        }
+
+        assert!(task.commands.is_empty());
+        let deadline = port.shared.close_deadline().unwrap();
+        assert!(deadline <= by);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert_eq!(task.poll_serve(&mut cx), Poll::Ready(deadline));
+        assert!(task.poll_close_request(&mut cx).is_none());
+    }
+
+    // A write admitted before the close waits in the queue apart from the
+    // close request, and still goes to the backend before the task turns to
+    // closing, as one the backend had already taken would drain.
+    #[test]
+    fn writes_queued_before_a_close_still_go() {
+        let backend = Backend::default();
+        let (port, _ingress, mut task) = port(&backend);
+        let mut endpoint = port.register().unwrap();
+        serve(&mut task);
+        submit(&mut endpoint, 0, "queued");
+
+        drop(port.close(Duration::from_secs(1)));
+        let mut cx = Context::from_waker(Waker::noop());
+
+        assert!(task.poll_serve(&mut cx).is_ready());
+        assert_eq!(backend.offered(), ["queued"]);
+        drop(endpoint);
     }
 
     // An endpoint's write that waits in the task's queue when the endpoint

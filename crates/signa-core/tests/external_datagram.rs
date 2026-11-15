@@ -2603,6 +2603,84 @@ async fn a_closed_port_s_address_can_be_bound_again() {
     }
 }
 
+// A close starts when it is called. Dropping its future does not stop it,
+// and a call after the close finished gets the same outcome at once.
+#[tokio::test]
+async fn a_dropped_close_still_closes_the_port() {
+    let wire = Wire::default();
+    let (port, mut ingress) = intercept(&wire);
+
+    drop(port.close(Duration::from_secs(1)));
+
+    let ended = timeout(Duration::from_secs(2), ingress.recv()).await.unwrap();
+    assert!(ended.is_none());
+    timeout(Duration::from_secs(2), async {
+        while !wire.closed() {
+            sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the backend closes");
+    let again = timeout(Duration::from_millis(50), port.close(Duration::ZERO));
+    assert_eq!(again.await.unwrap(), ShutdownOutcome::Drained);
+}
+
+// A later close with an earlier deadline brings the close forward, both
+// while the port drains a write its wire holds and while the wire never
+// finishes closing. Both callers get the outcome by the earlier deadline.
+#[tokio::test]
+async fn a_later_close_brings_the_deadline_forward() {
+    for draining in [true, false] {
+        let wire = Wire::default();
+        let (port, mut ingress) = intercept(&wire);
+        let upstream = upstream(&port).await;
+        wire.writes(Writes::Delay);
+        if !draining {
+            wire.state.lock().unwrap().stuck = true;
+        }
+        let held = port.send_bytes(Bytes::from_static(b"raw"), &upstream);
+        wire.sent(1).await;
+        if !draining {
+            wire.finish(Ok(()));
+        }
+
+        let first = tokio::spawn(port.close(Duration::from_secs(60)));
+        // The ingress ends as the task turns to closing, and a stuck wire
+        // reports itself closed once the drain is over and its close began.
+        assert!(
+            timeout(Duration::from_secs(2), ingress.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        if !draining {
+            timeout(Duration::from_secs(2), async {
+                while !wire.closed() {
+                    sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("the wire starts to close");
+        }
+        let second = port.close(Duration::from_millis(50));
+
+        let second = timeout(Duration::from_secs(2), second).await;
+        let first = timeout(Duration::from_secs(2), first).await;
+        assert_eq!(
+            second.unwrap(),
+            ShutdownOutcome::DeadlineExpired,
+            "{draining}"
+        );
+        assert_eq!(first.unwrap().unwrap(), ShutdownOutcome::DeadlineExpired);
+        let held = held.unwrap().await;
+        if draining {
+            assert!(held.unwrap_err().is_transport(), "the wire closed it");
+        } else {
+            held.unwrap();
+        }
+    }
+}
+
 // A capture only receives. Its datagrams carry no disposition and it has no
 // send, so an INVITE it captures gets no 100 Trying and nothing else goes out.
 #[tokio::test]
