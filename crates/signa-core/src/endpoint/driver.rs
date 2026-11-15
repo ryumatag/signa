@@ -43,7 +43,7 @@ use std::{
     collections::HashMap,
     future::{Future, poll_fn},
     io, mem,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, SocketAddr, SocketAddrV6},
     ops::{Deref, DerefMut},
     pin::{Pin, pin},
     sync::{
@@ -1917,12 +1917,17 @@ impl Driver {
         };
         let port = udp.local_addr().port();
         let source = self.udp_source(remote).map_err(Error::transport)?;
+        // A link-local source is on the interface of the peer it sends to.
+        let local = match (source, remote) {
+            (IpAddr::V6(ip), SocketAddr::V6(peer))
+                if ip.is_unicast_link_local() =>
+            {
+                SocketAddr::V6(SocketAddrV6::new(ip, port, 0, peer.scope_id()))
+            }
+            (ip, _) => SocketAddr::new(ip, port),
+        };
 
-        Ok(Flow {
-            transport: Transport::Udp,
-            local: SocketAddr::new(source, port),
-            remote,
-        })
+        Ok(Flow { transport: Transport::Udp, local, remote })
     }
 
     /// The UDP link to `target`: its prepared path, or the flow from this

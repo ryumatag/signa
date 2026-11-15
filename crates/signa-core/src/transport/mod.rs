@@ -8,7 +8,10 @@ implementation details used by the endpoint. TCP connections are framed by Conte
 reach the driver; UDP datagrams already carry their boundaries.
 */
 
-use std::{fmt, net::SocketAddr};
+use std::{
+    fmt,
+    net::{SocketAddr, SocketAddrV4},
+};
 
 // Without tokio nothing takes a permit, but a kept path still names its type.
 #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
@@ -110,8 +113,8 @@ impl fmt::Display for Transport {
     }
 }
 
-/// A transport-layer association, which RFC 5626 section 3 calls a flow: the
-/// transport, and the address and port of both ends.
+/// A transport-layer association, which [RFC 5626 section 2.1] calls a flow:
+/// the transport, and the address and port of both ends.
 ///
 /// A flow says where a message came from and where its answer goes. Over UDP
 /// the local address is the one the datagram was received on, which matters on
@@ -119,6 +122,8 @@ impl fmt::Display for Transport {
 ///
 /// The endpoint delivers the flow a message arrived on in its incoming
 /// envelope, as the `ReceiveInfo::flow` of its `received` field.
+///
+/// [RFC 5626 section 2.1]: https://www.rfc-editor.org/rfc/rfc5626.html#section-2.1
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct Flow {
     /// The protocol.
@@ -127,4 +132,71 @@ pub struct Flow {
     pub local: SocketAddr,
     /// The other end.
     pub remote: SocketAddr,
+}
+
+/// `addr` with an IPv4-mapped IPv6 address in its IPv4 form, and any other
+/// address as it is.
+///
+/// A dual-stack socket names an IPv4 peer by its mapped form, but a `Via`
+/// names it by its IPv4 address, and so do `received` and the transaction
+/// keys. A native IPv6 address keeps its scope ID and flow label. A reply to
+/// a link-local peer needs the scope to leave on the interface the request
+/// came in on.
+#[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+pub(crate) fn unmap(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(ip) => SocketAddr::V4(SocketAddrV4::new(ip, v6.port())),
+            None => addr,
+        },
+        SocketAddr::V4(_) => addr,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV6};
+
+    use super::*;
+
+    #[test]
+    fn unmap_turns_a_mapped_address_back() {
+        let mapped = SocketAddr::V6(SocketAddrV6::new(
+            Ipv4Addr::new(192, 0, 2, 1).to_ipv6_mapped(),
+            5060,
+            0,
+            0,
+        ));
+        let plain = SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::new(192, 0, 2, 1),
+            5060,
+        ));
+
+        assert_eq!(unmap(mapped), plain);
+        assert_eq!(unmap(plain), plain);
+
+        // An IPv4 address has neither a scope nor a flow label to keep.
+        let labelled = SocketAddr::V6(SocketAddrV6::new(
+            Ipv4Addr::new(192, 0, 2, 1).to_ipv6_mapped(),
+            5060,
+            0x12345,
+            7,
+        ));
+        assert_eq!(unmap(labelled), plain);
+    }
+
+    #[test]
+    fn unmap_keeps_a_native_ipv6_address_whole() {
+        let link_local = SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x20),
+            5070,
+            0x12345,
+            7,
+        ));
+        let loopback =
+            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 5060, 0, 0));
+
+        assert_eq!(unmap(link_local), link_local);
+        assert_eq!(unmap(loopback), loopback);
+    }
 }

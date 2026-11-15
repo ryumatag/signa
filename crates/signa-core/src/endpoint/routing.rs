@@ -21,7 +21,7 @@ use std::{
     fmt::Write as _,
     hash::{BuildHasher, Hasher},
     io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6},
     sync::Arc,
 };
 
@@ -126,9 +126,28 @@ pub(super) fn sent_by(
                 && (listener.ip().is_unspecified()
                     || listener.ip() == flow.local.ip()) =>
         {
-            SocketAddr::new(flow.local.ip(), listener.port())
+            let mut sent_by = flow.local;
+            sent_by.set_port(listener.port());
+            sent_by
         }
         _ => flow.local,
+    }
+}
+
+/// `addr` as a Via `sent-by` names it, without the zone and flow label that
+/// an IPv6 socket address may carry.
+///
+/// An `IPv6reference` has no zone ([RFC 3261 section 25.1]), and a zone means
+/// something only on this host. The addresses a datagram is sent between keep
+/// theirs.
+///
+/// [RFC 3261 section 25.1]: https://www.rfc-editor.org/rfc/rfc3261.html#section-25.1
+pub(super) fn advertised(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) if v6.scope_id() != 0 || v6.flowinfo() != 0 => {
+            SocketAddr::V6(SocketAddrV6::new(*v6.ip(), v6.port(), 0, 0))
+        }
+        _ => addr,
     }
 }
 
@@ -145,6 +164,7 @@ pub(super) fn via_value(
     let mut value = String::with_capacity(80);
     let n = branches.next;
     branches.next += 1;
+    let sent_by = advertised(sent_by);
     let _ = write!(
         value,
         "SIP/2.0/{transport} {sent_by};rport;branch={}{n:x}",
@@ -161,6 +181,7 @@ pub(super) fn via_value_with(
     branch: &str,
 ) -> HeaderValue {
     let mut value = String::with_capacity(48 + branch.len());
+    let sent_by = advertised(sent_by);
     let _ =
         write!(value, "SIP/2.0/{transport} {sent_by};rport;branch={branch}");
 
@@ -192,7 +213,11 @@ pub(super) fn reply_flow(via: &Via<'_>, flow: &Flow) -> Flow {
         _ => via.port.unwrap_or(DEFAULT_PORT),
     };
 
-    Flow { remote: SocketAddr::new(flow.remote.ip(), port), ..*flow }
+    // Only the port changes. A link-local peer's scope stays, so that the
+    // response leaves on the interface the request came in on.
+    let mut remote = flow.remote;
+    remote.set_port(port);
+    Flow { remote, ..*flow }
 }
 
 /// Returns the top `Via` with `received` and `rport` filled in, or `None` when
@@ -347,6 +372,85 @@ mod tests {
         }
     }
 
+    // A link-local peer's scope says which interface the response leaves on,
+    // so only the port of its address changes.
+    #[test]
+    fn a_reply_keeps_the_scope_and_flow_label_of_its_peer() {
+        let peer =
+            SocketAddrV6::new("fe80::20".parse().unwrap(), 40000, 0x12345, 7);
+        for (via, port) in [
+            ("SIP/2.0/UDP [fe80::20]:5070;rport", 40000),
+            ("SIP/2.0/UDP [fe80::20]:5070", 5070),
+        ] {
+            let value = HeaderValue::from_bytes(via.as_bytes()).unwrap();
+            let via = Via::top(&value).unwrap();
+            let flow = Flow {
+                transport: Transport::Udp,
+                local: "[fe80::10%7]:5060".parse().unwrap(),
+                remote: SocketAddr::V6(peer),
+            };
+
+            let reply = reply_flow(&via, &flow);
+
+            let mut expected = peer;
+            expected.set_port(port);
+            assert_eq!(reply.remote, SocketAddr::V6(expected));
+            assert_eq!(reply.local, flow.local);
+        }
+    }
+
+    // RFC 3261 section 25.1 has no zone in an `IPv6reference`. A `SocketAddr`
+    // prints one, so a Via made from it would not parse.
+    #[test]
+    fn a_via_names_no_zone() {
+        let sent_by = SocketAddr::V6(SocketAddrV6::new(
+            "fe80::10".parse().unwrap(),
+            5060,
+            0x12345,
+            7,
+        ));
+        assert_eq!(sent_by.to_string(), "[fe80::10%7]:5060");
+
+        let fresh = via_value(Transport::Udp, sent_by, &mut Branches::new());
+        let chosen = via_value_with(Transport::Tcp, sent_by, "z9hG4bKchosen");
+
+        assert!(
+            fresh.as_str().starts_with(
+                "SIP/2.0/UDP [fe80::10]:5060;rport;branch=z9hG4bK"
+            )
+        );
+        assert!(!fresh.as_str().contains('%'), "{fresh:?}");
+        assert_eq!(
+            chosen.as_str(),
+            "SIP/2.0/TCP [fe80::10]:5060;rport;branch=z9hG4bKchosen"
+        );
+        for value in [&fresh, &chosen] {
+            let via = Via::top(value).unwrap();
+            assert!(sent_by_is(&via, sent_by));
+        }
+    }
+
+    // `received` names the address a request came from without the zone of
+    // its scope, as the `sent-by` does.
+    #[test]
+    fn received_names_a_link_local_source_without_its_zone() {
+        let value =
+            HeaderValue::from_static("SIP/2.0/UDP [fe80::20]:5070;rport");
+        let via = Via::top(&value).unwrap();
+        let flow = Flow {
+            transport: Transport::Udp,
+            local: "[fe80::10%7]:5060".parse().unwrap(),
+            remote: "[fe80::20%7]:40000".parse().unwrap(),
+        };
+
+        let marked = mark_via(&value, &via, &flow).unwrap();
+
+        assert_eq!(
+            marked.as_str(),
+            "SIP/2.0/UDP [fe80::20]:5070;rport=40000;received=fe80::20"
+        );
+    }
+
     #[test]
     fn sent_by_names_a_listener_that_accepts_on_the_connection_s_address() {
         for (transport, local, listener, sent_by) in [
@@ -382,6 +486,13 @@ mod tests {
                 "[2001:db8::2]:49152",
                 Some("[::]:5060"),
                 "[2001:db8::2]:5060",
+            ),
+            // A link-local connection keeps its scope, which the Via drops.
+            (
+                Transport::Tcp,
+                "[fe80::2%7]:49152",
+                Some("[::]:5060"),
+                "[fe80::2%7]:5060",
             ),
             // UDP answers the socket itself.
             (

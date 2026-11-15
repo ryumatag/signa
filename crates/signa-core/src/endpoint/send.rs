@@ -379,6 +379,8 @@ impl Endpoint {
     /// `sent-by` port, or 5060. Without `received` the `sent-by` must be an IP
     /// address, IPv4 or IPv6. The endpoint does not resolve host names, and
     /// never guesses a destination from the address a message came from.
+    /// A Via names no IPv6 zone, so a link-local destination has no scope,
+    /// and the kernel fails a write to it from the endpoint's own socket.
     ///
     /// The 1300-byte limit of [RFC 3261 section 18.1.1] applies to requests,
     /// so a larger response still goes over UDP. The UDP write limits of

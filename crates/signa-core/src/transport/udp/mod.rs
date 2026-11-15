@@ -27,7 +27,7 @@ use std::{
     collections::VecDeque,
     future::poll_fn,
     io,
-    net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6},
+    net::{IpAddr, SocketAddr, SocketAddrV6},
     task::{Context, Poll, ready},
 };
 
@@ -40,6 +40,7 @@ use super::{
         Capabilities, Datagram, DatagramIo, DatagramWrite, RecvError, Submit,
         TransportContext, WriteId,
     },
+    unmap,
 };
 
 #[cfg(any(
@@ -73,8 +74,9 @@ struct Received {
     len: usize,
     /// Where it came from.
     remote: SocketAddr,
-    /// The address it was sent to, when the platform reports it.
-    local: Option<IpAddr>,
+    /// The address it was sent to, when the platform reports it, with the
+    /// scope ID of a link-local IPv6 address.
+    local: Option<(IpAddr, u32)>,
 }
 
 /// A UDP socket that sends and receives SIP datagrams.
@@ -154,7 +156,10 @@ impl Socket {
         // the key comparisons want it in that form.
         let remote = unmap(received.remote);
         let local = match received.local {
-            Some(ip) => unmap(SocketAddr::new(ip, self.local.port())),
+            Some((IpAddr::V6(ip), scope)) => unmap(SocketAddr::V6(
+                SocketAddrV6::new(ip, self.local.port(), 0, scope),
+            )),
+            Some((ip, _)) => SocketAddr::new(ip, self.local.port()),
             None => self.local,
         };
         let flow = Flow { transport: Transport::Udp, local, remote };
@@ -223,6 +228,17 @@ impl Socket {
             (SocketAddr::V6(_), SocketAddr::V4(remote)) => {
                 let ip = remote.ip().to_ipv6_mapped();
                 SocketAddr::V6(SocketAddrV6::new(ip, remote.port(), 0, 0))
+            }
+            // A flow label the peer sent with is its own, and the kernel picks
+            // the one of a datagram this socket sends. Only the scope says
+            // where it goes.
+            (_, SocketAddr::V6(remote)) if remote.flowinfo() != 0 => {
+                SocketAddr::V6(SocketAddrV6::new(
+                    *remote.ip(),
+                    remote.port(),
+                    0,
+                    remote.scope_id(),
+                ))
             }
             (_, remote) => remote,
         };
@@ -367,7 +383,7 @@ impl DatagramIo for Io {
                 "a socket takes no path context",
             ));
         }
-        Ok(())
+        check_scopes(local, source, destination)
     }
 
     // The endpoint collects completions right after each submission, so an
@@ -387,15 +403,42 @@ impl DatagramIo for Io {
     }
 }
 
-/// Turns a mapped IPv4 address back into its IPv4 form.
-fn unmap(addr: SocketAddr) -> SocketAddr {
-    match addr {
-        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
-            Some(ip) => SocketAddr::V4(SocketAddrV4::new(ip, v6.port())),
-            None => addr,
-        },
-        SocketAddr::V4(_) => addr,
+/// Checks the IPv6 scopes of a path on a socket bound to `local`.
+///
+/// A link-local address means something only on one interface, and its scope
+/// ID names which. The kernel sends on the interface of the destination's
+/// scope, so a link-local destination without one cannot be reached, and a
+/// source scoped to another interface than the destination or the socket
+/// cannot be sent from. A scope of zero names no interface and agrees with
+/// any.
+fn check_scopes(
+    local: SocketAddr,
+    source: SocketAddr,
+    destination: SocketAddr,
+) -> io::Result<()> {
+    let scope = |addr: SocketAddr| match addr {
+        SocketAddr::V6(v6) => v6.scope_id(),
+        SocketAddr::V4(_) => 0,
+    };
+    if let SocketAddr::V6(v6) = destination {
+        if v6.ip().is_unicast_link_local() && v6.scope_id() == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a link-local destination needs its scope",
+            ));
+        }
     }
+    let source_scope = scope(source);
+    let agrees =
+        |other: u32| source_scope == 0 || other == 0 || other == source_scope;
+    if !agrees(scope(destination)) || !agrees(scope(local)) {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "the source is scoped to another interface",
+        ));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -540,6 +583,38 @@ mod tests {
         assert_eq!(flow.remote, alice.local);
     }
 
+    // A link-local address means something only with its scope. A wildcard
+    // socket learns the interface a datagram came in on from its packet info
+    // and names the address it came to with that scope, as the kernel names
+    // the peer. Apple's loopback has a link-local address. Linux's has none.
+    #[cfg(target_vendor = "apple")]
+    #[tokio::test]
+    async fn a_wildcard_socket_learns_the_scope_of_a_link_local_destination() {
+        // SAFETY: The name is a NUL-terminated string that outlives the call.
+        let index = unsafe { libc::if_nametoindex(c"lo0".as_ptr()) };
+        let link_local = SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+            0,
+            0,
+            index,
+        ));
+        let Ok(alice) = Socket::bind(link_local) else {
+            return; // No link-local address on the loopback here.
+        };
+        let unspecified =
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+        let bob = Socket::bind(unspecified).unwrap();
+        let mut buf = BytesMut::new();
+        let mut to = link_local;
+        to.set_port(bob.local.port());
+
+        alice.send(b"hello", &flow_to(&alice, to)).await.unwrap();
+        let (_, flow) = bob.recv(&mut buf).await.unwrap();
+
+        assert_eq!(flow.local, to);
+        assert_eq!(flow.remote, alice.local);
+    }
+
     // Linux routes the whole of 127.0.0.0/8 to the loopback, so a wildcard
     // socket there can pick any of those addresses as its source.
     #[cfg(target_os = "linux")]
@@ -563,19 +638,60 @@ mod tests {
     }
 
     #[test]
-    fn unmap_turns_a_mapped_address_back() {
-        let mapped = SocketAddr::V6(SocketAddrV6::new(
-            Ipv4Addr::new(192, 0, 2, 1).to_ipv6_mapped(),
-            5060,
-            0,
-            0,
-        ));
-        let plain = SocketAddr::V4(SocketAddrV4::new(
-            Ipv4Addr::new(192, 0, 2, 1),
-            5060,
-        ));
-        assert_eq!(unmap(mapped), plain);
-        assert_eq!(unmap(plain), plain);
-        assert_eq!(unmap(LOCALHOST_V6), LOCALHOST_V6);
+    fn a_link_local_path_needs_scopes_that_agree() {
+        let scoped = |text: &str, scope| {
+            let mut addr: SocketAddr = text.parse().unwrap();
+            if let SocketAddr::V6(v6) = &mut addr {
+                v6.set_scope_id(scope);
+            }
+            addr
+        };
+        let wildcard = scoped("[::]:5060", 0);
+        let source = scoped("[fe80::10]:5060", 7);
+        let peer = scoped("[fe80::20]:5060", 7);
+
+        for (local, source, destination, refused) in [
+            (wildcard, source, peer, None),
+            (wildcard, scoped("[fe80::10]:5060", 0), peer, None),
+            (scoped("[fe80::10]:5060", 7), source, peer, None),
+            (
+                wildcard,
+                source,
+                scoped("[fe80::20]:5060", 0),
+                Some(io::ErrorKind::InvalidInput),
+            ),
+            (
+                wildcard,
+                source,
+                scoped("[fe80::20]:5060", 8),
+                Some(io::ErrorKind::AddrNotAvailable),
+            ),
+            (
+                scoped("[fe80::10]:5060", 8),
+                source,
+                peer,
+                Some(io::ErrorKind::AddrNotAvailable),
+            ),
+            // A global destination needs no scope.
+            (
+                wildcard,
+                scoped("[2001:db8::10]:5060", 0),
+                scoped("[2001:db8::20]:5060", 0),
+                None,
+            ),
+            (
+                "0.0.0.0:5060".parse().unwrap(),
+                "192.0.2.10:5060".parse().unwrap(),
+                "192.0.2.20:5060".parse().unwrap(),
+                None,
+            ),
+        ] {
+            let result = check_scopes(local, source, destination);
+            assert_eq!(
+                result.err().map(|error| error.kind()),
+                refused,
+                "{local} {source} {destination}"
+            );
+        }
     }
 }

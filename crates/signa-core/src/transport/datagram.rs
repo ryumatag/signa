@@ -183,7 +183,9 @@ pub trait DatagramIo: Send + 'static {
     /// prepares a path, and offers that path's writes as
     /// [`WritePath::Prepared`] later. It must not block. The backend refuses
     /// a source address it may not send from, a context it cannot read, or a
-    /// destination it cannot reach. A path that turns stale afterwards, such as
+    /// destination it cannot reach. A link-local IPv6 address names its
+    /// interface by its scope ID, which is the backend's to check too. A path
+    /// that turns stale afterwards, such as
     /// one over a session that has ended, is the backend's to refuse in
     /// [`DatagramIo::poll_submit`].
     ///
@@ -261,7 +263,9 @@ impl Datagram {
     /// A datagram from `source` to `destination`, with no context.
     ///
     /// Report an IPv4 peer of a dual-stack socket by its IPv4 address, not its
-    /// IPv4-mapped IPv6 form, since a `Via` names it that way.
+    /// IPv4-mapped IPv6 form, since a `Via` names it that way. The endpoint
+    /// turns a mapped address back too. Report a link-local IPv6 source and
+    /// destination with their scope ID. A response goes back with them.
     pub fn new(
         payload: Bytes,
         source: SocketAddr,

@@ -12,7 +12,7 @@ wires with the same addresses stand for two network domains.
 use std::{
     collections::VecDeque,
     io,
-    net::SocketAddr,
+    net::{Ipv6Addr, SocketAddr, SocketAddrV6},
     pin::pin,
     sync::{Arc, Mutex},
     task::{Context, Poll, Waker},
@@ -53,6 +53,21 @@ const ALTERNATE: SocketAddr = SocketAddr::new(
     std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 10)),
     5060,
 );
+/// A link-local address of the wire on interface 7. The scope says which
+/// interface, and nothing else in the endpoint reads it.
+const LINK_LOCAL: SocketAddr = SocketAddr::V6(SocketAddrV6::new(
+    Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x10),
+    5060,
+    0,
+    7,
+));
+/// A link-local peer on the same interface, with a flow label.
+const LINK_PEER: SocketAddr = SocketAddr::V6(SocketAddrV6::new(
+    Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x20),
+    5070,
+    0x12345,
+    7,
+));
 /// A public address that a static NAT maps onto `ALTERNATE`.
 const PUBLIC: SocketAddr = SocketAddr::new(
     std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 5)),
@@ -116,6 +131,8 @@ struct State {
     /// Path contexts the wire refuses to send on any more, as for a PPPoE
     /// session that has ended.
     stale: Vec<Bytes>,
+    /// The address the wire names as its own, `LOCAL` unless set.
+    local: Option<SocketAddr>,
 }
 
 #[derive(Clone, Default)]
@@ -125,6 +142,13 @@ struct Wire {
 }
 
 impl Wire {
+    /// A wire that names `local` as its own address.
+    fn at(local: SocketAddr) -> Wire {
+        let wire = Wire::default();
+        wire.state.lock().unwrap().local = Some(local);
+        wire
+    }
+
     fn deliver(&self, datagram: Result<Datagram, RecvError>) {
         let mut state = self.state.lock().unwrap();
         state.inbound.push_back(datagram);
@@ -186,7 +210,7 @@ impl Wire {
 
 impl DatagramIo for Wire {
     fn local_addr(&self) -> SocketAddr {
-        LOCAL
+        self.state.lock().unwrap().local.unwrap_or(LOCAL)
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -272,15 +296,16 @@ impl DatagramIo for Wire {
         }
     }
 
-    // The wire may send from its own address or the alternate one, with any
-    // context. Another source is not this host's to use.
+    // The wire may send from its own address, the alternate one or its
+    // link-local one, with any context. Another source, or the link-local
+    // address on another interface, is not this host's to use.
     fn check_path(
         &mut self,
         source: SocketAddr,
         _destination: SocketAddr,
         _context: &TransportContext,
     ) -> io::Result<()> {
-        if source == LOCAL || source == ALTERNATE {
+        if [LOCAL, ALTERNATE, LINK_LOCAL].contains(&source) {
             Ok(())
         } else {
             Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "not ours"))
@@ -1407,4 +1432,170 @@ async fn a_dual_stack_socket_takes_ipv4_paths() {
             .unwrap()
             .unwrap();
     assert_eq!(from, source);
+}
+
+// A link-local peer is reachable only through the interface its scope names.
+// The request comes up with the scope and flow label the wire reported, and
+// the response goes back with them, to the source port with `rport` and to
+// the Via port without it (RFC 3581 section 4, RFC 3261 section 18.2.2), and
+// so does the response a retransmission gets.
+#[tokio::test]
+async fn a_link_local_peer_is_answered_on_its_interface() {
+    let wire = Wire::default();
+    let (_endpoint, mut incoming) = bind(&wire);
+    let scoped =
+        |branch| options(branch).replace("192.0.2.20:5060", "[fe80::20]:5060");
+    let mut via_port = LINK_PEER;
+    via_port.set_port(5060);
+
+    for (text, destination) in [
+        (scoped("rport"), LINK_PEER),
+        (scoped("plain").replace(";rport", ""), via_port),
+    ] {
+        let sent = wire.count();
+        let text = Bytes::from(text);
+        wire.deliver(Ok(Datagram::new(text.clone(), LINK_PEER, LINK_LOCAL)));
+        let request = request(&mut incoming).await;
+        assert_eq!(request.received.source(), LINK_PEER);
+        assert_eq!(request.received.destination(), LINK_LOCAL);
+
+        let (responder, _) = request.transaction.into_parts();
+        responder.respond(ok(&request.request)).await.unwrap();
+
+        let response = &wire.sent(sent + 1).await[sent];
+        assert_eq!(
+            (response.source, response.destination),
+            (LINK_LOCAL, destination)
+        );
+
+        // A retransmission gets the cached response the same way.
+        wire.deliver(Ok(Datagram::new(text, LINK_PEER, LINK_LOCAL)));
+        let resent = &wire.sent(sent + 2).await[sent + 1];
+        assert_eq!(
+            (resent.source, resent.destination),
+            (LINK_LOCAL, destination)
+        );
+        assert_eq!(resent.payload, response.payload);
+    }
+}
+
+// A path keeps the scope of its addresses, which the wire checks, and its
+// requests go out with it. The `sent-by` has none, since a Via cannot name
+// one (RFC 3261 section 25.1), and the response is matched against it.
+#[tokio::test]
+async fn a_scoped_path_keeps_its_scope_and_advertises_none() {
+    let wire = Wire::default();
+    let (endpoint, _incoming) = bind(&wire);
+    let mut elsewhere = LINK_LOCAL;
+    if let SocketAddr::V6(addr) = &mut elsewhere {
+        addr.set_scope_id(8);
+    }
+
+    let refused = endpoint
+        .prepare_path(PathSelection::new(elsewhere, LINK_PEER))
+        .await
+        .unwrap_err();
+    let path = endpoint
+        .prepare_path(PathSelection::new(LINK_LOCAL, LINK_PEER))
+        .await
+        .unwrap();
+
+    assert!(refused.is_path_refused());
+    assert_eq!((path.source(), path.destination()), (LINK_LOCAL, LINK_PEER));
+    assert_eq!(path.sent_by(), "[fe80::10]:5060".parse().unwrap());
+
+    let (_control, mut responses) = endpoint
+        .start(outgoing("scoped-path"), Target::path(path))
+        .await
+        .unwrap()
+        .into_parts();
+    let sent = wire.sent(1).await;
+    assert_eq!((sent[0].source, sent[0].destination), (LINK_LOCAL, LINK_PEER));
+    let request = Request::from_bytes(&sent[0].payload).unwrap();
+    let via = request.headers().get(VIA).unwrap().as_str();
+    assert!(
+        via.starts_with("SIP/2.0/UDP [fe80::10]:5060;rport;branch="),
+        "{via}"
+    );
+
+    wire.deliver(Ok(Datagram::new(
+        ok(&request).to_bytes(),
+        LINK_PEER,
+        LINK_LOCAL,
+    )));
+    let response = timeout(Duration::from_secs(2), responses.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+}
+
+// A dual-stack socket reports an IPv4 peer by its mapped address, and the
+// endpoint names it in its IPv4 form, as a Via does. An IPv6 socket takes
+// IPv4 by default on Linux, Android and Apple's systems, which also report
+// the address a datagram came to. Windows and some BSDs bind it to IPv6 only
+// unless told otherwise, and a Linux host can be set up so too.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple"
+))]
+#[tokio::test]
+async fn a_dual_stack_socket_names_ipv4_peers_in_their_own_form() {
+    let Ok((endpoint, mut incoming)) =
+        Endpoint::builder().udp("[::]:0".parse().unwrap()).bind()
+    else {
+        return; // No IPv6 here.
+    };
+    let port = endpoint.udp_addr().unwrap().port();
+    let local = SocketAddr::new([127, 0, 0, 1].into(), port);
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    let text =
+        options("dual").replace("192.0.2.20:5060", &peer_addr.to_string());
+
+    peer.send_to(text.as_bytes(), local).await.unwrap();
+
+    let request = request(&mut incoming).await;
+    assert_eq!(request.received.source(), peer_addr);
+    assert_eq!(request.received.destination(), local);
+
+    let (responder, _) = request.transaction.into_parts();
+    responder.respond(ok(&request.request)).await.unwrap();
+    let mut buffer = [0; 2048];
+    let (n, _) = timeout(Duration::from_secs(2), peer.recv_from(&mut buffer))
+        .await
+        .unwrap()
+        .unwrap();
+    let response = Response::from_bytes(&buffer[..n]).unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+}
+
+// A request to a link-local peer goes from the wire's link-local address on
+// the peer's interface, which the peer's scope names. The Via names the
+// address without one.
+#[tokio::test]
+async fn a_request_to_a_link_local_peer_goes_out_on_its_interface() {
+    let mut unscoped = LINK_LOCAL;
+    if let SocketAddr::V6(addr) = &mut unscoped {
+        addr.set_scope_id(0);
+    }
+    let wire = Wire::at(unscoped);
+    let (endpoint, _incoming) = bind(&wire);
+
+    endpoint
+        .send_request(
+            outgoing("link-local"),
+            Target::new(Transport::Udp, LINK_PEER),
+            ViaMode::Fresh,
+        )
+        .await
+        .unwrap();
+
+    let sent = wire.sent(1).await;
+    assert_eq!((sent[0].source, sent[0].destination), (LINK_LOCAL, LINK_PEER));
+    let request = Request::from_bytes(&sent[0].payload).unwrap();
+    let via = request.headers().get(VIA).unwrap().as_str();
+    assert!(via.starts_with("SIP/2.0/UDP [fe80::10]:5060;rport;"), "{via}");
 }

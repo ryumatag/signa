@@ -116,8 +116,9 @@ pub(super) fn recv(
     Ok(Received { len, remote, local })
 }
 
-/// Finds the destination address among the control messages of a receive.
-fn destination(hdr: &libc::msghdr) -> Option<IpAddr> {
+/// Finds the destination address among the control messages of a receive,
+/// with the scope of a link-local IPv6 one.
+fn destination(hdr: &libc::msghdr) -> Option<(IpAddr, u32)> {
     // SAFETY: `hdr` describes the control buffer the kernel just filled, with
     // `msg_controllen` set to what it wrote, and the macros stay within that
     // length.
@@ -144,7 +145,7 @@ fn destination(hdr: &libc::msghdr) -> Option<IpAddr> {
                 };
                 let octets = info.ipi_addr.s_addr.to_ne_bytes();
 
-                return Some(IpAddr::V4(Ipv4Addr::from(octets)));
+                return Some((IpAddr::V4(Ipv4Addr::from(octets)), 0));
             }
             (libc::IPPROTO_IPV6, libc::IPV6_PKTINFO) => {
                 // SAFETY: As above, with an `in6_pktinfo`.
@@ -152,8 +153,17 @@ fn destination(hdr: &libc::msghdr) -> Option<IpAddr> {
                     ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast())
                 };
                 let ip = Ipv6Addr::from(info.ipi6_addr.s6_addr);
+                // A link-local address names its interface only with its
+                // scope, as the peer's does in the name the kernel gives.
+                // Another keeps none, as an address bound to a socket does.
+                #[allow(clippy::unnecessary_cast)] // A `c_int` on Android.
+                let scope = if ip.is_unicast_link_local() {
+                    info.ipi6_ifindex as u32
+                } else {
+                    0
+                };
 
-                return Some(IpAddr::V6(ip));
+                return Some((IpAddr::V6(ip), scope));
             }
             _ => {}
         }

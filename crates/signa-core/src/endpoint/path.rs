@@ -43,11 +43,12 @@ use std::{
 
 use tokio::sync::oneshot;
 
-use super::{Endpoint, Error, driver::Command};
+use super::{Endpoint, Error, driver::Command, routing::advertised};
 use crate::transport::{
     Flow, Transport,
     budget::Budget,
     datagram::{Binding, Path, Prepared, TransportContext},
+    unmap,
 };
 
 #[cfg(doc)]
@@ -106,8 +107,13 @@ impl PathSelection {
     /// only one that does not answers the `sent-by` ([RFC 3261 section
     /// 18.2.2]).
     ///
+    /// A Via names no IPv6 zone ([RFC 3261 section 25.1]), so the path drops
+    /// the scope ID and flow label of `sent_by`. Its source and destination
+    /// keep theirs.
+    ///
     /// [RFC 3261 section 18.1.2]: https://www.rfc-editor.org/rfc/rfc3261.html#section-18.1.2
     /// [RFC 3261 section 18.2.2]: https://www.rfc-editor.org/rfc/rfc3261.html#section-18.2.2
+    /// [RFC 3261 section 25.1]: https://www.rfc-editor.org/rfc/rfc3261.html#section-25.1
     /// [RFC 3581]: https://www.rfc-editor.org/rfc/rfc3581.html#section-4
     pub fn sent_by(mut self, sent_by: SocketAddr) -> PathSelection {
         self.sent_by = Some(sent_by);
@@ -226,16 +232,6 @@ impl fmt::Debug for ReceiveInfo {
             .field("flow", &self.flow)
             .field("context", self.context())
             .finish()
-    }
-}
-
-/// `addr` with an IPv4-mapped IPv6 address in its IPv4 form.
-pub(super) fn canonical(addr: SocketAddr) -> SocketAddr {
-    match addr {
-        SocketAddr::V4(_) => addr,
-        SocketAddr::V6(v6) => {
-            SocketAddr::new(v6.ip().to_canonical(), v6.port())
-        }
     }
 }
 
@@ -374,9 +370,12 @@ impl Endpoint {
             let PathSelection { source, destination, context, sent_by } =
                 selection;
             // A Via names an IPv4 host in its own form, see `Datagram::new`.
-            let source = canonical(source);
-            let destination = canonical(destination);
-            let sent_by = sent_by.map_or(source, canonical);
+            // The source and destination keep an IPv6 scope for the backend.
+            // The `sent-by` drops it here, so that `SendPath::sent_by` says
+            // what the Via names, which `via_value` makes sure of anyway.
+            let source = unmap(source);
+            let destination = unmap(destination);
+            let sent_by = advertised(sent_by.map_or(source, unmap));
             if ![source, destination, sent_by].into_iter().all(unicast) {
                 return Err(Error::path_refused(io::Error::new(
                     io::ErrorKind::InvalidInput,

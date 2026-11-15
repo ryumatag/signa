@@ -33,7 +33,6 @@ use tokio::sync::oneshot;
 
 use super::{
     driver::{ReceptionCounters, increment},
-    path::canonical,
     reply::{Completion, ReplyError},
     routing::Link,
     server::{Shared, WriteObservation},
@@ -44,6 +43,7 @@ use crate::transport::{
         DatagramIo, DatagramWrite, Path, RecvError, Submit, TransportContext,
         WriteId,
     },
+    unmap,
 };
 
 /// How many writes, completions or datagrams one poll handles before it lets
@@ -475,11 +475,11 @@ impl Port {
                         datagram.into_parts();
                     // An IPv4 peer is named in its own form, as a Via names
                     // it, whichever backend reported it. The socket already
-                    // does, and for it this is a match on the family.
+                    // does. A native IPv6 address keeps its scope.
                     let flow = Flow {
                         transport: Transport::Udp,
-                        local: canonical(destination),
-                        remote: canonical(source),
+                        local: unmap(destination),
+                        remote: unmap(source),
                     };
                     return Poll::Ready((payload, flow, context));
                 }
