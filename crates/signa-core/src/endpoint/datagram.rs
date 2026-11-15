@@ -33,7 +33,7 @@ use tokio::sync::oneshot;
 
 use super::{
     driver::{ReceptionCounters, increment},
-    port::WritePermit,
+    port::{Withdrawal, WritePermit},
     reply::{Completion, ReplyError},
     routing::Link,
     server::WriteObservation,
@@ -106,7 +106,13 @@ enum Outcome {
     /// A write of an endpoint registered on a shared port, by its own ID.
     /// The permit is its share of the port's write limits, which returns its
     /// room and wakes the endpoints waiting for it when the outcome drops.
-    Registration { registration: u64, local: WriteId, _permit: WritePermit },
+    /// The write reaches the backend only while `withdrawal` lets it.
+    Registration {
+        registration: u64,
+        local: WriteId,
+        _permit: WritePermit,
+        withdrawal: Arc<Withdrawal>,
+    },
     /// A raw send through a shared port.
     Raw { done: oneshot::Sender<WriteOutcome>, _permit: WritePermit },
 }
@@ -192,10 +198,14 @@ impl Port {
             link.flow.remote,
             link.path.clone(),
             limits,
+            None,
         )
     }
 
     /// As [`Port::start`], for a write named by its addresses and path.
+    ///
+    /// A write of an endpoint on a shared port passes `gate`, so that it
+    /// does not reach the backend once the endpoint has withdrawn.
     fn start_parts(
         &mut self,
         bytes: Bytes,
@@ -203,6 +213,7 @@ impl Port {
         destination: SocketAddr,
         path: Option<Arc<Path>>,
         limits: WriteLimits,
+        gate: Option<&Withdrawal>,
     ) -> Started {
         let len = bytes.len();
         if len > self.max_payload {
@@ -227,7 +238,11 @@ impl Port {
         }
 
         let mut cx = Context::from_waker(Waker::noop());
-        match self.io.poll_submit(&mut cx, write) {
+        let Some(submitted) = self.offer(&mut cx, write, gate) else {
+            self.release(len);
+            return Started::Done(WriteOutcome::NotWritten(withdrawn()));
+        };
+        match submitted {
             Submit::Accepted => {
                 self.awaited = Some((id, len));
                 self.collect(&mut cx);
@@ -386,7 +401,14 @@ impl Port {
 
             let id = write.id();
             let len = write.payload().len();
-            match self.io.poll_submit(cx, write) {
+            // A write that waited here passes its endpoint's withdrawal
+            // again, since the endpoint may have stopped while it waited.
+            let Some(submitted) = self.offer(cx, write, gate(&outcome)) else {
+                self.release(len);
+                self.finish(outcome, WriteOutcome::NotWritten(withdrawn()));
+                continue;
+            };
+            match submitted {
                 Submit::Accepted => {
                     self.in_flight.insert(id, InFlight { len, outcome });
                 }
@@ -404,6 +426,25 @@ impl Port {
 
         if self.collect(cx) || more {
             cx.waker().wake_by_ref();
+        }
+    }
+
+    /// Offers `write` to the backend, through `gate` for a write of an
+    /// endpoint on a shared port. Returns `None`, without offering it, once
+    /// that endpoint has withdrawn.
+    ///
+    /// Only the offer runs under the gate's lock. The caller settles what it
+    /// returns after, since settling can release a share of the port's write
+    /// limits, whose lock is never taken under this one.
+    fn offer(
+        &mut self,
+        cx: &mut Context<'_>,
+        write: DatagramWrite,
+        gate: Option<&Withdrawal>,
+    ) -> Option<Submit> {
+        match gate {
+            Some(gate) => gate.offer(|| self.io.poll_submit(cx, write)),
+            None => Some(self.io.poll_submit(cx, write)),
         }
     }
 
@@ -457,7 +498,7 @@ impl Port {
             Outcome::Client(receipt) => {
                 let _ = receipt.send(result);
             }
-            Outcome::Registration { registration, local, _permit } => {
+            Outcome::Registration { registration, local, .. } => {
                 self.routed.push_back((registration, local, result));
             }
             Outcome::Raw { done, _permit } => {
@@ -476,13 +517,24 @@ impl Port {
         &mut self,
         write: DatagramWrite,
         registration: u64,
+        withdrawal: Arc<Withdrawal>,
         permit: WritePermit,
     ) {
         let (local, bytes, source, destination, path) = write.into_parts();
-        let outcome =
-            Outcome::Registration { registration, local, _permit: permit };
-        let started =
-            self.start_parts(bytes, source, destination, path, self.limits);
+        let started = self.start_parts(
+            bytes,
+            source,
+            destination,
+            path,
+            self.limits,
+            Some(&withdrawal),
+        );
+        let outcome = Outcome::Registration {
+            registration,
+            local,
+            _permit: permit,
+            withdrawal,
+        };
         self.settle(started, outcome);
     }
 
@@ -503,6 +555,7 @@ impl Port {
             destination,
             Some(path),
             self.limits,
+            None,
         );
         self.settle(started, Outcome::Raw { done, _permit: permit });
     }
@@ -538,10 +591,7 @@ impl Port {
                 self.release(queued.write.payload().len());
                 self.finish(
                     queued.outcome,
-                    WriteOutcome::NotWritten(io::Error::new(
-                        io::ErrorKind::Interrupted,
-                        "the endpoint stopped before the write went out",
-                    )),
+                    WriteOutcome::NotWritten(withdrawn()),
                 );
             } else {
                 self.backlog.push_back(queued);
@@ -639,7 +689,7 @@ impl Port {
             }
         };
         match outcome {
-            Outcome::Registration { registration, local, _permit } => {
+            Outcome::Registration { registration, local, .. } => {
                 self.routed.push_back((registration, local, outcome_now()));
             }
             Outcome::Raw { done, _permit } => {
@@ -694,6 +744,23 @@ impl Port {
     pub(super) fn lost(&self) -> bool {
         self.lost
     }
+}
+
+/// The withdrawal a write must pass on its way to the backend, if it is a
+/// write of an endpoint on a shared port.
+fn gate(outcome: &Outcome) -> Option<&Withdrawal> {
+    match outcome {
+        Outcome::Registration { withdrawal, .. } => Some(withdrawal),
+        _ => None,
+    }
+}
+
+/// Why a write of an endpoint that stopped did not go out.
+fn withdrawn() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Interrupted,
+        "the endpoint stopped before the write went out",
+    )
 }
 
 /// The failure a caller that learns only failures is told. A write whose

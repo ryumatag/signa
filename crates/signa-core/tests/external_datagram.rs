@@ -2970,6 +2970,48 @@ async fn a_forced_port_close_leaves_an_endpoint_s_response_unknown() {
     drop(endpoint);
 }
 
+// An endpoint stopped at its deadline leaves the port to the others. A write
+// of its that the wire took before may still go out, and the wire's late
+// report of it reaches nobody: not the sibling still running, and not an
+// endpoint registered after the stop, whose own first write has the same
+// local ID as the stopped endpoint's.
+#[tokio::test]
+async fn a_forced_stop_leaves_the_port_to_the_other_endpoints() {
+    let wire = Wire::default();
+    let (port, _ingress) = intercept(&wire);
+    let (stopping, _stopping_incoming) =
+        Endpoint::builder().port(&port).bind().unwrap();
+    let (sibling, _sibling_incoming) =
+        Endpoint::builder().port(&port).bind().unwrap();
+    wire.writes(Writes::Delay);
+    let from_stopping = send_options(&stopping, "stopping");
+    wire.sent(1).await;
+
+    let stopped =
+        timeout(Duration::from_secs(2), stopping.shutdown(Duration::ZERO))
+            .await
+            .unwrap();
+
+    assert_eq!(stopped, ShutdownOutcome::DeadlineExpired);
+    let (late, _late_incoming) =
+        Endpoint::builder().port(&port).bind().unwrap();
+    let mut from_late = send_options(&late, "late");
+    wire.sent(2).await;
+    let from_sibling = send_options(&sibling, "sibling");
+    wire.sent(3).await;
+    wire.finish(Ok(()));
+    assert!(
+        timeout(Duration::from_millis(50), &mut from_late).await.is_err(),
+        "the stopped endpoint's outcome reached a later one"
+    );
+    wire.finish(Ok(()));
+    wire.finish(Ok(()));
+    let outcome = |write| timeout(Duration::from_secs(2), write);
+    assert!(outcome(from_late).await.unwrap().unwrap().is_ok());
+    assert!(outcome(from_sibling).await.unwrap().unwrap().is_ok());
+    assert!(outcome(from_stopping).await.unwrap().unwrap().is_err());
+}
+
 // An endpoint's write waits for room in the port's limits, so a byte limit
 // below the backend's largest payload could hold one back forever. The port
 // refuses that configuration.

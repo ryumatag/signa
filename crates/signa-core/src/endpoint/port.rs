@@ -19,7 +19,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
     task::{Context, Poll, ready},
     time::Duration,
@@ -50,8 +50,10 @@ use crate::{
     },
 };
 
+mod withdrawal;
 mod writes;
 
+pub(super) use withdrawal::Withdrawal;
 pub(super) use writes::WritePermit;
 use writes::{Admission, WriteAdmission};
 
@@ -236,6 +238,14 @@ impl PortBuilder {
     ///   address or sends no payload.
     /// * [`BindError::is_io`] when the socket cannot be bound.
     pub fn intercept(self) -> Result<(DatagramPort, Ingress), BindError> {
+        let (port, ingress, task) = self.build()?;
+        tokio::spawn(task.run());
+        Ok((port, ingress))
+    }
+
+    /// Checks the configuration and opens the backend, and returns the port
+    /// with the task that is to own the backend, not yet started.
+    fn build(self) -> Result<(DatagramPort, Ingress, PortTask), BindError> {
         for (reason, value) in [
             (
                 "write_limits.messages must be positive",
@@ -313,11 +323,11 @@ impl PortBuilder {
             ingress: Some(ingress),
             registrations: HashMap::new(),
         };
-        tokio::spawn(task.run());
 
         Ok((
             DatagramPort { shared, commands },
             Ingress { receiver: ingress_rx },
+            task,
         ))
     }
 
@@ -452,8 +462,9 @@ fn open(backend: Option<Backend>) -> Result<Box<dyn DatagramIo>, BindError> {
 ///    Reception, delivery and every write go on, so that registered endpoints
 ///    can finish their work, ACKs and late 2xx included.
 /// 2. [`Endpoint::shutdown`] drains one endpoint and ends its registration. The
-///    others go on. At its deadline the port drops the endpoint's writes it
-///    still queues. A write the backend already took cannot be taken back and
+///    others go on. Once it returns, whether drained or at its deadline, the
+///    backend takes none of the endpoint's writes, and those the port still
+///    queued fail. A write the backend took before cannot be taken back and
 ///    may still go out after the endpoint has stopped.
 /// 3. [`DatagramPort::close`] stops reception, invalidates the datagrams the
 ///    application still holds and every path of the port, refuses new writes
@@ -544,6 +555,7 @@ enum Command {
     Register {
         registration: u64,
         completions: mpsc::UnboundedSender<(WriteId, WriteOutcome)>,
+        withdrawal: Arc<Withdrawal>,
     },
     Unregister {
         registration: u64,
@@ -751,6 +763,7 @@ impl DatagramPort {
     pub(super) fn register(&self) -> Result<Registration, BindError> {
         let registration = path::next_id();
         let (completions, completions_rx) = mpsc::unbounded_channel();
+        let withdrawal = Arc::new(Withdrawal::default());
         {
             let mut registrations =
                 self.shared.lifecycle.lock().expect("not poisoned");
@@ -760,22 +773,26 @@ impl DatagramPort {
             if *registrations >= self.shared.max_registrations {
                 return Err(BindError::port_full());
             }
+            let command = Command::Register {
+                registration,
+                completions,
+                withdrawal: withdrawal.clone(),
+            };
             self.commands
-                .send(Command::Register { registration, completions })
+                .send(command)
                 .map_err(|_| BindError::port_closed())?;
             *registrations += 1;
         }
 
         let (deliveries, deliveries_rx) =
             mpsc::channel(self.shared.delivery_queue);
-        let state = Arc::new(RegistrationState::default());
         let proxy = Proxy {
             registration,
             shared: self.shared.clone(),
             commands: self.commands.clone(),
             deliveries: deliveries_rx,
             completions: completions_rx,
-            state: state.clone(),
+            withdrawal: withdrawal.clone(),
             unregistering: None,
         };
         Ok(Registration {
@@ -789,7 +806,7 @@ impl DatagramPort {
             client: PortClient {
                 shared: self.shared.clone(),
                 commands: self.commands.downgrade(),
-                state,
+                withdrawal,
             },
         })
     }
@@ -870,13 +887,7 @@ pub(super) struct Registration {
 pub(super) struct PortClient {
     shared: Arc<Shared>,
     commands: mpsc::WeakUnboundedSender<Command>,
-    state: Arc<RegistrationState>,
-}
-
-#[derive(Default)]
-struct RegistrationState {
-    /// Set once the endpoint's driver has started to close its backend.
-    closed: AtomicBool,
+    withdrawal: Arc<Withdrawal>,
 }
 
 impl PortClient {
@@ -888,7 +899,7 @@ impl PortClient {
     ) -> Result<Arc<Path>, Error> {
         let commands = self.commands.upgrade().ok_or_else(Error::closed)?;
         let path = check_path(&commands, path).await?;
-        if self.state.closed.load(Ordering::Acquire) || self.shared.closing() {
+        if self.withdrawal.is_withdrawn() || self.shared.closing() {
             return Err(Error::closed());
         }
         Ok(Arc::new(path))
@@ -909,7 +920,9 @@ struct Proxy {
     commands: mpsc::UnboundedSender<Command>,
     deliveries: mpsc::Receiver<ReceivedDatagram>,
     completions: mpsc::UnboundedReceiver<(WriteId, WriteOutcome)>,
-    state: Arc<RegistrationState>,
+    /// Set as the endpoint's driver starts to close the proxy, or drops it.
+    /// The port's task offers none of the endpoint's writes after that.
+    withdrawal: Arc<Withdrawal>,
     unregistering: Option<oneshot::Receiver<()>>,
 }
 
@@ -947,7 +960,7 @@ impl DatagramIo for Proxy {
         cx: &mut Context<'_>,
         write: DatagramWrite,
     ) -> Submit {
-        if self.shared.closing() || self.state.closed.load(Ordering::Acquire) {
+        if self.shared.closing() || self.withdrawal.is_withdrawn() {
             return Submit::Rejected(write, closing_error());
         }
         let len = write.payload().len();
@@ -1000,9 +1013,15 @@ impl DatagramIo for Proxy {
     /// Ends the registration. The port's task fails the endpoint's writes
     /// that the backend has not taken, and the outcomes reach the endpoint
     /// before this finishes, so that it counts them as lost.
+    ///
+    /// The first poll withdraws the endpoint before it asks the task to
+    /// unregister it. A driver that stops at its deadline drops the proxy
+    /// without waiting for the task, and the withdrawal is what keeps the
+    /// task from offering the endpoint's writes after that. See
+    /// [`Withdrawal`].
     fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         if self.unregistering.is_none() {
-            self.state.closed.store(true, Ordering::Release);
+            self.withdrawal.withdraw();
             self.deliveries.close();
             let (done, wait) = oneshot::channel();
             let command =
@@ -1028,7 +1047,7 @@ impl Drop for Proxy {
     // ends its registration, so that the port forgets it.
     fn drop(&mut self) {
         if self.unregistering.is_none() {
-            self.state.closed.store(true, Ordering::Release);
+            self.withdrawal.withdraw();
             let (done, _) = oneshot::channel();
             let _ = self.commands.send(Command::Unregister {
                 registration: self.registration,
@@ -1053,9 +1072,15 @@ struct PortTask {
     /// runs but do not keep it running.
     weak: mpsc::WeakUnboundedSender<Command>,
     ingress: Option<mpsc::UnboundedSender<ReceivedDatagram>>,
-    /// Where each registered endpoint takes its writes' outcomes.
-    registrations:
-        HashMap<u64, mpsc::UnboundedSender<(WriteId, WriteOutcome)>>,
+    registrations: HashMap<u64, Registered>,
+}
+
+/// What the port's task keeps of a registered endpoint.
+struct Registered {
+    /// Where the endpoint takes its writes' outcomes.
+    completions: mpsc::UnboundedSender<(WriteId, WriteOutcome)>,
+    /// Checked as each of its writes is offered to the backend.
+    withdrawal: Arc<Withdrawal>,
 }
 
 impl PortTask {
@@ -1126,8 +1151,11 @@ impl PortTask {
 
     fn on_command(&mut self, command: Command) {
         match command {
-            Command::Register { registration, completions } => {
-                self.registrations.insert(registration, completions);
+            Command::Register { registration, completions, withdrawal } => {
+                self.registrations.insert(
+                    registration,
+                    Registered { completions, withdrawal },
+                );
             }
             Command::Unregister { registration, done } => {
                 self.unregister(registration);
@@ -1136,8 +1164,15 @@ impl PortTask {
             Command::Write { registration, write, permit } => {
                 // The permit of a write whose endpoint has gone returns its
                 // room as it drops.
-                if self.registrations.contains_key(&registration) {
-                    self.port.submit_routed(write, registration, permit);
+                if let Some(registered) = self.registrations.get(&registration)
+                {
+                    let withdrawal = registered.withdrawal.clone();
+                    self.port.submit_routed(
+                        write,
+                        registration,
+                        withdrawal,
+                        permit,
+                    );
                 }
             }
             Command::Raw { payload, path, done, permit } => {
@@ -1172,8 +1207,8 @@ impl PortTask {
     fn route(&mut self) {
         while let Some((registration, local, result)) = self.port.take_routed()
         {
-            if let Some(completions) = self.registrations.get(&registration) {
-                let _ = completions.send((local, result));
+            if let Some(registered) = self.registrations.get(&registration) {
+                let _ = registered.completions.send((local, result));
             }
         }
     }
@@ -1302,11 +1337,10 @@ impl PortTask {
             }
             Command::Write { registration, write, permit } => {
                 drop(permit);
-                if let Some(completions) =
-                    self.registrations.get(&registration)
+                if let Some(registered) = self.registrations.get(&registration)
                 {
                     let outcome = WriteOutcome::NotWritten(closing_error());
-                    let _ = completions.send((write.id(), outcome));
+                    let _ = registered.completions.send((write.id(), outcome));
                 }
             }
             Command::Raw { done, permit, .. } => {
@@ -1892,5 +1926,267 @@ impl fmt::Debug for CapturedDatagram {
             .field("flow", &self.flow)
             .field("context", &self.context)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::VecDeque, sync::mpsc as std_mpsc, task::Waker, thread,
+    };
+
+    use super::*;
+
+    const LOCAL: SocketAddr = SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 10)),
+        5060,
+    );
+    const PEER: SocketAddr = SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 20)),
+        5060,
+    );
+
+    /// What the backend does with the next write it is offered.
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    enum Mode {
+        /// Takes it and reports it written at once.
+        #[default]
+        Take,
+        /// Cannot take it now.
+        Hold,
+        /// Takes it, but first waits in `poll_submit` until the test lets it
+        /// go, as a backend that blocked would.
+        Block,
+    }
+
+    #[derive(Default)]
+    struct State {
+        mode: Mode,
+        offered: Vec<Bytes>,
+        completions: VecDeque<(WriteId, WriteOutcome)>,
+        /// Told when a blocking `poll_submit` has started.
+        entered: Option<std_mpsc::Sender<()>>,
+        /// What a blocking `poll_submit` waits on.
+        release: Option<std_mpsc::Receiver<()>>,
+    }
+
+    /// A backend the test drives through shared state. It records the
+    /// payloads of the writes it took.
+    #[derive(Clone, Default)]
+    struct Backend(Arc<Mutex<State>>);
+
+    impl Backend {
+        fn mode(&self, mode: Mode) {
+            self.0.lock().unwrap().mode = mode;
+        }
+
+        fn offered(&self) -> Vec<Bytes> {
+            self.0.lock().unwrap().offered.clone()
+        }
+    }
+
+    impl DatagramIo for Backend {
+        fn local_addr(&self) -> SocketAddr {
+            LOCAL
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::new(1472)
+        }
+
+        fn poll_recv(
+            &mut self,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<Datagram, RecvError>> {
+            Poll::Pending
+        }
+
+        fn poll_submit(
+            &mut self,
+            _cx: &mut Context<'_>,
+            write: DatagramWrite,
+        ) -> Submit {
+            let mode = self.0.lock().unwrap().mode;
+            match mode {
+                Mode::Take => {}
+                Mode::Hold => return Submit::Pending(write),
+                Mode::Block => {
+                    // The lock on the state is not held while blocked, so
+                    // that the test can still read it.
+                    let (entered, release) = {
+                        let mut state = self.0.lock().unwrap();
+                        (state.entered.take(), state.release.take())
+                    };
+                    entered.unwrap().send(()).unwrap();
+                    let _ = release.unwrap().recv();
+                }
+            }
+            let mut state = self.0.lock().unwrap();
+            state.completions.push_back((write.id(), WriteOutcome::Written));
+            state.offered.push(write.payload().clone());
+            Submit::Accepted
+        }
+
+        fn poll_complete(
+            &mut self,
+            _cx: &mut Context<'_>,
+        ) -> Poll<(WriteId, WriteOutcome)> {
+            match self.0.lock().unwrap().completions.pop_front() {
+                Some(completion) => Poll::Ready(completion),
+                None => Poll::Pending,
+            }
+        }
+
+        fn poll_close(&mut self, _cx: &mut Context<'_>) -> Poll<()> {
+            Poll::Ready(())
+        }
+    }
+
+    /// A port on `backend` whose task the test polls itself, one step at a
+    /// time, instead of spawning it.
+    fn port(backend: &Backend) -> (DatagramPort, Ingress, PortTask) {
+        PortBuilder::new().udp_io(backend.clone()).build().unwrap()
+    }
+
+    /// One turn of the port's task: the commands queued so far, a flush of
+    /// the backlog, and reception.
+    fn serve(task: &mut PortTask) {
+        let _ = task.poll_serve(&mut Context::from_waker(Waker::noop()));
+    }
+
+    /// Offers `payload` to an endpoint's proxy, which admits it and queues
+    /// it for the port's task.
+    fn submit(
+        registration: &mut Registration,
+        id: u64,
+        payload: &'static str,
+    ) {
+        let write = DatagramWrite::new(
+            WriteId::new(id),
+            Bytes::from_static(payload.as_bytes()),
+            LOCAL,
+            PEER,
+            None,
+        );
+        let mut cx = Context::from_waker(Waker::noop());
+        let submitted = registration.io.poll_submit(&mut cx, write);
+        assert!(matches!(submitted, Submit::Accepted));
+    }
+
+    /// Stops an endpoint as its driver does at the deadline: the first poll
+    /// of its close withdraws it and asks the task to unregister it, and the
+    /// driver drops the proxy without waiting for the answer.
+    fn force_stop(mut registration: Registration) {
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(registration.io.poll_close(&mut cx).is_pending());
+        drop(registration);
+    }
+
+    // An endpoint's write that waits in the task's queue when the endpoint
+    // stops at its deadline never reaches the backend, although the task
+    // reads it before the unregistration that follows it. A sibling's write
+    // in the same queue still goes.
+    #[test]
+    fn a_queued_write_does_not_reach_the_backend_after_a_forced_stop() {
+        let backend = Backend::default();
+        let (port, _ingress, mut task) = port(&backend);
+        let mut stopping = port.register().unwrap();
+        let mut sibling = port.register().unwrap();
+        serve(&mut task);
+
+        submit(&mut stopping, 0, "stopping");
+        submit(&mut sibling, 0, "sibling");
+        force_stop(stopping);
+        serve(&mut task);
+
+        assert_eq!(backend.offered(), ["sibling"]);
+        assert_eq!(task.registrations.len(), 1);
+        drop(sibling);
+    }
+
+    // A write the backend could not take waits in the backlog, and the task
+    // can retry the backlog before it reads an unregistration queued behind
+    // a full batch of commands. The retry checks the withdrawal again, so the
+    // stopped endpoint's write stays back, and the sibling's writes queued
+    // behind it go.
+    #[test]
+    fn a_write_waiting_for_the_backend_is_not_retried_after_a_forced_stop() {
+        let backend = Backend::default();
+        let (port, _ingress, mut task) = port(&backend);
+        let mut stopping = port.register().unwrap();
+        let mut sibling = port.register().unwrap();
+        serve(&mut task);
+        backend.mode(Mode::Hold);
+        submit(&mut stopping, 0, "stopping");
+        serve(&mut task);
+        assert!(backend.offered().is_empty());
+
+        for id in 0..BATCH as u64 {
+            submit(&mut sibling, id, "sibling");
+        }
+        force_stop(stopping);
+        backend.mode(Mode::Take);
+        serve(&mut task);
+
+        // The turn read the full batch of the sibling's writes and stopped
+        // short of the unregistration, then retried the backlog.
+        let only_sibling = |offered: &[Bytes]| {
+            offered.iter().all(|payload| payload == "sibling")
+        };
+        assert!(!backend.offered().is_empty());
+        assert!(only_sibling(&backend.offered()));
+        assert_eq!(task.registrations.len(), 2, "unregistered in this turn");
+        serve(&mut task);
+        serve(&mut task);
+        assert_eq!(backend.offered().len(), BATCH);
+        assert!(only_sibling(&backend.offered()));
+        assert_eq!(task.registrations.len(), 1);
+        drop(sibling);
+    }
+
+    // A withdrawal that comes while the backend is taking one of the
+    // endpoint's writes waits for `poll_submit` to return, and that write
+    // counts as taken before the endpoint stopped. The task runs on a thread
+    // of its own, and the backend holds its `poll_submit` until the test has
+    // seen the withdrawal wait.
+    #[test]
+    fn a_withdrawal_waits_for_the_offer_in_progress() {
+        let backend = Backend::default();
+        let (port, _ingress, mut task) = port(&backend);
+        let mut stopping = port.register().unwrap();
+        serve(&mut task);
+        let (entered, offering) = std_mpsc::channel();
+        let (release, held) = std_mpsc::channel();
+        {
+            let mut state = backend.0.lock().unwrap();
+            state.mode = Mode::Block;
+            state.entered = Some(entered);
+            state.release = Some(held);
+        }
+        submit(&mut stopping, 0, "taken first");
+        let serving = thread::spawn(move || {
+            serve(&mut task);
+            task
+        });
+        offering.recv().unwrap();
+
+        let (stopped, done) = std_mpsc::channel();
+        let stop = thread::spawn(move || {
+            force_stop(stopping);
+            stopped.send(()).unwrap();
+        });
+        let waited =
+            done.recv_timeout(std::time::Duration::from_millis(50)).is_err();
+        // Released before any assertion, so that a failure cannot leave the
+        // task's thread blocked.
+        release.send(()).unwrap();
+
+        assert!(waited, "the endpoint stopped during the backend's offer");
+        let mut task = serving.join().unwrap();
+        done.recv().unwrap();
+        stop.join().unwrap();
+        assert_eq!(backend.offered(), ["taken first"]);
+        serve(&mut task);
+        assert!(task.registrations.is_empty());
     }
 }

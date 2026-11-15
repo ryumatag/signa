@@ -163,6 +163,12 @@ pub trait DatagramIo: Send + 'static {
     /// that kept the backend from taking it, such as a source address it may
     /// not send from. The endpoint never offers an accepted write again, and
     /// offers its writes in [`WriteId`] order.
+    ///
+    /// It must return at once, without waiting for I/O. A shared port offers
+    /// an endpoint's write under a lock that the endpoint's shutdown waits
+    /// for, so that the backend takes none of its writes once it has stopped.
+    /// A `poll_submit` that blocked would hold that shutdown past its
+    /// deadline, which the port cannot cut short.
     fn poll_submit(
         &mut self,
         cx: &mut Context<'_>,
