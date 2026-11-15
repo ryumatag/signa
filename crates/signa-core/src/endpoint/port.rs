@@ -1144,16 +1144,9 @@ impl PortTask {
     /// Serves until a close or until every handle is gone, and returns the
     /// close's deadline.
     fn poll_serve(&mut self, cx: &mut Context<'_>) -> Poll<Instant> {
+        // The commands still queued are left to `close`, which takes them in
+        // batches and checks the deadline before it offers any.
         if let Some(deadline) = self.poll_close_request(cx) {
-            // The writes queued here were admitted before the port started
-            // closing, since admission refuses once it has, and they get
-            // until the deadline like those already offered. A close request
-            // reaches the task apart from the queue, so the queue is taken
-            // as it stands rather than refused from here on. Admission bounds
-            // what it can hold.
-            while let Ok(command) = self.commands.try_recv() {
-                self.on_command(command);
-            }
             return Poll::Ready(deadline);
         }
 
@@ -1316,74 +1309,113 @@ impl PortTask {
 
     /// Drains what the port admitted until `deadline`, then closes the
     /// backend, as an endpoint's driver closes its own.
+    ///
+    /// Each poll looks at the deadline first, then takes a batch of commands,
+    /// then drains or closes the backend. The writes still queued for the
+    /// task were admitted before the close, since admission refuses once it
+    /// has started, and they get until the deadline like those the backend
+    /// already holds. Once the deadline has passed, nothing more is offered.
     async fn close(&mut self, deadline: Instant) -> ShutdownOutcome {
         // An endpoint waiting for room in the limits is woken, tries again
         // and finds the port closing.
         self.shared.set_phase(CLOSING);
         self.ingress = None;
         let mut sleep = Box::pin(sleep_until(deadline));
+        // Set once the backend has been told to close, or the deadline has
+        // passed. No write is offered after that.
         let mut closing = false;
         let mut overdue = false;
+        // Whether a write still in the queue failed at the deadline.
+        let mut refused = false;
+        // Whether the backend lost a write, once it has closed or been given
+        // up on.
+        let mut closed = None;
         let mut commands_open = true;
 
         let lost = poll_fn(|cx| {
-            loop {
-                // A later request can only bring the deadline forward, while
-                // draining or closing alike. Looking until there is none
-                // leaves the waker for the next.
-                while let Some(deadline) = self.poll_close_request(cx) {
-                    if deadline < sleep.deadline() {
-                        sleep.as_mut().reset(deadline);
-                    }
+            // A later request can only bring the deadline forward, while
+            // draining or closing alike. Looking until there is none leaves
+            // the waker for the next.
+            while let Some(deadline) = self.poll_close_request(cx) {
+                if deadline < sleep.deadline() {
+                    sleep.as_mut().reset(deadline);
                 }
-                while commands_open {
-                    match self.commands.poll_recv(cx) {
-                        Poll::Ready(Some(command)) => {
-                            self.on_closing_command(command);
-                        }
-                        Poll::Ready(None) => commands_open = false,
-                        Poll::Pending => break,
-                    }
-                }
-                if !closing {
-                    let drained = self.port.poll_drain(cx).is_ready();
-                    self.route();
-                    closing = drained;
-                }
-                if closing {
-                    if self.port.poll_close(cx).is_ready() {
-                        self.route();
-                        return Poll::Ready(self.port.lost());
-                    }
-                    if overdue {
-                        // A backend still closing at the deadline gets this
-                        // one more poll, and is dropped with the task. What
-                        // it took and never reported may have gone out.
-                        self.port.give_up();
-                        self.route();
-                        return Poll::Ready(true);
-                    }
-                }
-                if !overdue && sleep.as_mut().poll(cx).is_ready() {
-                    overdue = true;
-                    if !closing {
-                        self.port.abort();
-                        closing = true;
-                    }
-                    continue;
-                }
-                return Poll::Pending;
             }
+            // The timer fires on its own tick, which can come after the
+            // deadline, so the clock decides too. A deadline already past
+            // when the close was asked for stops the very first poll.
+            if !overdue
+                && (sleep.deadline() <= Instant::now()
+                    || sleep.as_mut().poll(cx).is_ready())
+            {
+                overdue = true;
+                if !closing {
+                    self.port.abort();
+                    self.route();
+                    closing = true;
+                }
+            }
+
+            // A source that stopped at its batch, rather than at `Pending`,
+            // has registered no waker, so the task wakes itself for it.
+            let mut more = false;
+            let mut handled = 0;
+            while commands_open {
+                if handled == BATCH {
+                    more = true;
+                    break;
+                }
+                match self.commands.poll_recv(cx) {
+                    Poll::Ready(Some(command)) => {
+                        refused |= self.on_closing_command(command, !closing);
+                        handled += 1;
+                    }
+                    Poll::Ready(None) => commands_open = false,
+                    Poll::Pending => break,
+                }
+            }
+
+            if closed.is_none() && !closing {
+                let drained = self.port.poll_drain(cx).is_ready();
+                self.route();
+                // A write admitted just before the close can still be on its
+                // way to the queue. It holds room in the limits until its
+                // outcome is known, and its command wakes the task.
+                closing = drained && self.shared.writes.is_idle();
+            }
+            if closed.is_none() && closing {
+                if self.port.poll_close(cx).is_ready() {
+                    self.route();
+                    closed = Some(self.port.lost());
+                } else if overdue {
+                    // A backend still closing at the deadline gets this one
+                    // more poll, and is dropped with the task. What it took
+                    // and never reported may have gone out.
+                    self.port.give_up();
+                    self.route();
+                    closed = Some(true);
+                }
+                if closed.is_some() {
+                    // Commands sent from here on fail at the sender. Those
+                    // already queued are refused in batches below, or an
+                    // endpoint would wait for a write's outcome forever.
+                    self.commands.close();
+                    more |= commands_open;
+                }
+            }
+
+            match closed {
+                Some(lost) if !commands_open => {
+                    return Poll::Ready(lost || refused);
+                }
+                _ => {}
+            }
+            if more {
+                cx.waker().wake_by_ref();
+            }
+            Poll::Pending
         })
         .await;
-
-        // Commands sent after the last poll would otherwise drop with the
-        // task, and an endpoint would wait for a write's outcome forever.
-        self.commands.close();
-        while let Ok(command) = self.commands.try_recv() {
-            self.on_closing_command(command);
-        }
-        self.route();
 
         if lost {
             ShutdownOutcome::DeadlineExpired
@@ -1392,9 +1424,16 @@ impl PortTask {
         }
     }
 
-    /// Refuses what a closing port no longer takes.
-    fn on_closing_command(&mut self, command: Command) {
+    /// Takes a command that reaches a closing port. A write goes to the
+    /// backend only while the port still `drains` before its deadline, and
+    /// fails otherwise. Returns `true` if it failed one.
+    fn on_closing_command(&mut self, command: Command, drains: bool) -> bool {
         match command {
+            // Its endpoint was bound before the close, and its writes queued
+            // behind this were admitted before it too.
+            command @ Command::Register { .. } if drains => {
+                self.on_command(command);
+            }
             Command::Register { .. } => {
                 *self.shared.lifecycle.lock().expect("not poisoned") -= 1;
             }
@@ -1402,13 +1441,22 @@ impl PortTask {
                 self.unregister(registration);
                 let _ = done.send(());
             }
+            command @ (Command::Write { .. } | Command::Raw { .. })
+                if drains =>
+            {
+                self.on_command(command);
+            }
             Command::Write { registration, write, permit } => {
                 drop(permit);
-                if let Some(registered) = self.registrations.get(&registration)
-                {
-                    let outcome = WriteOutcome::NotWritten(closing_error());
-                    let _ = registered.completions.send((write.id(), outcome));
-                }
+                // The write of an endpoint that has gone would have been
+                // dropped in any case, and was not lost to the deadline.
+                let Some(registered) = self.registrations.get(&registration)
+                else {
+                    return false;
+                };
+                let outcome = WriteOutcome::NotWritten(closing_error());
+                let _ = registered.completions.send((write.id(), outcome));
+                return true;
             }
             Command::Raw { done, permit, .. } => {
                 drop(permit);
@@ -1416,11 +1464,14 @@ impl PortTask {
                     io::ErrorKind::NotConnected,
                     "the port closed before the write went out",
                 )));
+                return true;
             }
+            // Every path turned invalid as the close started.
             Command::CheckPath { done, .. } => {
                 let _ = done.send(Err(Error::closed()));
             }
         }
+        false
     }
 }
 
@@ -1998,7 +2049,8 @@ impl fmt::Debug for CapturedDatagram {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::VecDeque, sync::mpsc as std_mpsc, task::Waker, thread,
+        collections::VecDeque, pin::pin, sync::mpsc as std_mpsc, task::Waker,
+        thread,
     };
 
     use super::*;
@@ -2020,6 +2072,8 @@ mod tests {
         Take,
         /// Cannot take it now.
         Hold,
+        /// Takes it and never reports it.
+        Keep,
         /// Takes it, but first waits in `poll_submit` until the test lets it
         /// go, as a backend that blocked would.
         Block,
@@ -2074,7 +2128,7 @@ mod tests {
         ) -> Submit {
             let mode = self.0.lock().unwrap().mode;
             match mode {
-                Mode::Take => {}
+                Mode::Take | Mode::Keep => {}
                 Mode::Hold => return Submit::Pending(write),
                 Mode::Block => {
                     // The lock on the state is not held while blocked, so
@@ -2088,7 +2142,11 @@ mod tests {
                 }
             }
             let mut state = self.0.lock().unwrap();
-            state.completions.push_back((write.id(), WriteOutcome::Written));
+            if mode != Mode::Keep {
+                state
+                    .completions
+                    .push_back((write.id(), WriteOutcome::Written));
+            }
             state.offered.push(write.payload().clone());
             Submit::Accepted
         }
@@ -2139,6 +2197,40 @@ mod tests {
         assert!(matches!(submitted, Submit::Accepted));
     }
 
+    /// The task's turn that sees a close request, which hands the close its
+    /// deadline.
+    fn closing(task: &mut PortTask) -> Instant {
+        let mut cx = Context::from_waker(Waker::noop());
+        match task.poll_serve(&mut cx) {
+            Poll::Ready(deadline) => deadline,
+            Poll::Pending => panic!("the task saw no close request"),
+        }
+    }
+
+    /// One poll of `future`, with a waker that does nothing.
+    fn step<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
+        future.poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    /// The outcomes the port has passed to an endpoint so far, in order.
+    fn outcomes(
+        registration: &mut Registration,
+    ) -> Vec<(WriteId, &'static str)> {
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut outcomes = Vec::new();
+        while let Poll::Ready((id, outcome)) =
+            registration.io.poll_complete(&mut cx)
+        {
+            let outcome = match outcome {
+                WriteOutcome::Written => "written",
+                WriteOutcome::NotWritten(_) => "not written",
+                WriteOutcome::Unknown(_) => "unknown",
+            };
+            outcomes.push((id, outcome));
+        }
+        outcomes
+    }
+
     /// Stops an endpoint as its driver does at the deadline: the first poll
     /// of its close withdraws it and asks the task to unregister it, and the
     /// driver drops the proxy without waiting for the answer.
@@ -2175,10 +2267,11 @@ mod tests {
     }
 
     // A write admitted before the close waits in the queue apart from the
-    // close request, and still goes to the backend before the task turns to
-    // closing, as one the backend had already taken would drain.
-    #[test]
-    fn writes_queued_before_a_close_still_go() {
+    // close request, and still goes to the backend before the deadline, as
+    // one the backend had already taken would drain. The turn that sees the
+    // request offers nothing itself.
+    #[tokio::test(start_paused = true)]
+    async fn writes_queued_before_a_close_still_go() {
         let backend = Backend::default();
         let (port, _ingress, mut task) = port(&backend);
         let mut endpoint = port.register().unwrap();
@@ -2186,11 +2279,163 @@ mod tests {
         submit(&mut endpoint, 0, "queued");
 
         drop(port.close(Duration::from_secs(1)));
-        let mut cx = Context::from_waker(Waker::noop());
+        let deadline = closing(&mut task);
+        assert!(backend.offered().is_empty());
+        let outcome = task.close(deadline).await;
 
-        assert!(task.poll_serve(&mut cx).is_ready());
+        assert_eq!(outcome, ShutdownOutcome::Drained);
         assert_eq!(backend.offered(), ["queued"]);
-        drop(endpoint);
+        assert_eq!(outcomes(&mut endpoint), [(WriteId::new(0), "written")]);
+    }
+
+    // A close whose deadline passed well before the task looks offers
+    // nothing more. A write still in the task's queue and one in the backlog
+    // fail without reaching the backend, which would take them now, and one
+    // it took and never reported ends unknown. The port lost them to the
+    // deadline, so it has not drained.
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_close_offers_nothing_more() {
+        let backend = Backend::default();
+        let (port, _ingress, mut task) = port(&backend);
+        let mut endpoint = port.register().unwrap();
+        serve(&mut task);
+        backend.mode(Mode::Keep);
+        submit(&mut endpoint, 0, "taken");
+        serve(&mut task);
+        backend.mode(Mode::Hold);
+        submit(&mut endpoint, 1, "backlog");
+        serve(&mut task);
+        submit(&mut endpoint, 2, "queued");
+        backend.mode(Mode::Take);
+
+        drop(port.close(Duration::ZERO));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let deadline = closing(&mut task);
+        let outcome = task.close(deadline).await;
+
+        assert_eq!(outcome, ShutdownOutcome::DeadlineExpired);
+        assert_eq!(backend.offered(), ["taken"]);
+        let mut outcomes = outcomes(&mut endpoint);
+        outcomes.sort();
+        assert_eq!(
+            outcomes,
+            [
+                (WriteId::new(0), "unknown"),
+                (WriteId::new(1), "not written"),
+                (WriteId::new(2), "not written"),
+            ]
+        );
+    }
+
+    // A close with no time at all offers nothing either. The clock runs, so
+    // the timer, which fires on a later tick, cannot be what stops it.
+    #[tokio::test]
+    async fn a_close_with_no_time_offers_nothing_more() {
+        let backend = Backend::default();
+        let (port, _ingress, mut task) = port(&backend);
+        let mut endpoint = port.register().unwrap();
+        serve(&mut task);
+        submit(&mut endpoint, 0, "queued");
+
+        drop(port.close(Duration::ZERO));
+        let deadline = closing(&mut task);
+        let mut close = pin!(task.close(deadline));
+        let _ = step(close.as_mut());
+
+        assert!(backend.offered().is_empty());
+        assert_eq!(close.await, ShutdownOutcome::DeadlineExpired);
+        assert_eq!(
+            outcomes(&mut endpoint),
+            [(WriteId::new(0), "not written")]
+        );
+    }
+
+    // The close takes the task's queue a batch at a time, as serving does,
+    // so that however long the queue, one poll does a bounded amount.
+    #[tokio::test(start_paused = true)]
+    async fn a_close_takes_the_queue_a_batch_at_a_time() {
+        let backend = Backend::default();
+        let (port, _ingress, mut task) = port(&backend);
+        let mut endpoint = port.register().unwrap();
+        serve(&mut task);
+        for id in 0..=BATCH as u64 {
+            submit(&mut endpoint, id, "queued");
+        }
+
+        drop(port.close(Duration::from_secs(60)));
+        let deadline = closing(&mut task);
+        let mut close = pin!(task.close(deadline));
+
+        assert!(step(close.as_mut()).is_pending());
+        assert_eq!(backend.offered().len(), BATCH);
+        assert_eq!(close.await, ShutdownOutcome::Drained);
+        assert_eq!(backend.offered().len(), BATCH + 1);
+        let outcomes = outcomes(&mut endpoint);
+        assert_eq!(outcomes.len(), BATCH + 1);
+        assert!(outcomes.iter().all(|&(_, outcome)| outcome == "written"));
+    }
+
+    // A deadline brought forward while the close works through the queue
+    // stops it there. The writes it offered went out, and the rest fail.
+    #[tokio::test(start_paused = true)]
+    async fn a_sooner_deadline_stops_the_close_in_the_queue() {
+        let backend = Backend::default();
+        let (port, _ingress, mut task) = port(&backend);
+        let mut endpoint = port.register().unwrap();
+        serve(&mut task);
+        for id in 0..=BATCH as u64 {
+            submit(&mut endpoint, id, "queued");
+        }
+        drop(port.close(Duration::from_secs(60)));
+        let deadline = closing(&mut task);
+        let mut close = pin!(task.close(deadline));
+        assert!(step(close.as_mut()).is_pending());
+
+        drop(port.close(Duration::ZERO));
+
+        assert_eq!(close.await, ShutdownOutcome::DeadlineExpired);
+        assert_eq!(backend.offered().len(), BATCH);
+        let outcomes = outcomes(&mut endpoint);
+        let (last, written) = outcomes.split_last().unwrap();
+        assert_eq!(*last, (WriteId::new(BATCH as u64), "not written"));
+        assert!(written.iter().all(|&(_, outcome)| outcome == "written"));
+    }
+
+    // An endpoint admits a write, then queues it. A close in between can
+    // drain everything in the queue before the write arrives. The room the
+    // write holds in the limits keeps the close from finishing there, and
+    // the write still goes before the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_close_waits_for_a_write_on_its_way_to_the_queue() {
+        let backend = Backend::default();
+        let (port, _ingress, mut task) = port(&backend);
+        let mut endpoint = port.register().unwrap();
+        serve(&mut task);
+        let admission =
+            port.shared.writes.admit(endpoint.registration, 4, Waker::noop());
+        let Admission::Admitted(permit) = admission else {
+            panic!("the limits have room");
+        };
+
+        drop(port.close(Duration::from_secs(60)));
+        let deadline = closing(&mut task);
+        let mut close = pin!(task.close(deadline));
+        assert!(step(close.as_mut()).is_pending());
+        let write = DatagramWrite::new(
+            WriteId::new(0),
+            Bytes::from_static(b"late"),
+            LOCAL,
+            PEER,
+            None,
+        );
+        let registration = endpoint.registration;
+        port.commands
+            .send(Command::Write { registration, write, permit })
+            .unwrap_or_else(|_| panic!("the close finished without it"));
+
+        assert_eq!(close.await, ShutdownOutcome::Drained);
+        assert_eq!(backend.offered(), ["late"]);
+        assert_eq!(outcomes(&mut endpoint), [(WriteId::new(0), "written")]);
     }
 
     // An endpoint's write that waits in the task's queue when the endpoint

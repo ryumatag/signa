@@ -147,6 +147,13 @@ impl WriteAdmission {
         wake(waiters);
     }
 
+    /// Returns `true` when no write holds room. A write is admitted before
+    /// its command is queued, so then none is on its way to the port's task
+    /// either.
+    pub(super) fn is_idle(&self) -> bool {
+        self.0.state().messages == 0
+    }
+
     /// Forgets the waker of a registration that has ended.
     pub(super) fn forget(&self, registration: u64) {
         let waker = self.0.state().waiters.remove(&registration);
