@@ -367,36 +367,10 @@ impl Endpoint {
             if self.commands.is_closed() {
                 return Err(Error::closed());
             }
-            let PathSelection { source, destination, context, sent_by } =
-                selection;
-            // A Via names an IPv4 host in its own form, see `Datagram::new`.
-            // The source and destination keep an IPv6 scope for the backend.
-            // The `sent-by` drops it here, so that `SendPath::sent_by` says
-            // what the Via names, which `via_value` makes sure of anyway.
-            let source = unmap(source);
-            let destination = unmap(destination);
-            let sent_by = advertised(sent_by.map_or(source, unmap));
-            if ![source, destination, sent_by].into_iter().all(unicast) {
-                return Err(Error::path_refused(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "a path needs unicast addresses with a port",
-                )));
+            let path = unchecked(selection, binding, &self.context_limits)?;
+            if let Some(port) = &self.port {
+                return port.check_path(path).await.map(SendPath);
             }
-            let permit = self
-                .context_limits
-                .acquire_request(Path::charge(&context, true))
-                .ok_or_else(Error::busy)?;
-
-            let path = Path {
-                context: context.detached(),
-                prepared: Some(Box::new(Prepared {
-                    binding,
-                    source,
-                    destination,
-                    sent_by,
-                })),
-                _permit: Some(permit),
-            };
             let (done, result) = oneshot::channel();
             self.commands
                 .send(Command::CheckPath { path, done })
@@ -405,4 +379,46 @@ impl Endpoint {
             Ok(SendPath(Arc::new(path)))
         }
     }
+}
+
+/// Makes a path of `selection` for `binding`, charged to `limits`, for the
+/// backend to check.
+///
+/// It refuses an address that cannot be a datagram's, and charges what the
+/// path keeps as new requests do, see [`Builder::context_limits`].
+///
+/// [`Builder::context_limits`]: super::Builder::context_limits
+pub(super) fn unchecked(
+    selection: PathSelection,
+    binding: Binding,
+    limits: &Budget,
+) -> Result<Path, Error> {
+    let PathSelection { source, destination, context, sent_by } = selection;
+    // A Via names an IPv4 host in its own form, see `Datagram::new`. The
+    // source and destination keep an IPv6 scope for the backend. The
+    // `sent-by` drops it here, so that `SendPath::sent_by` says what the Via
+    // names, which `via_value` makes sure of anyway.
+    let source = unmap(source);
+    let destination = unmap(destination);
+    let sent_by = advertised(sent_by.map_or(source, unmap));
+    if ![source, destination, sent_by].into_iter().all(unicast) {
+        return Err(Error::path_refused(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a path needs unicast addresses with a port",
+        )));
+    }
+    let permit = limits
+        .acquire_request(Path::charge(&context, true))
+        .ok_or_else(Error::busy)?;
+
+    Ok(Path {
+        context: context.detached(),
+        prepared: Some(Box::new(Prepared {
+            binding,
+            source,
+            destination,
+            sent_by,
+        })),
+        _permit: Some(permit),
+    })
 }

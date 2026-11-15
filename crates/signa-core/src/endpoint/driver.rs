@@ -564,7 +564,7 @@ enum End {
 /// How long the TCP writers of an endpoint whose last handle dropped get to
 /// write what is queued. A peer that takes longer to read a few messages is
 /// not reading at all.
-const ABANDONED_FLUSH: Duration = Duration::from_secs(5);
+pub(super) const ABANDONED_FLUSH: Duration = Duration::from_secs(5);
 
 /// What is left of a stopping driver while its transport tasks end.
 struct Stopping {

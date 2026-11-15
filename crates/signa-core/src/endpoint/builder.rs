@@ -7,16 +7,17 @@ use std::{fmt, net::SocketAddr, time::Duration};
 use tokio::sync::mpsc;
 
 use super::{
-    BindError, Endpoint, Incoming,
+    BindError, DatagramPort, Endpoint, Incoming,
     driver::{Driver, TCP_INBOUND},
     path::next_id,
+    port::Registration,
 };
 use crate::{
     transaction::Timers,
     transport::{
         MessageLimits, WriteLimits,
         budget::Budget,
-        datagram::{Binding, DatagramIo},
+        datagram::{Binding, DatagramIo, Owner},
         tcp, udp,
     },
 };
@@ -194,6 +195,8 @@ enum Udp {
     Bind(SocketAddr),
     /// A backend the application supplied.
     Io(Box<dyn DatagramIo>),
+    /// A port the endpoint shares with others.
+    Port(DatagramPort),
 }
 
 impl fmt::Debug for Udp {
@@ -203,6 +206,7 @@ impl fmt::Debug for Udp {
             Udp::Io(io) => {
                 f.debug_tuple("Io").field(&io.local_addr()).finish()
             }
+            Udp::Port(port) => f.debug_tuple("Port").field(port).finish(),
         }
     }
 }
@@ -250,6 +254,28 @@ impl Builder {
     /// [`datagram`](crate::transport::datagram) module for the contract.
     pub fn udp_io(mut self, io: impl DatagramIo) -> Builder {
         self.udp = Some(Udp::Io(Box::new(io)));
+        self
+    }
+
+    /// Registers the endpoint on `port`, which it shares with other
+    /// endpoints, in place of a UDP socket of its own.
+    ///
+    /// The endpoint receives only what the application delivers to it
+    /// through [`Endpoint::ingress`], and receives that as from a socket of
+    /// its own. Its writes go through the port's task, within the port's
+    /// write limits and its own [`Builder::udp_write_limits`]. Its paths and
+    /// transactions are its own, and other endpoints on the port refuse its
+    /// paths. When it stops, its registration ends and the port goes on. See
+    /// the [`DatagramPort`] docs.
+    ///
+    /// [`bind`](Builder::bind) fails with [`BindError::is_closed`] once the
+    /// port is quiesced or closing, and with [`BindError::is_busy`] when it
+    /// has as many endpoints as it takes.
+    ///
+    /// This replaces a socket or backend set with [`Builder::udp`] or
+    /// [`Builder::udp_io`].
+    pub fn port(mut self, port: &DatagramPort) -> Builder {
+        self.udp = Some(Udp::Port(port.clone()));
         self
     }
 
@@ -827,16 +853,29 @@ impl Builder {
         }
 
         let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
-        let udp = self
-            .udp
-            .map(|udp| match udp {
-                Udp::Bind(addr) => udp::Socket::bind(addr).map(|socket| {
-                    Box::new(udp::Io::new(socket)) as Box<dyn DatagramIo>
-                }),
-                Udp::Io(io) => Ok(io),
-            })
-            .transpose()
-            .map_err(BindError::io)?;
+        let mut shared = None;
+        let udp = match self.udp {
+            None => None,
+            Some(Udp::Bind(addr)) => Some(
+                udp::Socket::bind(addr)
+                    .map(|socket| {
+                        Box::new(udp::Io::new(socket)) as Box<dyn DatagramIo>
+                    })
+                    .map_err(BindError::io)?,
+            ),
+            Some(Udp::Io(io)) => Some(io),
+            Some(Udp::Port(port)) => {
+                let Registration {
+                    io,
+                    binding,
+                    registration,
+                    ingress,
+                    client,
+                } = port.register()?;
+                shared = Some((binding, registration, ingress, client));
+                Some(io)
+            }
+        };
         let (tcp_tx, tcp_rx) = mpsc::channel(TCP_INBOUND);
         let tasks = tcp::Tasks::new();
         let listener = self
@@ -853,7 +892,22 @@ impl Builder {
             .map_err(BindError::io)?;
         let (commands, commands_rx) = mpsc::unbounded_channel();
         let udp_addr = udp.as_ref().map(|io| io.local_addr());
-        let registration = next_id();
+        let registration = shared
+            .as_ref()
+            .map_or_else(next_id, |(_, registration, ..)| *registration);
+        let (binding, ingress, port) = match shared {
+            Some((binding, _, ingress, client)) => {
+                (Some(binding), Some(ingress), Some(client))
+            }
+            None => (
+                udp_addr.map(|_| Binding {
+                    port: next_id(),
+                    owner: Owner::Endpoint(registration),
+                }),
+                None,
+                None,
+            ),
+        };
         let tcp_addr = listener.as_ref().map(tcp::Listener::local_addr);
         self.config.tcp_listener = tcp_addr;
 
@@ -892,8 +946,9 @@ impl Builder {
             udp: udp_addr,
             tcp: tcp_addr,
             registration,
-            binding: udp_addr
-                .map(|_| Binding { port: next_id(), registration }),
+            binding,
+            port,
+            ingress,
             context_limits: driver.context_limits(),
             timers: self.config.timers,
         };

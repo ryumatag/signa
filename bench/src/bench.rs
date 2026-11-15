@@ -46,6 +46,10 @@ criterion::criterion_group! {
         endpoint::round_trip,
         // The UDP round trip through a stateless proxy between them.
         endpoint::stateless_forward,
+        // The UDP round trip with the server on a shared port, whose
+        // datagrams a classifier delivers, and a raw send through a port.
+        endpoint::intercepted_round_trip,
+        endpoint::send_bytes,
         // INVITE and CANCEL through the TU API, each to the point its
         // comment names, which is not the end of the transaction.
         endpoint::invite,

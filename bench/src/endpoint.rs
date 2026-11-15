@@ -16,8 +16,9 @@ use signa_core::{
     Request, Response, StatusCode,
     bench::{Flow, reply_driver, tcp, udp},
     endpoint::{
-        Branch, Builder, CancelOutcome, Endpoint, Error, Incoming,
-        IncomingEvent, Reception, ReplyRoute, Responder, Target, ViaMode,
+        Branch, Builder, CancelOutcome, DatagramPort, Endpoint, Error,
+        Incoming, IncomingEvent, PathSelection, Reception, ReplyRoute,
+        Responder, Target, ViaMode,
     },
     message::header::{CSEQ, HeaderValue, VIA},
     transaction::Timers,
@@ -1011,4 +1012,93 @@ impl Client {
             }
         }
     }
+}
+
+// The round trip of `round_trip` over UDP with the server on a shared port
+// whose every datagram a classifier task delivers to it, on the same runtime.
+// The difference is the interception path: the port's task, its ingress, the
+// classifier's delivery, the endpoint's queue, and each of the server's
+// writes through the port's task and its outcome back.
+pub(super) fn intercepted_round_trip(c: &mut Criterion) {
+    let rt = runtime();
+    let (server, client_end) = {
+        let _guard = rt.enter();
+        let (port, mut ingress) =
+            DatagramPort::builder().udp(LOCALHOST).intercept().unwrap();
+        let server = Endpoint::builder()
+            .port(&port)
+            .timers(short_timers())
+            .max_server_transactions(1 << 20)
+            .serve(Ok200)
+            .unwrap();
+        let to_server = server.ingress().unwrap();
+        tokio::spawn(async move {
+            // The port stays open as long as the classifier runs.
+            let _port = port;
+            while let Some(datagram) = ingress.recv().await {
+                // A refusal would make the benchmark look faster.
+                datagram.try_deliver(&to_server).expect("a delivery");
+            }
+        });
+        let client_end = Endpoint::builder()
+            .udp(LOCALHOST)
+            .timers(short_timers())
+            .max_client_transactions(1 << 20)
+            .serve(Ok200)
+            .unwrap();
+        (server, client_end)
+    };
+    let request = Request::builder()
+        .method("OPTIONS")
+        .uri("sip:bob@biloxi.example.com")
+        .header("From", "Alice <sip:alice@atlanta.example.com>;tag=1928301774")
+        .header("To", "Bob <sip:bob@biloxi.example.com>")
+        .header("Call-ID", "a84b4c76e66710@pc33.atlanta.example.com")
+        .header("CSeq", "314159 OPTIONS")
+        .header("Max-Forwards", "70")
+        .body(Bytes::new())
+        .unwrap();
+    let len = request.to_bytes().len() as u64;
+
+    let mut udp =
+        client_end.client(Transport::Udp, server.udp_addr().unwrap());
+    benchmark(c, "endpoint/udp/intercepted/round_trip", len, |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let response = udp.call(bb(request.clone())).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+            });
+        });
+    });
+}
+
+// One raw send through a port's task to a loopback socket, until its local
+// outcome comes back: the port's admission, the hop to its task, the socket's
+// send, and the outcome's hop back. Nothing reads the receiving socket, whose
+// kernel drops what overflows its buffer.
+pub(super) fn send_bytes(c: &mut Criterion) {
+    let rt = runtime();
+    let sink = std::net::UdpSocket::bind(LOCALHOST).unwrap();
+    let (port, path) = rt.block_on(async {
+        let (port, _ingress) =
+            DatagramPort::builder().udp(LOCALHOST).intercept().unwrap();
+        let path = port
+            .prepare_path(PathSelection::new(
+                port.local_addr(),
+                sink.local_addr().unwrap(),
+            ))
+            .await
+            .unwrap();
+        (port, path)
+    });
+    let payload = Bytes::from(vec![b'x'; 512]);
+
+    benchmark(c, "ingress/send_bytes", payload.len() as u64, |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let write = port.send_bytes(bb(payload.clone()), &path);
+                write.unwrap().await.unwrap();
+            });
+        });
+    });
 }

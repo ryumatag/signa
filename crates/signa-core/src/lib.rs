@@ -43,6 +43,10 @@ Its design draws heavily on the [`http`] and [`hyper`] crates.
   transaction-user API, bounds the work it holds, and drains that work in a
   graceful shutdown. Its UDP datagrams can travel over a backend the
   application supplies, such as a NIC adapter, in place of its own socket.
+* A UDP port that several endpoints share, whose datagrams the application
+  disposes of before any transaction sees them: delivered to one endpoint,
+  forwarded byte for byte with no SIP processing, or discarded. A port can
+  also capture traffic passively, with no way to send.
 * Stateless reception over UDP for a stateless proxy (RFC 3261 section 16.11).
   Every request and response arrives as an event without a transaction. The
   application forwards requests with a branch it computed, and responses by

@@ -39,6 +39,7 @@ use super::{
 };
 use crate::transport::{
     Flow, Transport, WriteLimits,
+    budget::Permit,
     datagram::{
         DatagramIo, DatagramWrite, Path, RecvError, Submit, TransportContext,
         WriteId,
@@ -75,6 +76,12 @@ pub(super) struct Port {
     /// Set when shutdown lost a write: one the backend never took, one it
     /// failed while closing, or one it left unreported.
     lost: bool,
+    /// Outcomes of shared port writes for the port task to pass on to their
+    /// registrations, see [`Outcome::Registration`].
+    routed: VecDeque<(u64, WriteId, io::Result<()>)>,
+    /// Set when a write that held a share of a shared port's write limits
+    /// ended, so that the port task wakes the endpoints waiting for one.
+    released: bool,
 }
 
 /// A write waiting for the backend to accept it.
@@ -99,6 +106,11 @@ enum Outcome {
     Server(WriteObservation),
     /// A client request whose failure ends its transaction.
     Client(oneshot::Sender<io::Result<()>>),
+    /// A write of an endpoint registered on a shared port, by its own ID.
+    /// The permit is its share of the port's write limits.
+    Registration { registration: u64, local: WriteId, _permit: Permit },
+    /// A raw send through a shared port.
+    Raw { done: oneshot::Sender<io::Result<()>>, _permit: Permit },
 }
 
 /// How a write went when [`Port::start`] returned.
@@ -131,6 +143,8 @@ impl Port {
             awaited_result: None,
             counters,
             lost: false,
+            routed: VecDeque::new(),
+            released: false,
         }
     }
 
@@ -173,6 +187,26 @@ impl Port {
         link: &Link,
         limits: WriteLimits,
     ) -> Started {
+        // Cloning the path is a reference count, and only for a backend that
+        // gave context. The socket's links have none.
+        self.start_parts(
+            bytes,
+            link.flow.local,
+            link.flow.remote,
+            link.path.clone(),
+            limits,
+        )
+    }
+
+    /// As [`Port::start`], for a write named by its addresses and path.
+    fn start_parts(
+        &mut self,
+        bytes: Bytes,
+        source: SocketAddr,
+        destination: SocketAddr,
+        path: Option<Arc<Path>>,
+        limits: WriteLimits,
+    ) -> Started {
         let len = bytes.len();
         if len > self.max_payload {
             return Started::Done(Err(io::Error::new(
@@ -188,15 +222,7 @@ impl Port {
         self.next_id += 1;
         self.writes += 1;
         self.bytes += len;
-        // Cloning the path is a reference count, and only for a backend that
-        // gave context. The socket's links have none.
-        let write = DatagramWrite::new(
-            id,
-            bytes,
-            link.flow.local,
-            link.flow.remote,
-            link.path.clone(),
-        );
+        let write = DatagramWrite::new(id, bytes, source, destination, path);
         if !self.backlog.is_empty() {
             self.backlog
                 .push_back(Queued { write, outcome: Outcome::Unobserved });
@@ -435,6 +461,103 @@ impl Port {
             Outcome::Client(receipt) => {
                 let _ = receipt.send(result);
             }
+            Outcome::Registration { registration, local, _permit } => {
+                self.routed.push_back((registration, local, result));
+                self.released = true;
+            }
+            Outcome::Raw { done, _permit } => {
+                let _ = done.send(result);
+                self.released = true;
+            }
+        }
+    }
+
+    /// Offers a write of the endpoint registered as `registration`, which
+    /// names it `local`, on behalf of a shared port's task. Its outcome goes
+    /// to [`Port::take_routed`].
+    ///
+    /// The shared port admitted it against its own limits, whose share
+    /// `permit` holds until the outcome is known.
+    pub(super) fn submit_routed(
+        &mut self,
+        write: DatagramWrite,
+        registration: u64,
+        permit: Permit,
+    ) {
+        let (local, bytes, source, destination, path) = write.into_parts();
+        let outcome =
+            Outcome::Registration { registration, local, _permit: permit };
+        let started =
+            self.start_parts(bytes, source, destination, path, self.limits);
+        self.settle(started, outcome);
+    }
+
+    /// Offers a raw send along a prepared `path`, whose outcome goes to
+    /// `done`.
+    pub(super) fn submit_raw(
+        &mut self,
+        bytes: Bytes,
+        path: Arc<Path>,
+        done: oneshot::Sender<io::Result<()>>,
+        permit: Permit,
+    ) {
+        let prepared = path.prepared.as_deref().expect("a prepared path");
+        let (source, destination) = (prepared.source, prepared.destination);
+        let started = self.start_parts(
+            bytes,
+            source,
+            destination,
+            Some(path),
+            self.limits,
+        );
+        self.settle(started, Outcome::Raw { done, _permit: permit });
+    }
+
+    /// Ends `outcome` now if its write has, or names it as the write's.
+    fn settle(&mut self, started: Started, outcome: Outcome) {
+        match started {
+            Started::Done(result) => self.finish(outcome, result),
+            Started::Waiting(id) => self.attach(id, outcome),
+        }
+    }
+
+    /// The next outcome of a registration's write, by its registration and
+    /// its own ID.
+    pub(super) fn take_routed(
+        &mut self,
+    ) -> Option<(u64, WriteId, io::Result<()>)> {
+        self.routed.pop_front()
+    }
+
+    /// Returns `true`, once, after a write that held a share of a shared
+    /// port's write limits ended.
+    pub(super) fn take_released(&mut self) -> bool {
+        mem::take(&mut self.released)
+    }
+
+    /// Fails the writes of `registration` the backend has not accepted, as
+    /// its endpoint stops. The backend cannot take back the ones it accepted,
+    /// and their outcomes still go to [`Port::take_routed`].
+    pub(super) fn withdraw(&mut self, registration: u64) {
+        let backlog = mem::take(&mut self.backlog);
+        for queued in backlog {
+            let ours = matches!(
+                queued.outcome,
+                Outcome::Registration { registration: owner, .. }
+                    if owner == registration
+            );
+            if ours {
+                self.release(queued.write.payload().len());
+                self.finish(
+                    queued.outcome,
+                    Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "the endpoint stopped before the write went out",
+                    )),
+                );
+            } else {
+                self.backlog.push_back(queued);
+            }
         }
     }
 
@@ -503,7 +626,37 @@ impl Port {
         for Queued { write, outcome } in mem::take(&mut self.backlog) {
             self.lost = true;
             self.release(write.payload().len());
-            drop(outcome);
+            self.abandon(outcome, false);
+        }
+    }
+
+    /// Ends the outcome of a write that shutdown gave up on. An endpoint's
+    /// waiter sees the endpoint closed when its outcome drops.
+    ///
+    /// A shared port tells its endpoints and raw senders instead, since they
+    /// outlive it. A write it never offered did not go out. One the backend
+    /// took and never reported may have, and the error says so.
+    fn abandon(&mut self, outcome: Outcome, offered: bool) {
+        let error = || {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                if offered {
+                    "the port closed before the backend reported the write"
+                } else {
+                    "the port closed before the write went out"
+                },
+            )
+        };
+        match outcome {
+            Outcome::Registration { registration, local, _permit } => {
+                self.routed.push_back((registration, local, Err(error())));
+                self.released = true;
+            }
+            Outcome::Raw { done, _permit } if !offered => {
+                let _ = done.send(Err(error()));
+                self.released = true;
+            }
+            outcome => drop(outcome),
         }
     }
 
@@ -531,13 +684,19 @@ impl Port {
                 Poll::Pending => break,
             }
         }
+        self.give_up();
+
+        Poll::Ready(())
+    }
+
+    /// Ends the writes the backend took and has not reported, as lost, when
+    /// it closed without reporting them or is dropped before it closes.
+    pub(super) fn give_up(&mut self) {
         for (_, InFlight { len, outcome }) in mem::take(&mut self.in_flight) {
             self.lost = true;
             self.release(len);
-            drop(outcome);
+            self.abandon(outcome, true);
         }
-
-        Poll::Ready(())
     }
 
     /// Returns `true` if shutdown lost a write. See [`Port::abort`] and

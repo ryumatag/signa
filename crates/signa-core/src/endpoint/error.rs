@@ -66,6 +66,7 @@ enum Kind {
     DeliveryOverflow,
     Transport(io::Error),
     TooLarge(usize),
+    OverPayload { len: usize, max: usize },
     Missing(HeaderName),
     InvalidCSeq,
     InvalidHeader(HeaderName),
@@ -76,6 +77,7 @@ enum Kind {
     PathRefused(io::Error),
     Busy,
     Closed,
+    Expired,
 }
 
 impl Error {
@@ -97,6 +99,10 @@ impl Error {
 
     pub(super) fn too_large(len: usize) -> Error {
         Error { kind: Kind::TooLarge(len) }
+    }
+
+    pub(super) fn over_payload(len: usize, max: usize) -> Error {
+        Error { kind: Kind::OverPayload { len, max } }
     }
 
     pub(super) fn missing(name: HeaderName) -> Error {
@@ -139,6 +145,10 @@ impl Error {
         Error { kind: Kind::Closed }
     }
 
+    pub(super) fn expired() -> Error {
+        Error { kind: Kind::Expired }
+    }
+
     /// Returns `true` if no response arrived in time: no final response
     /// before Timer F for a non-INVITE, or no response at all before Timer B
     /// for an INVITE. Both are 64 T1 after the request was sent. An INVITE
@@ -176,8 +186,14 @@ impl Error {
     /// transport when it is within 200 bytes of the path MTU, or over 1300
     /// bytes when the MTU is unknown, as it is here. The caller starts such a
     /// request with a TCP target instead.
+    ///
+    /// A raw send through a [`DatagramPort`] has no such rule. It is too large
+    /// only when it is over the backend's
+    /// [`max_payload`](crate::transport::datagram::Capabilities::max_payload).
+    ///
+    /// [`DatagramPort`]: super::DatagramPort
     pub fn is_too_large(&self) -> bool {
-        matches!(self.kind, Kind::TooLarge(_))
+        matches!(self.kind, Kind::TooLarge(_) | Kind::OverPayload { .. })
     }
 
     /// Returns `true` if a request has no CSeq, or an INVITE has no From, To
@@ -268,8 +284,23 @@ impl Error {
 
     /// Returns `true` if the endpoint has stopped or closed client admission
     /// for shutdown.
+    ///
+    /// Through a [`DatagramPort`] it also means the port is closing, or the
+    /// endpoint a datagram was delivered to has stopped. A raw write the port
+    /// dropped while closing reports this too. Whether it went out is not
+    /// known.
+    ///
+    /// [`DatagramPort`]: super::DatagramPort
     pub fn is_closed(&self) -> bool {
         matches!(self.kind, Kind::Closed)
+    }
+
+    /// Returns `true` if a [`ReceivedDatagram`]'s decision deadline has
+    /// passed, so that it can no longer be delivered or forwarded.
+    ///
+    /// [`ReceivedDatagram`]: super::ReceivedDatagram
+    pub fn is_expired(&self) -> bool {
+        matches!(self.kind, Kind::Expired)
     }
 }
 
@@ -283,6 +314,9 @@ impl fmt::Debug for Error {
             Kind::Transport(err) => debug.field(err),
             Kind::TooLarge(len) => {
                 debug.field(&format_args!("TooLarge({len})"))
+            }
+            Kind::OverPayload { len, max } => {
+                debug.field(&format_args!("OverPayload({len}, {max})"))
             }
             Kind::Missing(name) => {
                 debug.field(&format_args!("Missing({name:?})"))
@@ -300,6 +334,7 @@ impl fmt::Debug for Error {
             }
             Kind::Busy => debug.field(&"Busy"),
             Kind::Closed => debug.field(&"Closed"),
+            Kind::Expired => debug.field(&"Expired"),
         };
         debug.finish()
     }
@@ -320,6 +355,10 @@ impl fmt::Display for Error {
                 f,
                 "the request is {len} bytes, over the {MAX_UDP_REQUEST} \
                  that go over UDP"
+            ),
+            Kind::OverPayload { len, max } => write!(
+                f,
+                "the datagram is {len} bytes, over the {max} its backend sends"
             ),
             Kind::Missing(name) => write!(f, "the request has no {name}"),
             Kind::InvalidCSeq => f.write_str(
@@ -348,6 +387,9 @@ impl fmt::Display for Error {
                 f.write_str("client admission capacity is exhausted")
             }
             Kind::Closed => f.write_str("the endpoint is closed"),
+            Kind::Expired => {
+                f.write_str("the datagram's decision deadline has passed")
+            }
         }
     }
 }
@@ -379,6 +421,8 @@ enum BindKind {
     Io(io::Error),
     InvalidConfig(&'static str),
     UnsupportedConfig(&'static str),
+    PortClosed,
+    PortFull,
 }
 
 impl BindError {
@@ -392,6 +436,14 @@ impl BindError {
 
     pub(super) fn unsupported_config(reason: &'static str) -> BindError {
         BindError { kind: BindKind::UnsupportedConfig(reason) }
+    }
+
+    pub(super) fn port_closed() -> BindError {
+        BindError { kind: BindKind::PortClosed }
+    }
+
+    pub(super) fn port_full() -> BindError {
+        BindError { kind: BindKind::PortFull }
     }
 
     /// Returns `true` if the configuration is invalid, such as a zero
@@ -416,6 +468,23 @@ impl BindError {
     pub fn is_io(&self) -> bool {
         matches!(self.kind, BindKind::Io(_))
     }
+
+    /// Returns `true` if the [`DatagramPort`] the endpoint would share takes
+    /// no new endpoints, as it is quiesced or closing.
+    ///
+    /// [`DatagramPort`]: super::DatagramPort
+    pub fn is_closed(&self) -> bool {
+        matches!(self.kind, BindKind::PortClosed)
+    }
+
+    /// Returns `true` if the [`DatagramPort`] the endpoint would share has as
+    /// many endpoints as [`PortBuilder::max_registrations`] lets it.
+    ///
+    /// [`DatagramPort`]: super::DatagramPort
+    /// [`PortBuilder::max_registrations`]: super::PortBuilder::max_registrations
+    pub fn is_busy(&self) -> bool {
+        matches!(self.kind, BindKind::PortFull)
+    }
 }
 
 impl fmt::Debug for BindError {
@@ -429,6 +498,8 @@ impl fmt::Debug for BindError {
             BindKind::UnsupportedConfig(reason) => {
                 debug.field(&format_args!("UnsupportedConfig({reason:?})"))
             }
+            BindKind::PortClosed => debug.field(&"PortClosed"),
+            BindKind::PortFull => debug.field(&"PortFull"),
         };
         debug.finish()
     }
@@ -444,6 +515,12 @@ impl fmt::Display for BindError {
             BindKind::UnsupportedConfig(reason) => {
                 write!(f, "unsupported endpoint configuration: {reason}")
             }
+            BindKind::PortClosed => {
+                f.write_str("the datagram port takes no new endpoints")
+            }
+            BindKind::PortFull => {
+                f.write_str("the datagram port has all the endpoints it takes")
+            }
         }
     }
 }
@@ -452,9 +529,10 @@ impl error::Error for BindError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match &self.kind {
             BindKind::Io(err) => Some(err),
-            BindKind::InvalidConfig(_) | BindKind::UnsupportedConfig(_) => {
-                None
-            }
+            BindKind::InvalidConfig(_)
+            | BindKind::UnsupportedConfig(_)
+            | BindKind::PortClosed
+            | BindKind::PortFull => None,
         }
     }
 }
@@ -469,6 +547,11 @@ impl From<BindError> for io::Error {
             BindKind::UnsupportedConfig(_) => {
                 io::Error::new(io::ErrorKind::Unsupported, err)
             }
+            BindKind::PortClosed => {
+                io::Error::new(io::ErrorKind::NotConnected, err)
+            }
+            // Not `WouldBlock`, since only an endpoint that stops makes room.
+            BindKind::PortFull => io::Error::other(err),
         }
     }
 }

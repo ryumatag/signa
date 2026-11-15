@@ -118,9 +118,10 @@ pub const MAX_CONTEXT_LEN: usize = 256;
 
 /// A backend that sends and receives UDP payloads for one endpoint.
 ///
-/// The endpoint's driver owns the backend and polls it from its own task, so
-/// a backend that needs a task of its own, such as a NIC reader, talks to it
-/// through channels and wakes the waker it was last polled with. Every
+/// The endpoint's driver owns the backend and polls it from its own task, or a
+/// shared port's task does for the endpoints on it. Either way one task polls
+/// it, so a backend that needs a task of its own, such as a NIC reader, talks
+/// to it through channels and wakes the waker it was last polled with. Every
 /// `Pending` registers that waker. Nothing here retries a write.
 ///
 /// The driver may also poll with a waker that does nothing, to send at once
@@ -440,6 +441,16 @@ impl DatagramWrite {
         DatagramWrite { id, payload, source, destination, path }
     }
 
+    /// Takes the write apart, for a shared port that offers it again under an
+    /// ID of its own.
+    #[cfg(feature = "tokio")]
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn into_parts(
+        self,
+    ) -> (WriteId, Bytes, SocketAddr, SocketAddr, Option<Arc<Path>>) {
+        (self.id, self.payload, self.source, self.destination, self.path)
+    }
+
     /// The ID to report the write's outcome by.
     pub fn id(&self) -> WriteId {
         self.id
@@ -544,7 +555,7 @@ pub(crate) struct Path {
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
 pub(crate) struct Prepared {
-    /// The port and endpoint registration that prepared it. Any other one
+    /// The port, and the endpoint registration if one prepared it. Any other
     /// refuses the path.
     pub(crate) binding: Binding,
     pub(crate) source: SocketAddr,
@@ -554,14 +565,24 @@ pub(crate) struct Prepared {
     pub(crate) sent_by: SocketAddr,
 }
 
-/// Names one port and one endpoint registration on it. Both numbers come
-/// from counters that never repeat within the process, so a capability of a
-/// closed port or registration never matches a later one.
+/// Names one port and what on it a capability belongs to. The numbers come
+/// from a counter that never repeats within the process, so a capability of
+/// a closed port or registration never matches a later one.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
 pub(crate) struct Binding {
     pub(crate) port: u64,
-    pub(crate) registration: u64,
+    pub(crate) owner: Owner,
+}
+
+/// What on a port a capability belongs to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+pub(crate) enum Owner {
+    /// The port itself, for raw sends. No endpoint takes it.
+    Port,
+    /// One endpoint registration.
+    Endpoint(u64),
 }
 
 #[cfg_attr(not(feature = "tokio"), allow(dead_code))]

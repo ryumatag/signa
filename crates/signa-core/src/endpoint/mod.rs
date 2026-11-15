@@ -119,6 +119,16 @@ ends once its accepted writes finish. Dropping the observer has no protocol
 effect. A responder drop is ordered after the submissions it already queued,
 and a queued submission may still run after its waiting future is dropped.
 
+# Shared ports
+
+An endpoint built with [`Builder::port`] has no socket of its own. It is
+registered on a [`DatagramPort`], which owns one backend for several
+endpoints and lets the application decide what becomes of each datagram
+before any endpoint sees it. What the application delivers through
+[`Endpoint::ingress`] is received as from the endpoint's own socket, and
+everything above holds for it. See [`DatagramPort`] for the port's limits
+and the order in which a port and its endpoints stop.
+
 # Client operations
 
 [`Endpoint::start`] accepts an explicit [`Target`] and returns split control
@@ -244,6 +254,10 @@ pub use self::{
     },
     error::{BindError, Error},
     path::{PathSelection, ReceiveInfo, SendPath},
+    port::{
+        Capture, CapturedDatagram, DatagramPort, EndpointIngress, Ingress,
+        PortBuilder, PortStats, RawPath, RawWrite, ReceivedDatagram, Refused,
+    },
     reply::{ReplyError, ReplyRoute},
     send::{Branch, InvalidBranch, SentRequest, ViaMode},
     server::{
@@ -262,6 +276,7 @@ mod datagram;
 mod driver;
 mod error;
 mod path;
+mod port;
 mod reply;
 mod routing;
 mod send;
@@ -306,6 +321,10 @@ pub struct Endpoint {
     registration: u64,
     /// Names this endpoint and its UDP port to the paths it prepares.
     binding: Option<Binding>,
+    /// The shared port the endpoint is registered on, if it has no UDP
+    /// socket of its own, and where the application delivers to it.
+    port: Option<port::PortClient>,
+    ingress: Option<EndpointIngress>,
     /// The context copies and prepared paths alive at once.
     context_limits: Budget,
     timers: Timers,
@@ -393,6 +412,14 @@ impl Endpoint {
     /// Returns how this endpoint receives messages.
     pub fn reception(&self) -> Reception {
         self.reception
+    }
+
+    /// Returns where the application delivers datagrams to this endpoint,
+    /// for an endpoint registered on a [`DatagramPort`] with
+    /// [`Builder::port`]. `None` for any other endpoint, whose own socket or
+    /// backend delivers to it.
+    pub fn ingress(&self) -> Option<EndpointIngress> {
+        self.ingress.clone()
     }
 
     /// Returns connection-admission and ordinary fallback counters.
@@ -1831,6 +1858,8 @@ mod tests {
             tcp: None,
             registration: super::path::next_id(),
             binding: None,
+            port: None,
+            ingress: None,
             context_limits: fixture.context_limits(),
             timers: Timers::default(),
         }

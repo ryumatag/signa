@@ -47,6 +47,11 @@ tokio = { version = "1.54", features = ["macros", "rt-multi-thread"] }
 name = "facade"
 required-features = ["tokio"]
 
+# An application on a shared port, through the facade's paths only.
+[[test]]
+name = "ingress"
+required-features = ["tokio"]
+
 # docs.rs builds the default features only, which would leave `signa::ua` out.
 [package.metadata.docs.rs]
 features = ["ua"]

@@ -20,10 +20,12 @@ use std::{
 };
 
 use bytes::Bytes;
+use quickcheck::{Arbitrary, Gen, QuickCheck};
 use signa_core::{
-    Request, Response,
+    Message, Request, Response,
     endpoint::{
-        Endpoint, Incoming, IncomingEvent, PathSelection, Reception,
+        DatagramPort, Endpoint, Error, Incoming, IncomingEvent, Ingress,
+        PathSelection, PortStats, RawPath, ReceivedDatagram, Reception,
         ServerEvent, ServerRequest, ShutdownOutcome, Target, ViaMode,
     },
     message::header::{Tag, VIA},
@@ -37,7 +39,11 @@ use signa_core::{
         },
     },
 };
-use tokio::{sync::Notify, time::timeout};
+use tokio::{
+    sync::Notify,
+    task::{JoinHandle, yield_now},
+    time::{advance, sleep, timeout},
+};
 
 /// The address the endpoint owns on the wire. Nothing binds it on this host.
 const LOCAL: SocketAddr = SocketAddr::new(
@@ -165,6 +171,16 @@ impl Wire {
         let mut state = self.state.lock().unwrap();
         state.writes = writes;
         if let Some(waker) = state.submit.take() {
+            waker.wake();
+        }
+    }
+
+    /// Reports the newest delayed write.
+    fn finish_newest(&self, result: io::Result<()>) {
+        let mut state = self.state.lock().unwrap();
+        let id = state.delayed.pop_back().expect("a delayed write");
+        state.completions.push_back((id, result));
+        if let Some(waker) = state.complete.take() {
             waker.wake();
         }
     }
@@ -1314,7 +1330,7 @@ async fn control_messages_keep_a_share_of_the_context_limits() {
     wire.deliver(arriving(stray_ack(), "nic2"));
     timeout(Duration::from_secs(2), async {
         while endpoint.reception_stats().dropped_acks == 0 {
-            tokio::task::yield_now().await;
+            yield_now().await;
         }
     })
     .await
@@ -1370,7 +1386,7 @@ async fn a_path_is_counted_until_nothing_holds_it() {
             if let Ok(path) = prepare().await {
                 return path;
             }
-            tokio::task::yield_now().await;
+            yield_now().await;
         }
     })
     .await;
@@ -1814,5 +1830,824 @@ async fn a_failed_provisional_leaves_the_server_transaction_in_proceeding() {
             let sent = wire.sent(before + 2).await;
             assert_eq!(status(&sent[before + 1]), code, "{case}");
         }
+    }
+}
+
+/// A port on `wire` whose datagrams the test disposes of.
+fn intercept(wire: &Wire) -> (DatagramPort, Ingress) {
+    DatagramPort::builder().udp_io(wire.clone()).intercept().unwrap()
+}
+
+/// The next datagram the port received.
+async fn next(ingress: &mut Ingress) -> ReceivedDatagram {
+    timeout(Duration::from_secs(2), ingress.recv())
+        .await
+        .expect("a datagram within two seconds")
+        .expect("an open port")
+}
+
+// A datagram the application delivers to an endpoint on the port is received
+// as from the endpoint's own socket. Its envelope shows how it arrived, the
+// endpoint fills in `received` in its own copy, and its response goes out
+// through the port with the request's context (RFC 3261 section 18.2.2).
+#[tokio::test]
+async fn a_delivered_datagram_is_received_and_answered_by_its_endpoint() {
+    let wire = Wire::default();
+    let (port, mut ingress) = intercept(&wire);
+    let (endpoint, mut incoming) =
+        Endpoint::builder().port(&port).bind().unwrap();
+    let to_endpoint = endpoint.ingress().unwrap();
+    assert_eq!(endpoint.udp_addr(), Some(LOCAL));
+    // The Via names another host, so the endpoint marks its copy with
+    // `received`, and without `rport` the response goes to that address at
+    // the Via's port.
+    let text = options("port")
+        .replace("192.0.2.20:5060", "192.0.2.99:5060")
+        .replace(";rport", "");
+
+    wire.deliver(arriving(text.clone(), "nic0"));
+    let datagram = next(&mut ingress).await;
+    assert_eq!(datagram.payload(), text.as_bytes());
+    assert_eq!((datagram.source(), datagram.destination()), (PEER, LOCAL));
+    assert_eq!(datagram.context().as_bytes(), "nic0");
+    datagram.try_deliver(&to_endpoint).unwrap();
+
+    let request = request(&mut incoming).await;
+    assert_eq!(request.received.source(), PEER);
+    assert_eq!(request.received.context().as_bytes(), "nic0");
+    let via = request.request.headers().get(VIA).unwrap().as_str();
+    assert!(via.contains("received=192.0.2.20"), "{via}");
+    let (responder, _) = request.transaction.into_parts();
+    responder.respond(ok(&request.request)).await.unwrap();
+
+    let sent = wire.sent(1).await;
+    let via_port = SocketAddr::new(PEER.ip(), 5060);
+    assert_eq!((sent[0].source, sent[0].destination), (LOCAL, via_port));
+    assert_eq!(sent[0].path, Way::reply("nic0"));
+    assert_eq!(status(&sent[0]), 200);
+    let stats = port.stats();
+    assert_eq!((stats.received, stats.delivered), (1, 1));
+}
+
+/// Waits until the port's counts satisfy `done`.
+async fn stats_until(port: &DatagramPort, done: impl Fn(PortStats) -> bool) {
+    timeout(Duration::from_secs(2), async {
+        while !done(port.stats()) {
+            yield_now().await;
+        }
+    })
+    .await
+    .expect("the counts within two seconds");
+}
+
+/// A raw path from the wire's address to the public address, along `nic1`.
+async fn upstream(port: &DatagramPort) -> RawPath {
+    let selection = PathSelection::new(LOCAL, PUBLIC).context(context("nic1"));
+    port.prepare_path(selection).await.unwrap()
+}
+
+/// Short timers, so that a transaction ends at Timer J within a test.
+fn short_timers() -> Timers {
+    Timers::builder().t1(Duration::from_millis(5)).build().unwrap()
+}
+
+/// Sends a one-shot OPTIONS from `endpoint` in a task of its own, which
+/// resolves with the write's local outcome.
+fn send_options(
+    endpoint: &Endpoint,
+    call: &'static str,
+) -> JoinHandle<Result<(), Error>> {
+    let endpoint = endpoint.clone();
+    tokio::spawn(async move {
+        endpoint
+            .send_request(
+                outgoing(call),
+                Target::new(Transport::Udp, PEER),
+                ViaMode::Fresh,
+            )
+            .await
+            .map(|_| ())
+    })
+}
+
+// Forwarding sends the payload once, byte for byte, whether or not it parses
+// as SIP. Compact and mixed-case headers stay as they came, and a payload that
+// is not SIP goes too. Nothing else goes out: an INVITE forwarded this way
+// gets no 100 Trying, no transaction and no retransmission, and the endpoint
+// on the port sees nothing.
+#[tokio::test]
+async fn forwarding_sends_the_bytes_once_and_nothing_else() {
+    let wire = Wire::default();
+    let (port, mut ingress) = intercept(&wire);
+    let (_endpoint, mut incoming) =
+        Endpoint::builder().port(&port).bind().unwrap();
+    let upstream = upstream(&port).await;
+    let compact = Bytes::from_static(
+        b"INVITE sip:bob@192.0.2.10 SIP/2.0\r\n\
+          v: SIP/2.0/UDP 192.0.2.20:5070;branch=z9hG4bKcompact\r\n\
+          f: <sip:alice@192.0.2.20>;tag=a\r\n\
+          t: <sip:bob@192.0.2.10>\r\n\
+          i: compact\r\n\
+          cSeQ: 1 INVITE\r\n\
+          mAX-fORWARDS: 70\r\n\
+          l: 0\r\n\r\n",
+    );
+    let malformed = Bytes::from_static(b"INVITE this is not SIP\r\n\r\n\xff");
+
+    for payload in [&compact, &malformed] {
+        wire.deliver(Ok(Datagram::new(payload.clone(), PEER, LOCAL)));
+        let datagram = next(&mut ingress).await;
+        assert_eq!(datagram.parse().is_ok(), payload == &compact);
+        datagram.try_forward(&upstream).unwrap().await.unwrap();
+    }
+
+    let sent = wire.sent(2).await;
+    for (sent, payload) in sent.iter().zip([&compact, &malformed]) {
+        assert_eq!(&sent.payload, payload);
+        assert_eq!((sent.source, sent.destination), (LOCAL, PUBLIC));
+        assert_eq!(sent.path, Way::prepared("nic1"));
+    }
+    assert!(
+        timeout(Duration::from_millis(100), incoming.recv()).await.is_err()
+    );
+    assert_eq!(wire.count(), 2);
+    assert_eq!(port.stats().forwarded, 2);
+}
+
+// A request the endpoint generates must go over a congestion-controlled
+// transport once it is over 1300 bytes with no known path MTU (RFC 3261
+// section 18.1.1), so the endpoint refuses it over UDP. A raw send is not a
+// generated request and has only the backend's limit, so the same size goes.
+// One over the backend's maximum is refused before anything is sent.
+#[tokio::test]
+async fn a_raw_send_has_only_the_backend_s_size_limit() {
+    let wire = Wire::default();
+    let (port, _ingress) = intercept(&wire);
+    let (endpoint, _incoming) =
+        Endpoint::builder().port(&port).bind().unwrap();
+    let upstream = upstream(&port).await;
+    let mut large = outgoing("large");
+    *large.body_mut() = Bytes::from(vec![b'x'; 1250]);
+
+    let generated = endpoint
+        .send_request(
+            large.clone(),
+            Target::new(Transport::Udp, PEER),
+            ViaMode::Fresh,
+        )
+        .await
+        .unwrap_err();
+    let raw = large.to_bytes();
+    port.send_bytes(raw.clone(), &upstream).unwrap().await.unwrap();
+    let over =
+        port.send_bytes(Bytes::from(vec![0; 1473]), &upstream).unwrap_err();
+
+    assert!(generated.is_too_large());
+    assert!(raw.len() > 1300 && raw.len() <= 1472, "{}", raw.len());
+    assert!(over.is_too_large());
+    let sent = wire.sent(1).await;
+    assert_eq!(sent[0].payload, raw);
+    assert_eq!(wire.count(), 1);
+}
+
+// Delivery commits when the endpoint's queue takes the datagram. A full queue
+// refuses it before then and hands it back with its disposition, so it can be
+// tried again, go elsewhere or be discarded. It is never processed twice.
+#[tokio::test]
+async fn a_full_endpoint_queue_hands_the_datagram_back() {
+    let wire = Wire::default();
+    let (port, mut ingress) = DatagramPort::builder()
+        .udp_io(wire.clone())
+        .delivery_queue(1)
+        .intercept()
+        .unwrap();
+    let (endpoint, mut incoming) =
+        Endpoint::builder().port(&port).bind().unwrap();
+    let to_endpoint = endpoint.ingress().unwrap();
+    wire.deliver(datagram(options("first")));
+    wire.deliver(datagram(options("second")));
+    let first = next(&mut ingress).await;
+    let second = next(&mut ingress).await;
+
+    // Nothing awaits between the two, so the endpoint's driver has not run.
+    first.try_deliver(&to_endpoint).unwrap();
+    let refused = second.try_deliver(&to_endpoint).unwrap_err();
+
+    assert!(refused.error().is_busy());
+    let second = refused.into_datagram();
+    assert_eq!(second.payload(), options("second").as_bytes());
+    let taken = request(&mut incoming).await;
+    assert_eq!(taken.request.headers().get("Call-ID").unwrap(), "first");
+    second.try_deliver(&to_endpoint).unwrap();
+    let taken = request(&mut incoming).await;
+    assert_eq!(taken.request.headers().get("Call-ID").unwrap(), "second");
+    assert!(
+        timeout(Duration::from_millis(50), incoming.recv()).await.is_err()
+    );
+    assert_eq!(port.stats().delivered, 2);
+}
+
+// After its deadline a datagram can no longer be delivered or forwarded, and
+// it comes back from either. It still holds its share of the ingress limits
+// until it drops, since the application still holds its bytes, so a datagram
+// that arrives meanwhile finds them full. The clock is paused, so the
+// deadline passes exactly when the test says.
+#[tokio::test(start_paused = true)]
+async fn an_expired_datagram_is_refused_but_still_counted() {
+    let wire = Wire::default();
+    let (port, mut ingress) = DatagramPort::builder()
+        .udp_io(wire.clone())
+        .ingress_limits(WriteLimits { messages: 1, bytes: 64 * 1024 })
+        .decision_deadline(Duration::from_millis(500))
+        .intercept()
+        .unwrap();
+    let (endpoint, _incoming) =
+        Endpoint::builder().port(&port).bind().unwrap();
+    let to_endpoint = endpoint.ingress().unwrap();
+    let upstream = upstream(&port).await;
+    wire.deliver(datagram(options("late")));
+    let held = next(&mut ingress).await;
+
+    advance(Duration::from_millis(500)).await;
+    let refused = held.try_deliver(&to_endpoint).unwrap_err();
+    assert!(refused.error().is_expired());
+    let refused = refused.into_datagram().try_forward(&upstream).unwrap_err();
+    assert!(refused.error().is_expired());
+    let held = refused.into_datagram();
+
+    wire.deliver(datagram(options("meanwhile")));
+    stats_until(&port, |stats| stats.overflow == 1).await;
+    drop(held);
+    wire.deliver(datagram(options("after")));
+    let after = next(&mut ingress).await;
+    assert_eq!(after.payload(), options("after").as_bytes());
+    let stats = port.stats();
+    assert_eq!((stats.received, stats.expired, stats.overflow), (3, 1, 1));
+    assert_eq!(wire.count(), 0);
+}
+
+// An application that reads slowly loses traffic. The datagrams beyond the
+// ingress limits are dropped on receipt and counted, and no SIP goes out for
+// them. ACK and CANCEL progress is the endpoint's to guarantee once a
+// datagram reaches it, not the port's.
+#[tokio::test]
+async fn a_slow_classifier_loses_what_is_beyond_the_ingress_limits() {
+    let wire = Wire::default();
+    let (port, mut ingress) = DatagramPort::builder()
+        .udp_io(wire.clone())
+        .ingress_limits(WriteLimits { messages: 2, bytes: 64 * 1024 })
+        .intercept()
+        .unwrap();
+
+    for n in 0..5 {
+        wire.deliver(datagram(options(&format!("slow{n}"))));
+    }
+    stats_until(&port, |stats| stats.received == 5).await;
+
+    assert_eq!(port.stats().overflow, 3);
+    for n in 0..2 {
+        let kept = next(&mut ingress).await;
+        assert_eq!(kept.payload(), options(&format!("slow{n}")).as_bytes());
+        kept.discard();
+    }
+    assert!(timeout(Duration::from_millis(50), ingress.recv()).await.is_err());
+    assert_eq!(port.stats().discarded, 2);
+    assert_eq!(wire.count(), 0);
+}
+
+// Two endpoints on one port are two network domains. The same request
+// delivered to each makes a transaction in each, and each answers it. A path
+// one endpoint prepared is refused by the other. When one stops, the other
+// goes on, and the stopped one refuses a delivery and hands it back.
+#[tokio::test]
+async fn endpoints_on_one_port_stay_apart() {
+    let wire = Wire::default();
+    let (port, mut ingress) = intercept(&wire);
+    let bind = || {
+        Endpoint::builder().port(&port).timers(short_timers()).bind().unwrap()
+    };
+    let (a, mut a_incoming) = bind();
+    let (b, mut b_incoming) = bind();
+    let (to_a, to_b) = (a.ingress().unwrap(), b.ingress().unwrap());
+
+    for (to, incoming) in [(&to_a, &mut a_incoming), (&to_b, &mut b_incoming)]
+    {
+        wire.deliver(datagram(options("both")));
+        next(&mut ingress).await.try_deliver(to).unwrap();
+        let request = request(incoming).await;
+        let (responder, _) = request.transaction.into_parts();
+        responder.respond(ok(&request.request)).await.unwrap();
+    }
+    let sent = wire.sent(2).await;
+    assert_eq!(sent.iter().map(status).collect::<Vec<_>>(), [200, 200]);
+
+    let path = a.prepare_path(PathSelection::new(LOCAL, PEER)).await.unwrap();
+    let refused =
+        b.start(outgoing("stale"), Target::path(path)).await.unwrap_err();
+    assert!(refused.is_stale_path());
+
+    let outcome = a.shutdown(Duration::from_secs(2)).await;
+    assert_eq!(outcome, ShutdownOutcome::Drained);
+    wire.deliver(datagram(options("after")));
+    let refused = next(&mut ingress).await.try_deliver(&to_a).unwrap_err();
+    assert!(refused.error().is_closed());
+    refused.into_datagram().try_deliver(&to_b).unwrap();
+    let request = request(&mut b_incoming).await;
+    assert_eq!(request.request.headers().get("Call-ID").unwrap(), "after");
+}
+
+// The port numbers every write, the endpoints' and its raw sends, in one
+// sequence of its own, and sends each outcome back to the write that made it.
+// The wire here reports three writes in reverse order and fails the middle
+// one, and only its sender sees the failure.
+#[tokio::test]
+async fn each_write_outcome_goes_back_to_its_own_write() {
+    let wire = Wire::default();
+    let (port, _ingress) = intercept(&wire);
+    let (a, _a_incoming) = Endpoint::builder().port(&port).bind().unwrap();
+    let (b, _b_incoming) = Endpoint::builder().port(&port).bind().unwrap();
+    let upstream = upstream(&port).await;
+    wire.writes(Writes::Delay);
+
+    let raw = port.send_bytes(Bytes::from_static(b"raw"), &upstream).unwrap();
+    wire.sent(1).await;
+    let from_a = send_options(&a, "a");
+    wire.sent(2).await;
+    let from_b = send_options(&b, "b");
+    wire.sent(3).await;
+    wire.finish_newest(Ok(()));
+    wire.finish_newest(Err(io::Error::new(
+        io::ErrorKind::NotConnected,
+        "down",
+    )));
+    wire.finish_newest(Ok(()));
+
+    assert!(from_b.await.unwrap().is_ok());
+    assert!(from_a.await.unwrap().unwrap_err().is_transport());
+    raw.await.unwrap();
+}
+
+// An endpoint that stops at its deadline leaves unsent the writes the port
+// still queues for it, and its outcome is an expiry. A write the backend had
+// taken could not be taken back, but this one never reached it. The other
+// endpoint's writes go out once the wire takes them.
+#[tokio::test]
+async fn an_endpoint_that_stops_withdraws_its_queued_writes() {
+    let wire = Wire::default();
+    let (port, _ingress) = intercept(&wire);
+    let (a, _a_incoming) = Endpoint::builder().port(&port).bind().unwrap();
+    let (b, _b_incoming) = Endpoint::builder().port(&port).bind().unwrap();
+    wire.writes(Writes::Hold);
+
+    let from_a = send_options(&a, "a");
+    wire.until(|state| state.submit.is_some()).await;
+    let outcome = a.shutdown(Duration::from_millis(50)).await;
+    let from_b = send_options(&b, "b");
+    yield_now().await;
+    wire.writes(Writes::Complete);
+
+    assert_eq!(outcome, ShutdownOutcome::DeadlineExpired);
+    assert!(from_a.await.unwrap().is_err());
+    assert!(from_b.await.unwrap().is_ok());
+    let sent = wire.sent(1).await;
+    assert_eq!(sent.len(), 1);
+    let request = Request::from_bytes(&sent[0].payload).unwrap();
+    assert_eq!(request.headers().get("Call-ID").unwrap(), "b");
+}
+
+// Quiescing refuses new endpoints and new raw paths, and nothing else.
+// Delivery, the endpoint's responses and paths, and raw sends on an existing
+// path go on, so that registered endpoints can finish their work.
+#[tokio::test]
+async fn quiescing_refuses_only_new_endpoints_and_raw_paths() {
+    let wire = Wire::default();
+    let (port, mut ingress) = intercept(&wire);
+    let (endpoint, mut incoming) =
+        Endpoint::builder().port(&port).bind().unwrap();
+    let upstream = upstream(&port).await;
+
+    port.quiesce();
+
+    let refused = Endpoint::builder().port(&port).bind().unwrap_err();
+    assert!(refused.is_closed());
+    let selection = PathSelection::new(LOCAL, PEER);
+    let refused = port.prepare_path(selection.clone()).await.unwrap_err();
+    assert!(refused.is_closed());
+    assert!(endpoint.prepare_path(selection).await.is_ok());
+    wire.deliver(datagram(options("quiet")));
+    let to_endpoint = endpoint.ingress().unwrap();
+    next(&mut ingress).await.try_deliver(&to_endpoint).unwrap();
+    let request = request(&mut incoming).await;
+    let (responder, _) = request.transaction.into_parts();
+    responder.respond(ok(&request.request)).await.unwrap();
+    let raw = Bytes::from_static(b"raw");
+    port.send_bytes(raw, &upstream).unwrap().await.unwrap();
+    assert_eq!(wire.sent(2).await.len(), 2);
+}
+
+// Closing drains the writes already admitted, then closes the backend, and
+// everything of the port turns invalid: a raw send is refused, a datagram the
+// application still holds can no longer be delivered, and the ingress ends.
+#[tokio::test]
+async fn closing_the_port_drains_its_writes_then_closes_the_backend() {
+    let wire = Wire::default();
+    let (port, mut ingress) = intercept(&wire);
+    let (endpoint, _incoming) =
+        Endpoint::builder().port(&port).bind().unwrap();
+    let upstream = upstream(&port).await;
+    wire.deliver(datagram(options("held")));
+    let held = next(&mut ingress).await;
+    wire.writes(Writes::Delay);
+    let raw = port.send_bytes(Bytes::from_static(b"raw"), &upstream).unwrap();
+    wire.sent(1).await;
+
+    let close = tokio::spawn(port.close(Duration::from_secs(2)));
+    yield_now().await;
+    assert!(!wire.closed());
+    wire.finish(Ok(()));
+
+    raw.await.unwrap();
+    assert_eq!(close.await.unwrap(), ShutdownOutcome::Drained);
+    assert!(wire.closed());
+    let refused = port.send_bytes(Bytes::from_static(b"late"), &upstream);
+    assert!(refused.unwrap_err().is_closed());
+    let refused = held.try_deliver(&endpoint.ingress().unwrap()).unwrap_err();
+    assert!(refused.error().is_closed());
+    assert!(ingress.recv().await.is_none());
+}
+
+// At the close's deadline the writes left fail, and a backend that does not
+// finish closing is dropped, as an endpoint drops its own. The outcome says
+// the deadline came first, and the raw write's waiter learns that the port
+// closed without its outcome.
+#[tokio::test]
+async fn a_port_close_gives_up_at_its_deadline() {
+    let wire = Wire::default();
+    let (port, _ingress) = intercept(&wire);
+    let upstream = upstream(&port).await;
+    wire.writes(Writes::Delay);
+    wire.state.lock().unwrap().stuck = true;
+    let raw = port.send_bytes(Bytes::from_static(b"raw"), &upstream).unwrap();
+    wire.sent(1).await;
+
+    let close = port.close(Duration::from_millis(50));
+    let outcome = timeout(Duration::from_secs(2), close).await.unwrap();
+
+    assert_eq!(outcome, ShutdownOutcome::DeadlineExpired);
+    assert!(raw.await.unwrap_err().is_closed());
+}
+
+// A capture only receives. Its datagrams carry no disposition and it has no
+// send, so an INVITE it captures gets no 100 Trying and nothing else goes out.
+#[tokio::test]
+async fn a_capture_receives_and_sends_nothing() {
+    let wire = Wire::default();
+    let mut capture =
+        DatagramPort::builder().udp_io(wire.clone()).capture().unwrap();
+
+    wire.deliver(arriving(invite("captured"), "tap0"));
+    let captured = timeout(Duration::from_secs(2), capture.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(captured.payload(), invite("captured").as_bytes());
+    assert_eq!(captured.context().as_bytes(), "tap0");
+    assert!(matches!(captured.parse(), Ok(Message::Request(_))));
+    sleep(Duration::from_millis(50)).await;
+    assert_eq!(wire.count(), 0);
+    let outcome = capture.close(Duration::from_secs(1)).await;
+    assert_eq!(outcome, ShutdownOutcome::Drained);
+    assert!(wire.closed());
+}
+
+// A port runs while a handle or a registered endpoint is left. Once the last
+// endpoint has stopped and every handle is gone, it closes its backend.
+#[tokio::test]
+async fn a_port_closes_once_nothing_uses_it() {
+    let wire = Wire::default();
+    let (port, ingress) = intercept(&wire);
+    let (endpoint, _incoming) =
+        Endpoint::builder().port(&port).bind().unwrap();
+    drop(port);
+    drop(ingress);
+    sleep(Duration::from_millis(50)).await;
+    assert!(!wire.closed());
+
+    let outcome = endpoint.shutdown(Duration::from_secs(1)).await;
+
+    assert_eq!(outcome, ShutdownOutcome::Drained);
+    timeout(Duration::from_secs(2), async {
+        while !wire.closed() {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the wire closed");
+}
+
+// A port takes as many endpoints as it is configured for, and one more once
+// an endpoint has stopped and ended its registration.
+#[tokio::test]
+async fn registrations_are_bounded() {
+    let wire = Wire::default();
+    let (port, _ingress) = DatagramPort::builder()
+        .udp_io(wire)
+        .max_registrations(1)
+        .intercept()
+        .unwrap();
+    let (first, _first_incoming) =
+        Endpoint::builder().port(&port).bind().unwrap();
+
+    assert!(Endpoint::builder().port(&port).bind().unwrap_err().is_busy());
+    let outcome = first.shutdown(Duration::from_secs(1)).await;
+    assert_eq!(outcome, ShutdownOutcome::Drained);
+    yield_now().await;
+    assert!(Endpoint::builder().port(&port).bind().is_ok());
+}
+
+/// What becomes of one datagram in the disposition property.
+#[derive(Clone, Copy, Debug)]
+enum Fate {
+    Deliver,
+    Forward,
+    Discard,
+    Drop,
+    /// Held until the end, so that later datagrams may find the limits full.
+    Hold,
+    /// Tried after its deadline, then dropped.
+    Expire,
+}
+
+impl Arbitrary for Fate {
+    fn arbitrary(g: &mut Gen) -> Fate {
+        *g.choose(&[
+            Fate::Deliver,
+            Fate::Forward,
+            Fate::Discard,
+            Fate::Drop,
+            Fate::Hold,
+            Fate::Expire,
+        ])
+        .unwrap()
+    }
+}
+
+// Whatever the application does, each datagram ends exactly once: delivered,
+// forwarded, discarded, abandoned, expired, or dropped on receipt when the
+// ingress limits are full. Once none is held, the limits are whole again.
+// The clock is paused, so expiry is exact.
+#[test]
+fn every_datagram_ends_once_and_gives_back_its_share() {
+    const LIMIT: usize = 3;
+
+    fn property(fates: Vec<Fate>) -> bool {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let wire = Wire::default();
+            let (port, mut ingress) = DatagramPort::builder()
+                .udp_io(wire.clone())
+                .ingress_limits(WriteLimits {
+                    messages: LIMIT,
+                    bytes: 64 * 1024,
+                })
+                .decision_deadline(Duration::from_millis(500))
+                .intercept()
+                .unwrap();
+            let (endpoint, _incoming) =
+                Endpoint::builder().port(&port).bind().unwrap();
+            let to_endpoint = endpoint.ingress().unwrap();
+            let upstream = upstream(&port).await;
+            let mut held = Vec::new();
+
+            for (n, fate) in fates.iter().take(12).enumerate() {
+                wire.deliver(datagram(options(&format!("q{n}"))));
+                stats_until(&port, |stats| stats.received == n as u64 + 1)
+                    .await;
+                let stats = port.stats();
+                let ended = stats.overflow
+                    + stats.delivered
+                    + stats.forwarded
+                    + stats.discarded
+                    + stats.abandoned
+                    + stats.expired;
+                if ended + held.len() as u64 == stats.received {
+                    continue; // Dropped on receipt.
+                }
+                let datagram = next(&mut ingress).await;
+                match fate {
+                    Fate::Deliver => {
+                        datagram.try_deliver(&to_endpoint).unwrap();
+                    }
+                    Fate::Forward => {
+                        datagram
+                            .try_forward(&upstream)
+                            .unwrap()
+                            .await
+                            .unwrap();
+                    }
+                    Fate::Discard => datagram.discard(),
+                    Fate::Drop => drop(datagram),
+                    Fate::Hold => held.push(datagram),
+                    Fate::Expire => {
+                        advance(Duration::from_millis(500)).await;
+                        let refused =
+                            datagram.try_deliver(&to_endpoint).unwrap_err();
+                        assert!(refused.error().is_expired());
+                    }
+                }
+            }
+            drop(held);
+
+            let stats = port.stats();
+            let ended = stats.overflow
+                + stats.delivered
+                + stats.forwarded
+                + stats.discarded
+                + stats.abandoned
+                + stats.expired;
+            let mut whole = true;
+            for n in 0..LIMIT {
+                wire.deliver(datagram(options(&format!("after{n}"))));
+            }
+            let received = stats.received + LIMIT as u64;
+            stats_until(&port, |stats| stats.received == received).await;
+            whole &= port.stats().overflow == stats.overflow;
+            ended == stats.received && whole
+        })
+    }
+
+    QuickCheck::new().tests(40).quickcheck(property as fn(Vec<Fate>) -> bool);
+}
+
+// A port can intercept the endpoint's own kind of socket too. A request from
+// an ordinary endpoint reaches the endpoint on the port through the
+// application, and its response comes back through the port's socket.
+#[tokio::test]
+async fn a_socket_port_carries_a_round_trip() {
+    let (port, mut ingress) = DatagramPort::builder()
+        .udp("127.0.0.1:0".parse().unwrap())
+        .intercept()
+        .unwrap();
+    let (server, mut incoming) =
+        Endpoint::builder().port(&port).bind().unwrap();
+    let to_server = server.ingress().unwrap();
+    let (client, _client_incoming) = Endpoint::builder()
+        .udp("127.0.0.1:0".parse().unwrap())
+        .bind()
+        .unwrap();
+    let target = Target::new(Transport::Udp, port.local_addr());
+
+    let (_control, mut responses) =
+        client.start(outgoing("socket"), target).await.unwrap().into_parts();
+    next(&mut ingress).await.try_deliver(&to_server).unwrap();
+    let request = request(&mut incoming).await;
+    let (responder, _) = request.transaction.into_parts();
+    responder.respond(ok(&request.request)).await.unwrap();
+
+    let response = timeout(Duration::from_secs(2), responses.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+}
+
+// A port that closes while an endpoint still has writes in it tells the
+// endpoint how each ended, so that nothing waits for an outcome forever: the
+// write the wire held never went out, and the one it took and never reported
+// may have. That holds whether the wire finishes closing or is dropped at the
+// deadline.
+#[tokio::test]
+async fn a_closing_port_ends_the_writes_of_its_endpoints() {
+    for stuck in [false, true] {
+        let wire = Wire::default();
+        let (port, _ingress) = intercept(&wire);
+        let (endpoint, _incoming) =
+            Endpoint::builder().port(&port).bind().unwrap();
+        wire.writes(Writes::Delay);
+        let taken = send_options(&endpoint, "taken");
+        wire.sent(1).await;
+        wire.writes(Writes::Hold);
+        let held = send_options(&endpoint, "held");
+        wire.until(|state| state.submit.is_some()).await;
+        wire.state.lock().unwrap().stuck = stuck;
+
+        let close = port.close(Duration::from_millis(50));
+        let outcome = timeout(Duration::from_secs(2), close).await.unwrap();
+
+        assert_eq!(outcome, ShutdownOutcome::DeadlineExpired, "{stuck}");
+        let taken = timeout(Duration::from_secs(2), taken).await.unwrap();
+        let held = timeout(Duration::from_secs(2), held).await.unwrap();
+        assert!(taken.unwrap().is_err(), "{stuck}");
+        assert!(held.unwrap().is_err(), "{stuck}");
+        assert_eq!(wire.count(), 1);
+    }
+}
+
+// An endpoint's write waits for room in the port's limits, so a byte limit
+// below the backend's largest payload could hold one back forever. The port
+// refuses that configuration.
+#[test]
+fn the_port_s_write_limits_must_hold_a_whole_payload() {
+    let refused = DatagramPort::builder()
+        .udp_io(Wire::default())
+        .write_limits(WriteLimits { messages: 16, bytes: 1000 })
+        .intercept()
+        .unwrap_err();
+
+    assert!(refused.is_invalid_config());
+}
+
+// Endpoints whose writes find the port's limits full wait, and go out as
+// room frees up, without losing a write or an outcome.
+#[tokio::test]
+async fn endpoints_wait_for_room_in_the_port_s_limits() {
+    let wire = Wire::default();
+    let (port, _ingress) = DatagramPort::builder()
+        .udp_io(wire.clone())
+        .write_limits(WriteLimits { messages: 1, bytes: 64 * 1024 })
+        .intercept()
+        .unwrap();
+    let (a, _a_incoming) = Endpoint::builder().port(&port).bind().unwrap();
+    let (b, _b_incoming) = Endpoint::builder().port(&port).bind().unwrap();
+    wire.writes(Writes::Delay);
+
+    let from_a = send_options(&a, "a");
+    wire.sent(1).await;
+    let from_b = send_options(&b, "b");
+    sleep(Duration::from_millis(20)).await;
+    assert_eq!(wire.count(), 1);
+    wire.finish(Ok(()));
+    wire.sent(2).await;
+    wire.finish(Ok(()));
+
+    assert!(from_a.await.unwrap().is_ok());
+    assert!(from_b.await.unwrap().is_ok());
+}
+
+// The same with endpoints on several threads at once, where a waiter and a
+// release race. Every write still goes out and reports back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn endpoints_on_several_threads_share_the_port_s_limits() {
+    let wire = Wire::default();
+    let (port, _ingress) = DatagramPort::builder()
+        .udp_io(wire.clone())
+        .write_limits(WriteLimits { messages: 2, bytes: 64 * 1024 })
+        .intercept()
+        .unwrap();
+    let mut endpoints = Vec::new();
+    for _ in 0..4 {
+        endpoints.push(Endpoint::builder().port(&port).bind().unwrap());
+    }
+
+    let mut sends = Vec::new();
+    for (endpoint, _incoming) in &endpoints {
+        for _ in 0..25 {
+            sends.push(send_options(endpoint, "busy"));
+        }
+    }
+    for send in sends {
+        let sent = timeout(Duration::from_secs(10), send).await.unwrap();
+        sent.unwrap().unwrap();
+    }
+
+    assert_eq!(wire.count(), 100);
+}
+
+// Raw sends take at most three quarters of the port's write limits, so that
+// a busy forwarder leaves endpoints room for their own writes.
+#[tokio::test]
+async fn raw_sends_leave_endpoints_room() {
+    let wire = Wire::default();
+    let (port, _ingress) = DatagramPort::builder()
+        .udp_io(wire.clone())
+        .write_limits(WriteLimits { messages: 4, bytes: 64 * 1024 })
+        .intercept()
+        .unwrap();
+    let (endpoint, _incoming) =
+        Endpoint::builder().port(&port).bind().unwrap();
+    let upstream = upstream(&port).await;
+    wire.writes(Writes::Delay);
+
+    let raw: Vec<_> = (0..3)
+        .map(|_| port.send_bytes(Bytes::from_static(b"raw"), &upstream))
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let refused = port.send_bytes(Bytes::from_static(b"raw"), &upstream);
+    let from_endpoint = send_options(&endpoint, "room");
+
+    assert!(refused.unwrap_err().is_busy());
+    wire.sent(4).await;
+    for _ in 0..4 {
+        wire.finish(Ok(()));
+    }
+    assert!(from_endpoint.await.unwrap().is_ok());
+    for write in raw {
+        write.await.unwrap();
     }
 }
