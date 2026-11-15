@@ -77,14 +77,16 @@ async fn shutdown_waits_for_or_aborts_tracked_adapter_work() {
     assert_eq!((served.calls, served.completed, served.aborted), (1, 1, 0));
 
     let (ua, udp, _, _) = brisk_with(config());
-    let held = Arc::new(());
+    let (gate, held) = (Gate::new(), Arc::new(()));
     let handler = {
-        let held = held.clone();
+        let (gate, held) = (gate.clone(), held.clone());
         service_fn(move |invite: IncomingInvite| {
-            let held = held.clone();
+            let (gate, held) = (gate.clone(), held.clone());
             async move {
                 let _undecided = (invite, held);
-                std::future::pending::<Result<(), Infallible>>().await
+                // The gate never opens.
+                gate.passed().await;
+                Ok::<(), Infallible>(())
             }
         })
     };
@@ -92,9 +94,7 @@ async fn shutdown_waits_for_or_aborts_tracked_adapter_work() {
     let peer = Peer::new().await;
     peer.send(&direct_invite(peer.address(), "never"), udp).await;
     peer.recv_starting("SIP/2.0 100").await;
-    while Arc::strong_count(&held) < 2 {
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    gate.reached().await;
 
     let shutdown = serving
         .handle
