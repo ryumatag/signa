@@ -21,7 +21,7 @@ use signa::{
     },
     transport::datagram::{
         Capabilities, Datagram, DatagramIo, DatagramWrite, RecvError, Submit,
-        TransportContext, WriteId,
+        TransportContext, WriteId, WriteOutcome,
     },
 };
 use tokio::time::timeout;
@@ -106,9 +106,9 @@ impl DatagramIo for Backend {
     fn poll_complete(
         &mut self,
         _cx: &mut Context<'_>,
-    ) -> Poll<(WriteId, io::Result<()>)> {
+    ) -> Poll<(WriteId, WriteOutcome)> {
         match self.0.lock().unwrap().done.pop_front() {
-            Some(id) => Poll::Ready((id, Ok(()))),
+            Some(id) => Poll::Ready((id, WriteOutcome::Written)),
             None => Poll::Pending,
         }
     }

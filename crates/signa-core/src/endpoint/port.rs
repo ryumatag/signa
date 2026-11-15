@@ -44,7 +44,7 @@ use crate::{
         budget::{Budget, Permit},
         datagram::{
             Binding, Capabilities, Datagram, DatagramIo, DatagramWrite, Owner,
-            Path, RecvError, Submit, TransportContext, WriteId,
+            Path, RecvError, Submit, TransportContext, WriteId, WriteOutcome,
         },
         udp, unmap,
     },
@@ -458,7 +458,8 @@ fn open(backend: Option<Backend>) -> Result<Box<dyn DatagramIo>, BindError> {
 /// 3. [`DatagramPort::close`] stops reception, invalidates the datagrams the
 ///    application still holds and every path of the port, refuses new writes
 ///    and drains the rest, then closes the backend, as [`Endpoint::shutdown`]
-///    closes its own. An endpoint still registered sees its writes fail.
+///    closes its own. An endpoint still registered sees its writes fail, or
+///    their outcomes unknown for those the backend took and never reported.
 ///
 /// That no backend task sends after the close rests on the backend, whose
 /// `Drop` must stop what `poll_close` would have stopped. The port cannot join
@@ -542,7 +543,7 @@ struct Counters {
 enum Command {
     Register {
         registration: u64,
-        completions: mpsc::UnboundedSender<(WriteId, io::Result<()>)>,
+        completions: mpsc::UnboundedSender<(WriteId, WriteOutcome)>,
     },
     Unregister {
         registration: u64,
@@ -556,7 +557,7 @@ enum Command {
     Raw {
         payload: Bytes,
         path: Arc<Path>,
-        done: oneshot::Sender<io::Result<()>>,
+        done: oneshot::Sender<WriteOutcome>,
         permit: WritePermit,
     },
     CheckPath {
@@ -717,9 +718,11 @@ impl DatagramPort {
     /// Reception stops, the datagrams the application holds and every path
     /// of the port turn invalid, and new writes are refused at once. The
     /// writes already admitted get until the deadline. At the deadline the
-    /// rest fail, and the backend gets one more poll to close before it is
-    /// dropped. Closing does not wait for registered endpoints, which see
-    /// their writes fail. Stop them first.
+    /// writes the backend never took fail, and those it took and never
+    /// reported end with their outcomes unknown. The backend gets one more
+    /// poll to close before it is dropped. Closing does not wait for
+    /// registered endpoints, which see their writes end the same way. Stop
+    /// them first.
     ///
     /// Another call can bring the deadline forward. Every caller gets the
     /// same outcome.
@@ -903,7 +906,7 @@ struct Proxy {
     shared: Arc<Shared>,
     commands: mpsc::UnboundedSender<Command>,
     deliveries: mpsc::Receiver<ReceivedDatagram>,
-    completions: mpsc::UnboundedReceiver<(WriteId, io::Result<()>)>,
+    completions: mpsc::UnboundedReceiver<(WriteId, WriteOutcome)>,
     state: Arc<RegistrationState>,
     unregistering: Option<oneshot::Receiver<()>>,
 }
@@ -969,7 +972,7 @@ impl DatagramIo for Proxy {
     fn poll_complete(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<(WriteId, io::Result<()>)> {
+    ) -> Poll<(WriteId, WriteOutcome)> {
         match ready!(self.completions.poll_recv(cx)) {
             Some(completion) => Poll::Ready(completion),
             // The port's task has ended. What it never reported stays
@@ -1050,7 +1053,7 @@ struct PortTask {
     ingress: Option<mpsc::UnboundedSender<ReceivedDatagram>>,
     /// Where each registered endpoint takes its writes' outcomes.
     registrations:
-        HashMap<u64, mpsc::UnboundedSender<(WriteId, io::Result<()>)>>,
+        HashMap<u64, mpsc::UnboundedSender<(WriteId, WriteOutcome)>>,
 }
 
 impl PortTask {
@@ -1286,13 +1289,13 @@ impl PortTask {
                 if let Some(completions) =
                     self.registrations.get(&registration)
                 {
-                    let _ =
-                        completions.send((write.id(), Err(closing_error())));
+                    let outcome = WriteOutcome::NotWritten(closing_error());
+                    let _ = completions.send((write.id(), outcome));
                 }
             }
             Command::Raw { done, permit, .. } => {
                 drop(permit);
-                let _ = done.send(Err(io::Error::new(
+                let _ = done.send(WriteOutcome::NotWritten(io::Error::new(
                     io::ErrorKind::NotConnected,
                     "the port closed before the write went out",
                 )));
@@ -1668,12 +1671,13 @@ impl fmt::Debug for RawPath {
 /// it.
 ///
 /// `Ok` means the backend wrote the datagram locally, not that the peer got
-/// it. [`Error::is_transport`] carries the backend's failure, and
-/// [`Error::is_closed`] says the port closed before the outcome was known,
-/// so whether it went out is unknown. Dropping it does not take the send
-/// back.
+/// it. [`Error::is_transport`] means it did not go out, with the backend's
+/// error or the port's, which closed before offering it.
+/// [`Error::is_outcome_unknown`] means it may have: the backend cannot tell,
+/// or the port closed while the backend held it unreported. Dropping it does
+/// not take the send back.
 #[must_use = "dropping a write does not cancel it, but its outcome is lost"]
-pub struct RawWrite(oneshot::Receiver<io::Result<()>>);
+pub struct RawWrite(oneshot::Receiver<WriteOutcome>);
 
 impl Future for RawWrite {
     type Output = Result<(), Error>;
@@ -1683,9 +1687,19 @@ impl Future for RawWrite {
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), Error>> {
         Poll::Ready(match ready!(Pin::new(&mut self.0).poll(cx)) {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(Error::transport(error)),
-            Err(_) => Err(Error::closed()),
+            Ok(WriteOutcome::Written) => Ok(()),
+            Ok(WriteOutcome::NotWritten(error)) => {
+                Err(Error::transport(error))
+            }
+            Ok(WriteOutcome::Unknown(error)) => {
+                Err(Error::outcome_unknown(error))
+            }
+            // The port settles every raw write it took. Its task ends without
+            // doing so only when its runtime drops it.
+            Err(_) => Err(Error::outcome_unknown(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "the port stopped without reporting the write",
+            ))),
         })
     }
 }

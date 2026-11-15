@@ -253,6 +253,8 @@ impl Endpoint {
     ///   [`Builder::max_reply_bytes`], the transport's output or the
     ///   connection limits are full.
     /// * [`Error::is_transport`] when a connection or the write fails.
+    /// * [`Error::is_outcome_unknown`] when the UDP backend took the write
+    ///   and cannot tell whether it went out.
     /// * [`Error::is_closed`] once the endpoint has stopped.
     ///
     /// # Example
@@ -405,6 +407,8 @@ impl Endpoint {
     ///   error.
     /// * [`Error::is_transport`] when the source address toward the
     ///   destination cannot be found or the write fails.
+    /// * [`Error::is_outcome_unknown`] when the UDP backend took the write
+    ///   and cannot tell whether it went out.
     /// * [`Error::is_closed`] once the endpoint has stopped.
     ///
     /// # Example

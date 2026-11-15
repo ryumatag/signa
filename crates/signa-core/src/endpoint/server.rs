@@ -26,7 +26,10 @@ use super::{
 };
 use crate::{
     message::{Method, Request, Response},
-    transport::budget::{Budget, Permit},
+    transport::{
+        budget::{Budget, Permit},
+        datagram::WriteOutcome,
+    },
 };
 
 /// Receives owned incoming events from one endpoint.
@@ -638,6 +641,18 @@ pub enum ServerEvent {
         /// The original local transport error.
         error: Arc<io::Error>,
     },
+    /// A UDP write of the transaction's output was handed to the backend,
+    /// which cannot tell whether it went out.
+    ///
+    /// The transaction keeps its state, as for a transport failure. This is
+    /// not one, since the response may have reached the peer. The backend
+    /// reports nothing more about the write.
+    OutcomeUnknown {
+        /// The submitted response, or `None` for driver-generated output.
+        operation: Option<ResponseId>,
+        /// Why the backend cannot tell.
+        error: Arc<io::Error>,
+    },
     /// Local output capacity refused a response that the driver generated
     /// or retransmits, such as the automatic 100 or a cached response sent
     /// again for a request retransmission.
@@ -690,6 +705,7 @@ pub(super) enum End {
 #[derive(Clone, Debug)]
 pub(super) enum Problem {
     Transport(Arc<io::Error>),
+    Unknown(Arc<io::Error>),
     Rejected,
 }
 
@@ -774,6 +790,12 @@ impl ServerEvents {
                     return Some(match &state.problem {
                         Some(Problem::Transport(error)) => {
                             ServerEvent::TransportFailure {
+                                operation,
+                                error: error.clone(),
+                            }
+                        }
+                        Some(Problem::Unknown(error)) => {
+                            ServerEvent::OutcomeUnknown {
                                 operation,
                                 error: error.clone(),
                             }
@@ -926,13 +948,24 @@ impl WriteObservation {
         self
     }
 
-    pub(super) fn complete(mut self, result: io::Result<()>) {
-        if let Err(error) = result {
-            if let Some(counters) = &self.fallback {
-                super::driver::increment(&counters.dropped);
+    pub(super) fn complete(mut self, outcome: WriteOutcome) {
+        match outcome {
+            WriteOutcome::Written => {}
+            WriteOutcome::NotWritten(error) => {
+                if let Some(counters) = &self.fallback {
+                    super::driver::increment(&counters.dropped);
+                }
+                self.shared.problem(
+                    self.operation,
+                    Problem::Transport(Arc::new(error)),
+                );
             }
-            self.shared
-                .problem(self.operation, Problem::Transport(Arc::new(error)));
+            WriteOutcome::Unknown(error) => {
+                self.shared.problem(
+                    self.operation,
+                    Problem::Unknown(Arc::new(error)),
+                );
+            }
         }
         self.completed = true;
     }
@@ -1689,7 +1722,9 @@ mod tests {
                     Some(ServerEvent::Terminated)
                 ));
 
-                write.complete(Err(io::Error::from_raw_os_error(5)));
+                write.complete(WriteOutcome::NotWritten(
+                    io::Error::from_raw_os_error(5),
+                ));
 
                 let Some(ServerEvent::TransportFailure {
                     operation: failed,
@@ -1734,12 +1769,14 @@ mod tests {
         let counters =
             Arc::new(super::super::driver::ConnectionCounters::default());
 
+        shared.write(None).fallback(counters.clone()).complete(
+            WriteOutcome::NotWritten(io::Error::from_raw_os_error(5)),
+        );
+        assert_eq!(counters.dropped.load(Ordering::Relaxed), 1);
         shared
             .write(None)
             .fallback(counters.clone())
-            .complete(Err(io::Error::from_raw_os_error(5)));
-        assert_eq!(counters.dropped.load(Ordering::Relaxed), 1);
-        shared.write(None).fallback(counters.clone()).complete(Ok(()));
+            .complete(WriteOutcome::Written);
         assert_eq!(counters.dropped.load(Ordering::Relaxed), 1);
         drop(shared.write(None).fallback(counters.clone()));
         assert_eq!(counters.dropped.load(Ordering::Relaxed), 2);

@@ -43,6 +43,8 @@ use crate::message::HeaderName;
 ///         "no final response within 64 T1 of the CANCEL"
 ///     } else if error.is_transport() {
 ///         "the transport failed, which RFC 3261 treats as a 503"
+///     } else if error.is_outcome_unknown() {
+///         "the request may or may not have gone out"
 ///     } else if error.is_delivery_overflow() {
 ///         "responses came faster than they were read, and the rest is lost"
 ///     } else if error.is_closed() {
@@ -65,6 +67,7 @@ enum Kind {
     CancelTimeout,
     DeliveryOverflow,
     Transport(io::Error),
+    OutcomeUnknown(io::Error),
     TooLarge(usize),
     OverPayload { len: usize, max: usize },
     Missing(HeaderName),
@@ -95,6 +98,10 @@ impl Error {
 
     pub(super) fn transport(err: io::Error) -> Error {
         Error { kind: Kind::Transport(err) }
+    }
+
+    pub(super) fn outcome_unknown(err: io::Error) -> Error {
+        Error { kind: Kind::OutcomeUnknown(err) }
     }
 
     pub(super) fn too_large(len: usize) -> Error {
@@ -178,6 +185,21 @@ impl Error {
     /// [`Error::source`]: error::Error::source
     pub fn is_transport(&self) -> bool {
         matches!(self.kind, Kind::Transport(_))
+    }
+
+    /// Returns `true` if a write was handed to the transport and its outcome
+    /// is not known, so that it may or may not have gone out.
+    /// [`Error::source`] says why.
+    ///
+    /// A UDP backend reports this when it can no longer account for a write,
+    /// and a [`DatagramPort`] when it closes with a write its backend took
+    /// and never reported. It is not [`Error::is_transport`], which means the
+    /// write did not go out.
+    ///
+    /// [`Error::source`]: error::Error::source
+    /// [`DatagramPort`]: super::DatagramPort
+    pub fn is_outcome_unknown(&self) -> bool {
+        matches!(self.kind, Kind::OutcomeUnknown(_))
     }
 
     /// Returns `true` if the request is too large to go over UDP.
@@ -286,9 +308,7 @@ impl Error {
     /// for shutdown.
     ///
     /// Through a [`DatagramPort`] it also means the port is closing, or the
-    /// endpoint a datagram was delivered to has stopped. A raw write the port
-    /// dropped while closing reports this too. Whether it went out is not
-    /// known.
+    /// endpoint a datagram was delivered to has stopped.
     ///
     /// [`DatagramPort`]: super::DatagramPort
     pub fn is_closed(&self) -> bool {
@@ -312,6 +332,9 @@ impl fmt::Debug for Error {
             Kind::CancelTimeout => debug.field(&"CancelTimeout"),
             Kind::DeliveryOverflow => debug.field(&"DeliveryOverflow"),
             Kind::Transport(err) => debug.field(err),
+            Kind::OutcomeUnknown(err) => {
+                debug.field(&format_args!("OutcomeUnknown({err:?})"))
+            }
             Kind::TooLarge(len) => {
                 debug.field(&format_args!("TooLarge({len})"))
             }
@@ -351,6 +374,9 @@ impl fmt::Display for Error {
                 f.write_str("client response delivery capacity is exhausted")
             }
             Kind::Transport(err) => write!(f, "transport error: {err}"),
+            Kind::OutcomeUnknown(err) => {
+                write!(f, "the write's outcome is unknown: {err}")
+            }
             Kind::TooLarge(len) => write!(
                 f,
                 "the request is {len} bytes, over the {MAX_UDP_REQUEST} \
@@ -397,7 +423,9 @@ impl fmt::Display for Error {
 impl error::Error for Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match &self.kind {
-            Kind::Transport(err) | Kind::PathRefused(err) => Some(err),
+            Kind::Transport(err)
+            | Kind::OutcomeUnknown(err)
+            | Kind::PathRefused(err) => Some(err),
             _ => None,
         }
     }

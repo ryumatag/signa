@@ -156,6 +156,8 @@ impl ReplyRoute {
     /// * [`ReplyError::Closed`] once the endpoint has stopped. Existing routes
     ///   remain usable while admitted work drains.
     /// * [`ReplyError::Transport`] for a local I/O error, with its source.
+    /// * [`ReplyError::OutcomeUnknown`] when the UDP backend took the
+    ///   response and cannot tell whether it went out.
     ///
     /// # Example
     ///
@@ -301,6 +303,9 @@ pub enum ReplyError {
     Closed,
     /// A local transport operation failed, possibly after a partial write.
     Transport(io::Error),
+    /// The response was handed to the UDP backend, which cannot tell whether
+    /// it went out. The error says why.
+    OutcomeUnknown(io::Error),
 }
 
 impl fmt::Display for ReplyError {
@@ -315,6 +320,9 @@ impl fmt::Display for ReplyError {
             ReplyError::Transport(error) => {
                 write!(f, "response transport failed: {error}")
             }
+            ReplyError::OutcomeUnknown(error) => {
+                write!(f, "the response's write outcome is unknown: {error}")
+            }
         }
     }
 }
@@ -322,7 +330,8 @@ impl fmt::Display for ReplyError {
 impl error::Error for ReplyError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
-            ReplyError::Transport(error) => Some(error),
+            ReplyError::Transport(error)
+            | ReplyError::OutcomeUnknown(error) => Some(error),
             _ => None,
         }
     }
@@ -416,11 +425,12 @@ impl Completion {
 }
 
 /// The error a one-shot request or forwarded response reports for a write
-/// result. Only `Busy` and `Transport` come from a write.
+/// result. Only `Busy`, `Transport` and `OutcomeUnknown` come from a write.
 fn request_error(error: ReplyError) -> Error {
     match error {
         ReplyError::Busy => Error::busy(),
         ReplyError::Transport(error) => Error::transport(error),
+        ReplyError::OutcomeUnknown(error) => Error::outcome_unknown(error),
         ReplyError::Closed
         | ReplyError::InvalidResponse
         | ReplyError::Unsupported => Error::closed(),

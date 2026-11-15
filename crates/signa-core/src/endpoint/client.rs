@@ -916,6 +916,18 @@ impl Endpoint {
     /// with a transport error as soon as the connection closes, since no
     /// response can reach it any more.
     ///
+    /// # Write outcomes
+    ///
+    /// A write of the request that did not go out ends the transaction, and
+    /// its [`Responses`] ends with [`Error::is_transport`] ([RFC 3261 section
+    /// 17.1.1.2] and [section 17.1.2.2]). A UDP backend that cannot tell
+    /// whether the request went out does not end it, since the peer may have
+    /// it. The transaction goes on as if UDP had lost the request, until a
+    /// response or Timer B or F ends it.
+    ///
+    /// [RFC 3261 section 17.1.1.2]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17.1.1.2
+    /// [section 17.1.2.2]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17.1.2.2
+    ///
     /// # Cancellation
     ///
     /// Dropping an unpolled future does nothing. The first poll queues the

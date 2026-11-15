@@ -38,7 +38,7 @@ use super::{
     Flow, Transport,
     datagram::{
         Capabilities, Datagram, DatagramIo, DatagramWrite, RecvError, Submit,
-        TransportContext, WriteId,
+        TransportContext, WriteId, WriteOutcome,
     },
     unmap,
 };
@@ -391,9 +391,9 @@ impl DatagramIo for Io {
     fn poll_complete(
         &mut self,
         _cx: &mut Context<'_>,
-    ) -> Poll<(WriteId, io::Result<()>)> {
+    ) -> Poll<(WriteId, WriteOutcome)> {
         match self.done.pop_front() {
-            Some(id) => Poll::Ready((id, Ok(()))),
+            Some(id) => Poll::Ready((id, WriteOutcome::Written)),
             None => Poll::Pending,
         }
     }

@@ -35,7 +35,7 @@ use signa_core::{
         datagram::{
             Capabilities, Datagram, DatagramIo, DatagramWrite,
             MAX_CONTEXT_LEN, RecvError, Submit, TransportContext, WriteId,
-            WritePath,
+            WriteOutcome, WritePath,
         },
     },
 };
@@ -130,7 +130,7 @@ struct State {
     writes: Writes,
     sent: Vec<Sent>,
     submit: Option<Waker>,
-    completions: VecDeque<(WriteId, io::Result<()>)>,
+    completions: VecDeque<(WriteId, WriteOutcome)>,
     complete: Option<Waker>,
     delayed: VecDeque<WriteId>,
     closed: bool,
@@ -176,20 +176,20 @@ impl Wire {
     }
 
     /// Reports the newest delayed write.
-    fn finish_newest(&self, result: io::Result<()>) {
+    fn finish_newest(&self, outcome: impl Into<WriteOutcome>) {
         let mut state = self.state.lock().unwrap();
         let id = state.delayed.pop_back().expect("a delayed write");
-        state.completions.push_back((id, result));
+        state.completions.push_back((id, outcome.into()));
         if let Some(waker) = state.complete.take() {
             waker.wake();
         }
     }
 
     /// Reports the oldest delayed write.
-    fn finish(&self, result: io::Result<()>) {
+    fn finish(&self, outcome: impl Into<WriteOutcome>) {
         let mut state = self.state.lock().unwrap();
         let id = state.delayed.pop_front().expect("a delayed write");
-        state.completions.push_back((id, result));
+        state.completions.push_back((id, outcome.into()));
         if let Some(waker) = state.complete.take() {
             waker.wake();
         }
@@ -284,11 +284,16 @@ impl DatagramIo for Wire {
             }
         }
         match state.writes {
-            Writes::Complete => state.completions.push_back((id, Ok(()))),
+            Writes::Complete => {
+                state.completions.push_back((id, WriteOutcome::Written));
+            }
             Writes::Delay => state.delayed.push_back(id),
             Writes::Fail => state.completions.push_back((
                 id,
-                Err(io::Error::new(io::ErrorKind::NotConnected, "link down")),
+                WriteOutcome::NotWritten(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "link down",
+                )),
             )),
             Writes::Hold => {
                 state.submit = Some(cx.waker().clone());
@@ -318,7 +323,7 @@ impl DatagramIo for Wire {
     fn poll_complete(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<(WriteId, io::Result<()>)> {
+    ) -> Poll<(WriteId, WriteOutcome)> {
         let mut state = self.state.lock().unwrap();
         match state.completions.pop_front() {
             Some(completion) => Poll::Ready(completion),
@@ -356,7 +361,10 @@ impl DatagramIo for Wire {
         while let Some(id) = state.delayed.pop_front() {
             state.completions.push_back((
                 id,
-                Err(io::Error::new(io::ErrorKind::Interrupted, "closed")),
+                WriteOutcome::NotWritten(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "closed",
+                )),
             ));
         }
         Poll::Ready(())
@@ -547,6 +555,127 @@ async fn a_failed_write_is_reported() {
         .unwrap()
         .unwrap_err();
     assert!(error.is_transport());
+}
+
+/// What a wire reports for a write it took and can no longer account for.
+fn unknown() -> WriteOutcome {
+    WriteOutcome::Unknown(io::Error::other("the writer stopped"))
+}
+
+// A write the wire took and cannot account for may have gone out, so it is
+// not a failure. A one-shot send and a one-shot reply report the outcome
+// unknown, and a client transaction goes on until its response. Only a
+// request that did not go out ends a transaction (RFC 3261 sections 17.1.1.2
+// and 17.1.2.2).
+#[tokio::test]
+async fn an_unknown_write_outcome_is_not_a_failure() {
+    let wire = Wire::default();
+    let (endpoint, mut incoming) = bind(&wire);
+    wire.writes(Writes::Delay);
+
+    let send = send_options(&endpoint, "unknown");
+    wire.sent(1).await;
+    wire.finish(unknown());
+    let error = timeout(Duration::from_secs(2), send)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(error.is_outcome_unknown());
+    assert!(!error.is_transport() && !error.is_closed());
+
+    let target = Target::new(Transport::Udp, PEER);
+    let (_control, mut responses) = endpoint
+        .start(outgoing("uac-unknown"), target)
+        .await
+        .unwrap()
+        .into_parts();
+    let sent = wire.sent(2).await;
+    wire.finish(unknown());
+    assert!(
+        timeout(Duration::from_millis(50), responses.next()).await.is_err(),
+        "the transaction ended on an unknown outcome"
+    );
+    let sent_request = Request::from_bytes(&sent[1].payload).unwrap();
+    let response = ok(&sent_request).to_bytes();
+    wire.deliver(Ok(Datagram::new(response, PEER, LOCAL)));
+    let response = timeout(Duration::from_secs(2), responses.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+
+    wire.writes(Writes::Complete);
+    wire.deliver(datagram(options("reply-unknown")));
+    let request = request(&mut incoming).await;
+    // The responder stays alive, so that its drop sends no 500 meanwhile.
+    let (responder, _) = request.transaction.into_parts();
+    let route = responder.reply_route();
+    wire.writes(Writes::Delay);
+    let reply = tokio::spawn({
+        let response = ok(&request.request);
+        async move { route.send(response).await }
+    });
+    wire.until(|state| !state.delayed.is_empty()).await;
+    wire.finish(unknown());
+    let reply = timeout(Duration::from_secs(2), reply).await.unwrap();
+    assert!(matches!(
+        reply.unwrap(),
+        Err(signa_core::endpoint::ReplyError::OutcomeUnknown(_))
+    ));
+    drop(responder);
+}
+
+// A final the wire cannot account for is observed as an unknown outcome, not
+// as a transport failure, and the transaction keeps its state as it does
+// after one (RFC 6026 section 8.8). A retransmission of the request is
+// absorbed and gets the cached final.
+#[tokio::test]
+async fn an_unknown_final_is_observed_apart_from_failures() {
+    for is_invite in [false, true] {
+        let branch =
+            if is_invite { "unknown-invite" } else { "unknown-options" };
+        let text = if is_invite { invite(branch) } else { options(branch) };
+        let code = if is_invite { 486 } else { 200 };
+        let wire = Wire::default();
+        let (_endpoint, mut incoming) = bind(&wire);
+        wire.deliver(datagram(text.clone()));
+        let request = request(&mut incoming).await;
+        if is_invite {
+            wire.sent(1).await; // The automatic 100.
+        }
+        let (responder, mut events) = request.transaction.into_parts();
+        let response = Response::reply_to(&request.request)
+            .status(code)
+            .to_tag(Tag::random())
+            .body(Bytes::new())
+            .unwrap();
+
+        wire.writes(Writes::Delay);
+        responder.respond(response).await.unwrap();
+        wire.until(|state| !state.delayed.is_empty()).await;
+        wire.finish(unknown());
+
+        let event =
+            timeout(Duration::from_secs(2), events.next()).await.unwrap();
+        assert!(
+            matches!(
+                event,
+                Some(ServerEvent::OutcomeUnknown { operation: Some(_), .. })
+            ),
+            "{is_invite}: {event:?}"
+        );
+        wire.writes(Writes::Complete);
+        let before = wire.count();
+        wire.deliver(datagram(text));
+        let sent = wire.sent(before + 1).await;
+        assert_eq!(status(&sent[before]), code, "{is_invite}");
+        assert!(
+            timeout(Duration::from_millis(50), incoming.recv()).await.is_err(),
+            "{is_invite}: the retransmission reached the TU"
+        );
+    }
 }
 
 // Writes the wire cannot take wait in the endpoint, within its UDP write
@@ -753,7 +882,7 @@ fn a_backend_must_name_its_address_and_send_something() {
         fn poll_complete(
             &mut self,
             cx: &mut Context<'_>,
-        ) -> Poll<(WriteId, io::Result<()>)> {
+        ) -> Poll<(WriteId, WriteOutcome)> {
             self.wire.poll_complete(cx)
         }
 
@@ -2278,8 +2407,9 @@ async fn closing_the_port_drains_its_writes_then_closes_the_backend() {
 
 // At the close's deadline the writes left fail, and a backend that does not
 // finish closing is dropped, as an endpoint drops its own. The outcome says
-// the deadline came first, and the raw write's waiter learns that the port
-// closed without its outcome.
+// the deadline came first. The raw write the backend took and never reported
+// may have gone out, and its waiter learns that its outcome is unknown, not
+// that it failed.
 #[tokio::test]
 async fn a_port_close_gives_up_at_its_deadline() {
     let wire = Wire::default();
@@ -2294,7 +2424,9 @@ async fn a_port_close_gives_up_at_its_deadline() {
     let outcome = timeout(Duration::from_secs(2), close).await.unwrap();
 
     assert_eq!(outcome, ShutdownOutcome::DeadlineExpired);
-    assert!(raw.await.unwrap_err().is_closed());
+    let error = raw.await.unwrap_err();
+    assert!(error.is_outcome_unknown());
+    assert!(!error.is_transport() && !error.is_closed());
 }
 
 // A capture only receives. Its datagrams carry no disposition and it has no
@@ -2543,10 +2675,125 @@ async fn a_closing_port_ends_the_writes_of_its_endpoints() {
         assert_eq!(outcome, ShutdownOutcome::DeadlineExpired, "{stuck}");
         let taken = timeout(Duration::from_secs(2), taken).await.unwrap();
         let held = timeout(Duration::from_secs(2), held).await.unwrap();
-        assert!(taken.unwrap().is_err(), "{stuck}");
-        assert!(held.unwrap().is_err(), "{stuck}");
+        // A wire that closes reports what it held as not written. One that
+        // never finishes closing leaves it unknown.
+        let taken = taken.unwrap().unwrap_err();
+        if stuck {
+            assert!(taken.is_outcome_unknown() && !taken.is_transport());
+        } else {
+            assert!(taken.is_transport() && !taken.is_outcome_unknown());
+        }
+        // The port never offered the held write, so it did not go out.
+        assert!(held.unwrap().unwrap_err().is_transport(), "{stuck}");
         assert_eq!(wire.count(), 1);
     }
+}
+
+// What a raw write's waiter learns, for each way it can end. A write the
+// wire reports written is `Ok`. One it reports failed, and one the port
+// never offered before a forced close, did not go out. One the wire reports
+// unknown, and one it held unreported through a forced close, may have.
+#[tokio::test]
+async fn a_raw_write_tells_a_failure_from_an_unknown_outcome() {
+    let wire = Wire::default();
+    let (port, _ingress) = intercept(&wire);
+    let upstream = upstream(&port).await;
+    wire.writes(Writes::Delay);
+    let send = || port.send_bytes(Bytes::from_static(b"raw"), &upstream);
+
+    let written = send().unwrap();
+    let failed = send().unwrap();
+    let unknown_write = send().unwrap();
+    wire.sent(3).await;
+    wire.finish(Ok(()));
+    wire.finish(Err(io::Error::new(io::ErrorKind::NotConnected, "link down")));
+    wire.finish(unknown());
+
+    written.await.unwrap();
+    let error = failed.await.unwrap_err();
+    assert!(error.is_transport() && !error.is_outcome_unknown());
+    let error = unknown_write.await.unwrap_err();
+    assert!(error.is_outcome_unknown() && !error.is_transport());
+
+    let taken = send().unwrap();
+    wire.sent(4).await;
+    wire.writes(Writes::Hold);
+    let held = send().unwrap();
+    wire.until(|state| state.submit.is_some()).await;
+    wire.state.lock().unwrap().stuck = true;
+    let close = port.close(Duration::from_millis(50));
+    let outcome = timeout(Duration::from_secs(2), close).await.unwrap();
+
+    assert_eq!(outcome, ShutdownOutcome::DeadlineExpired);
+    assert!(taken.await.unwrap_err().is_outcome_unknown());
+    assert!(held.await.unwrap_err().is_transport());
+}
+
+// An endpoint on a port learns the same of its writes as over a wire of its
+// own: written, failed, or unknown, as the port's wire reported them.
+#[tokio::test]
+async fn an_endpoint_on_a_port_learns_each_write_outcome() {
+    let wire = Wire::default();
+    let (port, _ingress) = intercept(&wire);
+    let (endpoint, _incoming) =
+        Endpoint::builder().port(&port).bind().unwrap();
+    wire.writes(Writes::Delay);
+
+    let written = send_options(&endpoint, "written");
+    wire.sent(1).await;
+    let failed = send_options(&endpoint, "failed");
+    wire.sent(2).await;
+    let unknown_write = send_options(&endpoint, "unknown");
+    wire.sent(3).await;
+    wire.finish(Ok(()));
+    wire.finish(Err(io::Error::new(io::ErrorKind::NotConnected, "link down")));
+    wire.finish(unknown());
+
+    async fn outcome(
+        write: JoinHandle<Result<(), Error>>,
+    ) -> Result<(), Error> {
+        timeout(Duration::from_secs(2), write).await.unwrap().unwrap()
+    }
+    outcome(written).await.unwrap();
+    let error = outcome(failed).await.unwrap_err();
+    assert!(error.is_transport() && !error.is_outcome_unknown());
+    let error = outcome(unknown_write).await.unwrap_err();
+    assert!(error.is_outcome_unknown() && !error.is_transport());
+}
+
+// A response the port's wire took and never reported, when the port closes
+// at its deadline, is observed as an unknown outcome. The endpoint is still
+// running, so it is not told that it closed, and the server transaction keeps
+// its state.
+#[tokio::test]
+async fn a_forced_port_close_leaves_an_endpoint_s_response_unknown() {
+    let wire = Wire::default();
+    let (port, mut ingress) = intercept(&wire);
+    let (endpoint, mut incoming) =
+        Endpoint::builder().port(&port).bind().unwrap();
+    wire.deliver(arriving(options("forced"), "nic0"));
+    let datagram = next(&mut ingress).await;
+    datagram.try_deliver(&endpoint.ingress().unwrap()).unwrap();
+    let request = request(&mut incoming).await;
+    let (responder, mut events) = request.transaction.into_parts();
+    wire.writes(Writes::Delay);
+    wire.state.lock().unwrap().stuck = true;
+    responder.respond(ok(&request.request)).await.unwrap();
+    wire.sent(1).await;
+
+    let close = port.close(Duration::from_millis(50));
+    let outcome = timeout(Duration::from_secs(2), close).await.unwrap();
+
+    assert_eq!(outcome, ShutdownOutcome::DeadlineExpired);
+    let event = timeout(Duration::from_secs(2), events.next()).await.unwrap();
+    assert!(
+        matches!(
+            event,
+            Some(ServerEvent::OutcomeUnknown { operation: Some(_), .. })
+        ),
+        "{event:?}"
+    );
+    drop(endpoint);
 }
 
 // An endpoint's write waits for room in the port's limits, so a byte limit

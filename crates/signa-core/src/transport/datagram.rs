@@ -23,13 +23,15 @@ backend finishes both at once:
    accepts it, refuses it, or says that it cannot take it yet and hands it
    back. An accepted write is never offered again.
 2. [`DatagramIo::poll_complete`] reports the local outcome of each accepted
-   write once, by its [`WriteId`].
+   write once, by its [`WriteId`], as a [`WriteOutcome`].
 
-A completion means that one complete datagram was written locally, not that
-the peer received it. An adapter with a writer task of its own reports when
-that task has written the datagram, not when its queue took it. The endpoint
-counts a write against its UDP write limits from the moment it is queued
-until its completion.
+[`WriteOutcome::Written`] means that one complete datagram was written
+locally, not that the peer received it. An adapter with a writer task of its
+own reports when that task has written the datagram, not when its queue took
+it. [`WriteOutcome::NotWritten`] means that the datagram did not go out, and
+[`WriteOutcome::Unknown`] that the backend cannot tell, such as when its
+writer task ended with the datagram handed over. The endpoint counts a write
+against its UDP write limits from the moment it is queued until its outcome.
 
 # Example
 
@@ -47,7 +49,7 @@ use std::{
 
 use signa_core::transport::datagram::{
     Capabilities, Datagram, DatagramIo, DatagramWrite, RecvError, Submit,
-    WriteId,
+    WriteId, WriteOutcome,
 };
 
 struct Discard {
@@ -83,9 +85,9 @@ impl DatagramIo for Discard {
     fn poll_complete(
         &mut self,
         _cx: &mut Context<'_>,
-    ) -> Poll<(WriteId, io::Result<()>)> {
+    ) -> Poll<(WriteId, WriteOutcome)> {
         match self.done.pop_front() {
-            Some(id) => Poll::Ready((id, Ok(()))),
+            Some(id) => Poll::Ready((id, WriteOutcome::Written)),
             None => Poll::Pending,
         }
     }
@@ -169,13 +171,13 @@ pub trait DatagramIo: Send + 'static {
 
     /// Polls for the outcome of an accepted write.
     ///
-    /// Each accepted [`WriteId`] is reported once, in any order. `Ok` means
-    /// the datagram was written whole to the local network, `Err` that it was
-    /// not.
+    /// Each accepted [`WriteId`] is reported once, in any order, and that
+    /// outcome is final. A backend that reported [`WriteOutcome::Unknown`]
+    /// does not report the same write again once it learns more.
     fn poll_complete(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<(WriteId, io::Result<()>)>;
+    ) -> Poll<(WriteId, WriteOutcome)>;
 
     /// Checks that the backend can send from `source` to `destination` along
     /// `context`, before the endpoint makes a path of them.
@@ -221,11 +223,12 @@ pub trait DatagramIo: Send + 'static {
     /// complete. At the shutdown deadline it calls this with writes still
     /// outstanding instead.
     ///
-    /// Before it returns `Ready`, the backend finishes or fails every write
-    /// it accepted, so that [`DatagramIo::poll_complete`] reports each one
+    /// Before it returns `Ready`, the backend settles every write it
+    /// accepted, so that [`DatagramIo::poll_complete`] reports each one
     /// without waiting, and stops every task of its own that could still
-    /// send. The endpoint then collects those outcomes and drops the backend.
-    /// It treats a write left unreported as lost.
+    /// send. A write it can no longer account for is
+    /// [`WriteOutcome::Unknown`]. The endpoint then collects those outcomes
+    /// and drops the backend. It treats a write left unreported as lost.
     ///
     /// Closing is bounded by the same deadline. A backend still closing when
     /// it passes gets one more poll, and is then dropped without one, so its
@@ -405,6 +408,41 @@ impl fmt::Display for ContextTooLong {
 }
 
 impl Error for ContextTooLong {}
+
+/// The local outcome of an accepted write, which
+/// [`DatagramIo::poll_complete`] reports once.
+///
+/// None of them says anything about the peer. Reporting a write `Unknown`
+/// neither takes it back nor shows that whatever held it has stopped. That
+/// is still the backend's to ensure when it closes.
+#[derive(Debug)]
+pub enum WriteOutcome {
+    /// The datagram was written whole to the local network.
+    Written,
+    /// The datagram did not go out, for the reason the error gives.
+    NotWritten(io::Error),
+    /// The backend cannot tell whether the datagram went out, and will not
+    /// learn it. The error says why.
+    Unknown(io::Error),
+}
+
+impl WriteOutcome {
+    /// Returns `true` for [`WriteOutcome::Written`].
+    pub fn is_written(&self) -> bool {
+        matches!(self, WriteOutcome::Written)
+    }
+}
+
+/// A backend whose every error means that the datagram did not go out, such
+/// as a socket's send, reports its result this way.
+impl From<io::Result<()>> for WriteOutcome {
+    fn from(result: io::Result<()>) -> WriteOutcome {
+        match result {
+            Ok(()) => WriteOutcome::Written,
+            Err(error) => WriteOutcome::NotWritten(error),
+        }
+    }
+}
 
 /// Names one write from its submission to its completion.
 ///

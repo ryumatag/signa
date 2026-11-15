@@ -103,7 +103,7 @@ use crate::{
     transport::{
         Flow, Transport, WriteLimits,
         budget::Budget,
-        datagram::{DatagramIo, Path, TransportContext},
+        datagram::{DatagramIo, Path, TransportContext, WriteOutcome},
         tcp,
     },
 };
@@ -1106,7 +1106,12 @@ impl Driver {
             if let Poll::Ready(result) = self.client_writes[index].0.poll(cx) {
                 let (_, id, observation) =
                     self.client_writes.swap_remove(index);
-                let Err(error) = result else { continue };
+                // Only a request that did not go out ends its transaction
+                // (RFC 3261 sections 17.1.1.2 and 17.1.2.2). One whose outcome
+                // is unknown may have reached the peer, so the transaction
+                // goes on, retransmitting over UDP, until a response or its
+                // timeout ends it.
+                let WriteOutcome::NotWritten(error) = result else { continue };
                 let current = self
                     .clients
                     .get(id)
@@ -1180,7 +1185,7 @@ impl Driver {
             {
                 let (_, observation, _) =
                     self.server_writes.swap_remove(index);
-                observation.complete(result);
+                observation.complete(result.into());
             } else {
                 index += 1;
             }
@@ -1753,10 +1758,9 @@ impl Driver {
                         Some(permit),
                     )),
                     Err(error) => {
-                        observation.complete(Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            error,
-                        )));
+                        observation.complete(WriteOutcome::NotWritten(
+                            io::Error::new(io::ErrorKind::BrokenPipe, error),
+                        ));
                     }
                 }
             }
@@ -2238,10 +2242,9 @@ impl Driver {
                             )));
                         }
                         Pending::Server(_, observation, _) => {
-                            observation.complete(Err(io::Error::new(
-                                source.kind(),
-                                source.clone(),
-                            )));
+                            observation.complete(WriteOutcome::NotWritten(
+                                io::Error::new(source.kind(), source.clone()),
+                            ));
                         }
                         Pending::OneShot(_, completion) => {
                             completion.finish(Err(ReplyError::Transport(
@@ -2836,10 +2839,9 @@ impl Driver {
                         fallback,
                     )),
                     Err(error) => {
-                        observation.complete(Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            error,
-                        )));
+                        observation.complete(WriteOutcome::NotWritten(
+                            io::Error::new(io::ErrorKind::BrokenPipe, error),
+                        ));
                     }
                 }
             }
@@ -3195,17 +3197,21 @@ async fn connect_until<T>(
 /// The local write outcome of a client request.
 enum ClientReceipt {
     Tcp(tcp::Receipt),
-    Udp(oneshot::Receiver<io::Result<()>>),
+    Udp(oneshot::Receiver<WriteOutcome>),
 }
 
 impl ClientReceipt {
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<WriteOutcome> {
         match self {
-            ClientReceipt::Tcp(receipt) => Pin::new(receipt).poll(cx),
+            ClientReceipt::Tcp(receipt) => {
+                Pin::new(receipt).poll(cx).map(WriteOutcome::from)
+            }
+            // The port drops a receipt's sender only as the endpoint stops,
+            // and the transaction stops with it.
             ClientReceipt::Udp(receipt) => {
-                Pin::new(receipt).poll(cx).map(|result| {
-                    result.unwrap_or_else(|_| {
-                        Err(io::Error::new(
+                Pin::new(receipt).poll(cx).map(|outcome| {
+                    outcome.unwrap_or_else(|_| {
+                        WriteOutcome::NotWritten(io::Error::new(
                             io::ErrorKind::BrokenPipe,
                             "UDP writer closed",
                         ))

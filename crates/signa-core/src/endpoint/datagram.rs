@@ -42,7 +42,7 @@ use crate::transport::{
     Flow, Transport, WriteLimits,
     datagram::{
         DatagramIo, DatagramWrite, Path, RecvError, Submit, TransportContext,
-        WriteId,
+        WriteId, WriteOutcome,
     },
     unmap,
 };
@@ -71,14 +71,14 @@ pub(super) struct Port {
     /// The accepted write whose completion [`Port::start`] is collecting,
     /// with its length, and its result once it is in.
     awaited: Option<(WriteId, usize)>,
-    awaited_result: Option<io::Result<()>>,
+    awaited_result: Option<WriteOutcome>,
     counters: Arc<ReceptionCounters>,
     /// Set when shutdown lost a write: one the backend never took, one it
     /// failed while closing, or one it left unreported.
     lost: bool,
     /// Outcomes of shared port writes for the port task to pass on to their
     /// registrations, see [`Outcome::Registration`].
-    routed: VecDeque<(u64, WriteId, io::Result<()>)>,
+    routed: VecDeque<(u64, WriteId, WriteOutcome)>,
 }
 
 /// A write waiting for the backend to accept it.
@@ -101,20 +101,20 @@ enum Outcome {
     Reply(Completion),
     /// A response submitted to a server transaction.
     Server(WriteObservation),
-    /// A client request whose failure ends its transaction.
-    Client(oneshot::Sender<io::Result<()>>),
+    /// A client request, which ends its transaction if it did not go out.
+    Client(oneshot::Sender<WriteOutcome>),
     /// A write of an endpoint registered on a shared port, by its own ID.
     /// The permit is its share of the port's write limits, which returns its
     /// room and wakes the endpoints waiting for it when the outcome drops.
     Registration { registration: u64, local: WriteId, _permit: WritePermit },
     /// A raw send through a shared port.
-    Raw { done: oneshot::Sender<io::Result<()>>, _permit: WritePermit },
+    Raw { done: oneshot::Sender<WriteOutcome>, _permit: WritePermit },
 }
 
 /// How a write went when [`Port::start`] returned.
 enum Started {
     /// It ended, or was never admitted.
-    Done(io::Result<()>),
+    Done(WriteOutcome),
     /// It waits, in the backlog or for its completion.
     Waiting(WriteId),
 }
@@ -206,13 +206,13 @@ impl Port {
     ) -> Started {
         let len = bytes.len();
         if len > self.max_payload {
-            return Started::Done(Err(io::Error::new(
+            return Started::Done(WriteOutcome::NotWritten(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "the datagram is larger than the UDP backend sends",
             )));
         }
         if let Err(error) = self.admit(len, limits) {
-            return Started::Done(Err(error));
+            return Started::Done(WriteOutcome::NotWritten(error));
         }
 
         let id = WriteId::new(self.next_id);
@@ -249,7 +249,7 @@ impl Port {
             Submit::Rejected(write, error) => {
                 drop(write);
                 self.release(len);
-                Started::Done(Err(error))
+                Started::Done(WriteOutcome::NotWritten(error))
             }
         }
     }
@@ -276,16 +276,17 @@ impl Port {
 
     /// Sends `bytes` on `link`, or queues it until the backend takes it.
     ///
-    /// Only an error known now is returned. A write that waits and then fails
-    /// is dropped. UDP loses datagrams anyway, and the transactions
-    /// retransmit over it.
+    /// Only a failure known now is returned. A write that waits and then
+    /// fails is dropped. UDP loses datagrams anyway, and the transactions
+    /// retransmit over it. A write whose outcome is unknown may have gone
+    /// out, and counts as sent.
     pub(super) fn send(
         &mut self,
         bytes: &Bytes,
         link: &Link,
     ) -> io::Result<()> {
         match self.start(bytes.clone(), link, self.limits) {
-            Started::Done(result) => result,
+            Started::Done(outcome) => failure(outcome),
             Started::Waiting(_) => Ok(()),
         }
     }
@@ -299,26 +300,26 @@ impl Port {
     ) -> io::Result<()> {
         let limits = crate::transport::budget::request_limits(self.limits);
         match self.start(bytes.clone(), link, limits) {
-            Started::Done(result) => result,
+            Started::Done(outcome) => failure(outcome),
             Started::Waiting(_) => Ok(()),
         }
     }
 
     /// Sends a client request, returning a receipt when its outcome is not
-    /// known yet.
+    /// known yet. Only a request that did not go out is an error.
     pub(super) fn submit_client(
         &mut self,
         bytes: &Bytes,
         link: &Link,
         initial: bool,
-    ) -> io::Result<Option<oneshot::Receiver<io::Result<()>>>> {
+    ) -> io::Result<Option<oneshot::Receiver<WriteOutcome>>> {
         let limits = if initial {
             crate::transport::budget::request_limits(self.limits)
         } else {
             self.limits
         };
         match self.start(bytes.clone(), link, limits) {
-            Started::Done(result) => result.map(|()| None),
+            Started::Done(outcome) => failure(outcome).map(|()| None),
             Started::Waiting(id) => {
                 let (done, receipt) = oneshot::channel();
                 self.attach(id, Outcome::Client(done));
@@ -335,15 +336,13 @@ impl Port {
         completion: Completion,
     ) {
         match self.start(bytes, link, self.limits) {
-            Started::Done(result) => {
-                completion.finish(result.map_err(|error| {
-                    if error.kind() == io::ErrorKind::WouldBlock {
-                        ReplyError::Busy
-                    } else {
-                        ReplyError::Transport(error)
-                    }
-                }));
+            // Only the endpoint's own write limits refuse with `WouldBlock`.
+            Started::Done(WriteOutcome::NotWritten(error))
+                if error.kind() == io::ErrorKind::WouldBlock =>
+            {
+                completion.finish(Err(ReplyError::Busy));
             }
+            Started::Done(outcome) => completion.finish(reply_result(outcome)),
             Started::Waiting(id) => {
                 self.attach(id, Outcome::Reply(completion))
             }
@@ -363,7 +362,7 @@ impl Port {
     ) {
         debug_assert!(self.admit_response(bytes.len()).is_ok());
         match self.start(bytes, link, self.limits) {
-            Started::Done(result) => observation.complete(result),
+            Started::Done(outcome) => observation.complete(outcome),
             Started::Waiting(id) => {
                 self.attach(id, Outcome::Server(observation));
             }
@@ -398,7 +397,7 @@ impl Port {
                 Submit::Rejected(write, error) => {
                     drop(write);
                     self.release(len);
-                    self.finish(outcome, Err(error));
+                    self.finish(outcome, WriteOutcome::NotWritten(error));
                 }
             }
         }
@@ -431,7 +430,7 @@ impl Port {
 
     /// Ends an accepted write. An ID the backend never had, or reported
     /// before, is ignored rather than trusted.
-    fn complete(&mut self, id: WriteId, result: io::Result<()>) {
+    fn complete(&mut self, id: WriteId, result: WriteOutcome) {
         if let Some((awaited, len)) = self.awaited {
             if awaited == id {
                 self.awaited = None;
@@ -448,11 +447,11 @@ impl Port {
         self.finish(outcome, result);
     }
 
-    fn finish(&mut self, outcome: Outcome, result: io::Result<()>) {
+    fn finish(&mut self, outcome: Outcome, result: WriteOutcome) {
         match outcome {
             Outcome::Unobserved => {}
             Outcome::Reply(completion) => {
-                completion.finish(result.map_err(ReplyError::Transport));
+                completion.finish(reply_result(result))
             }
             Outcome::Server(observation) => observation.complete(result),
             Outcome::Client(receipt) => {
@@ -493,7 +492,7 @@ impl Port {
         &mut self,
         bytes: Bytes,
         path: Arc<Path>,
-        done: oneshot::Sender<io::Result<()>>,
+        done: oneshot::Sender<WriteOutcome>,
         permit: WritePermit,
     ) {
         let prepared = path.prepared.as_deref().expect("a prepared path");
@@ -520,7 +519,7 @@ impl Port {
     /// its own ID.
     pub(super) fn take_routed(
         &mut self,
-    ) -> Option<(u64, WriteId, io::Result<()>)> {
+    ) -> Option<(u64, WriteId, WriteOutcome)> {
         self.routed.pop_front()
     }
 
@@ -539,7 +538,7 @@ impl Port {
                 self.release(queued.write.payload().len());
                 self.finish(
                     queued.outcome,
-                    Err(io::Error::new(
+                    WriteOutcome::NotWritten(io::Error::new(
                         io::ErrorKind::Interrupted,
                         "the endpoint stopped before the write went out",
                     )),
@@ -624,24 +623,27 @@ impl Port {
     ///
     /// A shared port tells its endpoints and raw senders instead, since they
     /// outlive it. A write it never offered did not go out. One the backend
-    /// took and never reported may have, and the error says so.
+    /// took and never reported may have, so its outcome is unknown.
     fn abandon(&mut self, outcome: Outcome, offered: bool) {
-        let error = || {
-            io::Error::new(
-                io::ErrorKind::NotConnected,
-                if offered {
-                    "the port closed before the backend reported the write"
-                } else {
-                    "the port closed before the write went out"
-                },
-            )
+        let outcome_now = || {
+            if offered {
+                WriteOutcome::Unknown(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "the port closed before the backend reported the write",
+                ))
+            } else {
+                WriteOutcome::NotWritten(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "the port closed before the write went out",
+                ))
+            }
         };
         match outcome {
             Outcome::Registration { registration, local, _permit } => {
-                self.routed.push_back((registration, local, Err(error())));
+                self.routed.push_back((registration, local, outcome_now()));
             }
-            Outcome::Raw { done, _permit } if !offered => {
-                let _ = done.send(Err(error()));
+            Outcome::Raw { done, _permit } => {
+                let _ = done.send(outcome_now());
             }
             outcome => drop(outcome),
         }
@@ -663,7 +665,8 @@ impl Port {
             }
             match self.io.poll_complete(&mut cx) {
                 Poll::Ready((id, result)) => {
-                    if result.is_err() && self.in_flight.contains_key(&id) {
+                    if !result.is_written() && self.in_flight.contains_key(&id)
+                    {
                         self.lost = true;
                     }
                     self.complete(id, result);
@@ -690,6 +693,24 @@ impl Port {
     /// [`Port::poll_close`].
     pub(super) fn lost(&self) -> bool {
         self.lost
+    }
+}
+
+/// The failure a caller that learns only failures is told. A write whose
+/// outcome is unknown may have gone out, so it is not one.
+fn failure(outcome: WriteOutcome) -> io::Result<()> {
+    match outcome {
+        WriteOutcome::NotWritten(error) => Err(error),
+        WriteOutcome::Written | WriteOutcome::Unknown(_) => Ok(()),
+    }
+}
+
+/// What a one-shot reply's waiter is told of its write.
+fn reply_result(outcome: WriteOutcome) -> Result<(), ReplyError> {
+    match outcome {
+        WriteOutcome::Written => Ok(()),
+        WriteOutcome::NotWritten(error) => Err(ReplyError::Transport(error)),
+        WriteOutcome::Unknown(error) => Err(ReplyError::OutcomeUnknown(error)),
     }
 }
 
@@ -745,11 +766,11 @@ mod tests {
     struct State {
         mode: Option<Mode>,
         accepted: Vec<(WriteId, Bytes)>,
-        completions: VecDeque<(WriteId, io::Result<()>)>,
+        completions: VecDeque<(WriteId, WriteOutcome)>,
         received: VecDeque<Result<Datagram, RecvError>>,
         closes: usize,
         /// What the backend reports for its outstanding writes on close.
-        on_close: Vec<(WriteId, io::Result<()>)>,
+        on_close: Vec<(WriteId, WriteOutcome)>,
         /// The wakers of the last pending submission and completion poll.
         submit_waker: Option<Waker>,
         complete_waker: Option<Waker>,
@@ -764,8 +785,9 @@ mod tests {
             self.0.lock().unwrap().mode = Some(mode);
         }
 
-        fn complete(&self, id: WriteId, result: io::Result<()>) {
-            self.0.lock().unwrap().completions.push_back((id, result));
+        fn complete(&self, id: WriteId, outcome: impl Into<WriteOutcome>) {
+            let outcome = outcome.into();
+            self.0.lock().unwrap().completions.push_back((id, outcome));
         }
 
         fn accepted(&self) -> Vec<WriteId> {
@@ -804,7 +826,9 @@ mod tests {
             let mut state = self.0.lock().unwrap();
             match state.mode.unwrap_or(Mode::Complete) {
                 Mode::Complete => {
-                    state.completions.push_back((write.id(), Ok(())));
+                    state
+                        .completions
+                        .push_back((write.id(), WriteOutcome::Written));
                 }
                 Mode::Accept => {}
                 Mode::Hold => {
@@ -825,7 +849,7 @@ mod tests {
         fn poll_complete(
             &mut self,
             cx: &mut Context<'_>,
-        ) -> Poll<(WriteId, io::Result<()>)> {
+        ) -> Poll<(WriteId, WriteOutcome)> {
             let mut state = self.0.lock().unwrap();
             match state.completions.pop_front() {
                 Some(completion) => Poll::Ready(completion),
@@ -842,6 +866,13 @@ mod tests {
             let on_close = mem::take(&mut state.on_close);
             state.completions.extend(on_close);
             Poll::Ready(())
+        }
+    }
+
+    fn not_written(outcome: WriteOutcome) -> io::Error {
+        match outcome {
+            WriteOutcome::NotWritten(error) => error,
+            other => panic!("expected a write that did not go out: {other:?}"),
         }
     }
 
@@ -1021,11 +1052,39 @@ mod tests {
         flush(&mut port);
 
         assert_eq!(
-            receipt.await.unwrap().unwrap_err().kind(),
+            not_written(receipt.await.unwrap()).kind(),
             io::ErrorKind::ConnectionRefused
         );
         assert!(port.is_idle());
         assert_eq!(port.bytes, 0);
+    }
+
+    // An outcome is final. A backend that reports a write unknown and then
+    // written gets the first through, and the second neither reaches anyone
+    // nor returns the write's budget twice.
+    #[tokio::test]
+    async fn a_write_ends_once_however_often_it_is_reported() {
+        let script = Script::default();
+        let mut port = port(&script, WriteLimits::default());
+        script.mode(Mode::Accept);
+        let receipt = port
+            .submit_client(&Bytes::from_static(b"request"), &LINK, true)
+            .unwrap()
+            .unwrap();
+        let id = script.accepted()[0];
+
+        script.complete(
+            id,
+            WriteOutcome::Unknown(io::Error::other("the writer stopped")),
+        );
+        script.complete(id, Ok(()));
+        flush(&mut port);
+
+        assert!(matches!(receipt.await.unwrap(), WriteOutcome::Unknown(_)));
+        assert!(port.is_idle());
+        assert_eq!(port.bytes, 0);
+        port.send(&Bytes::from_static(b"next"), &LINK).unwrap();
+        assert_eq!(port.writes, 1);
     }
 
     #[test]
@@ -1141,7 +1200,10 @@ mod tests {
             .unwrap();
         script.0.lock().unwrap().on_close = vec![(
             script.accepted()[0],
-            Err(io::Error::new(io::ErrorKind::Interrupted, "closed")),
+            WriteOutcome::NotWritten(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "closed",
+            )),
         )];
 
         port.abort();
@@ -1151,7 +1213,7 @@ mod tests {
 
         assert_eq!(script.0.lock().unwrap().closes, 1);
         assert_eq!(
-            accepted.blocking_recv().unwrap().unwrap_err().kind(),
+            not_written(accepted.blocking_recv().unwrap()).kind(),
             io::ErrorKind::Interrupted
         );
         assert!(unreported.blocking_recv().is_err());
@@ -1166,7 +1228,7 @@ mod tests {
         script.mode(Mode::Accept);
         port.send(&Bytes::from_static(b"accepted"), &LINK).unwrap();
         script.0.lock().unwrap().on_close =
-            vec![(script.accepted()[0], Ok(()))];
+            vec![(script.accepted()[0], WriteOutcome::Written)];
 
         port.abort();
         let mut cx = Context::from_waker(Waker::noop());
