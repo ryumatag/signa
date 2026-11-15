@@ -244,7 +244,7 @@ impl Driver {
             // datagram, and G or the request's retransmission repeats it.
             invite::ServerEvent::Send(bytes) => {
                 let link = entry.link.clone();
-                self.send_generated(id, &link, bytes, &shared);
+                self.send_generated(&link, bytes, &shared);
             }
             invite::ServerEvent::Timeout => shared.ack_timeout(),
             _ => {}

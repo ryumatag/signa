@@ -622,7 +622,16 @@ impl error::Error for SubmitError {}
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum ServerEvent {
-    /// A locally accepted write or reconnect failed.
+    /// A write of the transaction's output, or the reconnect it needed,
+    /// failed.
+    ///
+    /// The transaction keeps its state ([RFC 6026 section 8.8]). A
+    /// retransmission of the request is still absorbed and gets the cached
+    /// response again. A final that failed is still the transaction's final,
+    /// so the TU cannot send another, and the transaction lasts until its
+    /// timer ends it, which a graceful shutdown waits for.
+    ///
+    /// [RFC 6026 section 8.8]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.8
     TransportFailure {
         /// The submitted response, or `None` for driver-generated output.
         operation: Option<ResponseId>,
@@ -653,12 +662,14 @@ pub enum ServerEvent {
     ///
     /// [RFC 3261 section 17.2.1]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17.2.1
     AckTimeout,
-    /// The transaction ended. A non-INVITE ends at Timer J over UDP, at the
-    /// final response over TCP, or after a transport failure. An INVITE ends
-    /// at Timer I after its ACK over UDP, at the ACK over TCP, at Timer H
-    /// without one, or at Timer L after a 2xx. An INVITE transport failure
-    /// does not end it ([RFC 6026 section 8.8]). Writes already accepted may
-    /// still report failures before the stream ends.
+    /// The transaction ended. A non-INVITE ends at Timer J over UDP or at the
+    /// final response over TCP. An INVITE ends at Timer I after its ACK over
+    /// UDP, at the ACK over TCP, at Timer H without one, or at Timer L after a
+    /// 2xx. A transport failure ends neither kind ([RFC 6026 section 8.8]).
+    /// Either kind ends early when its responder is dropped and the 500 that
+    /// answers for it finds no room, as [`ServerEvent::OutputRejected`] says.
+    /// Writes already accepted may still report failures before the stream
+    /// ends.
     ///
     /// [RFC 6026 section 8.8]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.8
     Terminated,
@@ -915,10 +926,6 @@ impl WriteObservation {
         self
     }
 
-    pub(super) fn shared(&self) -> &Arc<Shared> {
-        &self.shared
-    }
-
     pub(super) fn complete(mut self, result: io::Result<()>) {
         if let Err(error) = result {
             if let Some(counters) = &self.fallback {
@@ -1152,10 +1159,17 @@ mod integration {
         assert_eq!(response(&peer).await.status().as_u16(), 200);
     }
 
+    // RFC 6026 section 8.8. A failed write is reported with its operation,
+    // and the transaction keeps its state: a retransmission is absorbed and
+    // its cached response tried again, until Timer J ends it.
     #[tokio::test]
-    async fn accepted_io_failure_precedes_termination_and_retains_operation_id()
-     {
-        let (endpoint, mut incoming, peer) = udp(Endpoint::builder()).await;
+    async fn a_failed_final_keeps_the_transaction_until_timer_j() {
+        let timers = crate::transaction::Timers::builder()
+            .t1(Duration::from_millis(5))
+            .build()
+            .unwrap();
+        let (endpoint, mut incoming, peer) =
+            udp(Endpoint::builder().timers(timers)).await;
         send(&peer, &endpoint, "io-failure").await;
         let envelope = request(&mut incoming).await;
         let (responder, mut events) = envelope.transaction.into_parts();
@@ -1175,6 +1189,15 @@ mod integration {
         };
         assert_eq!(failed, Some(operation));
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        send(&peer, &endpoint, "io-failure").await;
+        assert!(matches!(
+            observe(&mut events).await,
+            Some(ServerEvent::TransportFailure { operation: None, .. })
+        ));
+        assert!(
+            timeout(Duration::from_millis(50), incoming.recv()).await.is_err()
+        );
         assert!(matches!(
             observe(&mut events).await,
             Some(ServerEvent::Terminated)

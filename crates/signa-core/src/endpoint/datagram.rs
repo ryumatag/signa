@@ -35,7 +35,7 @@ use super::{
     driver::{ReceptionCounters, increment},
     reply::{Completion, ReplyError},
     routing::Link,
-    server::{Shared, WriteObservation},
+    server::WriteObservation,
 };
 use crate::transport::{
     Flow, Transport, WriteLimits,
@@ -71,7 +71,6 @@ pub(super) struct Port {
     /// with its length, and its result once it is in.
     awaited: Option<(WriteId, usize)>,
     awaited_result: Option<io::Result<()>>,
-    failures: VecDeque<Arc<Shared>>,
     counters: Arc<ReceptionCounters>,
     /// Set when shutdown lost a write: one the backend never took, one it
     /// failed while closing, or one it left unreported.
@@ -130,7 +129,6 @@ impl Port {
             next_id: 0,
             awaited: None,
             awaited_result: None,
-            failures: VecDeque::new(),
             counters,
             lost: false,
         }
@@ -332,31 +330,21 @@ impl Port {
     /// Commits the driver's earlier admission check without yielding between
     /// phases. No other task owns this queue or can change its quota.
     ///
-    /// Returns `false` when the write has already failed, which `observation`
-    /// has seen. A later failure goes to [`Port::take_failure`].
+    /// `observation` learns how the write ends, now or when the backend
+    /// reports it.
     pub(super) fn send_admitted(
         &mut self,
         bytes: Bytes,
         link: &Link,
         observation: WriteObservation,
-    ) -> bool {
+    ) {
         debug_assert!(self.admit_response(bytes.len()).is_ok());
         match self.start(bytes, link, self.limits) {
-            Started::Done(result) => {
-                let success = result.is_ok();
-                observation.complete(result);
-                success
-            }
+            Started::Done(result) => observation.complete(result),
             Started::Waiting(id) => {
                 self.attach(id, Outcome::Server(observation));
-                true
             }
         }
-    }
-
-    /// The next server transaction whose waiting write failed.
-    pub(super) fn take_failure(&mut self) -> Option<Arc<Shared>> {
-        self.failures.pop_front()
     }
 
     /// Offers what waits to the backend, as far as it takes it, and collects
@@ -443,12 +431,7 @@ impl Port {
             Outcome::Reply(completion) => {
                 completion.finish(result.map_err(ReplyError::Transport));
             }
-            Outcome::Server(observation) => {
-                if result.is_err() {
-                    self.failures.push_back(observation.shared().clone());
-                }
-                observation.complete(result);
-            }
+            Outcome::Server(observation) => observation.complete(result),
             Outcome::Client(receipt) => {
                 let _ = receipt.send(result);
             }

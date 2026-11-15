@@ -261,24 +261,11 @@ impl ServerMachine {
         }
     }
 
-    /// A response write failed. A non-INVITE ends. An INVITE keeps its state
-    /// ([RFC 6026 section 8.8]).
-    ///
-    /// [RFC 6026 section 8.8]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.8
-    fn on_transport_error(&mut self) {
-        match self {
-            ServerMachine::NonInvite(tx) => tx.on_transport_error(),
-            ServerMachine::Invite(tx) => {
-                tx.on_transport_error();
-            }
-        }
-    }
-
     /// Ends a transaction whose abandonment 500 could not be sent. See
     /// `Driver::respond_abandoned`.
     fn abandon(&mut self) {
         match self {
-            ServerMachine::NonInvite(tx) => tx.on_transport_error(),
+            ServerMachine::NonInvite(tx) => tx.abandon(),
             ServerMachine::Invite(tx) => {
                 tx.abandon();
             }
@@ -1193,9 +1180,6 @@ impl Driver {
             {
                 let (_, observation, _) =
                     self.server_writes.swap_remove(index);
-                if result.is_err() {
-                    self.fail_observed(observation.shared());
-                }
                 observation.complete(result);
             } else {
                 index += 1;
@@ -1233,22 +1217,14 @@ impl Driver {
                     .poll_recv(cx)
                     .map(|inbound| inbound.map(Event::Inbound)),
                 4 => {
-                    let receive = if let Some(udp) = &mut self.udp {
+                    if let Some(udp) = &mut self.udp {
                         udp.poll_flush(cx);
                         udp.poll_recv(cx).map(|(bytes, flow, context)| {
                             Some(Event::Datagram(bytes, flow, context))
                         })
                     } else {
                         Poll::Pending
-                    };
-
-                    while let Some(shared) =
-                        self.udp.as_mut().and_then(Port::take_failure)
-                    {
-                        self.fail_observed(&shared);
                     }
-
-                    receive
                 }
                 _ => self.drops.poll_recv(cx).map(|drop| {
                     drop.map(|(id, route)| Event::Abandon(id, route))
@@ -1385,7 +1361,7 @@ impl Driver {
                                 .as_ref()
                                 .expect("TU transaction")
                                 .clone();
-                            self.send_generated(id, &link, trying, &shared);
+                            self.send_generated(&link, trying, &shared);
                         }
                     }
                     ServerMachine::Invite(_) => {
@@ -1777,7 +1753,6 @@ impl Driver {
                         Some(permit),
                     )),
                     Err(error) => {
-                        self.fail_observed(observation.shared());
                         observation.complete(Err(io::Error::new(
                             io::ErrorKind::BrokenPipe,
                             error,
@@ -2263,7 +2238,6 @@ impl Driver {
                             )));
                         }
                         Pending::Server(_, observation, _) => {
-                            self.fail_observed(observation.shared());
                             observation.complete(Err(io::Error::new(
                                 source.kind(),
                                 source.clone(),
@@ -2619,7 +2593,7 @@ impl Driver {
                     let link = entry.link.clone();
                     let shared =
                         entry.shared.clone().expect("a new TU transaction");
-                    self.send_generated(id, &link, trying, &shared);
+                    self.send_generated(&link, trying, &shared);
                 }
 
                 IncomingEvent::Request(ServerRequest {
@@ -2660,16 +2634,13 @@ impl Driver {
         let Some(response) = entry.tx.on_retransmission() else { return };
         let link = entry.link.clone();
         if let Some(shared) = entry.shared.clone() {
-            self.send_generated(id, &link, response, &shared);
+            self.send_generated(&link, response, &shared);
         } else {
-            // An unobserved Completed entry has no observer to tell. A busy
-            // budget only drops this copy, as in `send_generated`.
-            match self.send_reply(&link, &response) {
-                Err(error) if error.kind() != io::ErrorKind::WouldBlock => {
-                    self.fail_server(id);
-                }
-                _ => {}
-            }
+            // An unobserved Completed entry has no observer to tell. Whether
+            // this copy is refused now or fails later, the transaction keeps
+            // its state until its timer, as in `send_generated` (RFC 6026
+            // section 8.8).
+            let _ = self.send_reply(&link, &response);
         }
     }
 
@@ -2849,7 +2820,7 @@ impl Driver {
         output: PreparedServerOutput,
         shared: &Arc<server::Shared>,
         operation: Option<server::ResponseId>,
-    ) -> bool {
+    ) {
         let observation = shared.write(operation);
         match output {
             PreparedServerOutput::Tcp(write, fallback) => {
@@ -2869,16 +2840,15 @@ impl Driver {
                             io::ErrorKind::BrokenPipe,
                             error,
                         )));
-                        return false;
                     }
                 }
             }
             PreparedServerOutput::Udp(bytes, link) => {
-                return self
-                    .udp
-                    .as_mut()
-                    .expect("prepared UDP socket")
-                    .send_admitted(bytes, &link, observation);
+                self.udp.as_mut().expect("prepared UDP socket").send_admitted(
+                    bytes,
+                    &link,
+                    observation,
+                );
             }
             PreparedServerOutput::Waiting { remote, bytes, fallback } => {
                 let TcpState::Connecting(waiting) = &mut self
@@ -2913,19 +2883,19 @@ impl Driver {
                 self.spawn_connect(remote, connection, attempt);
             }
         }
-        true
     }
 
     /// Sends driver-generated server output: the automatic 100, or a cached
     /// response for a request retransmission.
     ///
-    /// Local saturation only drops this attempt. The machine keeps its cached
-    /// response, so the peer's next retransmission recovers it. Terminating
+    /// Neither local saturation nor a failed write changes the machine. It
+    /// keeps its cached response, so the peer's next retransmission recovers
+    /// it. RFC 6026 section 8.8 has a server transaction "inform the TU that
+    /// a failure has occurred" and "remain in the current state". Terminating
     /// instead would let that retransmission start a new transaction and
     /// reach the TU a second time.
     fn send_generated(
         &mut self,
-        id: Id,
         link: &Link,
         bytes: Bytes,
         shared: &Arc<server::Shared>,
@@ -2933,11 +2903,7 @@ impl Driver {
         let fallback =
             link.writer.as_ref().is_some_and(tcp::Writer::is_closed);
         match self.prepare_server_output(link, bytes) {
-            Ok(output) => {
-                if !self.commit_server_output(output, shared, None) {
-                    self.fail_server(id);
-                }
-            }
+            Ok(output) => self.commit_server_output(output, shared, None),
             Err(_) => {
                 if fallback {
                     increment(&self.connection_stats.dropped);
@@ -2947,21 +2913,8 @@ impl Driver {
         }
     }
 
-    fn fail_server(&mut self, id: Id) {
-        if let Some(entry) = self.servers.get_mut(id) {
-            entry.tx.on_transport_error();
-            self.settle_server(id, None);
-        }
-    }
-
     fn live_work_is_drained(&self) -> bool {
         self.work.is_idle()
-    }
-
-    fn fail_observed(&mut self, shared: &Arc<server::Shared>) {
-        if self.owns_server(shared) {
-            self.fail_server(shared.slot);
-        }
     }
 
     // A TU capability can outlive every timer, and its slot can hold a newer
@@ -3126,11 +3079,9 @@ impl Driver {
             }
         }
 
-        if !self.commit_server_output(output, &shared, operation) {
-            if let Some(entry) = self.servers.get_mut(id) {
-                entry.tx.on_transport_error();
-            }
-        }
+        // A write that fails, now or later, reaches the TU through its
+        // observation, and the machine keeps the state it just entered.
+        self.commit_server_output(output, &shared, operation);
         self.settle_server(id, before);
         Ok(())
     }
@@ -3764,6 +3715,13 @@ mod tests {
         .unwrap();
     }
 
+    /// Ends a server transaction, as a responder drop does when its 500 finds
+    /// no room.
+    fn end_server(driver: &mut Driver, id: Id) {
+        driver.servers.get_mut(id).unwrap().tx.abandon();
+        driver.settle_server(id, None);
+    }
+
     #[tokio::test]
     async fn a_terminated_machine_does_not_release_queued_event_bytes() {
         let (mut driver, _commands, local) = reply_driver_with(Config {
@@ -3778,7 +3736,7 @@ mod tests {
         driver.on_request(first, link.clone(), &TransportContext::EMPTY);
         let id = driver.servers.find(&key).unwrap().0;
 
-        driver.fail_server(id);
+        end_server(&mut driver, id);
         assert!(driver.work.is_idle());
         assert!(!driver.event_admission.is_idle());
         driver.on_request(
@@ -3952,7 +3910,6 @@ mod tests {
             _permit: permit,
         });
         driver.abandon(&stale);
-        driver.fail_observed(&stale);
 
         assert_eq!(accepted.await.unwrap(), Err(SubmitError::Terminated));
         let live = driver.servers.get(original.slot).unwrap();
@@ -4175,7 +4132,7 @@ mod tests {
             );
             let received = driver.take_request();
             let id = received.transaction.responder.shared.slot;
-            driver.fail_server(id);
+            end_server(&mut driver, id);
             drop(received);
             poll_fn(|cx| {
                 if let Poll::Ready(Event::Timer(key)) = driver.poll_event(cx) {

@@ -108,7 +108,8 @@ Supported:
 * Accepted on the client until Timer M, delivering every 2xx, and on the
   server until Timer L, taking further 2xx and passing their ACKs to the TU
   ([8.4], [8.7]).
-* An INVITE server keeps its state after a transport error ([8.8]).
+* A server transaction, INVITE or not, keeps its state after a transport
+  error and reports it to an observing TU ([8.8]).
 * A stateful endpoint discards a response that matches no transaction
   ([8.9]).
 * A stateful proxy forwards only through a live transaction ([7.3], [8.3]).

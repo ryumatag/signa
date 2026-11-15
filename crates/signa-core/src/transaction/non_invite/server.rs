@@ -290,8 +290,15 @@ impl ServerTransaction {
         true
     }
 
-    /// Ends the transaction because the transport could not send a response.
-    pub fn on_transport_error(&mut self) {
+    /// Ends the transaction when no transaction user is left to answer and
+    /// the caller cannot send a response of its own either.
+    ///
+    /// `Trying` and `Proceeding` have no timer, so the transaction would stay
+    /// forever otherwise. A transport error is no reason to call this. The
+    /// transaction keeps its state then ([RFC 6026 section 8.8]).
+    ///
+    /// [RFC 6026 section 8.8]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.8
+    pub fn abandon(&mut self) {
         self.state = State::Terminated;
     }
 }
@@ -531,11 +538,11 @@ mod tests {
     }
 
     #[test]
-    fn a_transport_error_ends_it() {
+    fn abandoning_ends_it() {
         let start = Instant::now();
 
         let mut tx = transaction(false, start);
-        tx.on_transport_error();
+        tx.abandon();
         assert!(tx.is_terminated());
         assert!(!tx.on_response(status(200), response(200), &TIMERS, start));
         assert_eq!(tx.on_timeout(start + 7 * T1), None);

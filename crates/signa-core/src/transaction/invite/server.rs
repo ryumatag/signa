@@ -54,8 +54,6 @@ pub enum ServerEvent {
     Ack,
     /// Timer H elapsed without the transaction ACK.
     Timeout,
-    /// Notify the TU without discarding transaction state.
-    TransportError,
     /// Timer I or L elapsed, or a reliable transaction received its ACK.
     Terminated,
 }
@@ -246,15 +244,6 @@ impl ServerTransaction {
         }
     }
 
-    /// RFC 6026 section 8.8 retains state after a response transport error.
-    pub fn on_transport_error(&self) -> ServerEvent {
-        if self.is_terminated() {
-            ServerEvent::None
-        } else {
-            ServerEvent::TransportError
-        }
-    }
-
     /// Ends Proceeding when no TU is left to answer and the driver cannot send
     /// its fallback response either.
     ///
@@ -387,8 +376,7 @@ mod tests {
         assert_eq!(tx.on_ack(&TIMERS, end), S::None);
     }
 
-    // RFC 6026 8.7/8.8. L remains live across ACK and response transport
-    // errors.
+    // RFC 6026 section 8.7. L remains live across ACK and further 2xx.
     #[test]
     fn accepted_server_absorbs_invites_and_passes_ack_without_restarting_l() {
         let start = Instant::now();
@@ -409,43 +397,12 @@ mod tests {
                     tx.on_ack(&TIMERS, start + u32::from(offset) * T1),
                     S::Ack
                 );
-                assert_eq!(tx.on_transport_error(), S::TransportError);
                 assert_eq!(tx.deadline(), Some(start + 64 * T1));
             }
 
             assert_eq!(tx.on_timeout(&TIMERS, start + 63 * T1), S::None);
             assert_eq!(tx.on_timeout(&TIMERS, start + 64 * T1), S::Terminated);
-            assert_eq!(tx.on_transport_error(), S::None);
             assert!(tx.is_terminated());
-        }
-    }
-
-    #[test]
-    fn server_transport_failure_preserves_each_live_state() {
-        let start = Instant::now();
-        for state in 0..4 {
-            let mut tx = server(false);
-
-            match state {
-                1 => {
-                    send(&mut tx, 486, start);
-                }
-                2 => {
-                    send(&mut tx, 486, start);
-                    tx.on_ack(&TIMERS, start);
-                }
-                3 => {
-                    send(&mut tx, 200, start);
-                }
-                _ => {}
-            }
-            let deadline = tx.deadline();
-            let retransmission = tx.on_retransmission();
-
-            assert_eq!(tx.on_transport_error(), S::TransportError);
-            assert_eq!(tx.deadline(), deadline);
-            assert_eq!(tx.on_retransmission(), retransmission);
-            assert!(!tx.is_terminated());
         }
     }
 

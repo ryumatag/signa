@@ -3944,6 +3944,59 @@ mod tests {
         );
     }
 
+    // RFC 6026 section 8.8. Over TCP a non-INVITE may get a 100 from the TU
+    // at once. Its connection has closed, and no listener takes the new
+    // connection to its `sent-by` (RFC 3261 section 18.2.2), so the 100 fails.
+    // The transaction stays in Proceeding and takes its final, which fails
+    // the same way and ends it, as a final over TCP does.
+    #[tokio::test]
+    async fn a_failed_provisional_over_tcp_keeps_the_non_invite() {
+        // Windows may retry SYNs before reporting connection refusal, even
+        // on loopback, and each response here waits for a refused one.
+        const REFUSED: Duration = Duration::from_secs(10);
+        let (endpoint, mut incoming) = invite_endpoint(Timers::default());
+        let (mut remote, via) = uac(Transport::Tcp, &endpoint, "gone").await;
+        remote.send(&raw("OPTIONS", &via, None)).await;
+        let ServerRequest { request, transaction, .. } =
+            server_request(&mut incoming).await;
+        let (responder, mut events) = transaction.into_parts();
+        drop(remote);
+        // Let the endpoint see the close.
+        sleep(Duration::from_millis(50)).await;
+
+        let trying = responder.respond(reply(&request, 100, "a"));
+        let operation = trying.id();
+        trying.await.unwrap();
+
+        let Some(ServerEvent::TransportFailure { operation: failed, .. }) =
+            timeout(REFUSED, events.next()).await.unwrap()
+        else {
+            panic!("a transport failure");
+        };
+        assert_eq!(failed, Some(operation));
+        let ok = responder.respond(reply(&request, 200, "a"));
+        let operation = ok.id();
+        ok.await.unwrap();
+
+        // The final ends the machine at once, and its write fails after, so
+        // the two events may come in either order.
+        let mut failed = false;
+        let mut terminated = false;
+        while let Some(event) = timeout(REFUSED, events.next()).await.unwrap()
+        {
+            match event {
+                ServerEvent::TransportFailure {
+                    operation: Some(id), ..
+                } => {
+                    failed |= id == operation;
+                }
+                ServerEvent::Terminated => terminated = true,
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(failed && terminated);
+    }
+
     // RFC 3261 section 17. No ACK gets a response. One that matches no
     // transaction, even without an RFC 3261 branch, goes to the TU. One
     // without a usable identity is discarded.
