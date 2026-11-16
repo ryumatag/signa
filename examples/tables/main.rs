@@ -41,7 +41,7 @@ use signa::{
     endpoint::{Endpoint, IncomingEvent, Target, ViaMode},
     message::header::{CALL_ID, FROM, TO},
     transaction::Timers,
-    transport::{Transport, WriteLimits},
+    transport::{Limits, Transport},
 };
 
 const LOCALHOST: SocketAddr =
@@ -131,7 +131,7 @@ async fn main() {
     let mode = Mode::from_env();
     let observed = env::var_os("SIGNA_TABLES_OBSERVE").is_some();
     let timers = Timers::default();
-    let unbounded = WriteLimits { messages: usize::MAX, bytes: usize::MAX };
+    let unbounded = Limits { count: usize::MAX, bytes: usize::MAX };
 
     // Retain every transaction for its timers instead of measuring overload.
     let (server, mut incoming) = Endpoint::builder()

@@ -34,7 +34,7 @@ use crate::{
         uri::{InvalidSipUriKind, SipUri},
     },
     transport::{
-        Flow, Transport, WriteLimits,
+        Flow, Limits, Transport,
         budget::{Budget, Permit},
     },
 };
@@ -178,7 +178,7 @@ impl ClientControl {
     }
 
     /// The number the endpoint's observation records name this transaction
-    /// by, in [`WriteOrigin`](super::WriteOrigin).
+    /// by, in [`WriteOrigin`](super::observe::WriteOrigin).
     ///
     /// It names the transaction among the endpoint's own, not across
     /// endpoints. A number names one transaction at a time, and comes round
@@ -480,7 +480,7 @@ pub struct Responses {
 }
 
 impl Responses {
-    fn new(budget: Budget, limits: WriteLimits, handle: Permit) -> Responses {
+    fn new(budget: Budget, limits: Limits, handle: Permit) -> Responses {
         Responses {
             shared: Arc::new(Mutex::new(State {
                 queue: VecDeque::new(),
@@ -561,7 +561,7 @@ struct State {
     detached: bool,
     waker: Option<Waker>,
     budget: Budget,
-    limits: WriteLimits,
+    limits: Limits,
     /// The `max_client_handles` slot, shared with [`ClientTransactionId`].
     _handle: Arc<Permit>,
 }
@@ -605,7 +605,7 @@ impl Delivery {
                     len.checked_add(response.received.retained_len())
                 })
                 .unwrap_or(usize::MAX);
-            let permit = if state.queue.len() < state.limits.messages
+            let permit = if state.queue.len() < state.limits.count
                 && bytes <= state.limits.bytes.saturating_sub(state.bytes)
             {
                 state.budget.acquire(bytes)
@@ -1414,14 +1414,9 @@ pub(super) mod compatibility {
 
             let (accepted, response) = oneshot::channel();
             let responses = Responses::new(
-                Budget::new(WriteLimits {
-                    messages: 4096,
-                    bytes: 64 * 1024 * 1024,
-                }),
-                WriteLimits { messages: 64, bytes: 1024 * 1024 },
-                Budget::new(WriteLimits { messages: 1, bytes: 1 })
-                    .acquire(0)
-                    .unwrap(),
+                Budget::new(Limits { count: 4096, bytes: 64 * 1024 * 1024 }),
+                Limits { count: 64, bytes: 1024 * 1024 },
+                Budget::new(Limits { count: 1, bytes: 1 }).acquire(0).unwrap(),
             );
             let respond = Starting {
                 accepted,
@@ -1515,10 +1510,9 @@ mod tests {
             .block_on(future);
     }
 
-    fn stream(limits: WriteLimits, budget: Budget) -> (Delivery, Responses) {
-        let handle = Budget::new(WriteLimits { messages: 1, bytes: 1 })
-            .acquire(0)
-            .unwrap();
+    fn stream(limits: Limits, budget: Budget) -> (Delivery, Responses) {
+        let handle =
+            Budget::new(Limits { count: 1, bytes: 1 }).acquire(0).unwrap();
         let responses = Responses::new(budget, limits, handle);
         (Delivery(responses.shared.clone()), responses)
     }
@@ -1541,16 +1535,16 @@ mod tests {
     }
 
     fn budget() -> Budget {
-        Budget::new(WriteLimits { messages: 10, bytes: 4096 })
+        Budget::new(Limits { count: 10, bytes: 4096 })
     }
 
     #[test]
     fn overflow_preserves_queued_responses_and_reserved_terminal_error() {
         run(async {
             for limits in [
-                WriteLimits { messages: 1, bytes: 4096 },
-                WriteLimits {
-                    messages: 10,
+                Limits { count: 1, bytes: 4096 },
+                Limits {
+                    count: 10,
                     bytes: response(100).response.encoded_len().unwrap(),
                 },
             ] {
@@ -1588,8 +1582,8 @@ mod tests {
     #[test]
     fn endpoint_budget_survives_machine_completion_until_consumption() {
         run(async {
-            let budget = Budget::new(WriteLimits { messages: 1, bytes: 4096 });
-            let limits = WriteLimits { messages: 10, bytes: 4096 };
+            let budget = Budget::new(Limits { count: 1, bytes: 4096 });
+            let limits = Limits { count: 10, bytes: 4096 };
             let (delivery, mut responses) = stream(limits, budget.clone());
 
             delivery.send(Ok(response(200)));
@@ -1615,7 +1609,7 @@ mod tests {
     fn sender_drop_yields_closed_after_queued_response() {
         run(async {
             let (delivery, mut responses) =
-                stream(WriteLimits { messages: 10, bytes: 4096 }, budget());
+                stream(Limits { count: 10, bytes: 4096 }, budget());
             {
                 let mut receive = std::pin::pin!(responses.next());
                 poll_fn(|cx| {
@@ -1648,7 +1642,7 @@ mod tests {
     fn detached_consumer_releases_bytes_without_affecting_delivery_owner() {
         let budget = budget();
         let (delivery, responses) =
-            stream(WriteLimits { messages: 10, bytes: 4096 }, budget.clone());
+            stream(Limits { count: 10, bytes: 4096 }, budget.clone());
         delivery.response(response(100));
 
         drop(responses);
@@ -1662,7 +1656,7 @@ mod tests {
     #[test]
     #[allow(clippy::mutable_key_type)]
     fn transaction_ids_keep_identity_and_reservation_after_control_drop() {
-        let budget = Budget::new(WriteLimits { messages: 2, bytes: 1 });
+        let budget = Budget::new(Limits { count: 2, bytes: 1 });
         let first = ClientTransactionId(Arc::new(budget.acquire(0).unwrap()));
         let second = ClientTransactionId(Arc::new(budget.acquire(0).unwrap()));
 
@@ -1683,13 +1677,13 @@ mod tests {
         for builder in [
             Endpoint::builder().max_client_handles(0),
             Endpoint::builder()
-                .client_response_limits(WriteLimits { messages: 0, bytes: 1 }),
+                .client_response_limits(Limits { count: 0, bytes: 1 }),
             Endpoint::builder()
-                .client_response_limits(WriteLimits { messages: 1, bytes: 0 }),
+                .client_response_limits(Limits { count: 1, bytes: 0 }),
             Endpoint::builder()
-                .client_response_budget(WriteLimits { messages: 0, bytes: 1 }),
+                .client_response_budget(Limits { count: 0, bytes: 1 }),
             Endpoint::builder()
-                .client_response_budget(WriteLimits { messages: 1, bytes: 0 }),
+                .client_response_budget(Limits { count: 1, bytes: 0 }),
         ] {
             assert!(builder.bind().unwrap_err().is_invalid_config());
         }

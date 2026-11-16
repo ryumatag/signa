@@ -1,17 +1,21 @@
 /*!
-A lossy, bounded view of what an endpoint receives and writes.
+A lossy, bounded view of what an endpoint or a datagram port receives and
+writes.
 
-[`Endpoint::observe`] attaches one [`Observer`]. The driver records each
-message it receives, before it parses it, and the stages of each write it
-makes: when it starts, when the backend takes it, and how it ends. Records
-are copies. None of them can send, answer, deliver or hold a transaction, and
-dropping the observer changes nothing on the wire.
+[`Endpoint::observe`] and [`DatagramPort::observe`] attach one [`Observer`].
+The endpoint's driver, or the port's task, records each message it
+receives, before it parses it, and the stages of each write it makes: when
+it starts, when the backend takes it, and how it ends. Records are copies.
+None of them can send, answer, deliver or hold a transaction, and dropping
+the observer changes nothing on the wire.
 
 Observation never holds up the protocol. A record that does not fit the
 observer's limits is dropped and counted, and the driver goes on. The
 envelopes, the client response streams and the server observations are what
 a TU acts on. They do not depend on an observer, and an observer's losses say
 nothing about them.
+
+[`DatagramPort::observe`]: super::port::DatagramPort::observe
 */
 
 use std::{
@@ -34,7 +38,7 @@ use super::{
     driver::{Command, increment, now},
 };
 use crate::transport::{
-    Flow, ReceiveId, Stamp, WriteLimits,
+    Flow, Limits, ReceiveId, Stamp,
     budget::{Budget, Permit},
     datagram::{TransportContext, WriteId, WriteOutcome},
     next_id,
@@ -47,39 +51,39 @@ use crate::transport::{
 /// Up to 4096 records and 4 MiB, with the first 512 bytes of each message.
 ///
 /// ```
-/// use signa_core::endpoint::ObservationConfig;
+/// use signa_core::endpoint::observe::Config;
 ///
-/// let config = ObservationConfig::new()
+/// let config = Config::new()
 ///     .records(4096)
 ///     .bytes(4 * 1024 * 1024)
 ///     .payload(512);
 /// ```
 #[derive(Clone, Copy, Debug)]
-pub struct ObservationConfig {
-    limits: WriteLimits,
+pub struct Config {
+    limits: Limits,
     payload: usize,
     context: bool,
 }
 
-impl ObservationConfig {
+impl Config {
     /// Keeps up to 1024 records and 1 MiB, without payloads or contexts.
-    pub fn new() -> ObservationConfig {
-        ObservationConfig {
-            limits: WriteLimits { messages: 1024, bytes: 1024 * 1024 },
+    pub fn new() -> Config {
+        Config {
+            limits: Limits { count: 1024, bytes: 1024 * 1024 },
             payload: 0,
             context: false,
         }
     }
 
     /// The most records alive at once, queued or held by the application.
-    pub fn records(mut self, records: usize) -> ObservationConfig {
-        self.limits.messages = records;
+    pub fn records(mut self, records: usize) -> Config {
+        self.limits.count = records;
         self
     }
 
     /// The most bytes those records take: each record's own size and the
     /// payload and context it copied.
-    pub fn bytes(mut self, bytes: usize) -> ObservationConfig {
+    pub fn bytes(mut self, bytes: usize) -> Config {
         self.limits.bytes = bytes;
         self
     }
@@ -87,26 +91,26 @@ impl ObservationConfig {
     /// Copies up to `len` bytes of each message received or written. Zero,
     /// the default, copies none. The copy is the record's own, so it does
     /// not keep a received buffer alive.
-    pub fn payload(mut self, len: usize) -> ObservationConfig {
+    pub fn payload(mut self, len: usize) -> Config {
         self.payload = len;
         self
     }
 
     /// Copies the UDP backend's context of each received message.
-    pub fn context(mut self, context: bool) -> ObservationConfig {
+    pub fn context(mut self, context: bool) -> Config {
         self.context = context;
         self
     }
 }
 
-impl Default for ObservationConfig {
-    fn default() -> ObservationConfig {
-        ObservationConfig::new()
+impl Default for Config {
+    fn default() -> Config {
+        Config::new()
     }
 }
 
 /// Receives the [`Record`]s of an endpoint, or of a
-/// [`DatagramPort`](super::DatagramPort).
+/// [`DatagramPort`](super::port::DatagramPort).
 ///
 /// Records arrive in the order the driver made them. Each one is numbered as
 /// it is made, so a record dropped for want of room leaves a gap, which the
@@ -114,7 +118,7 @@ impl Default for ObservationConfig {
 /// [`Observer::stats`] counts the losses too, whether or not another record
 /// ever arrives.
 ///
-/// A record keeps its share of the [`ObservationConfig`] limits until it is
+/// A record keeps its share of the [`Config`] limits until it is
 /// dropped, so records the application holds count as well as queued ones.
 /// What the application copies out of them is its own.
 ///
@@ -150,9 +154,9 @@ impl Observer {
     }
 
     /// Returns what the observer has missed so far.
-    pub fn stats(&self) -> ObserverStats {
+    pub fn stats(&self) -> Stats {
         let counters = &self.counters;
-        ObserverStats {
+        Stats {
             lost: counters.lost.load(Ordering::Relaxed),
             lost_bytes: counters.lost_bytes.load(Ordering::Relaxed),
             truncated_bytes: counters.truncated_bytes.load(Ordering::Relaxed),
@@ -177,12 +181,12 @@ impl fmt::Debug for Observer {
 /// Counters saturate at `u64::MAX`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
-pub struct ObserverStats {
+pub struct Stats {
     /// Records dropped because the observer's limits were full.
     pub lost: u64,
     /// The payload and context bytes those records would have copied.
     pub lost_bytes: u64,
-    /// Bytes past [`ObservationConfig::payload`] that records did not copy,
+    /// Bytes past [`Config::payload`] that records did not copy,
     /// when the observer copies payloads.
     pub truncated_bytes: u64,
 }
@@ -395,16 +399,20 @@ pub enum WriteOrigin {
     /// A request sent with [`Endpoint::send_request`], or a response
     /// forwarded with [`Endpoint::forward_response`].
     Send,
-    /// On a [`DatagramPort`](super::DatagramPort), the write of an endpoint
-    /// registered on it, which that endpoint's own observer names `write`.
-    /// The endpoint's records say why it wrote it. This one is the same
-    /// datagram reaching the backend, not a second write.
+    /// On a [`DatagramPort`], the write of an endpoint registered on it,
+    /// which that endpoint's own observer names `write`. The endpoint's
+    /// records say why it wrote it. This one is the same datagram reaching
+    /// the backend, not a second write.
+    ///
+    /// [`DatagramPort`]: super::port::DatagramPort
     Endpoint {
         /// The endpoint's name for the write.
         write: WriteRef,
     },
-    /// On a [`DatagramPort`](super::DatagramPort), a raw send, or a datagram
-    /// forwarded unchanged, whose `cause` is the datagram's own arrival.
+    /// On a [`DatagramPort`], a raw send, or a datagram forwarded unchanged,
+    /// whose `cause` is the datagram's own arrival.
+    ///
+    /// [`DatagramPort`]: super::port::DatagramPort
     Raw,
 }
 
@@ -642,7 +650,7 @@ pub(super) fn attached(tap: &mut Option<Tap>) -> Option<&Tap> {
 
 /// Makes the tap and the observer of `config`.
 pub(super) fn pair(
-    config: ObservationConfig,
+    config: Config,
     attached: Arc<AtomicBool>,
 ) -> (Tap, Observer) {
     let (records, receiver) = mpsc::unbounded_channel();
@@ -683,10 +691,13 @@ impl Endpoint {
     /// # Example
     ///
     /// ```
-    /// use signa_core::endpoint::{Endpoint, Error, ObservationConfig, Observed};
+    /// use signa_core::endpoint::{
+    ///     Endpoint, Error,
+    ///     observe::{Config, Observed},
+    /// };
     ///
     /// async fn trace(endpoint: &Endpoint) -> Result<(), Error> {
-    ///     let mut observer = endpoint.observe(ObservationConfig::new()).await?;
+    ///     let mut observer = endpoint.observe(Config::new()).await?;
     ///     while let Some(record) = observer.recv().await {
     ///         if record.lost_before() > 0 {
     ///             eprintln!("{} records lost", record.lost_before());
@@ -701,7 +712,7 @@ impl Endpoint {
     #[allow(clippy::manual_async_fn)] // State the Send guarantee.
     pub fn observe(
         &self,
-        config: ObservationConfig,
+        config: Config,
     ) -> impl Future<Output = Result<Observer, Error>> + Send + '_ {
         async move {
             if self.commands.is_closed() {

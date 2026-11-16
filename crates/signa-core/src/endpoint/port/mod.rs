@@ -2,13 +2,17 @@
 Ports that several endpoints share, and what the application decides about
 their datagrams.
 
-[`DatagramPort`] states the contract. Inside, the port's task owns the backend
-through a `Port` with no limits of its own, since the shared write budget
-admits every write before it reaches the task. Each registered endpoint drives
-a `Proxy` as its backend, so its driver and its own `Port` work as over any
-backend, and the application delivers to it straight into the proxy's queue,
-past the port's task.
+A [`DatagramPort`] owns one UDP socket or backend for several endpoints. The
+application receives each datagram through [`Ingress`] and delivers it to an
+endpoint, forwards it unchanged or discards it. [`Capture`] only receives.
+[`DatagramPort`] states the contract, [`Builder`] its limits.
 */
+
+// Inside, the port's task owns the backend through a `Port` with no limits of
+// its own, since the shared write budget admits every write before it reaches
+// the task. Each registered endpoint drives a `Proxy` as its backend, so its
+// driver and its own `Port` work as over any backend, and the application
+// delivers to it straight into the proxy's queue, past the port's task.
 
 use std::{
     collections::HashMap,
@@ -35,13 +39,13 @@ use super::{
     BindError, Error, ShutdownOutcome,
     datagram::{Port, Received},
     driver::{ABANDONED_FLUSH, ReceptionCounters, increment},
-    observe::{self, ObservationConfig, Observer, Tap},
+    observe::{self, Observer, Tap},
     path::{self, PathSelection},
 };
 use crate::{
     message::{Message, error::InvalidMessage},
     transport::{
-        Flow, ReceiveId, Stamp, Stamps, Transport, WriteLimits,
+        Flow, Limits, ReceiveId, Stamp, Stamps, Transport,
         budget::{Budget, Permit},
         datagram::{
             Binding, Capabilities, Datagram, DatagramIo, DatagramWrite, Owner,
@@ -76,7 +80,7 @@ const CLOSING: u8 = 2;
 /// ```no_run
 /// use signa_core::{
 ///     Message,
-///     endpoint::{DatagramPort, Endpoint, PathSelection},
+///     endpoint::{Endpoint, PathSelection, port::DatagramPort},
 /// };
 ///
 /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -106,11 +110,11 @@ const CLOSING: u8 = 2;
 /// # Ok(())
 /// # }
 /// ```
-pub struct PortBuilder {
+pub struct Builder {
     backend: Option<Backend>,
-    write_limits: WriteLimits,
-    ingress_limits: WriteLimits,
-    context_limits: WriteLimits,
+    write_limits: Limits,
+    ingress_limits: Limits,
+    context_limits: Limits,
     decision_deadline: Duration,
     delivery_queue: usize,
     max_registrations: usize,
@@ -121,22 +125,13 @@ enum Backend {
     Io(Box<dyn DatagramIo>),
 }
 
-impl PortBuilder {
-    fn new() -> PortBuilder {
-        PortBuilder {
+impl Builder {
+    fn new() -> Builder {
+        Builder {
             backend: None,
-            write_limits: WriteLimits {
-                messages: 4096,
-                ..WriteLimits::default()
-            },
-            ingress_limits: WriteLimits {
-                messages: 4096,
-                bytes: 16 * 1024 * 1024,
-            },
-            context_limits: WriteLimits {
-                messages: 8192,
-                bytes: 4 * 1024 * 1024,
-            },
+            write_limits: Limits { count: 4096, ..Limits::default() },
+            ingress_limits: Limits { count: 4096, bytes: 16 * 1024 * 1024 },
+            context_limits: Limits { count: 8192, bytes: 4 * 1024 * 1024 },
             decision_deadline: Duration::from_secs(1),
             delivery_queue: 1024,
             max_registrations: 64,
@@ -145,19 +140,19 @@ impl PortBuilder {
 
     /// Binds a UDP socket of the port's own to `addr`.
     ///
-    /// This replaces a backend set with [`PortBuilder::udp_io`].
-    pub fn udp(mut self, addr: SocketAddr) -> PortBuilder {
+    /// This replaces a backend set with [`Builder::udp_io`].
+    pub fn udp(mut self, addr: SocketAddr) -> Builder {
         self.backend = Some(Backend::Bind(addr));
         self
     }
 
-    /// Carries the port's datagrams over `io`, as [`Builder::udp_io`] does
-    /// for an endpoint.
+    /// Carries the port's datagrams over `io`, as
+    /// [`endpoint::Builder::udp_io`] does for an endpoint.
     ///
-    /// This replaces an address set with [`PortBuilder::udp`].
+    /// This replaces an address set with [`Builder::udp`].
     ///
-    /// [`Builder::udp_io`]: super::Builder::udp_io
-    pub fn udp_io(mut self, io: impl DatagramIo) -> PortBuilder {
+    /// [`endpoint::Builder::udp_io`]: super::Builder::udp_io
+    pub fn udp_io(mut self, io: impl DatagramIo) -> Builder {
         self.backend = Some(Backend::Io(Box::new(io)));
         self
     }
@@ -168,33 +163,33 @@ impl PortBuilder {
     /// room for their responses.
     ///
     /// The bytes must hold the backend's largest payload. The default is
-    /// 4096 writes and the default bytes of [`WriteLimits`].
-    pub fn write_limits(mut self, limits: WriteLimits) -> PortBuilder {
+    /// 4096 writes and the default bytes of [`Limits`].
+    pub fn write_limits(mut self, limits: Limits) -> Builder {
         self.write_limits = limits;
         self
     }
 
     /// Bounds the datagrams received and not yet disposed of, by count and
     /// payload and context bytes. A datagram over them is dropped and
-    /// counted in [`PortStats::overflow`].
+    /// counted in [`Stats::overflow`].
     ///
     /// The port copies each datagram's context, but not its payload, which
     /// shares the backend's buffer. A backend that slices payloads out of a
     /// large buffer keeps that buffer alive with them.
     ///
     /// The default is 4096 datagrams and 16 MiB.
-    pub fn ingress_limits(mut self, limits: WriteLimits) -> PortBuilder {
+    pub fn ingress_limits(mut self, limits: Limits) -> Builder {
         self.ingress_limits = limits;
         self
     }
 
     /// Bounds the raw paths alive at once, by count and the bytes they keep,
-    /// as [`Builder::context_limits`] does for an endpoint's paths.
+    /// as [`endpoint::Builder::context_limits`] does for an endpoint's paths.
     ///
     /// The default is 8192 paths and 4 MiB.
     ///
-    /// [`Builder::context_limits`]: super::Builder::context_limits
-    pub fn context_limits(mut self, limits: WriteLimits) -> PortBuilder {
+    /// [`endpoint::Builder::context_limits`]: super::Builder::context_limits
+    pub fn context_limits(mut self, limits: Limits) -> Builder {
         self.context_limits = limits;
         self
     }
@@ -205,7 +200,7 @@ impl PortBuilder {
     /// It is a bound on the application's decision, not a protocol timer,
     /// and the one second default is my choice. A retransmission comes
     /// after T1 (500 ms) at the earliest and is a datagram of its own.
-    pub fn decision_deadline(mut self, deadline: Duration) -> PortBuilder {
+    pub fn decision_deadline(mut self, deadline: Duration) -> Builder {
         self.decision_deadline = deadline;
         self
     }
@@ -215,7 +210,7 @@ impl PortBuilder {
     /// [`Error::is_busy`].
     ///
     /// The default is 1024.
-    pub fn delivery_queue(mut self, datagrams: usize) -> PortBuilder {
+    pub fn delivery_queue(mut self, datagrams: usize) -> Builder {
         self.delivery_queue = datagrams;
         self
     }
@@ -223,7 +218,7 @@ impl PortBuilder {
     /// How many endpoints may be registered on the port at once.
     ///
     /// The default is 64.
-    pub fn max_registrations(mut self, endpoints: usize) -> PortBuilder {
+    pub fn max_registrations(mut self, endpoints: usize) -> Builder {
         self.max_registrations = endpoints;
         self
     }
@@ -248,22 +243,19 @@ impl PortBuilder {
     /// with the task that is to own the backend, not yet started.
     fn build(self) -> Result<(DatagramPort, Ingress, PortTask), BindError> {
         for (reason, value) in [
-            (
-                "write_limits.messages must be positive",
-                self.write_limits.messages,
-            ),
+            ("write_limits.count must be positive", self.write_limits.count),
             ("write_limits.bytes must be positive", self.write_limits.bytes),
             (
-                "ingress_limits.messages must be positive",
-                self.ingress_limits.messages,
+                "ingress_limits.count must be positive",
+                self.ingress_limits.count,
             ),
             (
                 "ingress_limits.bytes must be positive",
                 self.ingress_limits.bytes,
             ),
             (
-                "context_limits.messages must be positive",
-                self.context_limits.messages,
+                "context_limits.count must be positive",
+                self.context_limits.count,
             ),
             (
                 "context_limits.bytes must be positive",
@@ -296,7 +288,7 @@ impl PortBuilder {
         let id = crate::transport::next_id();
         let port = Port::new(
             io,
-            WriteLimits { messages: usize::MAX, bytes: usize::MAX },
+            Limits { count: usize::MAX, bytes: usize::MAX },
             reception.clone(),
             Stamps::in_domain(id),
             id,
@@ -348,21 +340,21 @@ impl PortBuilder {
     ///
     /// # Errors
     ///
-    /// As for [`PortBuilder::intercept`], for the backend.
+    /// As for [`Builder::intercept`], for the backend.
     pub fn capture(self) -> Result<Capture, BindError> {
         let io = open(self.backend)?;
         Ok(Capture { io, reception: Arc::default(), closed: false })
     }
 }
 
-impl fmt::Debug for PortBuilder {
+impl fmt::Debug for Builder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let backend = match &self.backend {
             None => "none".to_owned(),
             Some(Backend::Bind(addr)) => addr.to_string(),
             Some(Backend::Io(io)) => format!("backend at {}", io.local_addr()),
         };
-        f.debug_struct("PortBuilder")
+        f.debug_struct("Builder")
             .field("backend", &backend)
             .field("write_limits", &self.write_limits)
             .field("ingress_limits", &self.ingress_limits)
@@ -405,12 +397,13 @@ fn open(backend: Option<Backend>) -> Result<Box<dyn DatagramIo>, BindError> {
 /// A UDP port that several endpoints share, with the application deciding what
 /// becomes of each datagram before any endpoint sees it.
 ///
-/// An endpoint built with [`Builder::udp`] or [`Builder::udp_io`] owns its
-/// socket or backend, and its driver polls it. A `DatagramPort` owns one
-/// backend for many. [`PortBuilder::intercept`] starts a task of its own that
-/// alone polls the backend, and hands every datagram it receives to the
-/// application through [`Ingress`]. Each [`ReceivedDatagram`] is the original
-/// payload with how it arrived and one disposition:
+/// An endpoint built with [`endpoint::Builder::udp`] or
+/// [`endpoint::Builder::udp_io`] owns its socket or backend, and its driver
+/// polls it. A `DatagramPort` owns one backend for many.
+/// [`Builder::intercept`] starts a task of its own that alone polls the
+/// backend, and hands every datagram it receives to the application through
+/// [`Ingress`]. Each [`ReceivedDatagram`] is the original payload with how it
+/// arrived and one disposition:
 ///
 /// * [`ReceivedDatagram::try_deliver`] gives it to one endpoint registered on
 ///   the port, which receives it as it would from its own socket: parsed, with
@@ -419,18 +412,18 @@ fn open(backend: Option<Backend>) -> Result<Box<dyn DatagramIo>, BindError> {
 ///   [`RawPath`], unchanged, with no SIP processing at all.
 /// * [`ReceivedDatagram::discard`], or dropping it, drops it.
 ///
-/// [`PortBuilder::capture`] makes a receive-only [`Capture`] instead, which can
+/// [`Builder::capture`] makes a receive-only [`Capture`] instead, which can
 /// neither deliver nor send.
 ///
 /// # Endpoints on a port
 ///
-/// [`Builder::port`] registers an endpoint on the port. Each registration has
-/// its own transactions, reception policy and paths, so endpoints for network
-/// domains whose addresses overlap stay apart. A path one endpoint prepared, or
-/// a [`RawPath`] of the port, is refused by every other endpoint
-/// ([`Error::is_stale_path`]). The endpoint's writes go through the port's
-/// task, which numbers them in one sequence with the raw sends, and their
-/// outcomes come back to the endpoint that made them.
+/// [`endpoint::Builder::port`] registers an endpoint on the port. Each
+/// registration has its own transactions, reception policy and paths, so
+/// endpoints for network domains whose addresses overlap stay apart. A path
+/// one endpoint prepared, or a [`RawPath`] of the port, is refused by every
+/// other endpoint ([`Error::is_stale_path`]). The endpoint's writes go
+/// through the port's task, which numbers them in one sequence with the raw
+/// sends, and their outcomes come back to the endpoint that made them.
 ///
 /// A datagram reaches an endpoint through two queues, the port's ingress and
 /// the endpoint's, with the application deciding in between. An endpoint's
@@ -442,21 +435,22 @@ fn open(backend: Option<Backend>) -> Result<Box<dyn DatagramIo>, BindError> {
 ///
 /// The port bounds what it holds for the application and what it writes:
 ///
-/// * [`PortBuilder::ingress_limits`] counts the datagrams between receipt and
+/// * [`Builder::ingress_limits`] counts the datagrams between receipt and
 ///   disposition, with their payload and context bytes. A datagram that finds
-///   it full is dropped and counted in [`PortStats::overflow`]. An application
+///   it full is dropped and counted in [`Stats::overflow`]. An application
 ///   that holds datagrams, or reads them slowly, loses traffic. ACK and CANCEL
 ///   progress is the endpoint's to guarantee once a datagram reaches it, not
 ///   the port's.
-/// * [`PortBuilder::decision_deadline`] bounds how long a datagram can wait for
+/// * [`Builder::decision_deadline`] bounds how long a datagram can wait for
 ///   its disposition. After it the datagram can no longer be delivered or
 ///   forwarded. It still counts against the ingress limits until it is dropped,
 ///   since the application holds its bytes.
-/// * [`PortBuilder::write_limits`] bounds the writes of every endpoint and raw
+/// * [`Builder::write_limits`] bounds the writes of every endpoint and raw
 ///   send together, from admission to completion. An endpoint's own
-///   [`Builder::udp_write_limits`] bounds its share. An endpoint that finds the
-///   port's limits full waits. A raw send is refused once three quarters of
-///   them are taken, so that endpoints keep room for their responses.
+///   [`endpoint::Builder::udp_write_limits`] bounds its share. An endpoint
+///   that finds the port's limits full waits. A raw send is refused once
+///   three quarters of them are taken, so that endpoints keep room for their
+///   responses.
 ///
 /// The endpoints waiting for room are woken together as it frees up, and race
 /// for it. The limits bound how much they contend for, but the port promises
@@ -486,10 +480,10 @@ fn open(backend: Option<Backend>) -> Result<Box<dyn DatagramIo>, BindError> {
 /// a task it does not own. Dropping every [`DatagramPort`] and stopping every
 /// endpoint on it closes the port with five seconds to write what is queued.
 ///
-/// [`Builder::udp`]: super::Builder::udp
-/// [`Builder::udp_io`]: super::Builder::udp_io
-/// [`Builder::port`]: super::Builder::port
-/// [`Builder::udp_write_limits`]: super::Builder::udp_write_limits
+/// [`endpoint::Builder::udp`]: super::Builder::udp
+/// [`endpoint::Builder::udp_io`]: super::Builder::udp_io
+/// [`endpoint::Builder::port`]: super::Builder::port
+/// [`endpoint::Builder::udp_write_limits`]: super::Builder::udp_write_limits
 /// [`Endpoint::shutdown`]: super::Endpoint::shutdown
 ///
 /// Clones are handles to one port. Its task runs while a handle or a registered
@@ -632,7 +626,7 @@ enum Command {
 /// `u64::MAX`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
-pub struct PortStats {
+pub struct Stats {
     /// Datagrams the backend delivered whole.
     pub received: u64,
     /// Datagrams an endpoint took.
@@ -646,7 +640,7 @@ pub struct PortStats {
     pub abandoned: u64,
     /// Datagrams that ended undelivered after their deadline.
     pub expired: u64,
-    /// Datagrams dropped on receipt because [`PortBuilder::ingress_limits`]
+    /// Datagrams dropped on receipt because [`Builder::ingress_limits`]
     /// was full.
     pub overflow: u64,
     /// Datagrams the backend reported truncated.
@@ -657,8 +651,8 @@ pub struct PortStats {
 
 impl DatagramPort {
     /// Returns a builder for a port.
-    pub fn builder() -> PortBuilder {
-        PortBuilder::new()
+    pub fn builder() -> Builder {
+        Builder::new()
     }
 
     /// The address the backend names as its own.
@@ -672,10 +666,10 @@ impl DatagramPort {
     }
 
     /// Returns the counts of what became of the port's datagrams.
-    pub fn stats(&self) -> PortStats {
+    pub fn stats(&self) -> Stats {
         let stats = &self.shared.stats;
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
-        PortStats {
+        Stats {
             received: load(&stats.received),
             delivered: load(&stats.delivered),
             forwarded: load(&stats.forwarded),
@@ -694,7 +688,7 @@ impl DatagramPort {
     /// accepts it.
     ///
     /// The path belongs to the port, not to an endpoint, so every endpoint
-    /// refuses it. It counts against [`PortBuilder::context_limits`] until
+    /// refuses it. It counts against [`Builder::context_limits`] until
     /// its last clone drops.
     ///
     /// # Cancellation
@@ -748,7 +742,7 @@ impl DatagramPort {
     ///
     /// * [`Error::is_stale_path`] for a path of another port.
     /// * [`Error::is_too_large`] for a payload over the backend's maximum.
-    /// * [`Error::is_busy`] when [`PortBuilder::write_limits`] is full.
+    /// * [`Error::is_busy`] when [`Builder::write_limits`] is full.
     /// * [`Error::is_closed`] once the port is closing.
     pub fn send_bytes(
         &self,
@@ -783,12 +777,12 @@ impl DatagramPort {
     /// * [`Error::is_closed`] once the port's task has ended.
     ///
     /// [`Endpoint::observe`]: super::Endpoint::observe
-    /// [`WriteOrigin::Endpoint`]: super::WriteOrigin::Endpoint
-    /// [`WriteOrigin::Raw`]: super::WriteOrigin::Raw
+    /// [`WriteOrigin::Endpoint`]: super::observe::WriteOrigin::Endpoint
+    /// [`WriteOrigin::Raw`]: super::observe::WriteOrigin::Raw
     #[allow(clippy::manual_async_fn)] // State the Send guarantee.
     pub fn observe(
         &self,
-        config: ObservationConfig,
+        config: observe::Config,
     ) -> impl Future<Output = Result<Observer, Error>> + Send + '_ {
         async move {
             if self.commands.is_closed() {
@@ -871,7 +865,8 @@ impl DatagramPort {
         }
     }
 
-    /// Registers an endpoint, for [`Builder::bind`](super::Builder::bind).
+    /// Registers an endpoint, for
+    /// [`endpoint::Builder::bind`](super::Builder::bind).
     pub(super) fn register(&self) -> Result<Registration, BindError> {
         let registration = crate::transport::next_id();
         let (completions, completions_rx) = mpsc::unbounded_channel();
@@ -1572,7 +1567,7 @@ impl PortTask {
 ///
 /// There is one per port. [`Ingress::recv`] ends once the port starts closing
 /// and what it queued has been taken. Dropping it does not stop the port, whose
-/// later datagrams then count as [`PortStats::abandoned`].
+/// later datagrams then count as [`Stats::abandoned`].
 pub struct Ingress {
     receiver: mpsc::UnboundedReceiver<ReceivedDatagram>,
 }
@@ -1606,13 +1601,13 @@ impl fmt::Debug for Ingress {
 /// The payload is the original bytes, which nothing has parsed or changed.
 /// The datagram is not `Clone`. Copying its bytes gives data, not a second
 /// disposition. Delivering, forwarding and discarding consume it, and
-/// dropping it discards it. Each is counted in [`PortStats`]. It holds its
-/// share of [`PortBuilder::ingress_limits`] until then, even after its
+/// dropping it discards it. Each is counted in [`Stats`]. It holds its
+/// share of [`Builder::ingress_limits`] until then, even after its
 /// [deadline](ReceivedDatagram::deadline), since its bytes are still held.
 ///
 /// ```compile_fail
 /// // A datagram has one disposition, so it cannot be cloned into two.
-/// fn twice(datagram: signa_core::endpoint::ReceivedDatagram) {
+/// fn twice(datagram: signa_core::endpoint::port::ReceivedDatagram) {
 ///     let copy = datagram.clone();
 ///     datagram.discard();
 ///     copy.discard();
@@ -1712,7 +1707,7 @@ impl ReceivedDatagram {
     /// * [`Error::is_stale_path`] for an endpoint on another port.
     /// * [`Error::is_expired`] after the deadline.
     /// * [`Error::is_busy`] when the endpoint's
-    ///   [queue](PortBuilder::delivery_queue) is full.
+    ///   [queue](Builder::delivery_queue) is full.
     /// * [`Error::is_closed`] when the endpoint has stopped or the port is
     ///   closing.
     pub fn try_deliver(self, to: &EndpointIngress) -> Result<(), Refused> {
@@ -1750,7 +1745,7 @@ impl ReceivedDatagram {
     /// * [`Error::is_stale_path`] for a path of another port.
     /// * [`Error::is_expired`] after the deadline.
     /// * [`Error::is_too_large`] for a payload over the backend's maximum.
-    /// * [`Error::is_busy`] when [`PortBuilder::write_limits`] is full.
+    /// * [`Error::is_busy`] when [`Builder::write_limits`] is full.
     /// * [`Error::is_closed`] once the port is closing.
     pub fn try_forward(mut self, path: &RawPath) -> Result<RawWrite, Refused> {
         if let Err(error) = self.check(path.binding().port) {
@@ -1914,7 +1909,7 @@ impl fmt::Debug for EndpointIngress {
 /// [`DatagramPort::prepare_path`] makes one. It belongs to the port alone:
 /// every endpoint refuses it, and it is not a [`SendPath`](super::SendPath).
 /// It is invalid once the port closes. Clones share one path, which counts
-/// against [`PortBuilder::context_limits`] until the last drops.
+/// against [`Builder::context_limits`] until the last drops.
 #[derive(Clone)]
 pub struct RawPath(Arc<Path>);
 
@@ -2000,8 +1995,8 @@ impl fmt::Debug for RawWrite {
 /// ```compile_fail
 /// // Capture has no way to send.
 /// fn sends(
-///     capture: &signa_core::endpoint::Capture,
-///     path: &signa_core::endpoint::RawPath,
+///     capture: &signa_core::endpoint::port::Capture,
+///     path: &signa_core::endpoint::port::RawPath,
 /// ) {
 ///     let _ = capture.send_bytes(bytes::Bytes::new(), path);
 /// }
@@ -2010,8 +2005,8 @@ impl fmt::Debug for RawWrite {
 /// ```compile_fail
 /// // A captured datagram cannot be delivered to an endpoint.
 /// fn delivers(
-///     datagram: signa_core::endpoint::CapturedDatagram,
-///     to: &signa_core::endpoint::EndpointIngress,
+///     datagram: signa_core::endpoint::port::CapturedDatagram,
+///     to: &signa_core::endpoint::port::EndpointIngress,
 /// ) {
 ///     let _ = datagram.try_deliver(to);
 /// }
@@ -2071,8 +2066,8 @@ impl Capture {
 
     /// Counts of what the backend could not deliver whole. The other counts
     /// stay zero, since a capture disposes of nothing.
-    pub fn stats(&self) -> PortStats {
-        PortStats {
+    pub fn stats(&self) -> Stats {
+        Stats {
             truncated_datagrams: self
                 .reception
                 .truncated_datagrams
@@ -2081,7 +2076,7 @@ impl Capture {
                 .reception
                 .receive_errors
                 .load(Ordering::Relaxed),
-            ..PortStats::default()
+            ..Stats::default()
         }
     }
 
@@ -2284,7 +2279,7 @@ mod tests {
     /// A port on `backend` whose task the test polls itself, one step at a
     /// time, instead of spawning it.
     fn port(backend: &Backend) -> (DatagramPort, Ingress, PortTask) {
-        PortBuilder::new().udp_io(backend.clone()).build().unwrap()
+        Builder::new().udp_io(backend.clone()).build().unwrap()
     }
 
     /// One turn of the port's task: the commands queued so far, a flush of

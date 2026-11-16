@@ -16,9 +16,9 @@ use signa_core::{
     Request, Response, StatusCode,
     bench::{Flow, reply_driver, tcp, udp},
     endpoint::{
-        Branch, Builder, CancelOutcome, DatagramPort, Endpoint, Error,
-        Incoming, IncomingEvent, ObservationConfig, PathSelection, Reception,
-        ReplyRoute, Responder, Target, ViaMode,
+        Branch, Builder, CancelOutcome, Endpoint, Error, Incoming,
+        IncomingEvent, PathSelection, Reception, ReplyRoute, Responder,
+        Target, ViaMode, observe, port::DatagramPort,
     },
     message::header::{CSEQ, HeaderValue, VIA},
     transaction::Timers,
@@ -159,9 +159,9 @@ pub(super) fn observed_round_trip(c: &mut Criterion) {
         .unwrap();
     let len = request.to_bytes().len() as u64;
     let variants = [
-        ("observed", ObservationConfig::new()),
-        ("captured", ObservationConfig::new().payload(512)),
-        ("full_observer", ObservationConfig::new().records(0)),
+        ("observed", observe::Config::new()),
+        ("captured", observe::Config::new().payload(512)),
+        ("full_observer", observe::Config::new().records(0)),
     ];
 
     for (variant, config) in variants {
@@ -1118,8 +1118,8 @@ pub(super) fn intercepted_round_trip(c: &mut Criterion) {
     // its own.
     let variants = [
         ("", None),
-        ("/observed", Some(ObservationConfig::new())),
-        ("/captured", Some(ObservationConfig::new().payload(512))),
+        ("/observed", Some(observe::Config::new())),
+        ("/captured", Some(observe::Config::new().payload(512))),
     ];
 
     for (variant, config) in variants {

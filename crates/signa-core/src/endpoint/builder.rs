@@ -7,14 +7,14 @@ use std::{fmt, net::SocketAddr, time::Duration};
 use tokio::sync::mpsc;
 
 use super::{
-    BindError, DatagramPort, Endpoint, Incoming,
+    BindError, Endpoint, Incoming,
     driver::{Driver, TCP_INBOUND},
-    port::Registration,
+    port::{DatagramPort, Registration},
 };
 use crate::{
     transaction::Timers,
     transport::{
-        MessageLimits, WriteLimits,
+        Limits, MessageLimits,
         budget::Budget,
         datagram::{Binding, DatagramIo, Owner},
         next_id, tcp, udp,
@@ -93,24 +93,24 @@ pub(super) struct Config {
     pub(super) timers: Timers,
     pub(super) tcp: tcp::Config,
     pub(super) max_pending_requests: usize,
-    pub(super) control_event_limits: WriteLimits,
+    pub(super) control_event_limits: Limits,
     pub(super) max_server_transactions: usize,
     pub(super) max_client_transactions: usize,
     pub(super) max_client_request_bytes: usize,
-    pub(super) client_response_limits: WriteLimits,
-    pub(super) client_response_budget: WriteLimits,
+    pub(super) client_response_limits: Limits,
+    pub(super) client_response_budget: Limits,
     pub(super) max_client_handles: usize,
-    pub(super) udp_write_limits: WriteLimits,
+    pub(super) udp_write_limits: Limits,
     pub(super) max_reply_bytes: usize,
     pub(super) max_server_request_bytes: usize,
     pub(super) max_server_response_bytes: usize,
     pub(super) max_responder_bytes: usize,
     pub(super) max_responder_handles: usize,
-    pub(super) context_limits: WriteLimits,
+    pub(super) context_limits: Limits,
     pub(super) max_outbound_connections: usize,
     pub(super) max_pending_connects: usize,
     pub(super) max_routes: usize,
-    pub(super) fallback_limits: WriteLimits,
+    pub(super) fallback_limits: Limits,
     pub(super) connect_timeout: Duration,
     /// The address the TCP listener is bound to, which `bind` fills in once
     /// the port is known. Client `Via` headers advertise its port.
@@ -124,42 +124,30 @@ impl Default for Config {
             timers: Timers::default(),
             tcp: tcp::Config::default(),
             max_pending_requests: 1024,
-            control_event_limits: WriteLimits {
-                messages: 1024,
+            control_event_limits: Limits {
+                count: 1024,
                 bytes: 16 * 1024 * 1024,
             },
             max_server_transactions: 4096,
             max_client_transactions: 4096,
             max_client_request_bytes: 64 * 1024 * 1024,
-            client_response_limits: WriteLimits {
-                messages: 64,
-                bytes: 1024 * 1024,
-            },
-            client_response_budget: WriteLimits {
-                messages: 4096,
+            client_response_limits: Limits { count: 64, bytes: 1024 * 1024 },
+            client_response_budget: Limits {
+                count: 4096,
                 bytes: 64 * 1024 * 1024,
             },
             max_client_handles: 4096,
-            udp_write_limits: WriteLimits {
-                messages: 1024,
-                ..WriteLimits::default()
-            },
+            udp_write_limits: Limits { count: 1024, ..Limits::default() },
             max_reply_bytes: 64 * 1024 * 1024,
             max_server_request_bytes: 64 * 1024 * 1024,
             max_server_response_bytes: 64 * 1024 * 1024,
             max_responder_bytes: 64 * 1024 * 1024,
             max_responder_handles: 4096,
-            context_limits: WriteLimits {
-                messages: 8192,
-                bytes: 4 * 1024 * 1024,
-            },
+            context_limits: Limits { count: 8192, bytes: 4 * 1024 * 1024 },
             max_outbound_connections: 1024,
             max_pending_connects: 64,
             max_routes: 4096,
-            fallback_limits: WriteLimits {
-                messages: 64,
-                bytes: 8 * 1024 * 1024,
-            },
+            fallback_limits: Limits { count: 64, bytes: 8 * 1024 * 1024 },
             connect_timeout: Duration::from_secs(10),
             tcp_listener: None,
         }
@@ -396,7 +384,7 @@ impl Builder {
     /// dropped and counted by [`Endpoint::connection_stats`].
     ///
     /// [`Endpoint::connection_stats`]: super::Endpoint::connection_stats
-    pub fn fallback_limits(mut self, limits: WriteLimits) -> Builder {
+    pub fn fallback_limits(mut self, limits: Limits) -> Builder {
         self.config.fallback_limits = limits;
         self
     }
@@ -424,14 +412,14 @@ impl Builder {
     /// # Example
     ///
     /// ```
-    /// use signa_core::{endpoint::Endpoint, transport::WriteLimits};
-    /// let builder = Endpoint::builder().tcp_write_limits(WriteLimits {
-    ///     messages: 128,
+    /// use signa_core::{endpoint::Endpoint, transport::Limits};
+    /// let builder = Endpoint::builder().tcp_write_limits(Limits {
+    ///     count: 128,
     ///     bytes: 16 * 1024 * 1024,
     /// });
     /// # drop(builder);
     /// ```
-    pub fn tcp_write_limits(mut self, limits: WriteLimits) -> Builder {
+    pub fn tcp_write_limits(mut self, limits: Limits) -> Builder {
         self.config.tcp.write_limits = limits;
         self
     }
@@ -451,14 +439,14 @@ impl Builder {
     /// # Example
     ///
     /// ```
-    /// use signa_core::{endpoint::Endpoint, transport::WriteLimits};
-    /// let builder = Endpoint::builder().udp_write_limits(WriteLimits {
-    ///     messages: 512,
+    /// use signa_core::{endpoint::Endpoint, transport::Limits};
+    /// let builder = Endpoint::builder().udp_write_limits(Limits {
+    ///     count: 512,
     ///     bytes: 4 * 1024 * 1024,
     /// });
     /// # drop(builder);
     /// ```
-    pub fn udp_write_limits(mut self, limits: WriteLimits) -> Builder {
+    pub fn udp_write_limits(mut self, limits: Limits) -> Builder {
         self.config.udp_write_limits = limits;
         self
     }
@@ -524,7 +512,7 @@ impl Builder {
     /// 503.
     ///
     /// The default is 1024 messages and 16 MiB. Both must be positive.
-    pub fn control_event_limits(mut self, limits: WriteLimits) -> Builder {
+    pub fn control_event_limits(mut self, limits: Limits) -> Builder {
         self.config.control_event_limits = limits;
         self
     }
@@ -556,7 +544,7 @@ impl Builder {
     /// [`SendPath`]: super::SendPath
     /// [`Endpoint::prepare_path`]: super::Endpoint::prepare_path
     /// [`Error::is_busy`]: super::Error::is_busy
-    pub fn context_limits(mut self, limits: WriteLimits) -> Builder {
+    pub fn context_limits(mut self, limits: Limits) -> Builder {
         self.config.context_limits = limits;
         self
     }
@@ -708,7 +696,7 @@ impl Builder {
     /// The default is 64 messages and 1 MiB. Both values must be positive.
     /// Overflow keeps the queued responses and then delivers one terminal
     /// error on [`Responses`](super::Responses).
-    pub fn client_response_limits(mut self, limits: WriteLimits) -> Builder {
+    pub fn client_response_limits(mut self, limits: Limits) -> Builder {
         self.config.client_response_limits = limits;
         self
     }
@@ -720,7 +708,7 @@ impl Builder {
     /// Shared `Bytes` backing allocations and application `Extensions` are not
     /// measured. A stateless endpoint has no response streams, and bounds the
     /// responses waiting in [`Incoming`] with this instead.
-    pub fn client_response_budget(mut self, limits: WriteLimits) -> Builder {
+    pub fn client_response_budget(mut self, limits: Limits) -> Builder {
         self.config.client_response_budget = limits;
         self
     }
@@ -794,8 +782,8 @@ impl Builder {
                 self.config.max_pending_requests,
             ),
             (
-                "control_event_limits.messages must be positive",
-                self.config.control_event_limits.messages,
+                "control_event_limits.count must be positive",
+                self.config.control_event_limits.count,
             ),
             (
                 "control_event_limits.bytes must be positive",
@@ -822,24 +810,24 @@ impl Builder {
                 self.config.max_client_handles,
             ),
             (
-                "context_limits.messages must be positive",
-                self.config.context_limits.messages,
+                "context_limits.count must be positive",
+                self.config.context_limits.count,
             ),
             (
                 "context_limits.bytes must be positive",
                 self.config.context_limits.bytes,
             ),
             (
-                "client_response_limits.messages must be positive",
-                self.config.client_response_limits.messages,
+                "client_response_limits.count must be positive",
+                self.config.client_response_limits.count,
             ),
             (
                 "client_response_limits.bytes must be positive",
                 self.config.client_response_limits.bytes,
             ),
             (
-                "client_response_budget.messages must be positive",
-                self.config.client_response_budget.messages,
+                "client_response_budget.count must be positive",
+                self.config.client_response_budget.count,
             ),
             (
                 "client_response_budget.bytes must be positive",
@@ -929,8 +917,8 @@ impl Builder {
             client_response_budget: Budget::new(
                 self.config.client_response_budget,
             ),
-            client_handles: Budget::new(WriteLimits {
-                messages: self.config.max_client_handles,
+            client_handles: Budget::new(Limits {
+                count: self.config.max_client_handles,
                 bytes: usize::MAX,
             }),
             client_response_limits: self.config.client_response_limits,

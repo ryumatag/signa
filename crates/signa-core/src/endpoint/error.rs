@@ -197,7 +197,7 @@ impl Error {
     /// write did not go out.
     ///
     /// [`Error::source`]: error::Error::source
-    /// [`DatagramPort`]: super::DatagramPort
+    /// [`DatagramPort`]: super::port::DatagramPort
     pub fn is_outcome_unknown(&self) -> bool {
         matches!(self.kind, Kind::OutcomeUnknown(_))
     }
@@ -213,7 +213,7 @@ impl Error {
     /// only when it is over the backend's
     /// [`max_payload`](crate::transport::datagram::Capabilities::max_payload).
     ///
-    /// [`DatagramPort`]: super::DatagramPort
+    /// [`DatagramPort`]: super::port::DatagramPort
     pub fn is_too_large(&self) -> bool {
         matches!(self.kind, Kind::TooLarge(_) | Kind::OverPayload { .. })
     }
@@ -310,7 +310,7 @@ impl Error {
     /// Through a [`DatagramPort`] it also means the port is closing, or the
     /// endpoint a datagram was delivered to has stopped.
     ///
-    /// [`DatagramPort`]: super::DatagramPort
+    /// [`DatagramPort`]: super::port::DatagramPort
     pub fn is_closed(&self) -> bool {
         matches!(self.kind, Kind::Closed)
     }
@@ -318,7 +318,7 @@ impl Error {
     /// Returns `true` if a [`ReceivedDatagram`]'s decision deadline has
     /// passed, so that it can no longer be delivered or forwarded.
     ///
-    /// [`ReceivedDatagram`]: super::ReceivedDatagram
+    /// [`ReceivedDatagram`]: super::port::ReceivedDatagram
     pub fn is_expired(&self) -> bool {
         matches!(self.kind, Kind::Expired)
     }
@@ -500,16 +500,16 @@ impl BindError {
     /// Returns `true` if the [`DatagramPort`] the endpoint would share takes
     /// no new endpoints, as it is quiesced or closing.
     ///
-    /// [`DatagramPort`]: super::DatagramPort
+    /// [`DatagramPort`]: super::port::DatagramPort
     pub fn is_closed(&self) -> bool {
         matches!(self.kind, BindKind::PortClosed)
     }
 
     /// Returns `true` if the [`DatagramPort`] the endpoint would share has as
-    /// many endpoints as [`PortBuilder::max_registrations`] lets it.
+    /// many endpoints as [`port::Builder::max_registrations`] lets it.
     ///
-    /// [`DatagramPort`]: super::DatagramPort
-    /// [`PortBuilder::max_registrations`]: super::PortBuilder::max_registrations
+    /// [`DatagramPort`]: super::port::DatagramPort
+    /// [`port::Builder::max_registrations`]: super::port::Builder::max_registrations
     pub fn is_busy(&self) -> bool {
         matches!(self.kind, BindKind::PortFull)
     }

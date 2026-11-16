@@ -1035,7 +1035,7 @@ mod integration {
             tests::{route_request, route_response},
         },
         message::header::{HeaderValue, TO, VIA},
-        transport::WriteLimits,
+        transport::Limits,
     };
 
     async fn udp(builder: Builder) -> (Endpoint, Incoming, UdpSocket) {
@@ -1248,7 +1248,7 @@ mod integration {
     #[tokio::test]
     async fn transport_quota_rejection_does_not_commit_a_final_response() {
         let (endpoint, mut incoming, peer) = udp(Endpoint::builder()
-            .udp_write_limits(WriteLimits { messages: 1, bytes: 1 }))
+            .udp_write_limits(Limits { count: 1, bytes: 1 }))
         .await;
         send(&peer, &endpoint, "quota").await;
         let envelope = request(&mut incoming).await;
@@ -1283,7 +1283,7 @@ mod integration {
             .unwrap();
         let (endpoint, mut incoming, peer) = udp(Endpoint::builder()
             .timers(timers)
-            .udp_write_limits(WriteLimits { messages: 1, bytes: 1 }))
+            .udp_write_limits(Limits { count: 1, bytes: 1 }))
         .await;
         send(&peer, &endpoint, "saturated").await;
         let envelope = request(&mut incoming).await;
@@ -1663,10 +1663,10 @@ mod integration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{endpoint::table::Table, transport::WriteLimits};
+    use crate::{endpoint::table::Table, transport::Limits};
 
     fn observed() -> (Arc<Shared>, ServerEvents, Budget) {
-        let budget = Budget::new(WriteLimits { messages: 1, bytes: 1 });
+        let budget = Budget::new(Limits { count: 1, bytes: 1 });
         let permit = budget.acquire(1).unwrap();
         let slot = Table::new().insert(1u8, ());
         let (observation, receiver) = watch::channel(Observation::default());

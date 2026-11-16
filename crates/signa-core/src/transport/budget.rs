@@ -12,20 +12,20 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use super::WriteLimits;
+use super::Limits;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Budget(Arc<Capacity>);
 
 #[derive(Debug)]
 struct Capacity {
-    limits: WriteLimits,
+    limits: Limits,
     messages: AtomicUsize,
     bytes: AtomicUsize,
 }
 
 impl Budget {
-    pub(crate) fn new(limits: WriteLimits) -> Budget {
+    pub(crate) fn new(limits: Limits) -> Budget {
         Budget(Arc::new(Capacity {
             limits,
             messages: AtomicUsize::new(0),
@@ -50,9 +50,9 @@ impl Budget {
     fn acquire_with_limits(
         &self,
         bytes: usize,
-        limits: WriteLimits,
+        limits: Limits,
     ) -> Option<Permit> {
-        reserve(&self.0.messages, 1, limits.messages)?;
+        reserve(&self.0.messages, 1, limits.count)?;
         let mut permit = Permit { budget: self.clone(), bytes: 0 };
         reserve(&self.0.bytes, bytes, limits.bytes)?;
         permit.bytes = bytes;
@@ -60,9 +60,9 @@ impl Budget {
     }
 }
 
-pub(crate) fn request_limits(limits: WriteLimits) -> WriteLimits {
-    WriteLimits {
-        messages: limits.messages - limits.messages / 4,
+pub(crate) fn request_limits(limits: Limits) -> Limits {
+    Limits {
+        count: limits.count - limits.count / 4,
         bytes: limits.bytes - limits.bytes / 4,
     }
 }
@@ -123,7 +123,7 @@ mod tests {
 
     #[test]
     fn byte_rejection_rolls_back_the_message_and_drop_returns_both() {
-        let budget = Budget::new(WriteLimits { messages: 2, bytes: 3 });
+        let budget = Budget::new(Limits { count: 2, bytes: 3 });
         let first = budget.acquire(3).unwrap();
 
         assert!(budget.acquire(1).is_none());
@@ -139,7 +139,7 @@ mod tests {
 
     #[test]
     fn resize_keeps_the_slot_and_failed_growth_keeps_the_bytes() {
-        let budget = Budget::new(WriteLimits { messages: 1, bytes: 10 });
+        let budget = Budget::new(Limits { count: 1, bytes: 10 });
         let mut permit = budget.acquire(6).unwrap();
         assert_eq!(permit.resize(10), Some(()));
         assert_eq!(permit.resize(11), None);
@@ -154,10 +154,9 @@ mod tests {
 
     #[test]
     fn zero_and_overflow_never_reserve_unavailable_capacity() {
-        let budget =
-            Budget::new(WriteLimits { messages: 0, bytes: usize::MAX });
+        let budget = Budget::new(Limits { count: 0, bytes: usize::MAX });
         assert!(budget.acquire(0).is_none());
-        let budget = Budget::new(WriteLimits { messages: 1, bytes: 0 });
+        let budget = Budget::new(Limits { count: 1, bytes: 0 });
         assert!(budget.acquire(1).is_none());
         assert!(budget.acquire(0).is_some());
         let counter = AtomicUsize::new(usize::MAX);
@@ -167,7 +166,7 @@ mod tests {
 
     #[test]
     fn concurrent_reservations_stay_bounded_and_leave_no_charge() {
-        let budget = Budget::new(WriteLimits { messages: 4, bytes: 9 });
+        let budget = Budget::new(Limits { count: 4, bytes: 9 });
         let threads: Vec<_> = (0..8)
             .map(|_| {
                 let budget = budget.clone();

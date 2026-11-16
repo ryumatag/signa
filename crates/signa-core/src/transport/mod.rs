@@ -1,7 +1,7 @@
 /*!
 Transport metadata and message/write limits.
 
-[`Flow`], [`Transport`], [`ReceiveId`], [`MessageLimits`] and [`WriteLimits`]
+[`Flow`], [`Transport`], [`ReceiveId`], [`MessageLimits`] and [`Limits`]
 are runtime independent, and so is the [`datagram`] contract that lets
 another backend carry an endpoint's UDP datagrams. Socket I/O and stream framing remain
 implementation details used by the endpoint. TCP connections are framed by Content-Length before messages
@@ -62,26 +62,30 @@ impl Default for MessageLimits {
     }
 }
 
-/// Outstanding writes on one TCP connection or an endpoint's UDP socket.
+/// How many items something may hold at once, and how many bytes they may
+/// take together.
 ///
-/// Both limits include writes already taken from the queue but not yet fully
-/// written to the local socket. Bytes count the complete encoded messages,
-/// including headers. Capacity is returned at completion or teardown, even
-/// when the caller drops its completion future. This does not cap shared
-/// backing allocations or buffers owned by the operating system.
+/// The setting that takes it says what an item is: an outstanding write, a
+/// queued response or event, a copied transport context, a held datagram or
+/// an observation record. Outstanding writes include those already taken
+/// from the queue but not yet fully written, and their bytes are the complete
+/// encoded messages, headers included. Capacity comes back when an item is
+/// done with, such as at a write's completion or teardown, even when the
+/// caller drops its future. This does not cap shared backing allocations or
+/// buffers owned by the operating system.
 #[derive(Clone, Copy, Debug)]
-pub struct WriteLimits {
-    /// The most simultaneous writes. Zero refuses every write.
-    pub messages: usize,
-    /// The aggregate encoded bytes. Zero allows only empty writes.
+pub struct Limits {
+    /// The most items at once. Zero refuses every item.
+    pub count: usize,
+    /// The most bytes the items take together. Zero allows only empty items.
     pub bytes: usize,
 }
 
-impl Default for WriteLimits {
-    /// Allows 64 outstanding writes and 8 MiB per TCP connection.
-    /// The endpoint uses 1024 writes and 8 MiB for its UDP socket by default.
-    fn default() -> WriteLimits {
-        WriteLimits { messages: 64, bytes: 8 * 1024 * 1024 }
+impl Default for Limits {
+    /// Allows 64 items and 8 MiB, the outstanding writes of one TCP
+    /// connection. Each setting that takes limits states its own default.
+    fn default() -> Limits {
+        Limits { count: 64, bytes: 8 * 1024 * 1024 }
     }
 }
 

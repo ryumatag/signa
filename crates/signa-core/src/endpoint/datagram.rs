@@ -40,7 +40,7 @@ use super::{
     server::WriteObservation,
 };
 use crate::transport::{
-    Flow, ReceiveId, Stamp, Stamps, Transport, WriteLimits,
+    Flow, Limits, ReceiveId, Stamp, Stamps, Transport,
     datagram::{
         DatagramIo, DatagramWrite, Path, RecvError, Submit, TransportContext,
         WriteId, WriteOutcome,
@@ -57,7 +57,7 @@ pub(super) struct Port {
     io: Box<dyn DatagramIo>,
     local: SocketAddr,
     max_payload: usize,
-    limits: WriteLimits,
+    limits: Limits,
     /// Writes the backend has not accepted yet, oldest first.
     backlog: VecDeque<Queued>,
     /// Accepted writes waiting for their completion. A map rather than a
@@ -146,7 +146,7 @@ enum Started {
 impl Port {
     pub(super) fn new(
         io: Box<dyn DatagramIo>,
-        limits: WriteLimits,
+        limits: Limits,
         counters: Arc<ReceptionCounters>,
         stamps: Stamps,
         domain: u64,
@@ -231,8 +231,8 @@ impl Port {
         self.admit(bytes, self.limits)
     }
 
-    fn admit(&self, bytes: usize, limits: WriteLimits) -> io::Result<()> {
-        if self.writes >= limits.messages
+    fn admit(&self, bytes: usize, limits: Limits) -> io::Result<()> {
+        if self.writes >= limits.count
             || self
                 .bytes
                 .checked_add(bytes)
@@ -253,7 +253,7 @@ impl Port {
         &mut self,
         bytes: Bytes,
         link: &Link,
-        limits: WriteLimits,
+        limits: Limits,
         note: Note,
     ) -> Started {
         // Cloning the path is a reference count, and only for a backend that
@@ -285,7 +285,7 @@ impl Port {
         source: SocketAddr,
         destination: SocketAddr,
         path: Option<Arc<Path>>,
-        limits: WriteLimits,
+        limits: Limits,
         gate: Option<&Withdrawal>,
         note: Option<Note>,
     ) -> Started {
@@ -1064,7 +1064,7 @@ mod tests {
         }
     }
 
-    fn port(script: &Script, limits: WriteLimits) -> Port {
+    fn port(script: &Script, limits: Limits) -> Port {
         Port::new(
             Box::new(script.clone()),
             limits,
@@ -1097,7 +1097,7 @@ mod tests {
             link,
             commands,
             capacity.clone(),
-            Budget::new(WriteLimits::default()),
+            Budget::new(Limits::default()),
         );
         let response = route_response(&request);
 
@@ -1127,7 +1127,7 @@ mod tests {
     #[test]
     fn a_write_the_backend_finishes_at_once_needs_no_queue() {
         let script = Script::default();
-        let mut port = port(&script, WriteLimits::default());
+        let mut port = port(&script, Limits::default());
 
         port.send(&Bytes::from_static(b"hello"), &LINK, NOTE).unwrap();
 
@@ -1138,7 +1138,7 @@ mod tests {
     #[test]
     fn a_held_write_waits_in_order_and_keeps_its_budget() {
         let script = Script::default();
-        let mut port = port(&script, WriteLimits { messages: 2, bytes: 10 });
+        let mut port = port(&script, Limits { count: 2, bytes: 10 });
         script.mode(Mode::Hold);
 
         port.send(&Bytes::from_static(b"first"), &LINK, NOTE).unwrap();
@@ -1170,7 +1170,7 @@ mod tests {
     #[test]
     fn new_requests_leave_udp_capacity_for_transaction_output() {
         let script = Script::default();
-        let mut port = port(&script, WriteLimits { messages: 4, bytes: 8 });
+        let mut port = port(&script, Limits { count: 4, bytes: 8 });
         script.mode(Mode::Hold);
 
         port.send(&Bytes::from_static(b"123456"), &LINK, NOTE).unwrap();
@@ -1191,7 +1191,7 @@ mod tests {
     #[test]
     fn even_an_immediate_datagram_must_fit_its_budget() {
         let script = Script::default();
-        let mut port = port(&script, WriteLimits { messages: 1, bytes: 2 });
+        let mut port = port(&script, Limits { count: 1, bytes: 2 });
 
         assert_eq!(
             port.send(&Bytes::from_static(b"abc"), &LINK, NOTE)
@@ -1207,7 +1207,7 @@ mod tests {
     #[test]
     fn a_payload_over_the_backend_maximum_fails_before_submission() {
         let script = Script::default();
-        let mut port = port(&script, WriteLimits::default());
+        let mut port = port(&script, Limits::default());
 
         let error =
             port.send(&Bytes::from(vec![0; 1001]), &LINK, NOTE).unwrap_err();
@@ -1220,7 +1220,7 @@ mod tests {
     #[test]
     fn a_rejected_write_fails_now_and_frees_its_budget() {
         let script = Script::default();
-        let mut port = port(&script, WriteLimits { messages: 1, bytes: 8 });
+        let mut port = port(&script, Limits { count: 1, bytes: 8 });
         script.mode(Mode::Reject);
 
         let error =
@@ -1233,7 +1233,7 @@ mod tests {
     #[tokio::test]
     async fn queued_client_write_failure_reaches_its_receipt() {
         let script = Script::default();
-        let mut port = port(&script, WriteLimits::default());
+        let mut port = port(&script, Limits::default());
         script.mode(Mode::Hold);
 
         let receipt = port
@@ -1263,7 +1263,7 @@ mod tests {
     #[tokio::test]
     async fn a_write_ends_once_however_often_it_is_reported() {
         let script = Script::default();
-        let mut port = port(&script, WriteLimits::default());
+        let mut port = port(&script, Limits::default());
         script.mode(Mode::Accept);
         let receipt = port
             .submit_client(&Bytes::from_static(b"request"), &LINK, true, NOTE)
@@ -1288,7 +1288,7 @@ mod tests {
     #[test]
     fn an_immediate_client_write_needs_no_receipt() {
         let script = Script::default();
-        let mut port = port(&script, WriteLimits::default());
+        let mut port = port(&script, Limits::default());
 
         let receipt = port
             .submit_client(&Bytes::from_static(b"request"), &LINK, true, NOTE)
@@ -1300,7 +1300,7 @@ mod tests {
     #[tokio::test]
     async fn a_rejected_queued_reply_reports_its_io_error() {
         let script = Script::default();
-        let mut port = port(&script, WriteLimits::default());
+        let mut port = port(&script, Limits::default());
         let (route, response, mut commands, capacity) = route();
         script.mode(Mode::Hold);
 
@@ -1321,7 +1321,7 @@ mod tests {
     #[tokio::test]
     async fn a_reply_waits_for_its_completion_not_its_acceptance() {
         let script = Script::default();
-        let mut port = port(&script, WriteLimits::default());
+        let mut port = port(&script, Limits::default());
         let (route, response, mut commands, capacity) = route();
         script.mode(Mode::Accept);
 
@@ -1344,7 +1344,7 @@ mod tests {
     #[tokio::test]
     async fn queued_reply_survives_a_dropped_waiter() {
         let script = Script::default();
-        let mut port = port(&script, WriteLimits::default());
+        let mut port = port(&script, Limits::default());
         let (route, response, mut commands, capacity) = route();
         let expected = response.to_bytes();
         script.mode(Mode::Hold);
@@ -1365,7 +1365,7 @@ mod tests {
     #[test]
     fn unknown_and_repeated_completions_are_ignored() {
         let script = Script::default();
-        let mut port = port(&script, WriteLimits::default());
+        let mut port = port(&script, Limits::default());
         script.mode(Mode::Accept);
         port.send(&Bytes::from_static(b"abc"), &LINK, NOTE).unwrap();
         let id = script.accepted()[0];
@@ -1381,7 +1381,7 @@ mod tests {
     #[test]
     fn abort_drops_held_writes_and_close_collects_the_rest() {
         let script = Script::default();
-        let mut port = port(&script, WriteLimits::default());
+        let mut port = port(&script, Limits::default());
         script.mode(Mode::Accept);
         let accepted = port
             .submit_client(
@@ -1432,7 +1432,7 @@ mod tests {
     #[test]
     fn a_close_that_finishes_every_write_loses_nothing() {
         let script = Script::default();
-        let mut port = port(&script, WriteLimits::default());
+        let mut port = port(&script, Limits::default());
         script.mode(Mode::Accept);
         port.send(&Bytes::from_static(b"accepted"), &LINK, NOTE).unwrap();
         script.0.lock().unwrap().on_close =
@@ -1451,8 +1451,7 @@ mod tests {
     #[test]
     fn a_write_that_never_completes_holds_only_itself() {
         let script = Script::default();
-        let mut port =
-            port(&script, WriteLimits { messages: 1024, bytes: 1 << 20 });
+        let mut port = port(&script, Limits { count: 1024, bytes: 1 << 20 });
         script.mode(Mode::Accept);
         for _ in 0..100 {
             port.send(&Bytes::from_static(b"abc"), &LINK, NOTE).unwrap();
@@ -1485,7 +1484,7 @@ mod tests {
     #[test]
     fn a_flush_replaces_the_noop_waker_of_an_immediate_attempt() {
         let script = Script::default();
-        let mut port = port(&script, WriteLimits::default());
+        let mut port = port(&script, Limits::default());
         let waker = Waker::from(Arc::new(Counter::default()));
         let mut cx = Context::from_waker(&waker);
 
@@ -1543,7 +1542,7 @@ mod tests {
     #[test]
     fn receive_discards_and_counts_what_is_not_a_whole_datagram() {
         let script = Script::default();
-        let mut port = port(&script, WriteLimits::default());
+        let mut port = port(&script, Limits::default());
         let mut cx = Context::from_waker(Waker::noop());
         script.receive(Err(RecvError::Truncated));
         script.receive(Ok(Datagram::new(

@@ -27,16 +27,19 @@ use quickcheck::{Arbitrary, Gen, QuickCheck};
 use signa_core::{
     Message, Request, Response,
     endpoint::{
-        CancelOutcome, DatagramPort, Endpoint, Error, Incoming, IncomingEvent,
-        Ingress, ObservationConfig, Observed, Observer, ObserverStats,
-        PathSelection, PortStats, RawPath, ReceivedDatagram, ReceivedResponse,
-        Reception, Record, ServerEvent, ServerRequest, ShutdownOutcome,
-        Target, ViaMode, WriteOrigin, WriteRef, WriteResult,
+        CancelOutcome, Endpoint, Error, Incoming, IncomingEvent,
+        PathSelection, ReceivedResponse, Reception, ServerEvent,
+        ServerRequest, ShutdownOutcome, Target, ViaMode,
+        observe::{
+            self, Observed, Observer, Record, WriteOrigin, WriteRef,
+            WriteResult,
+        },
+        port::{self, DatagramPort, Ingress, RawPath, ReceivedDatagram},
     },
     message::header::{Tag, VIA},
     transaction::Timers,
     transport::{
-        Flow, Transport, WriteLimits,
+        Flow, Limits, Transport,
         datagram::{
             Capabilities, Datagram, DatagramIo, DatagramWrite,
             MAX_CONTEXT_LEN, RecvError, Submit, TransportContext, WriteId,
@@ -692,7 +695,7 @@ async fn a_held_wire_fills_the_write_limits() {
     let wire = Wire::default();
     let (endpoint, _incoming) = Endpoint::builder()
         .udp_io(wire.clone())
-        .udp_write_limits(WriteLimits { messages: 2, bytes: 64 * 1024 })
+        .udp_write_limits(Limits { count: 2, bytes: 64 * 1024 })
         .bind()
         .unwrap();
     wire.writes(Writes::Hold);
@@ -1094,7 +1097,7 @@ async fn kept_contexts_are_bounded_for_their_lifetime() {
     let (_endpoint, mut incoming) = Endpoint::builder()
         .udp_io(wire.clone())
         .timers(timers)
-        .context_limits(WriteLimits { messages: 4, bytes: 64 * 1024 })
+        .context_limits(Limits { count: 4, bytes: 64 * 1024 })
         .bind()
         .unwrap();
 
@@ -1448,7 +1451,7 @@ async fn control_messages_keep_a_share_of_the_context_limits() {
     let wire = Wire::default();
     let (endpoint, mut incoming) = Endpoint::builder()
         .udp_io(wire.clone())
-        .context_limits(WriteLimits { messages: 4, bytes: 64 * 1024 })
+        .context_limits(Limits { count: 4, bytes: 64 * 1024 })
         .bind()
         .unwrap();
 
@@ -1486,7 +1489,7 @@ async fn a_path_is_counted_until_nothing_holds_it() {
     let (endpoint, _incoming) = Endpoint::builder()
         .udp_io(wire.clone())
         .timers(timers)
-        .context_limits(WriteLimits { messages: 4, bytes: 64 * 1024 })
+        .context_limits(Limits { count: 4, bytes: 64 * 1024 })
         .bind()
         .unwrap();
     let prepare = || {
@@ -2028,7 +2031,7 @@ async fn a_delivered_datagram_is_received_and_answered_by_its_endpoint() {
 }
 
 /// Waits until the port's counts satisfy `done`.
-async fn stats_until(port: &DatagramPort, done: impl Fn(PortStats) -> bool) {
+async fn stats_until(port: &DatagramPort, done: impl Fn(port::Stats) -> bool) {
     timeout(Duration::from_secs(2), async {
         while !done(port.stats()) {
             yield_now().await;
@@ -2195,7 +2198,7 @@ async fn an_expired_datagram_is_refused_but_still_counted() {
     let wire = Wire::default();
     let (port, mut ingress) = DatagramPort::builder()
         .udp_io(wire.clone())
-        .ingress_limits(WriteLimits { messages: 1, bytes: 64 * 1024 })
+        .ingress_limits(Limits { count: 1, bytes: 64 * 1024 })
         .decision_deadline(Duration::from_millis(500))
         .intercept()
         .unwrap();
@@ -2233,7 +2236,7 @@ async fn a_slow_classifier_loses_what_is_beyond_the_ingress_limits() {
     let wire = Wire::default();
     let (port, mut ingress) = DatagramPort::builder()
         .udp_io(wire.clone())
-        .ingress_limits(WriteLimits { messages: 2, bytes: 64 * 1024 })
+        .ingress_limits(Limits { count: 2, bytes: 64 * 1024 })
         .intercept()
         .unwrap();
 
@@ -2801,10 +2804,7 @@ fn every_datagram_ends_once_and_gives_back_its_share() {
             let wire = Wire::default();
             let (port, mut ingress) = DatagramPort::builder()
                 .udp_io(wire.clone())
-                .ingress_limits(WriteLimits {
-                    messages: LIMIT,
-                    bytes: 64 * 1024,
-                })
+                .ingress_limits(Limits { count: LIMIT, bytes: 64 * 1024 })
                 .decision_deadline(Duration::from_millis(500))
                 .intercept()
                 .unwrap();
@@ -3104,7 +3104,7 @@ async fn a_forced_stop_leaves_the_port_to_the_other_endpoints() {
 fn the_port_s_write_limits_must_hold_a_whole_payload() {
     let refused = DatagramPort::builder()
         .udp_io(Wire::default())
-        .write_limits(WriteLimits { messages: 16, bytes: 1000 })
+        .write_limits(Limits { count: 16, bytes: 1000 })
         .intercept()
         .unwrap_err();
 
@@ -3118,7 +3118,7 @@ async fn endpoints_wait_for_room_in_the_port_s_limits() {
     let wire = Wire::default();
     let (port, _ingress) = DatagramPort::builder()
         .udp_io(wire.clone())
-        .write_limits(WriteLimits { messages: 1, bytes: 64 * 1024 })
+        .write_limits(Limits { count: 1, bytes: 64 * 1024 })
         .intercept()
         .unwrap();
     let (a, _a_incoming) = Endpoint::builder().port(&port).bind().unwrap();
@@ -3146,7 +3146,7 @@ async fn a_refused_raw_send_does_not_hold_back_a_waiting_endpoint() {
     let wire = Wire::default();
     let (port, _ingress) = DatagramPort::builder()
         .udp_io(wire.clone())
-        .write_limits(WriteLimits { messages: 1, bytes: 1472 })
+        .write_limits(Limits { count: 1, bytes: 1472 })
         .intercept()
         .unwrap();
     let (a, _a_incoming) = Endpoint::builder().port(&port).bind().unwrap();
@@ -3180,7 +3180,7 @@ async fn endpoints_on_several_threads_share_the_port_s_limits() {
     let wire = Wire::default();
     let (port, _ingress) = DatagramPort::builder()
         .udp_io(wire.clone())
-        .write_limits(WriteLimits { messages: 2, bytes: 64 * 1024 })
+        .write_limits(Limits { count: 2, bytes: 64 * 1024 })
         .intercept()
         .unwrap();
     let mut endpoints = Vec::new();
@@ -3209,7 +3209,7 @@ async fn raw_sends_leave_endpoints_room() {
     let wire = Wire::default();
     let (port, _ingress) = DatagramPort::builder()
         .udp_io(wire.clone())
-        .write_limits(WriteLimits { messages: 4, bytes: 64 * 1024 })
+        .write_limits(Limits { count: 4, bytes: 64 * 1024 })
         .intercept()
         .unwrap();
     let (endpoint, _incoming) =
@@ -3345,7 +3345,7 @@ async fn a_response_never_arrives_without_its_context() {
     let wire = Wire::default();
     let (endpoint, _incoming) = Endpoint::builder()
         .udp_io(wire.clone())
-        .client_response_limits(WriteLimits { messages: 8, bytes: LIMIT })
+        .client_response_limits(Limits { count: 8, bytes: LIMIT })
         .bind()
         .unwrap();
     let large =
@@ -3451,7 +3451,7 @@ async fn written(
 async fn an_observer_sees_arrivals_and_every_write_they_cause() {
     let wire = Wire::default();
     let (endpoint, mut incoming) = bind(&wire);
-    let config = ObservationConfig::new().payload(4096).context(true);
+    let config = observe::Config::new().payload(4096).context(true);
     let mut observer = endpoint.observe(config).await.unwrap();
     // Compact names and extra spaces, which a re-encoding would change.
     let text = invite("observed")
@@ -3508,7 +3508,7 @@ async fn an_observer_sees_arrivals_and_every_write_they_cause() {
     )
     .await;
     assert_eq!(resent, final_response);
-    assert_eq!(observer.stats(), ObserverStats::default());
+    assert_eq!(observer.stats(), observe::Stats::default());
 }
 
 // A client transaction's writes name it by the number its control gives:
@@ -3523,8 +3523,7 @@ async fn an_observer_names_client_writes_by_their_transaction() {
         .timers(short_timers())
         .bind()
         .unwrap();
-    let mut observer =
-        endpoint.observe(ObservationConfig::new()).await.unwrap();
+    let mut observer = endpoint.observe(observe::Config::new()).await.unwrap();
     let target = Target::new(Transport::Udp, PEER);
     let (control, mut responses) = endpoint
         .start(outgoing_invite("client"), target)
@@ -3589,7 +3588,7 @@ async fn an_observer_names_client_writes_by_their_transaction() {
 async fn a_full_observer_loses_records_but_nothing_else() {
     let wire = Wire::default();
     let (endpoint, _incoming) = bind(&wire);
-    let config = ObservationConfig::new().records(2).payload(64);
+    let config = observe::Config::new().records(2).payload(64);
     let mut observer = endpoint.observe(config).await.unwrap();
     let target = Target::new(Transport::Udp, PEER);
     let (_control, mut responses) =
@@ -3642,11 +3641,10 @@ async fn response_overflow_does_not_depend_on_the_observer() {
     let wire = Wire::default();
     let (endpoint, _incoming) = Endpoint::builder()
         .udp_io(wire.clone())
-        .client_response_limits(WriteLimits { messages: 1, bytes: 64 * 1024 })
+        .client_response_limits(Limits { count: 1, bytes: 64 * 1024 })
         .bind()
         .unwrap();
-    let mut observer =
-        endpoint.observe(ObservationConfig::new()).await.unwrap();
+    let mut observer = endpoint.observe(observe::Config::new()).await.unwrap();
     let target = Target::new(Transport::Udp, PEER);
     let (_control, mut responses) = endpoint
         .start(outgoing_invite("overflow"), target)
@@ -3678,7 +3676,7 @@ async fn response_overflow_does_not_depend_on_the_observer() {
         }
     }
     assert_eq!(arrivals[0], first.received.id());
-    assert_eq!(observer.stats(), ObserverStats::default());
+    assert_eq!(observer.stats(), observe::Stats::default());
 }
 
 // One observer at a time. Dropping it changes nothing on the wire, and
@@ -3687,8 +3685,8 @@ async fn response_overflow_does_not_depend_on_the_observer() {
 async fn one_observer_at_a_time_and_dropping_it_changes_nothing() {
     let wire = Wire::default();
     let (endpoint, mut incoming) = bind(&wire);
-    let first = endpoint.observe(ObservationConfig::new()).await.unwrap();
-    let busy = endpoint.observe(ObservationConfig::new()).await.unwrap_err();
+    let first = endpoint.observe(observe::Config::new()).await.unwrap();
+    let busy = endpoint.observe(observe::Config::new()).await.unwrap_err();
     assert!(busy.is_busy());
 
     drop(first);
@@ -3698,7 +3696,7 @@ async fn one_observer_at_a_time_and_dropping_it_changes_nothing() {
     responder.respond(ok(&request.request)).await.unwrap();
     assert_eq!(status(&wire.sent(1).await[0]), 200);
 
-    let mut second = endpoint.observe(ObservationConfig::new()).await.unwrap();
+    let mut second = endpoint.observe(observe::Config::new()).await.unwrap();
     wire.deliver(datagram(options("second")));
     let record = record(&mut second).await;
     assert!(matches!(record.observed(), Observed::Received { .. }));
@@ -3714,11 +3712,10 @@ async fn write_records_keep_each_stage_and_outcome() {
     let wire = Wire::default();
     let (endpoint, _incoming) = Endpoint::builder()
         .udp_io(wire.clone())
-        .udp_write_limits(WriteLimits { messages: 1, bytes: 64 * 1024 })
+        .udp_write_limits(Limits { count: 1, bytes: 64 * 1024 })
         .bind()
         .unwrap();
-    let mut observer =
-        endpoint.observe(ObservationConfig::new()).await.unwrap();
+    let mut observer = endpoint.observe(observe::Config::new()).await.unwrap();
     let target = || Target::new(Transport::Udp, PEER);
     let send = |call: &'static str| {
         endpoint.send_request(outgoing(call), target(), ViaMode::Fresh)
@@ -3802,7 +3799,7 @@ async fn write_records_keep_each_stage_and_outcome() {
 async fn records_copy_their_bytes_and_cut_long_ones() {
     let wire = Wire::default();
     let (endpoint, mut incoming) = bind(&wire);
-    let config = ObservationConfig::new().payload(16).context(true);
+    let config = observe::Config::new().payload(16).context(true);
     let mut observer = endpoint.observe(config).await.unwrap();
     let text = options("copied");
     // The datagram is a slice of a much larger capture buffer.
@@ -3834,8 +3831,7 @@ async fn records_copy_their_bytes_and_cut_long_ones() {
 async fn a_stateless_refusal_names_the_arrival_it_answers() {
     let wire = Wire::default();
     let (endpoint, _incoming) = bind(&wire);
-    let mut observer =
-        endpoint.observe(ObservationConfig::new()).await.unwrap();
+    let mut observer = endpoint.observe(observe::Config::new()).await.unwrap();
     let text = options("refused").replace("Call-ID: refused\r\n", "");
 
     // What is not SIP at all arrives too, and nothing answers it.
@@ -3885,13 +3881,12 @@ fn started(record: &Record) -> Option<(WriteRef, WriteOrigin)> {
 async fn a_port_observer_ties_each_backend_write_to_its_endpoint() {
     let wire = Wire::default();
     let (port, _ingress) = intercept(&wire);
-    let mut on_port = port.observe(ObservationConfig::new()).await.unwrap();
+    let mut on_port = port.observe(observe::Config::new()).await.unwrap();
     let mut endpoints = Vec::new();
     for _ in 0..2 {
         let (endpoint, incoming) =
             Endpoint::builder().port(&port).bind().unwrap();
-        let observer =
-            endpoint.observe(ObservationConfig::new()).await.unwrap();
+        let observer = endpoint.observe(observe::Config::new()).await.unwrap();
         endpoints.push((endpoint, incoming, observer));
     }
 
@@ -3934,14 +3929,14 @@ async fn a_port_observer_sees_arrivals_raw_sends_and_forwards() {
     let wire = Wire::default();
     let (port, mut ingress) = DatagramPort::builder()
         .udp_io(wire.clone())
-        .ingress_limits(WriteLimits { messages: 1, bytes: 64 * 1024 })
+        .ingress_limits(Limits { count: 1, bytes: 64 * 1024 })
         .intercept()
         .unwrap();
     let (endpoint, mut incoming) =
         Endpoint::builder().port(&port).bind().unwrap();
     let to_endpoint = endpoint.ingress().unwrap();
     let upstream = upstream(&port).await;
-    let config = ObservationConfig::new().payload(1500);
+    let config = observe::Config::new().payload(1500);
     let mut on_port = port.observe(config).await.unwrap();
 
     wire.deliver(arriving(options("held"), "nic0"));
@@ -4009,7 +4004,7 @@ async fn a_port_observer_sees_late_unknown_and_withdrawn_writes() {
     let (port, _ingress) = intercept(&wire);
     let (endpoint, _incoming) =
         Endpoint::builder().port(&port).bind().unwrap();
-    let mut on_port = port.observe(ObservationConfig::new()).await.unwrap();
+    let mut on_port = port.observe(observe::Config::new()).await.unwrap();
     let end = |record: &Record| match record.observed() {
         Observed::WriteEnded { result, accepted, .. } => {
             Some((*result, *accepted))

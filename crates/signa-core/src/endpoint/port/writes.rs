@@ -25,19 +25,19 @@ use std::{
     task::Waker,
 };
 
-use crate::transport::{WriteLimits, budget::request_limits};
+use crate::transport::{Limits, budget::request_limits};
 
 /// The port's write limits and who waits for room in them.
-pub(super) struct WriteAdmission(Arc<Limits>);
+pub(super) struct WriteAdmission(Arc<Shared>);
 
-struct Limits {
-    limits: WriteLimits,
+struct Shared {
+    limits: Limits,
     state: Mutex<State>,
 }
 
 #[derive(Default)]
 struct State {
-    messages: usize,
+    count: usize,
     bytes: usize,
     /// Set once the port closes. Nothing is admitted and nobody waits after.
     closed: bool,
@@ -56,7 +56,7 @@ pub(super) enum Admission {
     Closed,
 }
 
-impl Limits {
+impl Shared {
     // Nothing panics while the lock is held, short of a broken count. A
     // poisoned lock is still read, so that a permit dropped while a thread
     // unwinds cannot panic again.
@@ -66,8 +66,8 @@ impl Limits {
 }
 
 impl WriteAdmission {
-    pub(super) fn new(limits: WriteLimits) -> WriteAdmission {
-        WriteAdmission(Arc::new(Limits { limits, state: Mutex::default() }))
+    pub(super) fn new(limits: Limits) -> WriteAdmission {
+        WriteAdmission(Arc::new(Shared { limits, state: Mutex::default() }))
     }
 
     /// Takes room for a write of `len` bytes by the endpoint registered as
@@ -122,16 +122,16 @@ impl WriteAdmission {
         &self,
         state: &mut State,
         len: usize,
-        limits: WriteLimits,
+        limits: Limits,
     ) -> Option<WritePermit> {
-        if state.messages >= limits.messages {
+        if state.count >= limits.count {
             return None;
         }
         let bytes = state
             .bytes
             .checked_add(len)
             .filter(|&bytes| bytes <= limits.bytes)?;
-        state.messages += 1;
+        state.count += 1;
         state.bytes = bytes;
         Some(WritePermit { limits: self.0.clone(), bytes: len })
     }
@@ -151,7 +151,7 @@ impl WriteAdmission {
     /// its command is queued, so then none is on its way to the port's task
     /// either.
     pub(super) fn is_idle(&self) -> bool {
-        self.0.state().messages == 0
+        self.0.state().count == 0
     }
 
     /// Forgets the waker of a registration that has ended.
@@ -164,7 +164,7 @@ impl WriteAdmission {
 /// A write's share of the port's limits, which it holds until its outcome is
 /// known.
 pub(crate) struct WritePermit {
-    limits: Arc<Limits>,
+    limits: Arc<Shared>,
     bytes: usize,
 }
 
@@ -173,7 +173,7 @@ impl Drop for WritePermit {
     fn drop(&mut self) {
         let waiters = {
             let mut state = self.limits.state();
-            state.messages -= 1;
+            state.count -= 1;
             state.bytes -= self.bytes;
             mem::take(&mut state.waiters)
         };
@@ -233,7 +233,7 @@ mod tests {
 
     fn usage(admission: &WriteAdmission) -> (usize, usize) {
         let state = admission.0.state();
-        (state.messages, state.bytes)
+        (state.count, state.bytes)
     }
 
     // A raw send too large for its three quarters is refused without taking
@@ -243,8 +243,7 @@ mod tests {
     // to wake it.
     #[test]
     fn a_refused_raw_send_takes_nothing() {
-        let admission =
-            WriteAdmission::new(WriteLimits { messages: 1, bytes: 1472 });
+        let admission = WriteAdmission::new(Limits { count: 1, bytes: 1472 });
         let (count, waker) = counter();
 
         assert!(matches!(admission.admit_raw(1200), Admission::Full));
@@ -260,8 +259,7 @@ mod tests {
     // release that makes room, with no other traffic.
     #[test]
     fn a_waiter_is_woken_by_the_release_whatever_was_refused_meanwhile() {
-        let admission =
-            WriteAdmission::new(WriteLimits { messages: 1, bytes: 1472 });
+        let admission = WriteAdmission::new(Limits { count: 1, bytes: 1472 });
         let (count, waker) = counter();
         let held = admitted(admission.admit(1, 10, &waker));
 
@@ -278,8 +276,7 @@ mod tests {
     // Polling again keeps one waker per registration, the latest.
     #[test]
     fn a_registration_keeps_one_waker() {
-        let admission =
-            WriteAdmission::new(WriteLimits { messages: 1, bytes: 10 });
+        let admission = WriteAdmission::new(Limits { count: 1, bytes: 10 });
         let (_, holder) = counter();
         let held = admitted(admission.admit(1, 10, &holder));
         let (old, old_waker) = counter();
@@ -303,8 +300,7 @@ mod tests {
     // their room.
     #[test]
     fn a_close_wakes_the_waiters_and_leaves_none_after() {
-        let admission =
-            WriteAdmission::new(WriteLimits { messages: 1, bytes: 10 });
+        let admission = WriteAdmission::new(Limits { count: 1, bytes: 10 });
         let (count, waker) = counter();
         let held = admitted(admission.admit(1, 10, &waker));
         assert!(matches!(admission.admit(2, 1, &waker), Admission::Full));
@@ -321,8 +317,7 @@ mod tests {
 
     #[test]
     fn a_forgotten_registration_is_not_woken() {
-        let admission =
-            WriteAdmission::new(WriteLimits { messages: 1, bytes: 10 });
+        let admission = WriteAdmission::new(Limits { count: 1, bytes: 10 });
         let (count, waker) = counter();
         let held = admitted(admission.admit(1, 10, &waker));
         assert!(matches!(admission.admit(2, 1, &waker), Admission::Full));
@@ -334,7 +329,7 @@ mod tests {
 
     /// Records whether the admission's lock was free when it was woken.
     struct Probe {
-        limits: Arc<Limits>,
+        limits: Arc<Shared>,
         free: AtomicBool,
     }
 
@@ -348,8 +343,7 @@ mod tests {
     // Both a release and a close wake with the lock released.
     #[test]
     fn wakers_run_outside_the_lock() {
-        let admission =
-            WriteAdmission::new(WriteLimits { messages: 1, bytes: 10 });
+        let admission = WriteAdmission::new(Limits { count: 1, bytes: 10 });
         let probe = Arc::new(Probe {
             limits: admission.0.clone(),
             free: AtomicBool::new(false),
@@ -374,7 +368,7 @@ mod tests {
     #[test]
     fn the_counts_match_the_permits_and_no_waiter_is_lost() {
         fn property(steps: Vec<(u8, u8)>) -> bool {
-            let limits = WriteLimits { messages: 3, bytes: 8 };
+            let limits = Limits { count: 3, bytes: 8 };
             let raw = request_limits(limits);
             let admission = WriteAdmission::new(limits);
             let counts: Vec<_> = (0..3).map(|_| counter()).collect();
@@ -399,7 +393,7 @@ mod tests {
                             }
                             Admission::Full => {
                                 if closed
-                                    || messages < limits.messages
+                                    || messages < limits.count
                                         && bytes + len <= limits.bytes
                                 {
                                     return false;
@@ -417,8 +411,8 @@ mod tests {
                         false
                     }
                     1 => {
-                        let fits = messages < raw.messages
-                            && bytes + len <= raw.bytes;
+                        let fits =
+                            messages < raw.count && bytes + len <= raw.bytes;
                         match admission.admit_raw(len) {
                             Admission::Admitted(permit) => {
                                 if closed || !fits {
@@ -461,7 +455,7 @@ mod tests {
                 let (messages, bytes) = usage(&admission);
                 if messages != live.len()
                     || bytes != live.iter().map(|permit| permit.bytes).sum()
-                    || messages > limits.messages
+                    || messages > limits.count
                     || bytes > limits.bytes
                     || closed && !admission.0.state().waiters.is_empty()
                 {

@@ -102,7 +102,7 @@ use crate::{
         non_invite::{ClientEvent, ClientTransaction, ServerTransaction},
     },
     transport::{
-        Flow, ReceiveId, Stamp, Stamps, Transport, WriteLimits,
+        Flow, Limits, ReceiveId, Stamp, Stamps, Transport,
         budget::Budget,
         datagram::{DatagramIo, Path, TransportContext, WriteOutcome},
         tcp,
@@ -841,24 +841,24 @@ impl Driver {
 
         Driver {
             incoming,
-            routes_admission: Budget::new(WriteLimits {
-                messages: config.max_responder_handles,
+            routes_admission: Budget::new(Limits {
+                count: config.max_responder_handles,
                 bytes: config.max_responder_bytes,
             }),
-            event_admission: Budget::new(WriteLimits {
-                messages: config.max_pending_requests,
+            event_admission: Budget::new(Limits {
+                count: config.max_pending_requests,
                 bytes: config.max_server_request_bytes,
             }),
-            work: Budget::new(WriteLimits {
-                messages: config.max_pending_requests,
+            work: Budget::new(Limits {
+                count: config.max_pending_requests,
                 bytes: config.max_server_request_bytes,
             }),
-            submissions: Budget::new(WriteLimits {
-                messages: 64,
+            submissions: Budget::new(Limits {
+                count: 64,
                 bytes: config.max_server_response_bytes,
             }),
-            retained: Budget::new(WriteLimits {
-                messages: usize::MAX,
+            retained: Budget::new(Limits {
+                count: usize::MAX,
                 bytes: config.max_server_response_bytes,
             }),
             drops,
@@ -871,8 +871,8 @@ impl Driver {
             reply_admission: Admission(Arc::new(Semaphore::new(
                 REPLY_OPERATIONS,
             ))),
-            reply_bytes: Budget::new(WriteLimits {
-                messages: REPLY_OPERATIONS,
+            reply_bytes: Budget::new(Limits {
+                count: REPLY_OPERATIONS,
                 bytes: config.max_reply_bytes,
             }),
             writes: Vec::new(),
@@ -903,12 +903,12 @@ impl Driver {
                 config.max_outbound_connections.min(Semaphore::MAX_PERMITS),
             )),
             response_connections: Arc::new(Semaphore::new(REPLY_OPERATIONS)),
-            connects: Budget::new(WriteLimits {
-                messages: config.max_pending_connects,
+            connects: Budget::new(Limits {
+                count: config.max_pending_connects,
                 bytes: 0,
             }),
-            response_connects: Budget::new(WriteLimits {
-                messages: REPLY_OPERATIONS,
+            response_connects: Budget::new(Limits {
+                count: REPLY_OPERATIONS,
                 bytes: 0,
             }),
             fallback: Budget::new(config.fallback_limits),
@@ -3709,7 +3709,7 @@ mod tests {
     #[tokio::test]
     async fn fallback_count_and_bytes_survive_connect_and_write() {
         let (mut driver, _commands, _) = reply_driver_with(Config {
-            fallback_limits: WriteLimits { messages: 2, bytes: 3 },
+            fallback_limits: Limits { count: 2, bytes: 3 },
             ..Config::default()
         });
         let listener =
@@ -3747,7 +3747,7 @@ mod tests {
     async fn ordinary_fallback_rejects_before_enqueue_and_returns_its_budget()
     {
         let (mut driver, _commands, _) = reply_driver_with(Config {
-            fallback_limits: WriteLimits { messages: 2, bytes: 3 },
+            fallback_limits: Limits { count: 2, bytes: 3 },
             ..Config::default()
         });
         let listener =
@@ -3824,7 +3824,7 @@ mod tests {
     #[tokio::test]
     async fn fallback_failure_and_teardown_return_capacity_and_count_drops() {
         let (mut driver, _commands, _) = reply_driver_with(Config {
-            fallback_limits: WriteLimits { messages: 1, bytes: 3 },
+            fallback_limits: Limits { count: 1, bytes: 3 },
             ..Config::default()
         });
         let remote = "127.0.0.1:9".parse().unwrap();
@@ -3859,7 +3859,7 @@ mod tests {
     async fn ready_internal_commands_do_not_starve_udp() {
         let (mut driver, _commands, local) = reply_driver();
         // A connect result for a route nobody waits for is a no-op.
-        let attempts = Budget::new(WriteLimits { messages: 100, bytes: 0 });
+        let attempts = Budget::new(Limits { count: 100, bytes: 0 });
         for _ in 0..100 {
             driver
                 .internal_tx
@@ -4083,7 +4083,7 @@ mod tests {
         let response_b = route_response(&other.request).to_bytes();
         let capacity = response_a.len() + response_b.len();
         driver.retained =
-            Budget::new(WriteLimits { messages: usize::MAX, bytes: capacity });
+            Budget::new(Limits { count: usize::MAX, bytes: capacity });
         let blocker = driver.retained.acquire(response_b.len()).unwrap();
 
         driver.accept_response(a, status(200), response_a, None).unwrap();
@@ -4132,7 +4132,7 @@ mod tests {
         let original = &envelope.transaction.responder.shared;
         let (observation, _events) =
             watch::channel(server::Observation::default());
-        let capacity = Budget::new(WriteLimits { messages: 1, bytes: 0 });
+        let capacity = Budget::new(Limits { count: 1, bytes: 0 });
         // A capability of an earlier transaction in the same slot. Its id
         // came from the counter before this one's, which starts at 1.
         let stale = Arc::new(server::Shared {
@@ -4194,7 +4194,7 @@ mod tests {
 
         let (mut driver, _commands, local) = reply_driver();
         driver.submissions =
-            Budget::new(WriteLimits { messages: 1, bytes: usize::MAX });
+            Budget::new(Limits { count: 1, bytes: usize::MAX });
         let link = udp_reply_link(local, "127.0.0.1:9".parse().unwrap());
         driver.on_test_request(
             route_request(

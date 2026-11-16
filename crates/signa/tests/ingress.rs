@@ -16,8 +16,8 @@ use bytes::Bytes;
 use signa::{
     Message,
     endpoint::{
-        DatagramPort, Endpoint, EndpointIngress, IncomingEvent, PathSelection,
-        RawPath, ReceivedDatagram, ShutdownOutcome,
+        Endpoint, IncomingEvent, PathSelection, ShutdownOutcome,
+        port::{DatagramPort, EndpointIngress, RawPath, ReceivedDatagram},
     },
     transport::datagram::{
         Capabilities, Datagram, DatagramIo, DatagramWrite, RecvError, Submit,

@@ -4,8 +4,9 @@ The endpoint's transaction-user (TU) interface.
 Binding returns a cloneable [`Endpoint`] and one cancellation-safe [`Incoming`]
 receiver. The driver runs transport and transaction work. Application code owns
 its receive loop and handler tasks. Incoming requests carry their
-[`Flow`](crate::transport::Flow) in the envelope, and `Extensions` stays for
-application data.
+[`ReceiveInfo`] in the envelope, and `Extensions` stays for application data.
+Ports that several endpoints share are in [`port`], and observers in
+[`observe`].
 
 # Reception
 
@@ -153,6 +154,10 @@ endpoint's own record of it. Every received envelope and client response
 carries its [`ReceiveInfo`] whether or not an observer is attached, and
 nothing a TU acts on depends on one.
 
+[`DatagramPort`]: port::DatagramPort
+[`DatagramPort::observe`]: port::DatagramPort::observe
+[`Observer`]: observe::Observer
+
 # Shutdown
 
 [`Endpoint::shutdown`] closes new admission and drains current work until the
@@ -246,7 +251,9 @@ use tokio::sync::{Semaphore, mpsc, watch};
 
 #[cfg(test)]
 use self::client::compatibility::Client;
-use self::{admission::ClientAdmission, driver::Command};
+use self::{
+    admission::ClientAdmission, driver::Command, port::EndpointIngress,
+};
 #[cfg(feature = "__bench")]
 use self::{builder::Config, driver::Driver};
 #[cfg(test)]
@@ -258,7 +265,7 @@ use crate::{
 };
 use crate::{
     transaction::Timers,
-    transport::{WriteLimits, budget::Budget, datagram::Binding},
+    transport::{Limits, budget::Budget, datagram::Binding},
 };
 
 pub use self::{
@@ -268,15 +275,7 @@ pub use self::{
         ClientTransactionId, PreparedRequest, Responses, Target,
     },
     error::{BindError, Error},
-    observe::{
-        ObservationConfig, Observed, Observer, ObserverStats, Record,
-        WriteOrigin, WriteRef, WriteResult,
-    },
     path::{PathSelection, ReceiveInfo, SendPath},
-    port::{
-        Capture, CapturedDatagram, DatagramPort, EndpointIngress, Ingress,
-        PortBuilder, PortStats, RawPath, RawWrite, ReceivedDatagram, Refused,
-    },
     reply::{ReplyError, ReplyRoute},
     send::{Branch, InvalidBranch, SentRequest, ViaMode},
     server::{
@@ -288,15 +287,16 @@ pub use self::{
     shutdown::{Shutdown, ShutdownOutcome, WorkGuard},
 };
 
+pub mod observe;
+pub mod port;
+
 mod admission;
 mod builder;
 mod client;
 mod datagram;
 mod driver;
 mod error;
-mod observe;
 mod path;
-mod port;
 mod reply;
 mod routing;
 mod send;
@@ -324,7 +324,7 @@ pub struct Endpoint {
     client_admission: ClientAdmission,
     client_response_budget: Budget,
     client_handles: Budget,
-    client_response_limits: WriteLimits,
+    client_response_limits: Limits,
     shutdown_control: Arc<shutdown::Control>,
     control: mpsc::Sender<()>,
     shutdown_wait: watch::Receiver<Option<ShutdownOutcome>>,
@@ -348,7 +348,8 @@ pub struct Endpoint {
     /// The context copies and prepared paths alive at once.
     context_limits: Budget,
     timers: Timers,
-    /// Set while an [`Observer`] of the endpoint is alive.
+    /// Set while an [`Observer`](self::observe::Observer) of the endpoint is
+    /// alive.
     observing: Arc<AtomicBool>,
 }
 
@@ -437,9 +438,9 @@ impl Endpoint {
     }
 
     /// Returns where the application delivers datagrams to this endpoint,
-    /// for an endpoint registered on a [`DatagramPort`] with
-    /// [`Builder::port`]. `None` for any other endpoint, whose own socket or
-    /// backend delivers to it.
+    /// for an endpoint registered on a [`DatagramPort`](port::DatagramPort)
+    /// with [`Builder::port`]. `None` for any other endpoint, whose own
+    /// socket or backend delivers to it.
     pub fn ingress(&self) -> Option<EndpointIngress> {
         self.ingress.clone()
     }
@@ -746,13 +747,13 @@ mod tests {
     use crate::{
         endpoint::{
             Branch, Builder, CancelError, CancelOutcome, Endpoint, Incoming,
-            IncomingEvent, ObservationConfig, Observed, ReceivedRequest,
-            ReceivedResponse, Reception, ReplyError, Responses, ServerEvent,
-            ServerEvents, ServerRequest, ShutdownOutcome, SubmitError, Target,
-            ViaMode, WorkGuard, WriteOrigin, WriteResult,
+            IncomingEvent, ReceivedRequest, ReceivedResponse, Reception,
+            ReplyError, Responses, ServerEvent, ServerEvents, ServerRequest,
+            ShutdownOutcome, SubmitError, Target, ViaMode, WorkGuard,
             builder::Config,
             driver::{Command, Driver, TCP_INBOUND},
             error::Error,
+            observe::{self, Observed, WriteOrigin, WriteResult},
             routing::{Link, sent_by_is},
         },
         message::{
@@ -765,7 +766,7 @@ mod tests {
             response::Response,
         },
         transaction::Timers,
-        transport::{Flow, Transport, WriteLimits, budget::Budget, tcp, udp},
+        transport::{Flow, Limits, Transport, budget::Budget, tcp, udp},
     };
 
     const LOCALHOST: SocketAddr =
@@ -968,7 +969,7 @@ mod tests {
             .udp(LOCALHOST)
             .timers(short_timers())
             .max_client_transactions(1)
-            .client_response_limits(WriteLimits { messages: 1, bytes: 4096 })
+            .client_response_limits(Limits { count: 1, bytes: 4096 })
             .bind()
             .unwrap();
         let target =
@@ -1874,18 +1875,15 @@ mod tests {
         Endpoint {
             commands,
             client_admission: fixture.client_admission(),
-            client_response_budget: Budget::new(WriteLimits {
-                messages: 64,
+            client_response_budget: Budget::new(Limits {
+                count: 64,
                 bytes: 1 << 20,
             }),
-            client_handles: Budget::new(WriteLimits {
-                messages: 64,
+            client_handles: Budget::new(Limits {
+                count: 64,
                 bytes: usize::MAX,
             }),
-            client_response_limits: WriteLimits {
-                messages: 16,
-                bytes: 1 << 16,
-            },
+            client_response_limits: Limits { count: 16, bytes: 1 << 16 },
             shutdown_control: fixture.shutdown_control.clone(),
             control: fixture.control.clone(),
             shutdown_wait: fixture.shutdown_done.subscribe(),
@@ -3200,7 +3198,7 @@ mod tests {
      {
         let service = Counting::default();
         let server = serve(service.clone());
-        let limits = WriteLimits { messages: 1, bytes: 1 };
+        let limits = Limits { count: 1, bytes: 1 };
         let endpoint = Endpoint::builder()
             .udp(LOCALHOST)
             .max_client_transactions(1)
@@ -3499,7 +3497,7 @@ mod tests {
     async fn invite_client_overflow_keeps_acknowledging() {
         let (endpoint, _incoming) = Endpoint::builder()
             .udp(LOCALHOST)
-            .client_response_limits(WriteLimits { messages: 1, bytes: 4096 })
+            .client_response_limits(Limits { count: 1, bytes: 4096 })
             .bind()
             .unwrap();
         let far = Far::new().await;
@@ -4139,7 +4137,7 @@ mod tests {
     async fn control_capacity_discards_acks_beyond_it() {
         let (endpoint, mut incoming) = Endpoint::builder()
             .udp(LOCALHOST)
-            .control_event_limits(WriteLimits { messages: 1, bytes: 4096 })
+            .control_event_limits(Limits { count: 1, bytes: 4096 })
             .bind()
             .unwrap();
         let (mut remote, via) = uac(Transport::Udp, &endpoint, "full").await;
@@ -5175,11 +5173,8 @@ mod tests {
             .udp(LOCALHOST)
             .reception(Reception::Stateless)
             .max_pending_requests(1)
-            .control_event_limits(WriteLimits { messages: 1, bytes: 1 << 20 })
-            .client_response_budget(WriteLimits {
-                messages: 1,
-                bytes: 1 << 20,
-            })
+            .control_event_limits(Limits { count: 1, bytes: 1 << 20 })
+            .client_response_budget(Limits { count: 1, bytes: 1 << 20 })
             .bind()
             .unwrap();
         let to = endpoint.udp_addr().unwrap();
@@ -5242,8 +5237,8 @@ mod tests {
             .udp(LOCALHOST)
             .reception(Reception::Stateless)
             .max_server_request_bytes(64)
-            .control_event_limits(WriteLimits { messages: 16, bytes: 64 })
-            .client_response_budget(WriteLimits { messages: 16, bytes: 64 })
+            .control_event_limits(Limits { count: 16, bytes: 64 })
+            .client_response_budget(Limits { count: 16, bytes: 64 })
             .bind()
             .unwrap();
         let to = endpoint.udp_addr().unwrap();
@@ -6172,7 +6167,7 @@ mod tests {
     async fn an_observer_sees_tcp_messages_and_writes() {
         let (endpoint, mut incoming) =
             Endpoint::builder().tcp(LOCALHOST).bind().unwrap();
-        let config = ObservationConfig::new().payload(4096);
+        let config = observe::Config::new().payload(4096);
         let mut observer = endpoint.observe(config).await.unwrap();
         let mut next = async || {
             timeout(Duration::from_secs(1), observer.recv())

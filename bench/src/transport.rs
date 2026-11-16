@@ -8,7 +8,7 @@ use criterion::Criterion;
 use signa_core::{
     Message,
     bench::{Flow, Transport, tcp, udp},
-    transport::WriteLimits,
+    transport::Limits,
 };
 use tokio::{runtime, sync::mpsc};
 
@@ -32,7 +32,7 @@ pub(super) fn write_admission(c: &mut Criterion) {
                 tokio::net::TcpListener::bind(LOCALHOST).await.unwrap();
             let (inbound, _received) = mpsc::channel(4);
             let config = tcp::Config {
-                write_limits: WriteLimits { messages, bytes: 3 },
+                write_limits: Limits { count: messages, bytes: 3 },
                 ..tcp::Config::default()
             };
             let (_, writer) = tcp::connect(

@@ -69,7 +69,7 @@ fn facade_existing_endpoint_imports_compile() {
         },
         message::header::{CALL_ID, FROM, TO, Tag},
         transaction::Timers,
-        transport::{Flow, Transport, WriteLimits},
+        transport::{Flow, Limits, Transport},
     };
 
     assert!(same::<Endpoint, signa_core::endpoint::Endpoint>());
@@ -99,7 +99,7 @@ fn facade_existing_endpoint_imports_compile() {
     assert!(same::<Timers, signa_core::transaction::Timers>());
     assert!(same::<Transport, signa_core::transport::Transport>());
     assert!(same::<Flow, signa_core::transport::Flow>());
-    assert!(same::<WriteLimits, signa_core::transport::WriteLimits>());
+    assert!(same::<Limits, signa_core::transport::Limits>());
     assert_eq!(CALL_ID, signa_core::message::header::CALL_ID);
     assert_eq!(FROM, signa_core::message::header::FROM);
     assert_eq!(TO, signa_core::message::header::TO);

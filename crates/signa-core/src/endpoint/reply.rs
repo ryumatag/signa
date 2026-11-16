@@ -497,7 +497,7 @@ mod tests {
     ) -> (ReplyRoute, mpsc::UnboundedReceiver<Command>) {
         route_with_budget(
             request,
-            Budget::new(crate::transport::WriteLimits::default()),
+            Budget::new(crate::transport::Limits::default()),
         )
     }
 
@@ -579,7 +579,7 @@ mod tests {
 
     #[test]
     fn shared_reply_bytes_remain_charged_after_the_future_is_dropped() {
-        use crate::transport::WriteLimits;
+        use crate::transport::Limits;
         use std::{
             future::{Future, poll_fn},
             task::Poll,
@@ -592,8 +592,7 @@ mod tests {
                 let request = request();
                 let response = response(&request);
                 let len = response.encoded_len().unwrap();
-                let budget =
-                    Budget::new(WriteLimits { messages: 64, bytes: len });
+                let budget = Budget::new(Limits { count: 64, bytes: len });
                 let (first, mut commands) =
                     route_with_budget(&request, budget.clone());
                 let (second, mut more_commands) =
@@ -646,7 +645,7 @@ mod tests {
 
     #[test]
     fn oversized_reply_returns_busy_without_consuming_the_operation_slot() {
-        use crate::transport::WriteLimits;
+        use crate::transport::Limits;
         use std::{
             future::{Future, poll_fn},
             task::Poll,
@@ -659,8 +658,7 @@ mod tests {
                 let request = request();
                 let response = response(&request);
                 let len = response.encoded_len().unwrap();
-                let budget =
-                    Budget::new(WriteLimits { messages: 64, bytes: len });
+                let budget = Budget::new(Limits { count: 64, bytes: len });
                 let (route, mut commands) =
                     route_with_budget(&request, budget);
                 let mut large = response.clone();

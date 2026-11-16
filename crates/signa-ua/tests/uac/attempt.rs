@@ -238,8 +238,7 @@ async fn an_unanswered_invite_times_out() {
 #[tokio::test]
 async fn responses_overflow_on_the_wire_marks_the_attempt_incomplete() {
     let local = "127.0.0.1:0".parse().unwrap();
-    let limits =
-        signa_core::transport::WriteLimits { messages: 1, bytes: 1 << 20 };
+    let limits = signa_core::transport::Limits { count: 1, bytes: 1 << 20 };
     let (endpoint, incoming) = Endpoint::builder()
         .udp(local)
         .timers(fast())

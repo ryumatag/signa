@@ -51,7 +51,7 @@ use tokio::{
 };
 
 use super::{
-    Flow, MessageLimits, Stamp, Stamps, Transport, WriteLimits,
+    Flow, Limits, MessageLimits, Stamp, Stamps, Transport,
     budget::{Budget, Permit},
     framing::{Decoder, Frame, Role},
 };
@@ -190,7 +190,7 @@ pub struct Config {
     /// How many connections a listener keeps open at once.
     pub max_connections: usize,
     /// Outstanding writes through local completion on one connection.
-    pub write_limits: WriteLimits,
+    pub write_limits: Limits,
 }
 
 impl Default for Config {
@@ -204,7 +204,7 @@ impl Default for Config {
             limits: MessageLimits::default(),
             idle_timeout: Duration::from_secs(300),
             max_connections: 1024,
-            write_limits: WriteLimits::default(),
+            write_limits: Limits::default(),
         }
     }
 }
@@ -1055,7 +1055,7 @@ mod tests {
         (
             Writer(Arc::new(WriteSender {
                 queue,
-                capacity: Budget::new(WriteLimits { messages, bytes }),
+                capacity: Budget::new(Limits { count: messages, bytes }),
             })),
             pending,
         )

@@ -215,12 +215,15 @@ The minimum supported Rust version is 1.85.
   borrowed SIP/SIPS structure on demand.
 - [`transaction`] exposes transaction timer configuration. Its state machines
   are internal protocol machinery.
-- [`transport`] exposes [`transport::Flow`], [`transport::Transport`] and
-  [`transport::MessageLimits`], and [`transport::datagram`] the contract of a
-  UDP backend that takes the place of the endpoint's socket. Socket and
-  framing implementations are private.
+- [`transport`] exposes [`transport::Flow`], [`transport::ReceiveId`],
+  [`transport::Transport`], [`transport::MessageLimits`] and
+  [`transport::Limits`], and [`transport::datagram`] the contract of a UDP
+  backend that takes the place of the endpoint's socket. Socket and framing
+  implementations are private.
 - The `endpoint` module, enabled by `tokio`, provides running protocol
-  operations and their handles.
+  operations and their handles. Its `port` module has ports that several
+  endpoints share, and its `observe` module the observers of endpoints and
+  ports.
 
 [RFC and test map]: https://github.com/ryumatag/signa/blob/main/docs/rfc-test-map.md
 [section 7]: https://www.rfc-editor.org/rfc/rfc3261.html#section-7
