@@ -105,7 +105,8 @@ impl Default for ObservationConfig {
     }
 }
 
-/// Receives an endpoint's [`Record`]s.
+/// Receives the [`Record`]s of an endpoint, or of a
+/// [`DatagramPort`](super::DatagramPort).
 ///
 /// Records arrive in the order the driver made them. Each one is numbered as
 /// it is made, so a record dropped for want of room leaves a gap, which the
@@ -394,6 +395,17 @@ pub enum WriteOrigin {
     /// A request sent with [`Endpoint::send_request`], or a response
     /// forwarded with [`Endpoint::forward_response`].
     Send,
+    /// On a [`DatagramPort`](super::DatagramPort), the write of an endpoint
+    /// registered on it, which that endpoint's own observer names `write`.
+    /// The endpoint's records say why it wrote it. This one is the same
+    /// datagram reaching the backend, not a second write.
+    Endpoint {
+        /// The endpoint's name for the write.
+        write: WriteRef,
+    },
+    /// On a [`DatagramPort`](super::DatagramPort), a raw send, or a datagram
+    /// forwarded unchanged, whose `cause` is the datagram's own arrival.
+    Raw,
 }
 
 /// How a write ended, as the endpoint acted on it.
@@ -629,7 +641,7 @@ pub(super) fn attached(tap: &mut Option<Tap>) -> Option<&Tap> {
 }
 
 /// Makes the tap and the observer of `config`.
-fn pair(
+pub(super) fn pair(
     config: ObservationConfig,
     attached: Arc<AtomicBool>,
 ) -> (Tap, Observer) {

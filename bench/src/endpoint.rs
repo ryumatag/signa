@@ -1102,33 +1102,6 @@ impl Client {
 // writes through the port's task and its outcome back.
 pub(super) fn intercepted_round_trip(c: &mut Criterion) {
     let rt = runtime();
-    let (server, client_end) = {
-        let _guard = rt.enter();
-        let (port, mut ingress) =
-            DatagramPort::builder().udp(LOCALHOST).intercept().unwrap();
-        let server = Endpoint::builder()
-            .port(&port)
-            .timers(short_timers())
-            .max_server_transactions(1 << 20)
-            .serve(Ok200)
-            .unwrap();
-        let to_server = server.ingress().unwrap();
-        tokio::spawn(async move {
-            // The port stays open as long as the classifier runs.
-            let _port = port;
-            while let Some(datagram) = ingress.recv().await {
-                // A refusal would make the benchmark look faster.
-                datagram.try_deliver(&to_server).expect("a delivery");
-            }
-        });
-        let client_end = Endpoint::builder()
-            .udp(LOCALHOST)
-            .timers(short_timers())
-            .max_client_transactions(1 << 20)
-            .serve(Ok200)
-            .unwrap();
-        (server, client_end)
-    };
     let request = Request::builder()
         .method("OPTIONS")
         .uri("sip:bob@biloxi.example.com")
@@ -1140,17 +1113,64 @@ pub(super) fn intercepted_round_trip(c: &mut Criterion) {
         .body(Bytes::new())
         .unwrap();
     let len = request.to_bytes().len() as u64;
+    // Without an observer, then with one on the port that records metadata
+    // or copies the first 512 bytes of each datagram, drained by a task of
+    // its own.
+    let variants = [
+        ("", None),
+        ("/observed", Some(ObservationConfig::new())),
+        ("/captured", Some(ObservationConfig::new().payload(512))),
+    ];
 
-    let mut udp =
-        client_end.client(Transport::Udp, server.udp_addr().unwrap());
-    benchmark(c, "endpoint/udp/intercepted/round_trip", len, |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                let response = udp.call(bb(request.clone())).await.unwrap();
-                assert_eq!(response.status(), StatusCode::OK);
+    for (variant, config) in variants {
+        let (server, client_end) = rt.block_on(async {
+            let (port, mut ingress) =
+                DatagramPort::builder().udp(LOCALHOST).intercept().unwrap();
+            if let Some(config) = config {
+                let mut observer = port.observe(config).await.unwrap();
+                tokio::spawn(async move {
+                    while let Some(record) = observer.recv().await {
+                        bb(record);
+                    }
+                });
+            }
+            let server = Endpoint::builder()
+                .port(&port)
+                .timers(short_timers())
+                .max_server_transactions(1 << 20)
+                .serve(Ok200)
+                .unwrap();
+            let to_server = server.ingress().unwrap();
+            tokio::spawn(async move {
+                // The port stays open as long as the classifier runs.
+                let _port = port;
+                while let Some(datagram) = ingress.recv().await {
+                    // A refusal would make the benchmark look faster.
+                    datagram.try_deliver(&to_server).expect("a delivery");
+                }
+            });
+            let client_end = Endpoint::builder()
+                .udp(LOCALHOST)
+                .timers(short_timers())
+                .max_client_transactions(1 << 20)
+                .serve(Ok200)
+                .unwrap();
+            (server, client_end)
+        });
+
+        let mut udp =
+            client_end.client(Transport::Udp, server.udp_addr().unwrap());
+        let id = format!("endpoint/udp/intercepted/round_trip{variant}");
+        benchmark(c, id, len, |b| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let response =
+                        udp.call(bb(request.clone())).await.unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                });
             });
         });
-    });
+    }
 }
 
 // One raw send through a port's task to a loopback socket, until its local

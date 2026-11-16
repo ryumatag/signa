@@ -922,6 +922,7 @@ impl Builder {
             commands_rx,
             commands.downgrade(),
             tasks,
+            registration,
         );
         let endpoint = Endpoint {
             client_admission: driver.client_admission(),

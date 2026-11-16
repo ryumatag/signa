@@ -832,6 +832,7 @@ impl Driver {
         commands: mpsc::UnboundedReceiver<Command>,
         command_sender: mpsc::WeakUnboundedSender<Command>,
         tasks: tcp::Tasks,
+        registration: u64,
     ) -> Driver {
         let (internal_tx, internal) = mpsc::unbounded_channel();
         let reception_counters = Arc::<ReceptionCounters>::default();
@@ -881,11 +882,14 @@ impl Driver {
             internal,
             internal_tx,
             udp: udp.map(|io| {
+                // The endpoint's writes are numbered in its registration's
+                // domain, which a shared port's records name them by too.
                 Port::new(
                     io,
                     config.udp_write_limits,
                     reception_counters.clone(),
                     Stamps::new(),
+                    registration,
                 )
             }),
             tcp,

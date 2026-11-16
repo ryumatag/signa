@@ -146,9 +146,12 @@ quarter of output capacity for transaction output and responses. See
 [`Endpoint::observe`] attaches one [`Observer`], a lossy and bounded view of
 what the endpoint receives, before it parses it, and of each stage of every
 write it makes, its automatic and retransmitted output included. Records copy
-what they show and carry no capability. Every received envelope and client
-response carries its [`ReceiveInfo`] whether or not an observer is attached,
-and nothing a TU acts on depends on one.
+what they show and carry no capability. [`DatagramPort::observe`] attaches
+one to a shared port, which sees its datagrams before anyone decides about
+them and the writes its backend gets, each endpoint write named by that
+endpoint's own record of it. Every received envelope and client response
+carries its [`ReceiveInfo`] whether or not an observer is attached, and
+nothing a TU acts on depends on one.
 
 # Shutdown
 
@@ -703,6 +706,7 @@ pub fn reply_driver(
         rx,
         commands.downgrade(),
         tcp::Tasks::new(),
+        crate::transport::next_id(),
     );
     let (request, route) =
         driver.prepare_reply(request, Link { flow, writer, path: None })?;
@@ -1851,6 +1855,7 @@ mod tests {
             rx,
             commands.downgrade(),
             tcp::Tasks::new(),
+            crate::transport::next_id(),
         );
         let incoming = Incoming::new(
             events,

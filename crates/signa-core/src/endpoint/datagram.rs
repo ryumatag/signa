@@ -33,14 +33,14 @@ use tokio::sync::oneshot;
 
 use super::{
     driver::{ReceptionCounters, increment, now},
-    observe::{self, Note, Tap, WriteResult},
+    observe::{self, Note, Tap, WriteOrigin, WriteResult},
     port::{Withdrawal, WritePermit},
     reply::{Completion, ReplyError},
     routing::Link,
     server::WriteObservation,
 };
 use crate::transport::{
-    Flow, Stamp, Stamps, Transport, WriteLimits,
+    Flow, ReceiveId, Stamp, Stamps, Transport, WriteLimits,
     datagram::{
         DatagramIo, DatagramWrite, Path, RecvError, Submit, TransportContext,
         WriteId, WriteOutcome,
@@ -77,7 +77,8 @@ pub(super) struct Port {
     stamps: Stamps,
     /// The observer's tap, while one is attached.
     tap: Option<Tap>,
-    /// Names this port's writes in observation records.
+    /// Names this port's writes in observation records: an endpoint's
+    /// registration number, or a shared port's own.
     domain: u64,
     /// Set when shutdown lost a write: one the backend never took, one it
     /// failed while closing, or one it left unreported.
@@ -148,6 +149,7 @@ impl Port {
         limits: WriteLimits,
         counters: Arc<ReceptionCounters>,
         stamps: Stamps,
+        domain: u64,
     ) -> Port {
         let local = io.local_addr();
         let max_payload = io.capabilities().max_payload;
@@ -166,7 +168,7 @@ impl Port {
             counters,
             stamps,
             tap: None,
-            domain: crate::transport::next_id(),
+            domain,
             lost: false,
             routed: VecDeque::new(),
         }
@@ -615,6 +617,11 @@ impl Port {
         permit: WritePermit,
     ) {
         let (local, bytes, source, destination, path) = write.into_parts();
+        // The endpoint's own records name the write by its registration and
+        // its own ID, so the physical write names them as its origin.
+        let origin = WriteOrigin::Endpoint {
+            write: observe::datagram_write(registration, local),
+        };
         let started = self.start_parts(
             bytes,
             source,
@@ -622,7 +629,7 @@ impl Port {
             path,
             self.limits,
             Some(&withdrawal),
-            None,
+            Some(Note::new(origin, None)),
         );
         let outcome = Outcome::Registration {
             registration,
@@ -641,6 +648,7 @@ impl Port {
         path: Arc<Path>,
         done: oneshot::Sender<WriteOutcome>,
         permit: WritePermit,
+        cause: Option<ReceiveId>,
     ) {
         let prepared = path.prepared.as_deref().expect("a prepared path");
         let (source, destination) = (prepared.source, prepared.destination);
@@ -651,7 +659,7 @@ impl Port {
             Some(path),
             self.limits,
             None,
-            None,
+            Some(Note::new(WriteOrigin::Raw, cause)),
         );
         self.settle(started, Outcome::Raw { done, _permit: permit });
     }
@@ -1062,6 +1070,7 @@ mod tests {
             limits,
             Arc::default(),
             Stamps::new(),
+            crate::transport::next_id(),
         )
     }
 

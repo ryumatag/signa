@@ -19,7 +19,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     task::{Context, Poll, ready},
     time::Duration,
@@ -35,6 +35,7 @@ use super::{
     BindError, Error, ShutdownOutcome,
     datagram::{Port, Received},
     driver::{ABANDONED_FLUSH, ReceptionCounters, increment},
+    observe::{self, ObservationConfig, Observer, Tap},
     path::{self, PathSelection},
 };
 use crate::{
@@ -298,6 +299,7 @@ impl PortBuilder {
             WriteLimits { messages: usize::MAX, bytes: usize::MAX },
             reception.clone(),
             Stamps::in_domain(id),
+            id,
         );
         let shared = Arc::new(Shared {
             id,
@@ -316,6 +318,7 @@ impl PortBuilder {
             close: Mutex::new(None),
             closer: Arc::new(Notify::new()),
             done: watch::channel(None).0,
+            observing: Arc::default(),
         });
         let (commands, commands_rx) = mpsc::unbounded_channel();
         let (ingress, ingress_rx) = mpsc::unbounded_channel();
@@ -327,6 +330,7 @@ impl PortBuilder {
             weak: commands.downgrade(),
             ingress: Some(ingress),
             registrations: HashMap::new(),
+            tap: None,
         };
 
         Ok((
@@ -525,6 +529,8 @@ struct Shared {
     closer: Arc<Notify>,
     /// The close's outcome, for every caller of `close`.
     done: watch::Sender<Option<ShutdownOutcome>>,
+    /// Set while an [`Observer`] of the port is alive.
+    observing: Arc<AtomicBool>,
 }
 
 impl Shared {
@@ -604,6 +610,14 @@ enum Command {
         path: Arc<Path>,
         done: oneshot::Sender<WriteOutcome>,
         permit: WritePermit,
+        /// The datagram a forward sends on, for the port's records.
+        cause: Option<ReceiveId>,
+    },
+    /// An observer attaches, replacing any earlier one. `attached` learns
+    /// that the task records from now on.
+    Observe {
+        tap: Tap,
+        attached: oneshot::Sender<()>,
     },
     CheckPath {
         path: Path,
@@ -741,7 +755,68 @@ impl DatagramPort {
         payload: Bytes,
         path: &RawPath,
     ) -> Result<RawWrite, Error> {
-        submit_raw(&self.shared, &self.commands, payload, path)
+        submit_raw(&self.shared, &self.commands, payload, path, None)
+    }
+
+    /// Attaches an observer to the port, which records what its backend
+    /// receives and every write the port offers it, within the limits of
+    /// `config`.
+    ///
+    /// A datagram is recorded as the port's task takes it, before the
+    /// ingress limits, the application or an endpoint see it, under the ID
+    /// the endpoint it is delivered to keeps. The writes are the backend's:
+    /// a write of a registered endpoint names that endpoint's own record of
+    /// it in [`WriteOrigin::Endpoint`], and a raw send or forward is
+    /// [`WriteOrigin::Raw`]. The endpoints' observers see why they wrote,
+    /// and this one when the backend took and finished each write.
+    ///
+    /// It resolves once the port's task records. See [`Endpoint::observe`]
+    /// for how records are bounded.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping the future detaches the observer it would have returned.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::is_busy`] while another observer of this port is alive.
+    /// * [`Error::is_closed`] once the port's task has ended.
+    ///
+    /// [`Endpoint::observe`]: super::Endpoint::observe
+    /// [`WriteOrigin::Endpoint`]: super::WriteOrigin::Endpoint
+    /// [`WriteOrigin::Raw`]: super::WriteOrigin::Raw
+    #[allow(clippy::manual_async_fn)] // State the Send guarantee.
+    pub fn observe(
+        &self,
+        config: ObservationConfig,
+    ) -> impl Future<Output = Result<Observer, Error>> + Send + '_ {
+        async move {
+            if self.commands.is_closed() {
+                return Err(Error::closed());
+            }
+            let observing = &self.shared.observing;
+            if observing
+                .compare_exchange(
+                    false,
+                    true,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                return Err(Error::busy());
+            }
+
+            // From here on a failure drops the observer, which clears the
+            // flag again.
+            let (tap, observer) = observe::pair(config, observing.clone());
+            let (attached, done) = oneshot::channel();
+            self.commands
+                .send(Command::Observe { tap, attached })
+                .map_err(|_| Error::closed())?;
+            done.await.map_err(|_| Error::closed())?;
+            Ok(observer)
+        }
     }
 
     /// Refuses new endpoints and new raw paths from now on.
@@ -876,6 +951,7 @@ fn submit_raw(
     commands: &mpsc::UnboundedSender<Command>,
     payload: Bytes,
     path: &RawPath,
+    cause: Option<ReceiveId>,
 ) -> Result<RawWrite, Error> {
     if path.binding().port != shared.id {
         return Err(Error::stale_path());
@@ -899,8 +975,9 @@ fn submit_raw(
     };
 
     let (done, receipt) = oneshot::channel();
+    let path = path.0.clone();
     commands
-        .send(Command::Raw { payload, path: path.0.clone(), done, permit })
+        .send(Command::Raw { payload, path, done, permit, cause })
         .map_err(|_| Error::closed())?;
     Ok(RawWrite(receipt))
 }
@@ -1114,6 +1191,8 @@ struct PortTask {
     weak: mpsc::WeakUnboundedSender<Command>,
     ingress: Option<mpsc::UnboundedSender<ReceivedDatagram>>,
     registrations: HashMap<u64, Registered>,
+    /// The observer's tap, while one is attached.
+    tap: Option<Tap>,
 }
 
 /// What the port's task keeps of a registered endpoint.
@@ -1240,8 +1319,13 @@ impl PortTask {
                     );
                 }
             }
-            Command::Raw { payload, path, done, permit } => {
-                self.port.submit_raw(payload, path, done, permit);
+            Command::Raw { payload, path, done, permit, cause } => {
+                self.port.submit_raw(payload, path, done, permit, cause);
+            }
+            Command::Observe { tap, attached } => {
+                self.port.observe(tap.clone());
+                self.tap = Some(tap);
+                let _ = attached.send(());
             }
             Command::CheckPath { path, done } => {
                 let result = match self.port.check_path(&path) {
@@ -1279,6 +1363,10 @@ impl PortTask {
 
     fn on_datagram(&mut self, datagram: Received) {
         let Received { payload, flow, context, stamp, .. } = datagram;
+        // Before the ingress limits, so that a datagram they drop is seen.
+        if let Some(tap) = observe::attached(&mut self.tap) {
+            tap.received(stamp, flow, [&payload[..], &[][..]], &context);
+        }
         let stats = &self.shared.stats;
         increment(&stats.received);
         let Some(permit) =
@@ -1473,6 +1561,8 @@ impl PortTask {
             Command::CheckPath { done, .. } => {
                 let _ = done.send(Err(Error::closed()));
             }
+            // An observer still sees the drain.
+            command @ Command::Observe { .. } => self.on_command(command),
         }
         false
     }
@@ -1671,7 +1761,9 @@ impl ReceivedDatagram {
             return Err(self.refuse(Error::closed()));
         };
         let shared = held.shared.clone();
-        match submit_raw(&shared, &commands, self.payload.clone(), path) {
+        let payload = self.payload.clone();
+        let cause = Some(self.stamp.id);
+        match submit_raw(&shared, &commands, payload, path, cause) {
             Ok(write) => {
                 self.held = None;
                 increment(&shared.stats.forwarded);
