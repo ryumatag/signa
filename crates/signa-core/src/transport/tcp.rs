@@ -357,8 +357,6 @@ impl Writer {
         })
     }
 
-    /// Queues `write`. A write the queue refuses was never queued, so its
-    /// hook learns nothing.
     /// Queues `write`. A write the queue refuses was never queued, and its
     /// hook learns so.
     fn enqueue(&self, write: Write) -> Result<(), SendError> {
@@ -422,8 +420,12 @@ fn refuse(
     reserved: Result<Permit, SendError>,
     hook: &mut Option<Hook>,
 ) -> Result<Permit, SendError> {
-    if let (Err(error), Some(hook)) = (&reserved, hook.take()) {
-        hook.fire(&Err(refusal(*error)), false);
+    // Only a refusal takes the hook. A hook taken from a reserved write
+    // would drop here and report that write as never queued.
+    if let Err(error) = &reserved {
+        if let Some(hook) = hook.take() {
+            hook.fire(&Err(refusal(*error)), false);
+        }
     }
     reserved
 }
@@ -1600,6 +1602,76 @@ mod tests {
                     SendError::Closed
                 );
             });
+    }
+
+    /// What a hook learned: the error kind of each result, `None` when
+    /// written, and whether the write was queued.
+    type Learned = Arc<std::sync::Mutex<Vec<(Option<io::ErrorKind>, bool)>>>;
+
+    fn hook() -> (Hook, Learned) {
+        let learned = Learned::default();
+        let hook = Hook::new({
+            let learned = learned.clone();
+            move |result: &io::Result<()>, queued| {
+                let kind = result.as_ref().err().map(io::Error::kind);
+                learned.lock().unwrap().push((kind, queued));
+            }
+        });
+        (hook, learned)
+    }
+
+    // A hooked write learns how it ended once, whichever way it leaves:
+    // written, refused by a full queue or an ended connection, refused as
+    // its prepared write is queued, dropped unwritten from the queue, or
+    // never given to the writer at all.
+    #[test]
+    fn a_hook_learns_each_end_once() {
+        use io::ErrorKind::{BrokenPipe, Interrupted, WouldBlock};
+        let learned = |learned: &Learned| learned.lock().unwrap().clone();
+
+        let (writer, pending) = test_writer(1, 3);
+        let (written, was_written) = hook();
+        let receipt = writer
+            .submit_hooked(Bytes::from_static(b"abc"), Some(written))
+            .unwrap();
+        let (full, was_full) = hook();
+        assert_eq!(
+            writer.send_hooked(Bytes::from_static(b"d"), Some(full)),
+            Err(SendError::Full)
+        );
+        drop(writer);
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                write_loop(Vec::new(), pending).await;
+                receipt.await.unwrap();
+            });
+        assert_eq!(learned(&was_written), [(None, true)]);
+        assert_eq!(learned(&was_full), [(Some(WouldBlock), false)]);
+
+        let (writer, pending) = test_writer(2, 64);
+        let prepared = writer.prepare(Bytes::from_static(b"abc")).unwrap();
+        let (queued, was_queued) = hook();
+        writer.send_hooked(Bytes::from_static(b"def"), Some(queued)).unwrap();
+        drop(pending);
+        let (late, was_late) = hook();
+        assert_eq!(
+            prepared.submit(Some(late)).unwrap_err(),
+            SendError::Closed
+        );
+        let (closed, was_closed) = hook();
+        assert_eq!(
+            writer.send_hooked(Bytes::new(), Some(closed)),
+            Err(SendError::Closed)
+        );
+        assert_eq!(learned(&was_queued), [(Some(BrokenPipe), true)]);
+        assert_eq!(learned(&was_late), [(Some(BrokenPipe), false)]);
+        assert_eq!(learned(&was_closed), [(Some(BrokenPipe), false)]);
+
+        let (unused, was_unused) = hook();
+        drop(unused);
+        assert_eq!(learned(&was_unused), [(Some(Interrupted), false)]);
     }
 
     #[test]

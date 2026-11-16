@@ -213,8 +213,9 @@ impl Driver {
                     // A refused or failed connection loses this ACK as UDP
                     // would. A reliable INVITE has already ended, and the
                     // server's Timer H covers it.
-                    let pending = Pending::Ack(ack, note);
-                    self.send_over_tcp(link.flow.remote, pending);
+                    let remote = link.flow.remote;
+                    let write = self.park(remote, note, &ack);
+                    self.send_over_tcp(remote, Pending::Ack(ack, write));
                 }
                 None
             }

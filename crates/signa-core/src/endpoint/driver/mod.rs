@@ -71,7 +71,7 @@ use crate::{
         },
         datagram::{Port, Received},
         error::Error,
-        observe::{self, Note, Tap, WriteOrigin, WriteResult},
+        observe::{self, Note, Tap, WriteOrigin, WriteRef},
         path::{ReceiveInfo, retain, transient},
         reply::{Admission, Completion, ReplyError, ReplyRoute},
         routing::{
@@ -431,6 +431,11 @@ enum TcpState {
 }
 
 /// Something waiting for a TCP connection to open.
+///
+/// An encoded message waiting here has had its `WriteStarted` recorded, and
+/// keeps the `WriteRef` that names it, or `None` without an observer. The
+/// driver records its end however it leaves: on the new connection, or
+/// refused or failed before that.
 enum Pending {
     /// A client's request, which starts a transaction or is prepared once
     /// it has a connection.
@@ -438,7 +443,7 @@ enum Pending {
     /// A non-2xx ACK whose INVITE connection had closed. It goes to the
     /// INVITE's next hop (RFC 3261 section 17.1.1.3), not to where the final
     /// response came from.
-    Ack(Bytes, Note),
+    Ack(Bytes, Option<WriteRef>),
     /// A CANCEL whose INVITE connection had closed.
     Cancel(CancelStart),
     /// A request sent once, which gets its Via when the connection is open.
@@ -446,13 +451,13 @@ enum Pending {
     /// An encoded response whose request came on a connection that has closed
     /// since. It goes to `sent-by` on a new connection
     /// (RFC 3261 section 18.2.2).
-    Response(Bytes, Fallback, Note),
-    OneShot(Bytes, Completion, Note),
+    Response(Bytes, Fallback, Option<WriteRef>),
+    OneShot(Bytes, Completion, Option<WriteRef>),
     Server(
         Bytes,
         server::WriteObservation,
         crate::transport::budget::Permit,
-        Note,
+        Option<WriteRef>,
     ),
 }
 
@@ -462,6 +467,19 @@ impl Pending {
     /// new request.
     fn is_protocol_work(&self) -> bool {
         !matches!(self, Pending::Request(..) | Pending::OneShotRequest(..))
+    }
+
+    /// The write this holds, if an observer recorded its start.
+    fn write(&self) -> Option<WriteRef> {
+        match self {
+            Pending::Ack(_, write)
+            | Pending::Response(_, _, write)
+            | Pending::OneShot(_, _, write)
+            | Pending::Server(_, _, _, write) => *write,
+            Pending::Request(..)
+            | Pending::Cancel(..)
+            | Pending::OneShotRequest(..) => None,
+        }
     }
 }
 
@@ -1794,6 +1812,10 @@ impl Driver {
 
     fn reject_pending(&mut self, pending: Pending) {
         increment(&self.connection_stats.rejected);
+        if let (Some(tap), Some(write)) = (self.tap.as_ref(), pending.write())
+        {
+            tap.refused(write, io::ErrorKind::WouldBlock);
+        }
         match pending {
             Pending::Request(request, admitted, permit) => {
                 drop(request);
@@ -1831,9 +1853,8 @@ impl Driver {
             // A response that cannot be queued is lost. The connection is full
             // or gone again, and a server transaction over TCP has nothing to
             // retransmit it with.
-            Pending::OneShot(bytes, completion, note) => {
-                let tap = self.tap.as_ref();
-                match tcp_write(tap, flow, note, &bytes, |hook| {
+            Pending::OneShot(bytes, completion, write) => {
+                match tcp_resume(self.tap.as_ref(), write, |hook| {
                     writer.submit_hooked(bytes.clone(), hook)
                 }) {
                     Ok(receipt) => self.writes.push((receipt, completion)),
@@ -1845,9 +1866,8 @@ impl Driver {
                     })),
                 }
             }
-            Pending::Server(bytes, observation, permit, note) => {
-                let tap = self.tap.as_ref();
-                match tcp_write(tap, flow, note, &bytes, |hook| {
+            Pending::Server(bytes, observation, permit, write) => {
+                match tcp_resume(self.tap.as_ref(), write, |hook| {
                     writer.submit_hooked(bytes.clone(), hook)
                 }) {
                     Ok(receipt) => self.server_writes.push((
@@ -1862,10 +1882,9 @@ impl Driver {
                     }
                 }
             }
-            Pending::Response(bytes, permit, note) => {
-                let tap = self.tap.as_ref();
+            Pending::Response(bytes, permit, write) => {
                 if let Ok(receipt) =
-                    tcp_write(tap, flow, note, &bytes, |hook| {
+                    tcp_resume(self.tap.as_ref(), write, |hook| {
                         writer.submit_hooked(bytes.clone(), hook)
                     })
                 {
@@ -1874,11 +1893,10 @@ impl Driver {
             }
             // A lost ACK over TCP is like one lost over UDP. The server
             // retransmits its final response until Timer H.
-            Pending::Ack(bytes, note) => {
-                let _ =
-                    tcp_write(self.tap.as_ref(), flow, note, &bytes, |hook| {
-                        writer.send_hooked(bytes.clone(), hook)
-                    });
+            Pending::Ack(bytes, write) => {
+                let _ = tcp_resume(self.tap.as_ref(), write, |hook| {
+                    writer.send_hooked(bytes.clone(), hook)
+                });
             }
             Pending::Cancel(start) => {
                 let link = Link { flow, writer: Some(writer), path: None };
@@ -1939,9 +1957,11 @@ impl Driver {
                     completion.finish(Err(ReplyError::Busy))
                 }
                 Err(tcp::SendError::Closed) => {
+                    let remote = link.flow.remote;
+                    let write = self.park(remote, note, &bytes);
                     self.send_over_tcp(
-                        link.flow.remote,
-                        Pending::OneShot(bytes, completion, note),
+                        remote,
+                        Pending::OneShot(bytes, completion, write),
                     );
                 }
             }
@@ -2124,6 +2144,7 @@ impl Driver {
                         "response fallback budget is full",
                     ));
                 };
+                let write = self.park(target, note, bytes);
                 if self.send_over_tcp(
                     target,
                     Pending::Response(
@@ -2133,7 +2154,7 @@ impl Driver {
                             stats: self.connection_stats.clone(),
                             written: false,
                         },
-                        note,
+                        write,
                     ),
                 ) {
                     Ok(())
@@ -2354,6 +2375,11 @@ impl Driver {
                 let source = Arc::new(err);
 
                 for pending in pending {
+                    if let (Some(tap), Some(write)) =
+                        (self.tap.as_ref(), pending.write())
+                    {
+                        tap.refused(write, source.kind());
+                    }
                     match pending {
                         Pending::Request(request, admitted, permit) => {
                             let err = io::Error::new(
@@ -3017,6 +3043,7 @@ impl Driver {
                 );
             }
             PreparedServerOutput::Waiting { remote, bytes, fallback } => {
+                let write = self.park(remote, note, &bytes);
                 let TcpState::Connecting(waiting) = &mut self
                     .routes
                     .get_mut(&remote)
@@ -3031,7 +3058,7 @@ impl Driver {
                     bytes,
                     observation.fallback(self.connection_stats.clone()),
                     fallback,
-                    note,
+                    write,
                 ));
             }
             PreparedServerOutput::Connect {
@@ -3041,12 +3068,13 @@ impl Driver {
                 connection,
                 attempt,
             } => {
+                let write = self.park(remote, note, &bytes);
                 self.routes.get_mut(&remote).expect("prepared route").tcp =
                     TcpState::Connecting(vec![Pending::Server(
                         bytes,
                         observation.fallback(self.connection_stats.clone()),
                         fallback,
-                        note,
+                        write,
                     )]);
                 self.spawn_connect(remote, connection, attempt);
             }
@@ -3089,6 +3117,17 @@ impl Driver {
     /// driver is handling one.
     fn note(&self, origin: WriteOrigin) -> Note {
         Note::new(origin, self.cause)
+    }
+
+    /// Records the start of a TCP write to `remote` that is about to wait
+    /// for a connection, and returns its `WriteRef` for the `Pending`.
+    fn park(
+        &self,
+        remote: SocketAddr,
+        note: Note,
+        bytes: &Bytes,
+    ) -> Option<WriteRef> {
+        self.tap.as_ref().map(|tap| tap.tcp_parked(remote, note, bytes))
     }
 
     fn live_work_is_drained(&self) -> bool {
@@ -3481,13 +3520,18 @@ fn tcp_write<T>(
     bytes: &Bytes,
     write: impl FnOnce(Option<tcp::Hook>) -> Result<T, tcp::SendError>,
 ) -> Result<T, tcp::SendError> {
-    let Some(tap) = tap else { return write(None) };
-    let id = tap.tcp_write();
-    tap.started(id, flow, note, bytes);
-    let tap = tap.clone();
-    write(Some(tcp::Hook::new(move |result, queued| {
-        tap.ended(id, WriteResult::from(result), queued);
-    })))
+    let started = tap.map(|tap| tap.tcp_started(flow, note, bytes));
+    tcp_resume(tap, started, write)
+}
+
+/// Writes on a TCP connection with `write`, a write whose start is recorded
+/// already as `started`, when it waited for the connection.
+fn tcp_resume<T>(
+    tap: Option<&Tap>,
+    started: Option<WriteRef>,
+    write: impl FnOnce(Option<tcp::Hook>) -> Result<T, tcp::SendError>,
+) -> Result<T, tcp::SendError> {
+    write(tap.zip(started).and_then(|(tap, started)| tap.hook(started)))
 }
 
 /// The body of a received message, for its receive record.
@@ -3566,7 +3610,7 @@ mod tests {
                 stats: driver.connection_stats.clone(),
                 written: false,
             },
-            NOTE,
+            None,
         )
     }
 

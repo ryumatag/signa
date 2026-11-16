@@ -6236,4 +6236,99 @@ mod tests {
         assert_eq!(same, write);
         assert_eq!((result, accepted), (WriteResult::Written, true));
     }
+
+    // A request the endpoint queues on a TCP connection ends once, written,
+    // from the connection's writer task.
+    #[tokio::test]
+    async fn an_observer_sees_a_queued_tcp_request_end_once() {
+        let (endpoint, _incoming) =
+            Endpoint::builder().tcp(LOCALHOST).bind().unwrap();
+        let mut observer =
+            endpoint.observe(observe::Config::new()).await.unwrap();
+        let listener = TcpListener::bind(LOCALHOST).await.unwrap();
+        let target =
+            Target::new(Transport::Tcp, listener.local_addr().unwrap());
+
+        endpoint
+            .send_request(request("OPTIONS"), target, ViaMode::Fresh)
+            .await
+            .unwrap();
+
+        let started = observer.recv().await.unwrap();
+        let Observed::WriteStarted { write, origin, .. } = *started.observed()
+        else {
+            panic!("a started write, got {started:?}");
+        };
+        assert_eq!(origin, WriteOrigin::Send);
+        let ended = observer.recv().await.unwrap();
+        let Observed::WriteEnded { write: same, result, accepted } =
+            *ended.observed()
+        else {
+            panic!("an ended write, got {ended:?}");
+        };
+        assert_eq!(same, write);
+        assert_eq!((result, accepted), (WriteResult::Written, true));
+        assert!(
+            timeout(Duration::from_millis(50), observer.recv()).await.is_err()
+        );
+    }
+
+    // A response whose connection has closed waits for a new one to its
+    // `sent-by` (RFC 3261 section 18.2.2). Its write starts as it waits,
+    // before its local end is known, and the failed connect ends it once,
+    // never queued.
+    #[tokio::test]
+    async fn an_observer_sees_a_waiting_response_fail_to_connect() {
+        // Windows may retry SYNs before reporting connection refusal, even
+        // on loopback.
+        const REFUSED: Duration = Duration::from_secs(10);
+        let (endpoint, mut incoming) = invite_endpoint(Timers::default());
+        let mut observer =
+            endpoint.observe(observe::Config::new()).await.unwrap();
+        let (mut remote, via) = uac(Transport::Tcp, &endpoint, "parked").await;
+        remote.send(&raw("OPTIONS", &via, None)).await;
+        let ServerRequest { request, transaction, .. } =
+            server_request(&mut incoming).await;
+        let (responder, mut events) = transaction.into_parts();
+        let arrival = observer.recv().await.unwrap();
+        let Observed::Received { flow: arrived, .. } = *arrival.observed()
+        else {
+            panic!("an arrival, got {arrival:?}");
+        };
+        drop(remote);
+        // Let the endpoint see the close.
+        sleep(Duration::from_millis(50)).await;
+
+        responder.respond(reply(&request, 200, "a")).await.unwrap();
+        // The final ends the machine at once, and the failure comes before
+        // or after that.
+        while let Some(event) = timeout(REFUSED, events.next()).await.unwrap()
+        {
+            if matches!(event, ServerEvent::TransportFailure { .. }) {
+                break;
+            }
+        }
+
+        let started = observer.recv().await.unwrap();
+        let Observed::WriteStarted { write, flow, origin, .. } =
+            *started.observed()
+        else {
+            panic!("a started write, got {started:?}");
+        };
+        assert!(matches!(origin, WriteOrigin::Response { .. }));
+        assert_eq!(flow.local, "0.0.0.0:0".parse().unwrap());
+        assert_eq!(flow.remote, arrived.remote);
+        let ended = observer.recv().await.unwrap();
+        let Observed::WriteEnded { write: same, result, accepted } =
+            *ended.observed()
+        else {
+            panic!("an ended write, got {ended:?}");
+        };
+        assert_eq!(same, write);
+        assert!(matches!(result, WriteResult::NotWritten(_)), "{result:?}");
+        assert!(!accepted);
+        assert!(
+            timeout(Duration::from_millis(50), observer.recv()).await.is_err()
+        );
+    }
 }

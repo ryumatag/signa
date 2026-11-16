@@ -22,8 +22,9 @@ use std::{
     fmt,
     future::{Future, poll_fn},
     io,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
-        Arc,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll},
@@ -38,10 +39,10 @@ use super::{
     driver::{Command, increment, now},
 };
 use crate::transport::{
-    Flow, Limits, ReceiveId, Stamp,
+    Flow, Limits, ReceiveId, Stamp, Transport,
     budget::{Budget, Permit},
     datagram::{TransportContext, WriteId, WriteOutcome},
-    next_id,
+    next_id, tcp,
 };
 
 /// What an [`Observer`] keeps and copies.
@@ -81,8 +82,9 @@ impl Config {
         self
     }
 
-    /// The most bytes those records take: each record's own size and the
-    /// payload and context it copied.
+    /// The most bytes those records take. Each record is charged the size of
+    /// a [`Record`] itself, a few hundred bytes, plus the payload and context
+    /// it copied, so a record without copies still takes room.
     pub fn bytes(mut self, bytes: usize) -> Config {
         self.limits.bytes = bytes;
         self
@@ -147,8 +149,11 @@ impl Observer {
         else {
             return Poll::Ready(None);
         };
+        // The tap numbers and queues a record under one lock, so records
+        // arrive in the order of their numbers.
         let expected = self.last.map_or(0, |last| last + 1);
-        record.lost_before = record.sequence - expected;
+        debug_assert!(record.sequence >= expected, "records out of order");
+        record.lost_before = record.sequence.saturating_sub(expected);
         self.last = Some(record.sequence);
         Poll::Ready(Some(record))
     }
@@ -184,17 +189,19 @@ impl fmt::Debug for Observer {
 pub struct Stats {
     /// Records dropped because the observer's limits were full.
     pub lost: u64,
-    /// The payload and context bytes those records would have copied.
+    /// The lengths of the messages those records would have described, as
+    /// [`Record::len`] gives them, whether or not [`Config::payload`] would
+    /// have copied them. Write stages that carry no message add nothing.
     pub lost_bytes: u64,
-    /// Bytes past [`Config::payload`] that records did not copy,
-    /// when the observer copies payloads.
+    /// Bytes past [`Config::payload`] that delivered records did not copy,
+    /// when the observer copies payloads. Lost records add nothing here.
     pub truncated_bytes: u64,
 }
 
 /// One thing an endpoint received or did with a write.
 ///
-/// Its `Debug` shows the payload's length, never its bytes, since SIP
-/// traffic can carry credentials.
+/// Its `Debug` shows the lengths of the payload and the context, never their
+/// bytes, since SIP traffic can carry credentials.
 pub struct Record {
     sequence: u64,
     lost_before: u64,
@@ -266,7 +273,10 @@ impl fmt::Debug for Record {
             .field("observed", &self.observed)
             .field("len", &self.len)
             .field("payload", &self.payload.as_ref().map(Bytes::len))
-            .field("context", &self.context)
+            .field(
+                "context",
+                &self.context.as_ref().map(TransportContext::len),
+            )
             .finish()
     }
 }
@@ -276,8 +286,8 @@ impl fmt::Debug for Record {
 /// A write has up to three records, which share its [`WriteRef`]: it
 /// started, the backend took it, and it ended. A write that failed before
 /// the backend took it has no `WriteAccepted`. One started before the
-/// observer was attached may show only its later stages, and the last stage
-/// of a write can come after its transaction has ended.
+/// observer was attached may show only its later stages, or none, and the
+/// last stage of a write can come after its transaction has ended.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum Observed {
@@ -295,7 +305,9 @@ pub enum Observed {
     WriteStarted {
         /// Names the write in its later records.
         write: WriteRef,
-        /// The local and remote ends of the write.
+        /// The local and remote ends of the write. A TCP write that waits
+        /// for a new connection starts before its local end is known, and
+        /// shows the unspecified address of the remote's family, port zero.
         flow: Flow,
         /// Why the endpoint wrote it.
         origin: WriteOrigin,
@@ -482,10 +494,12 @@ struct TapShared {
     records: mpsc::UnboundedSender<Record>,
     budget: Budget,
     counters: Arc<Counters>,
-    /// The next record's number. Only the endpoint's tasks record, the
-    /// driver and the writer tasks of its TCP connections, so this is
-    /// uncontended in practice.
-    sequence: AtomicU64,
+    /// The next record's number. A record takes its number and goes into the
+    /// queue under this lock, so the queue holds records in the order of
+    /// their numbers. The driver and the writer tasks of its TCP connections
+    /// record from different threads, and a number taken apart from the send
+    /// could be queued after a later one. Nothing waits inside the lock.
+    sequence: Mutex<u64>,
     payload: usize,
     context: bool,
     /// The domain of the endpoint's TCP writes, and the next number in it.
@@ -553,14 +567,70 @@ impl Tap {
         self.record(now(), observed, [&[]; 2], None);
     }
 
-    /// Numbers a TCP write.
-    pub(super) fn tcp_write(&self) -> WriteRef {
+    /// Numbers a TCP write on `flow` and records its start.
+    pub(super) fn tcp_started(
+        &self,
+        flow: Flow,
+        note: Note,
+        bytes: &[u8],
+    ) -> WriteRef {
         let number = self.0.tcp_next.fetch_add(1, Ordering::Relaxed);
-        WriteRef { domain: self.0.tcp, number, datagram: false }
+        let write = WriteRef { domain: self.0.tcp, number, datagram: false };
+        self.started(write, flow, note, bytes);
+        write
+    }
+
+    /// Numbers a TCP write to `remote` that waits for a connection, and
+    /// records its start. The connection's local end is not known yet, so
+    /// the record shows the unspecified address of the remote's family.
+    pub(super) fn tcp_parked(
+        &self,
+        remote: SocketAddr,
+        note: Note,
+        bytes: &[u8],
+    ) -> WriteRef {
+        let any = match remote {
+            SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        };
+        let local = SocketAddr::new(any, 0);
+        let flow = Flow { transport: Transport::Tcp, local, remote };
+        self.tcp_started(flow, note, bytes)
+    }
+
+    /// The hook that records the end of `write` from the connection's writer
+    /// task, or `None` if this tap did not start it, as when another observer
+    /// has replaced the one that did.
+    ///
+    /// The hook holds the tap weakly. A write can stay queued on a connection
+    /// long after the endpoint has stopped, and a strong tap would keep the
+    /// observer's channel open, so `Observer::recv` would not end.
+    pub(super) fn hook(&self, write: WriteRef) -> Option<tcp::Hook> {
+        if !self.started_tcp(write) {
+            return None;
+        }
+        let tap = Arc::downgrade(&self.0);
+        Some(tcp::Hook::new(move |result, queued| {
+            if let Some(tap) = Weak::upgrade(&tap) {
+                Tap(tap).ended(write, WriteResult::from(result), queued);
+            }
+        }))
+    }
+
+    /// Records the end of a TCP `write` that was never queued, if this tap
+    /// started it.
+    pub(super) fn refused(&self, write: WriteRef, kind: io::ErrorKind) {
+        if self.started_tcp(write) {
+            self.ended(write, WriteResult::NotWritten(kind), false);
+        }
+    }
+
+    fn started_tcp(&self, write: WriteRef) -> bool {
+        !write.datagram && write.domain == self.0.tcp
     }
 
     /// Makes a record and queues it, or counts it lost when the limits are
-    /// full. Either way it takes the next sequence number, and the driver
+    /// full. Either way it takes the next sequence number, and the caller
     /// never waits.
     fn record(
         &self,
@@ -570,36 +640,32 @@ impl Tap {
         context: Option<TransportContext>,
     ) {
         let shared = &*self.0;
-        let sequence = shared.sequence.fetch_add(1, Ordering::Relaxed);
+        // An observer that has dropped takes nothing, and the tap's holders
+        // let it go at their next look. Its numbers no longer matter.
+        if shared.records.is_closed() {
+            return;
+        }
         let len = parts[0].len() + parts[1].len();
         let copied = len.min(shared.payload);
         let context_len = context.as_ref().map_or(0, TransportContext::len);
 
+        // The permit and the copies come before the lock, which then covers
+        // only the number and the send.
         let Some(permit) = shared.budget.acquire(charge(copied, context_len))
         else {
+            let mut next = shared.sequence.lock().expect("not poisoned");
+            *next += 1;
             increment(&shared.counters.lost);
-            add(&shared.counters.lost_bytes, copied + context_len);
+            add(&shared.counters.lost_bytes, len);
             return;
         };
-        if shared.payload > 0 {
-            add(&shared.counters.truncated_bytes, len - copied);
-        }
-        let payload = (shared.payload > 0 && len > 0).then(|| {
-            let mut copy = BytesMut::with_capacity(copied);
-            let mut left = copied;
-            for part in parts {
-                let n = part.len().min(left);
-                copy.extend_from_slice(&part[..n]);
-                left -= n;
-            }
-            copy.freeze()
-        });
+        let payload =
+            (shared.payload > 0 && len > 0).then(|| copy(parts, copied));
         // A context the backend sliced out of a capture buffer would keep
         // that buffer alive with the record.
         let context = context.map(|context| context.detached());
-
-        let record = Record {
-            sequence,
+        let mut record = Record {
+            sequence: 0,
             lost_before: 0,
             at,
             observed,
@@ -608,10 +674,29 @@ impl Tap {
             context,
             _permit: permit,
         };
-        // An observer that has dropped takes nothing, and the tap's holders
-        // let it go at their next look.
+
+        // The counters change under the lock, before the send, so that they
+        // already include what a record the observer receives reports.
+        let mut next = shared.sequence.lock().expect("not poisoned");
+        record.sequence = *next;
+        *next += 1;
+        if shared.payload > 0 {
+            add(&shared.counters.truncated_bytes, len - copied);
+        }
         let _ = shared.records.send(record);
     }
+}
+
+/// Copies the first `len` bytes of `parts`, taken in order.
+fn copy(parts: [&[u8]; 2], len: usize) -> Bytes {
+    let mut copy = BytesMut::with_capacity(len);
+    let mut left = len;
+    for part in parts {
+        let n = part.len().min(left);
+        copy.extend_from_slice(&part[..n]);
+        left -= n;
+    }
+    copy.freeze()
 }
 
 /// Adds `n` to `counter`, saturating at `u64::MAX`.
@@ -659,7 +744,7 @@ pub(super) fn pair(
         records,
         budget: Budget::new(config.limits),
         counters: counters.clone(),
-        sequence: AtomicU64::new(0),
+        sequence: Mutex::new(0),
         payload: config.payload,
         context: config.context,
         tcp: next_id(),
@@ -741,5 +826,211 @@ impl Endpoint {
             done.await.map_err(|_| Error::closed())?;
             Ok(observer)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::thread;
+
+    use super::*;
+
+    const PEER: SocketAddr =
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9);
+    const NOTE: Note = Note { origin: WriteOrigin::Send, cause: None };
+
+    fn attach(config: Config) -> (Tap, Observer) {
+        pair(config, Arc::new(AtomicBool::new(true)))
+    }
+
+    /// A TCP flow to the peer.
+    fn flow() -> Flow {
+        Flow { transport: Transport::Tcp, local: PEER, remote: PEER }
+    }
+
+    // The driver and the writer tasks of its connections record at once.
+    // However their sends interleave, the observer receives the numbers in
+    // order, and its gaps and stats account for every record made.
+    #[tokio::test]
+    async fn records_from_several_threads_arrive_in_order() {
+        const THREADS: u64 = 4;
+        const EACH: u64 = 5_000;
+        let (tap, mut observer) = attach(Config::new().records(64));
+        let threads: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let tap = tap.clone();
+                thread::spawn(move || {
+                    for _ in 0..EACH {
+                        let write = tap.tcp_started(flow(), NOTE, b"OPTIONS");
+                        tap.ended(write, WriteResult::Written, true);
+                    }
+                })
+            })
+            .collect();
+        drop(tap);
+
+        let (mut delivered, mut lost_before, mut last) = (0, 0, None);
+        while let Some(record) = observer.recv().await {
+            assert!(last.is_none_or(|last| record.sequence() > last));
+            last = Some(record.sequence());
+            delivered += 1;
+            lost_before += record.lost_before();
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let total = THREADS * EACH * 2;
+        assert_eq!(delivered + observer.stats().lost, total);
+        assert_eq!(delivered + lost_before, last.unwrap() + 1);
+    }
+
+    // A loss counts the whole message, whether or not payloads are copied,
+    // and only a delivered record counts what the capture length cut.
+    #[test]
+    fn stats_count_lost_messages_whole_and_truncation_once() {
+        let (tap, observer) = attach(Config::new().records(1).payload(4));
+        let first = tap.tcp_started(flow(), NOTE, b"first message");
+        tap.tcp_started(flow(), NOTE, b"lost message");
+        tap.ended(first, WriteResult::Written, true);
+
+        let stats = observer.stats();
+        assert_eq!(stats.lost, 2);
+        assert_eq!(stats.lost_bytes, 12);
+        assert_eq!(stats.truncated_bytes, 9);
+
+        let (tap, observer) = attach(Config::new().records(1));
+        tap.tcp_started(flow(), NOTE, b"first message");
+        tap.tcp_started(flow(), NOTE, b"lost message");
+        let stats = observer.stats();
+        assert_eq!((stats.lost, stats.lost_bytes), (1, 12));
+        assert_eq!(stats.truncated_bytes, 0);
+    }
+
+    // A record holds its share of the limits until the application drops it.
+    // Then the next one fits again, and reports the one lost meanwhile.
+    #[tokio::test]
+    async fn a_dropped_record_returns_its_permit() {
+        let (tap, mut observer) = attach(Config::new().records(1));
+        let write = tap.tcp_started(flow(), NOTE, b"OPTIONS");
+        let held = observer.recv().await.unwrap();
+
+        tap.ended(write, WriteResult::Written, true);
+        drop(held);
+        tap.ended(write, WriteResult::Written, true);
+
+        let next = observer.recv().await.unwrap();
+        assert_eq!((next.sequence(), next.lost_before()), (2, 1));
+        assert_eq!(tap.0.budget.acquire(0).map(drop), None);
+        drop(next);
+        assert!(tap.0.budget.acquire(charge(0, 0)).is_some());
+    }
+
+    // A TCP message comes as its head and its body, and the copy runs across
+    // the two up to the capture length.
+    #[test]
+    fn a_copy_takes_both_parts_in_order() {
+        let parts: [&[u8]; 2] = [b"head", b"body"];
+        assert_eq!(copy(parts, 0), "");
+        assert_eq!(copy(parts, 3), "hea");
+        assert_eq!(copy(parts, 6), "headbo");
+        assert_eq!(copy(parts, 8), "headbody");
+        assert_eq!(copy([&[], b"body"], 2), "bo");
+    }
+
+    #[test]
+    fn counters_saturate() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        add(&counter, 5);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        add(&counter, 1);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        increment(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    // SIP can carry credentials, in its payload and in what a backend keeps
+    // in its context, so `Debug` shows only their lengths.
+    #[tokio::test]
+    async fn debug_shows_no_payload_or_context() {
+        let config = Config::new().payload(64).context(true);
+        let (tap, mut observer) = attach(config);
+        let stamp = crate::transport::Stamps::new().stamp(now());
+        let context =
+            TransportContext::new(Bytes::from_static(b"secret-context"))
+                .unwrap();
+        tap.received(
+            stamp,
+            flow(),
+            [b"secret-head", b"secret-body"],
+            &context,
+        );
+
+        let record = observer.recv().await.unwrap();
+        assert_eq!(record.payload().unwrap(), "secret-headsecret-body");
+        assert_eq!(record.context().unwrap().as_bytes(), "secret-context");
+        let debug = format!("{record:?}");
+        assert!(!debug.contains("secret"), "{debug}");
+        assert!(debug.contains("payload: Some(22)"), "{debug}");
+        assert!(debug.contains("context: Some(14)"), "{debug}");
+    }
+
+    // Once the observer has dropped, a record neither copies nor counts, and
+    // takes no number.
+    #[test]
+    fn a_detached_tap_records_nothing() {
+        let (tap, observer) = attach(Config::new().records(0).payload(64));
+        drop(observer);
+
+        tap.tcp_started(flow(), NOTE, b"OPTIONS");
+
+        assert_eq!(*tap.0.sequence.lock().unwrap(), 0);
+        assert_eq!(tap.0.counters.lost.load(Ordering::Relaxed), 0);
+    }
+
+    // A hook holds the tap weakly. A write still queued once the endpoint
+    // has let its tap go does not keep the observer waiting, and records
+    // nothing when it ends. A write another tap started gets no hook.
+    #[tokio::test]
+    async fn a_hook_does_not_keep_the_observer_open() {
+        let (tap, mut observer) = attach(Config::new());
+        let write = tap.tcp_started(flow(), NOTE, b"OPTIONS");
+        let hook = tap.hook(write).unwrap();
+        let (other, _observer) = attach(Config::new());
+        assert!(other.hook(write).is_none());
+
+        drop(tap);
+
+        assert!(observer.recv().await.is_some());
+        assert!(observer.recv().await.is_none());
+        drop(hook);
+    }
+
+    // A parked TCP write starts before its connection exists, so its record
+    // shows no local address, and one that is refused ends unqueued.
+    #[tokio::test]
+    async fn a_parked_write_starts_without_a_local_end() {
+        let (tap, mut observer) = attach(Config::new());
+        let v6: SocketAddr = "[::1]:5060".parse().unwrap();
+        let write = tap.tcp_parked(v6, NOTE, b"OPTIONS");
+        tap.refused(write, io::ErrorKind::ConnectionRefused);
+
+        let started = observer.recv().await.unwrap();
+        let Observed::WriteStarted { flow, .. } = started.observed() else {
+            panic!("a started write, got {started:?}");
+        };
+        assert_eq!(flow.local, "[::]:0".parse().unwrap());
+        assert_eq!(flow.remote, v6);
+        let ended = observer.recv().await.unwrap();
+        let Observed::WriteEnded { write: same, result, accepted } =
+            *ended.observed()
+        else {
+            panic!("an ended write, got {ended:?}");
+        };
+        assert_eq!(same, write);
+        assert_eq!(
+            (result, accepted),
+            (WriteResult::NotWritten(io::ErrorKind::ConnectionRefused), false)
+        );
     }
 }

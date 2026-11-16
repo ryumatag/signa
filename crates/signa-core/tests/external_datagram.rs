@@ -3596,8 +3596,10 @@ async fn a_full_observer_loses_records_but_nothing_else() {
     let request = Request::from_bytes(&wire.sent(1).await[0].payload).unwrap();
 
     // The request's three stages and the response's arrival, with room for
-    // two records.
-    wire.deliver(Ok(Datagram::new(ok(&request).to_bytes(), PEER, LOCAL)));
+    // two records. The lost end of the write carries no message, so the
+    // response is all the lost bytes.
+    let ok = ok(&request).to_bytes();
+    wire.deliver(Ok(Datagram::new(ok.clone(), PEER, LOCAL)));
     let response = timeout(Duration::from_secs(2), responses.next())
         .await
         .unwrap()
@@ -3605,32 +3607,42 @@ async fn a_full_observer_loses_records_but_nothing_else() {
         .unwrap();
     assert_eq!(response.response.status().as_u16(), 200);
     let stats = observer.stats();
-    assert_eq!(stats.lost, 2);
-    assert!(stats.lost_bytes > 0);
+    assert_eq!((stats.lost, stats.lost_bytes), (2, ok.len() as u64));
 
     let held = [record(&mut observer).await, record(&mut observer).await];
     let sequences: Vec<_> = held.iter().map(Record::sequence).collect();
     assert_eq!(sequences, [0, 1]);
-    // The held records still fill the limits.
-    let _ = endpoint
+    // The held records still fill the limits, so all three stages of this
+    // write are lost.
+    endpoint
         .send_request(
             outgoing("lost"),
             Target::new(Transport::Udp, PEER),
             ViaMode::Fresh,
         )
-        .await;
+        .await
+        .unwrap();
+    let lost = wire.sent(2).await[1].payload.len();
     drop(held);
-    let _ = endpoint
+    endpoint
         .send_request(
             outgoing("seen"),
             Target::new(Transport::Udp, PEER),
             ViaMode::Fresh,
         )
-        .await;
+        .await
+        .unwrap();
+    let seen = wire.sent(3).await[2].payload.len();
     let next = record(&mut observer).await;
-    assert_eq!(next.lost_before(), next.sequence() - 2);
-    assert!(next.lost_before() >= 3);
-    assert!(observer.stats().lost >= 5);
+    assert!(matches!(next.observed(), Observed::WriteStarted { .. }));
+    assert_eq!((next.sequence(), next.lost_before()), (7, 5));
+    // The write's end, behind its start and acceptance, is lost too.
+    let stats = observer.stats();
+    assert_eq!(stats.lost, 6);
+    assert_eq!(stats.lost_bytes, (ok.len() + lost) as u64);
+    // Each delivered start copied the first 64 bytes of its message.
+    let full = wire.sent(1).await[0].payload.len();
+    assert_eq!(stats.truncated_bytes, (full - 64 + seen - 64) as u64);
 }
 
 // An overflowing response stream is its own explicit error, however much
@@ -3701,6 +3713,28 @@ async fn one_observer_at_a_time_and_dropping_it_changes_nothing() {
     let record = record(&mut second).await;
     assert!(matches!(record.observed(), Observed::Received { .. }));
     assert_eq!(record.sequence(), 0);
+}
+
+// An `observe` dropped after it asked the driver to attach leaves nothing
+// behind. Another observer attaches, and only it sees what comes next, from
+// the first number on.
+#[tokio::test]
+async fn an_observe_dropped_while_attaching_lets_another_attach() {
+    let wire = Wire::default();
+    let (endpoint, _incoming) = bind(&wire);
+    // One poll sends the request, and the driver has not answered yet.
+    let mut dropped = Box::pin(endpoint.observe(observe::Config::new()));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(dropped.as_mut().poll(&mut cx).is_pending());
+    drop(dropped);
+
+    let mut second = endpoint.observe(observe::Config::new()).await.unwrap();
+    wire.deliver(datagram(options("second")));
+
+    let record = record(&mut second).await;
+    assert!(matches!(record.observed(), Observed::Received { .. }));
+    assert_eq!((record.sequence(), record.lost_before()), (0, 0));
+    assert_eq!(second.stats(), observe::Stats::default());
 }
 
 // The write stages keep the backend's word apart: a write it holds is taken
