@@ -69,7 +69,7 @@ use crate::{
             Admitted, CancelError, CancelHandle, CancelOutcome, Delivery,
             Intent, Observation, Reserved, Starting, Target,
         },
-        datagram::{Port, Received},
+        datagram::{Port, Received, Unwritten},
         error::Error,
         observe::{self, Note, Tap, WriteOrigin, WriteRef},
         path::{ReceiveInfo, retain, transient},
@@ -1562,8 +1562,8 @@ impl Driver {
             }
             // A full local write queue is not a transport failure. Skip this
             // retransmission as if UDP had lost it, and keep the transaction.
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => None,
-            Err(err) => Some(err),
+            Err(Unwritten::Busy(_)) => None,
+            Err(Unwritten::Failed(err)) => Some(err),
         }
     }
 
@@ -2132,10 +2132,8 @@ impl Driver {
     ) -> io::Result<()> {
         let tap = self.tap.as_ref();
         match send_on(self.udp.as_mut(), tap, link, bytes, false, note) {
-            Err(err)
-                if err.kind() == io::ErrorKind::BrokenPipe
-                    && link.writer.is_some() =>
-            {
+            // Over TCP only a closed connection fails a write.
+            Err(Unwritten::Failed(_)) if link.writer.is_some() => {
                 let target = link.flow.remote;
                 let Some(permit) = self.fallback.acquire(bytes.len()) else {
                     increment(&self.connection_stats.dropped);
@@ -2165,7 +2163,7 @@ impl Driver {
                     ))
                 }
             }
-            result => result,
+            result => result.map_err(Unwritten::into_error),
         }
     }
 
@@ -2307,15 +2305,12 @@ impl Driver {
             note,
         ) {
             Ok(receipt) => receipt,
-            Err(err) => {
+            Err(unwritten) => {
                 drop((tx, permit));
-                let _ = accepted.send(Err(
-                    if err.kind() == io::ErrorKind::WouldBlock {
-                        Error::busy()
-                    } else {
-                        Error::transport(err)
-                    },
-                ));
+                let _ = accepted.send(Err(match unwritten {
+                    Unwritten::Busy(_) => Error::busy(),
+                    Unwritten::Failed(err) => Error::transport(err),
+                }));
                 return;
             }
         };
@@ -3441,7 +3436,7 @@ impl ClientReceipt {
 }
 
 /// Sends a client request and returns a receipt when its write is queued.
-/// A full TCP queue is reported as `WouldBlock`.
+/// A full TCP queue is [`Unwritten::Busy`].
 fn send_client(
     udp: Option<&mut Port>,
     tap: Option<&Tap>,
@@ -3449,21 +3444,13 @@ fn send_client(
     bytes: &Bytes,
     initial: bool,
     note: Note,
-) -> io::Result<Option<ClientReceipt>> {
+) -> Result<Option<ClientReceipt>, Unwritten> {
     if let Some(writer) = &link.writer {
         tcp_write(tap, link.flow, note, bytes, |hook| {
             writer.submit_request(bytes.clone(), hook)
         })
         .map(|receipt| Some(ClientReceipt::Tcp(receipt)))
-        .map_err(|error| {
-            io::Error::new(
-                match error {
-                    tcp::SendError::Full => io::ErrorKind::WouldBlock,
-                    tcp::SendError::Closed => io::ErrorKind::BrokenPipe,
-                },
-                error,
-            )
-        })
+        .map_err(tcp_unwritten)
     } else {
         udp.expect("UDP link has a socket")
             .submit_client(bytes, link, initial, note)
@@ -3480,7 +3467,7 @@ fn send_on(
     bytes: &Bytes,
     new_request: bool,
     note: Note,
-) -> io::Result<()> {
+) -> Result<(), Unwritten> {
     match (&link.writer, udp) {
         (Some(writer), _) => tcp_write(tap, link.flow, note, bytes, |hook| {
             if new_request {
@@ -3489,13 +3476,7 @@ fn send_on(
                 writer.send_hooked(bytes.clone(), hook)
             }
         })
-        .map_err(|err| {
-            let kind = match err {
-                tcp::SendError::Full => io::ErrorKind::WouldBlock,
-                tcp::SendError::Closed => io::ErrorKind::BrokenPipe,
-            };
-            io::Error::new(kind, err)
-        }),
+        .map_err(tcp_unwritten),
         (None, Some(udp)) => {
             if new_request {
                 udp.send_request(bytes, link, note)
@@ -3504,6 +3485,19 @@ fn send_on(
             }
         }
         (None, None) => unreachable!("a UDP flow comes from the UDP socket"),
+    }
+}
+
+/// What a TCP write that did not go out tells the driver. A full queue is the
+/// endpoint's own limit, and a closed connection a failure.
+fn tcp_unwritten(error: tcp::SendError) -> Unwritten {
+    match error {
+        tcp::SendError::Full => {
+            Unwritten::Busy(io::Error::new(io::ErrorKind::WouldBlock, error))
+        }
+        tcp::SendError::Closed => {
+            Unwritten::Failed(io::Error::new(io::ErrorKind::BrokenPipe, error))
+        }
     }
 }
 

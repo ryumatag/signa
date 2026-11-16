@@ -15,7 +15,7 @@ client, and [section 17.2.1] with [RFC 6026 sections 8.5 and 8.7] the server.
 [RFC 6026 sections 8.5 and 8.7]: https://www.rfc-editor.org/rfc/rfc6026.html#section-8.7
 */
 
-use std::{io, time::Instant};
+use std::time::Instant;
 
 use bytes::Bytes;
 
@@ -26,6 +26,7 @@ use super::{
 use crate::{
     endpoint::{
         admission::request_bytes,
+        datagram::Unwritten,
         error::Error,
         observe::WriteOrigin,
         path::{ReceiveInfo, retain},
@@ -222,12 +223,8 @@ impl Driver {
             None => {
                 match send_on(self.udp.as_mut(), tap, link, &ack, false, note)
                 {
-                    Err(error)
-                        if error.kind() != io::ErrorKind::WouldBlock =>
-                    {
-                        Some(error)
-                    }
-                    _ => None,
+                    Err(Unwritten::Failed(error)) => Some(error),
+                    Ok(()) | Err(Unwritten::Busy(_)) => None,
                 }
             }
         };

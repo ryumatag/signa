@@ -102,6 +102,8 @@ enum Writes {
     Hold,
     /// Refuses it when it is offered.
     Reject,
+    /// Refuses it with `WouldBlock`, as a backend whose own queue is full.
+    Busy,
 }
 
 /// One write the wire accepted.
@@ -149,7 +151,7 @@ struct State {
     stale: Vec<Bytes>,
     /// The address the wire names as its own, `LOCAL` unless set.
     local: Option<SocketAddr>,
-    /// Writes refused in `Writes::Reject`.
+    /// Writes refused in `Writes::Reject` or `Writes::Busy`.
     refused: usize,
 }
 
@@ -314,6 +316,14 @@ impl DatagramIo for Wire {
                 return Submit::Rejected(
                     write,
                     io::Error::new(io::ErrorKind::NotConnected, "refused"),
+                );
+            }
+            Writes::Busy => {
+                state.refused += 1;
+                self.sent.notify_waiters();
+                return Submit::Rejected(
+                    write,
+                    io::Error::new(io::ErrorKind::WouldBlock, "queue full"),
                 );
             }
         }
@@ -564,6 +574,67 @@ async fn a_failed_write_is_reported() {
         .unwrap()
         .unwrap_err();
     assert!(error.is_transport());
+}
+
+// A backend may refuse a write with `WouldBlock`, as one whose own queue is
+// full would. That is the backend's refusal, not the endpoint's limits, so a
+// one-shot send, a client transaction's request and a reply all fail as
+// transport errors, and none is told that the endpoint is busy.
+#[tokio::test]
+async fn a_backend_refusing_with_would_block_is_a_transport_error() {
+    let wire = Wire::default();
+    let (endpoint, mut incoming) = bind(&wire);
+    wire.deliver(datagram(options("refused-reply")));
+    let request = request(&mut incoming).await;
+    let (responder, _) = request.transaction.into_parts();
+    let route = responder.reply_route();
+    let target = Target::new(Transport::Udp, PEER);
+    wire.writes(Writes::Busy);
+
+    let sent = endpoint
+        .send_request(outgoing("refused-send"), target.clone(), ViaMode::Fresh)
+        .await
+        .unwrap_err();
+    let started =
+        endpoint.start(outgoing("refused-start"), target).await.unwrap_err();
+    let replied = route.send(ok(&request.request)).await;
+
+    assert!(sent.is_transport() && !sent.is_busy(), "{sent}");
+    assert!(started.is_transport() && !started.is_busy(), "{started}");
+    assert!(
+        matches!(replied, Err(signa_core::endpoint::ReplyError::Transport(_))),
+        "{replied:?}"
+    );
+    assert_eq!(wire.state.lock().unwrap().refused, 3);
+    drop(responder);
+}
+
+// A retransmission the backend refuses with `WouldBlock` is a transport
+// error, which ends the client transaction (RFC 3261 section 17.1.2.2). Only
+// a full limit of the endpoint's own skips a retransmission as if UDP had
+// lost it.
+#[tokio::test]
+async fn a_refused_retransmission_ends_its_transaction() {
+    let wire = Wire::default();
+    let (endpoint, _incoming) = Endpoint::builder()
+        .udp_io(wire.clone())
+        .timers(short_timers())
+        .bind()
+        .unwrap();
+    let target = Target::new(Transport::Udp, PEER);
+    let (_control, mut responses) = endpoint
+        .start(outgoing("retransmission"), target)
+        .await
+        .unwrap()
+        .into_parts();
+    wire.sent(1).await;
+
+    wire.writes(Writes::Busy);
+
+    let ended = timeout(Duration::from_secs(2), responses.next()).await;
+    let ended = ended.unwrap().unwrap().unwrap_err();
+    assert!(ended.is_transport() && !ended.is_timeout(), "{ended}");
+    assert_eq!(wire.count(), 1);
 }
 
 /// What a wire reports for a write it took and can no longer account for.
@@ -2593,6 +2664,128 @@ async fn a_close_resolves_after_its_backend_has_dropped() {
     }
 }
 
+/// A backend that panics in `poll_recv` once its fuse is lit, as an adapter
+/// with a bug might.
+struct Panicking<B> {
+    backend: B,
+    fuse: Arc<AtomicBool>,
+}
+
+impl<B: DatagramIo> DatagramIo for Panicking<B> {
+    fn local_addr(&self) -> SocketAddr {
+        self.backend.local_addr()
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.backend.capabilities()
+    }
+
+    fn poll_recv(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Datagram, RecvError>> {
+        let received = self.backend.poll_recv(cx);
+        if self.fuse.load(Ordering::SeqCst) && received.is_ready() {
+            panic!("the backend panics, as the test asked");
+        }
+        received
+    }
+
+    fn poll_submit(
+        &mut self,
+        cx: &mut Context<'_>,
+        write: DatagramWrite,
+    ) -> Submit {
+        self.backend.poll_submit(cx, write)
+    }
+
+    fn poll_complete(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<(WriteId, WriteOutcome)> {
+        self.backend.poll_complete(cx)
+    }
+
+    fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        self.backend.poll_close(cx)
+    }
+}
+
+// A port whose backend panics still closes, as one that ran out of time
+// would. Its task drops the backend before it reports the close expired, so
+// a closer neither waits forever nor hears of the close while the backend is
+// still dropping.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_port_whose_backend_panics_still_closes() {
+    let wire = Wire::default();
+    let (gated, gate) = gated(wire.clone());
+    let fuse = Arc::new(AtomicBool::new(true));
+    let backend = Panicking { backend: gated, fuse };
+    let (port, _ingress) =
+        DatagramPort::builder().udp_io(backend).intercept().unwrap();
+
+    wire.deliver(datagram(options("panic")));
+    // The close comes once the task has panicked. One that came first would
+    // stop reception before the panic.
+    timeout(Duration::from_secs(2), gate.dropping.notified())
+        .await
+        .expect("the backend is dropped");
+    let mut closing = tokio::spawn(port.close(Duration::from_secs(60)));
+    let early = timeout(Duration::from_millis(50), &mut closing).await.ok();
+    // Opened before any assertion, so that a failure cannot leave the task
+    // that drops the backend blocked.
+    gate.open.send(()).unwrap();
+    let resolved_early = early.is_some();
+    let outcome = match early {
+        Some(outcome) => outcome,
+        None => timeout(Duration::from_secs(2), closing).await.unwrap(),
+    };
+
+    assert!(!resolved_early, "resolved while the backend was dropping");
+    assert!(gate.dropped.load(Ordering::SeqCst));
+    assert_eq!(outcome.unwrap(), ShutdownOutcome::DeadlineExpired);
+}
+
+// The endpoints on a port whose backend panics learn how their writes ended
+// rather than wait forever. A write the backend had taken may have gone out,
+// so its outcome is unknown. One still waiting for room in the port's limits
+// never went out.
+#[tokio::test]
+async fn an_endpoint_learns_its_writes_when_the_port_s_backend_panics() {
+    let wire = Wire::default();
+    let fuse = Arc::new(AtomicBool::new(false));
+    let backend = Panicking { backend: wire.clone(), fuse: fuse.clone() };
+    let (port, _ingress) = DatagramPort::builder()
+        .udp_io(backend)
+        .write_limits(Limits { count: 1, bytes: 64 * 1024 })
+        .intercept()
+        .unwrap();
+    let (endpoint, _incoming) =
+        Endpoint::builder().port(&port).bind().unwrap();
+    wire.writes(Writes::Delay);
+    let taken = send_options(&endpoint, "taken");
+    wire.sent(1).await;
+    let waiting = send_options(&endpoint, "waiting");
+    sleep(Duration::from_millis(20)).await;
+
+    fuse.store(true, Ordering::SeqCst);
+    wire.deliver(datagram(options("panic")));
+
+    let taken = timeout(Duration::from_secs(2), taken).await.unwrap();
+    let waiting = timeout(Duration::from_secs(2), waiting).await.unwrap();
+    let (taken, waiting) =
+        (taken.unwrap().unwrap_err(), waiting.unwrap().unwrap_err());
+    assert!(taken.is_outcome_unknown() && !taken.is_transport(), "{taken}");
+    assert!(
+        waiting.is_transport() && !waiting.is_outcome_unknown(),
+        "{waiting}"
+    );
+    assert_eq!(wire.count(), 1);
+    let close = port.close(Duration::from_secs(1));
+    let closed = timeout(Duration::from_secs(2), close).await.unwrap();
+    assert_eq!(closed, ShutdownOutcome::DeadlineExpired);
+}
+
 // A port on a socket of its own has released its address once its close
 // resolves, so another socket can bind it at once. A few rounds give a close
 // that published early more chances to lose the race.
@@ -2712,6 +2905,30 @@ async fn a_capture_receives_and_sends_nothing() {
     let outcome = capture.close(Duration::from_secs(1)).await;
     assert_eq!(outcome, ShutdownOutcome::Drained);
     assert!(wire.closed());
+}
+
+// A captured datagram keeps a copy of its context, so holding it does not
+// keep alive the buffer the backend sliced the context out of.
+#[tokio::test]
+async fn a_captured_datagram_does_not_hold_the_capture_buffer() {
+    let wire = Wire::default();
+    let mut capture =
+        DatagramPort::builder().udp_io(wire.clone()).capture().unwrap();
+    let buffer =
+        Bytes::from(b"nic0 vlan 100, then the rest of a frame".to_vec());
+    let context = TransportContext::new(buffer.slice(..13)).unwrap();
+
+    wire.deliver(
+        datagram(options("buffer"))
+            .map(|datagram| datagram.with_context(context)),
+    );
+    let captured = timeout(Duration::from_secs(2), capture.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(captured.context().as_bytes(), "nic0 vlan 100");
+    assert!(buffer.is_unique(), "the captured datagram holds the buffer");
 }
 
 // A port runs while a handle or a registered endpoint is left. Once the last
@@ -3097,18 +3314,62 @@ async fn a_forced_stop_leaves_the_port_to_the_other_endpoints() {
     assert!(outcome(from_stopping).await.unwrap().unwrap().is_err());
 }
 
-// An endpoint's write waits for room in the port's limits, so a byte limit
-// below the backend's largest payload could hold one back forever. The port
-// refuses that configuration.
-#[test]
-fn the_port_s_write_limits_must_hold_a_whole_payload() {
-    let refused = DatagramPort::builder()
-        .udp_io(Wire::default())
-        .write_limits(Limits { count: 16, bytes: 1000 })
-        .intercept()
-        .unwrap_err();
+// Raw sends take three quarters of a port's write limits, rounded down, so
+// a byte limit whose share is below the backend's largest payload would
+// refuse a raw send that large as busy however idle the port was. The port
+// refuses that configuration. 1963 bytes leave a share of 1473.
+#[tokio::test]
+async fn the_port_s_write_limits_must_hold_a_whole_payload() {
+    for (bytes, valid) in [(1000, false), (1472, false), (1963, true)] {
+        let bound = DatagramPort::builder()
+            .udp_io(Wire::default())
+            .write_limits(Limits { count: 1, bytes })
+            .intercept();
 
-    assert!(refused.is_invalid_config());
+        match bound {
+            Ok(_) => assert!(valid, "{bytes}"),
+            Err(error) => {
+                assert!(!valid && error.is_invalid_config(), "{bytes}")
+            }
+        }
+    }
+}
+
+// An endpoint's new requests take three quarters of its UDP write limits.
+// With a backend, or on a port, a share without a write or smaller than the
+// backend's largest payload would refuse such requests as busy however idle
+// the endpoint was, so bind refuses it. An endpoint with a socket of its own
+// keeps zero limits valid, as a way to refuse its writes.
+#[tokio::test]
+async fn an_endpoint_s_write_limits_must_hold_a_whole_payload() {
+    let (port, _ingress) = intercept(&Wire::default());
+    for limits in [
+        Limits { count: 0, bytes: 64 * 1024 },
+        Limits { count: 16, bytes: 1472 },
+    ] {
+        let own = Endpoint::builder()
+            .udp_io(Wire::default())
+            .udp_write_limits(limits)
+            .bind();
+        let shared =
+            Endpoint::builder().port(&port).udp_write_limits(limits).bind();
+
+        assert!(own.unwrap_err().is_invalid_config(), "{limits:?}");
+        assert!(shared.unwrap_err().is_invalid_config(), "{limits:?}");
+    }
+
+    let fits = Limits { count: 1, bytes: 1963 };
+    Endpoint::builder()
+        .udp_io(Wire::default())
+        .udp_write_limits(fits)
+        .bind()
+        .unwrap();
+    Endpoint::builder().port(&port).udp_write_limits(fits).bind().unwrap();
+    Endpoint::builder()
+        .udp("127.0.0.1:0".parse().unwrap())
+        .udp_write_limits(Limits { count: 0, bytes: 0 })
+        .bind()
+        .unwrap();
 }
 
 // Endpoints whose writes find the port's limits full wait, and go out as
@@ -3146,20 +3407,21 @@ async fn a_refused_raw_send_does_not_hold_back_a_waiting_endpoint() {
     let wire = Wire::default();
     let (port, _ingress) = DatagramPort::builder()
         .udp_io(wire.clone())
-        .write_limits(Limits { count: 1, bytes: 1472 })
+        .write_limits(Limits { count: 1, bytes: 2000 })
         .intercept()
         .unwrap();
     let (a, _a_incoming) = Endpoint::builder().port(&port).bind().unwrap();
     let (b, _b_incoming) = Endpoint::builder().port(&port).bind().unwrap();
     let upstream = upstream(&port).await;
-    // Over the three quarters of 1472 bytes that raw sends may take.
+    // Within the three quarters that raw sends may take, but not beside the
+    // endpoint's write.
     let large = Bytes::from(vec![b'x'; 1200]);
 
-    let refused = port.send_bytes(large.clone(), &upstream);
-    assert!(refused.unwrap_err().is_busy());
     wire.writes(Writes::Delay);
     let from_a = send_options(&a, "a");
     wire.sent(1).await;
+    let refused = port.send_bytes(large.clone(), &upstream);
+    assert!(refused.unwrap_err().is_busy());
     let from_b = send_options(&b, "b");
     sleep(Duration::from_millis(20)).await;
     let refused = port.send_bytes(large, &upstream);

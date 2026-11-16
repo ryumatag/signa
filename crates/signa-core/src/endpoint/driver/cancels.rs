@@ -11,7 +11,7 @@ its own transaction. What the CANCEL means for the target is the TU's decision.
 [RFC 3261 section 9]: https://www.rfc-editor.org/rfc/rfc3261.html#section-9
 */
 
-use std::{io, mem, sync::Arc, time::Instant};
+use std::{mem, sync::Arc, time::Instant};
 
 use bytes::Bytes;
 use tokio::sync::oneshot;
@@ -25,6 +25,7 @@ use crate::{
     endpoint::{
         admission::request_bytes,
         client::{CancelError, CancelOutcome, Intent, Reserved},
+        datagram::Unwritten,
         error::Error,
         observe::WriteOrigin,
         path::{ReceiveInfo, retain},
@@ -192,13 +193,10 @@ impl Driver {
             Err(error) => {
                 let entry = self.clients.get_mut(id).expect("just inserted");
                 entry.tx.end_on_transport_error();
-                let completion = entry.answer(Err(
-                    if error.kind() == io::ErrorKind::WouldBlock {
-                        Error::busy()
-                    } else {
-                        Error::transport(error)
-                    },
-                ));
+                let completion = entry.answer(Err(match error {
+                    Unwritten::Busy(_) => Error::busy(),
+                    Unwritten::Failed(error) => Error::transport(error),
+                }));
                 self.unanswered -= 1;
                 self.settle_client(id, None);
                 if let Some((delivery, result)) = completion {

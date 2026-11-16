@@ -137,10 +137,37 @@ enum Outcome {
 
 /// How a write went when [`Port::start`] returned.
 enum Started {
-    /// It ended, or was never admitted.
+    /// It ended, or was refused before it reached the backend.
     Done(WriteOutcome),
+    /// The write limits had no room for it, and it ended with this error.
+    ///
+    /// A refusal of the limits is told apart here and never by the error's
+    /// kind, since a backend may refuse a write with any kind, `WouldBlock`
+    /// included.
+    Busy(io::Error),
     /// It waits, in the backlog or for its completion.
     Waiting(WriteId),
+}
+
+/// Why a write the driver started did not go out.
+///
+/// The driver tells a full limit of its own from a failure by the variant,
+/// not by the error's kind, which a backend chooses.
+#[derive(Debug)]
+pub(super) enum Unwritten {
+    /// A write limit or queue of the endpoint's own had no room. Nothing
+    /// reached the backend or the connection.
+    Busy(io::Error),
+    /// The write failed, or a check refused it before it was offered.
+    Failed(io::Error),
+}
+
+impl Unwritten {
+    pub(super) fn into_error(self) -> io::Error {
+        match self {
+            Unwritten::Busy(error) | Unwritten::Failed(error) => error,
+        }
+    }
 }
 
 impl Port {
@@ -218,10 +245,15 @@ impl Port {
     }
 
     /// Records how write `id` ended.
-    fn ended(&mut self, id: WriteId, result: &WriteOutcome, accepted: bool) {
+    fn ended(
+        &mut self,
+        id: WriteId,
+        result: impl Into<WriteResult>,
+        accepted: bool,
+    ) {
         if let Some(tap) = observe::attached(&mut self.tap) {
             let write = observe::datagram_write(self.domain, id);
-            tap.ended(write, WriteResult::from(result), accepted);
+            tap.ended(write, result.into(), accepted);
         }
     }
 
@@ -293,18 +325,17 @@ impl Port {
         self.next_id += 1;
         self.started(id, source, destination, note, &bytes);
         let len = bytes.len();
-        let refused = if len > self.max_payload {
-            Some(io::Error::new(
+        if len > self.max_payload {
+            let outcome = WriteOutcome::NotWritten(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "the datagram is larger than the UDP backend sends",
-            ))
-        } else {
-            self.admit(len, limits).err()
-        };
-        if let Some(error) = refused {
-            let outcome = WriteOutcome::NotWritten(error);
+            ));
             self.ended(id, &outcome, false);
             return Started::Done(outcome);
+        }
+        if let Err(error) = self.admit(len, limits) {
+            self.ended(id, WriteResult::NotWritten(error.kind()), false);
+            return Started::Busy(error);
         }
 
         self.writes += 1;
@@ -384,9 +415,10 @@ impl Port {
         bytes: &Bytes,
         link: &Link,
         note: Note,
-    ) -> io::Result<()> {
+    ) -> Result<(), Unwritten> {
         match self.start(bytes.clone(), link, self.limits, note) {
             Started::Done(outcome) => failure(outcome),
+            Started::Busy(error) => Err(Unwritten::Busy(error)),
             Started::Waiting(_) => Ok(()),
         }
     }
@@ -398,10 +430,11 @@ impl Port {
         bytes: &Bytes,
         link: &Link,
         note: Note,
-    ) -> io::Result<()> {
+    ) -> Result<(), Unwritten> {
         let limits = crate::transport::budget::request_limits(self.limits);
         match self.start(bytes.clone(), link, limits, note) {
             Started::Done(outcome) => failure(outcome),
+            Started::Busy(error) => Err(Unwritten::Busy(error)),
             Started::Waiting(_) => Ok(()),
         }
     }
@@ -414,7 +447,7 @@ impl Port {
         link: &Link,
         initial: bool,
         note: Note,
-    ) -> io::Result<Option<oneshot::Receiver<WriteOutcome>>> {
+    ) -> Result<Option<oneshot::Receiver<WriteOutcome>>, Unwritten> {
         let limits = if initial {
             crate::transport::budget::request_limits(self.limits)
         } else {
@@ -422,6 +455,7 @@ impl Port {
         };
         match self.start(bytes.clone(), link, limits, note) {
             Started::Done(outcome) => failure(outcome).map(|()| None),
+            Started::Busy(error) => Err(Unwritten::Busy(error)),
             Started::Waiting(id) => {
                 let (done, receipt) = oneshot::channel();
                 self.attach(id, Outcome::Client(done));
@@ -439,13 +473,8 @@ impl Port {
         note: Note,
     ) {
         match self.start(bytes, link, self.limits, note) {
-            // Only the endpoint's own write limits refuse with `WouldBlock`.
-            Started::Done(WriteOutcome::NotWritten(error))
-                if error.kind() == io::ErrorKind::WouldBlock =>
-            {
-                completion.finish(Err(ReplyError::Busy));
-            }
             Started::Done(outcome) => completion.finish(reply_result(outcome)),
+            Started::Busy(_) => completion.finish(Err(ReplyError::Busy)),
             Started::Waiting(id) => {
                 self.attach(id, Outcome::Reply(completion))
             }
@@ -467,6 +496,9 @@ impl Port {
         debug_assert!(self.admit_response(bytes.len()).is_ok());
         match self.start(bytes, link, self.limits, note) {
             Started::Done(outcome) => observation.complete(outcome),
+            Started::Busy(error) => {
+                observation.complete(WriteOutcome::NotWritten(error));
+            }
             Started::Waiting(id) => {
                 self.attach(id, Outcome::Server(observation));
             }
@@ -668,6 +700,9 @@ impl Port {
     fn settle(&mut self, started: Started, outcome: Outcome) {
         match started {
             Started::Done(result) => self.finish(outcome, result),
+            Started::Busy(error) => {
+                self.finish(outcome, WriteOutcome::NotWritten(error));
+            }
             Started::Waiting(id) => self.attach(id, outcome),
         }
     }
@@ -882,9 +917,9 @@ fn withdrawn() -> io::Error {
 
 /// The failure a caller that learns only failures is told. A write whose
 /// outcome is unknown may have gone out, so it is not one.
-fn failure(outcome: WriteOutcome) -> io::Result<()> {
+fn failure(outcome: WriteOutcome) -> Result<(), Unwritten> {
     match outcome {
-        WriteOutcome::NotWritten(error) => Err(error),
+        WriteOutcome::NotWritten(error) => Err(Unwritten::Failed(error)),
         WriteOutcome::Written | WriteOutcome::Unknown(_) => Ok(()),
     }
 }
@@ -948,6 +983,8 @@ mod tests {
         Hold,
         /// Refuse it with an I/O error.
         Reject,
+        /// Refuse it with `WouldBlock`, as a backend whose own queue is full.
+        RejectWouldBlock,
     }
 
     #[derive(Default)]
@@ -1027,6 +1064,15 @@ mod tests {
                     return Submit::Rejected(
                         write,
                         io::Error::from_raw_os_error(5),
+                    );
+                }
+                Mode::RejectWouldBlock => {
+                    return Submit::Rejected(
+                        write,
+                        io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "queue full",
+                        ),
                     );
                 }
             }
@@ -1144,10 +1190,10 @@ mod tests {
         port.send(&Bytes::from_static(b"first"), &LINK, NOTE).unwrap();
         port.send(&Bytes::from_static(b"second"), &LINK, NOTE).unwrap_err();
         port.send(&Bytes::from_static(b"two"), &LINK, NOTE).unwrap();
-        assert_eq!(
-            port.send(&Bytes::new(), &LINK, NOTE).unwrap_err().kind(),
-            io::ErrorKind::WouldBlock
-        );
+        assert!(matches!(
+            port.send(&Bytes::new(), &LINK, NOTE),
+            Err(Unwritten::Busy(_))
+        ));
 
         script.mode(Mode::Accept);
         flush(&mut port);
@@ -1174,12 +1220,10 @@ mod tests {
         script.mode(Mode::Hold);
 
         port.send(&Bytes::from_static(b"123456"), &LINK, NOTE).unwrap();
-        assert_eq!(
-            port.send_request(&Bytes::from_static(b"7"), &LINK, NOTE)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::WouldBlock
-        );
+        assert!(matches!(
+            port.send_request(&Bytes::from_static(b"7"), &LINK, NOTE),
+            Err(Unwritten::Busy(_))
+        ));
         port.send(&Bytes::from_static(b"78"), &LINK, NOTE).unwrap();
         port.send_request(&Bytes::new(), &LINK, NOTE).unwrap_err();
         port.send(&Bytes::new(), &LINK, NOTE).unwrap();
@@ -1193,12 +1237,10 @@ mod tests {
         let script = Script::default();
         let mut port = port(&script, Limits { count: 1, bytes: 2 });
 
-        assert_eq!(
-            port.send(&Bytes::from_static(b"abc"), &LINK, NOTE)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::WouldBlock
-        );
+        assert!(matches!(
+            port.send(&Bytes::from_static(b"abc"), &LINK, NOTE),
+            Err(Unwritten::Busy(_))
+        ));
 
         assert!(script.accepted().is_empty());
         assert!(port.admit_response(2).is_ok());
@@ -1209,9 +1251,11 @@ mod tests {
         let script = Script::default();
         let mut port = port(&script, Limits::default());
 
-        let error =
-            port.send(&Bytes::from(vec![0; 1001]), &LINK, NOTE).unwrap_err();
+        let error = port.send(&Bytes::from(vec![0; 1001]), &LINK, NOTE);
 
+        let Err(Unwritten::Failed(error)) = error else {
+            panic!("expected a failure, got {error:?}");
+        };
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(script.accepted().is_empty());
         assert!(port.is_idle());
@@ -1223,10 +1267,38 @@ mod tests {
         let mut port = port(&script, Limits { count: 1, bytes: 8 });
         script.mode(Mode::Reject);
 
-        let error =
-            port.send(&Bytes::from_static(b"abc"), &LINK, NOTE).unwrap_err();
+        let error = port.send(&Bytes::from_static(b"abc"), &LINK, NOTE);
 
+        let Err(Unwritten::Failed(error)) = error else {
+            panic!("expected a failure, got {error:?}");
+        };
         assert_eq!(error.raw_os_error(), Some(5));
+        assert!(port.is_idle());
+    }
+
+    // A backend may refuse a write with any error, `WouldBlock` included, as
+    // one whose own queue is full would. That is the backend's failure, not
+    // the endpoint's limits, so the write fails as a transport error and a
+    // reply's waiter is not told to retry later.
+    #[tokio::test]
+    async fn a_backend_refusing_with_would_block_is_not_busy() {
+        let script = Script::default();
+        let mut port = port(&script, Limits::default());
+        let (route, response, mut commands, _) = route();
+        script.mode(Mode::RejectWouldBlock);
+
+        let sent = port.send(&Bytes::from_static(b"abc"), &LINK, NOTE);
+        let mut reply = std::pin::pin!(route.send(response));
+        submit_reply(&mut port, reply.as_mut(), &mut commands).await;
+
+        let Err(Unwritten::Failed(error)) = sent else {
+            panic!("expected a failure, got {sent:?}");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        let Err(ReplyError::Transport(error)) = reply.await else {
+            panic!("expected a transport error");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
         assert!(port.is_idle());
     }
 

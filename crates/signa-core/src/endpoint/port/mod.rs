@@ -15,14 +15,14 @@ endpoint, forwards it unchanged or discards it. [`Capture`] only receives.
 // delivers to it straight into the proxy's queue, past the port's task.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fmt,
     future::{Future, poll_fn},
     io, mem,
     net::SocketAddr,
     pin::Pin,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     task::{Context, Poll, ready},
@@ -46,7 +46,7 @@ use crate::{
     message::{Message, error::InvalidMessage},
     transport::{
         Flow, Limits, ReceiveId, Stamp, Stamps, Transport,
-        budget::{Budget, Permit},
+        budget::{Budget, Permit, request_limits},
         datagram::{
             Binding, Capabilities, Datagram, DatagramIo, DatagramWrite, Owner,
             Path, RecvError, Submit, TransportContext, WriteId, WriteOutcome,
@@ -162,8 +162,9 @@ impl Builder {
     /// Raw sends take at most three quarters of them, so that endpoints keep
     /// room for their responses.
     ///
-    /// The bytes must hold the backend's largest payload. The default is
-    /// 4096 writes and the default bytes of [`Limits`].
+    /// Three quarters of the bytes, rounded down, must hold the backend's
+    /// largest payload, or a raw send that large could never go. The default
+    /// is 4096 writes and the default bytes of [`Limits`].
     pub fn write_limits(mut self, limits: Limits) -> Builder {
         self.write_limits = limits;
         self
@@ -230,8 +231,9 @@ impl Builder {
     /// # Errors
     ///
     /// * [`BindError::is_invalid_config`] without a backend, with a zero
-    ///   limit, deadline or queue, or with a backend that names no specific
-    ///   address or sends no payload.
+    ///   limit, deadline or queue, with write limits whose three quarters do
+    ///   not hold the backend's largest payload, or with a backend that names
+    ///   no specific address or sends no payload.
     /// * [`BindError::is_io`] when the socket cannot be bound.
     pub fn intercept(self) -> Result<(DatagramPort, Ingress), BindError> {
         let (port, ingress, task) = self.build()?;
@@ -276,11 +278,15 @@ impl Builder {
         let io = open(self.backend)?;
         let local = io.local_addr();
         let capabilities = io.capabilities();
-        // An endpoint's write waits for room in the port's limits, so one
-        // larger than the byte limit would wait forever.
-        if self.write_limits.bytes < capabilities.max_payload {
+        // A raw send takes at most three quarters of the limits, and a payload
+        // over that share would be refused as busy however idle the port was.
+        // An endpoint's write waits for room in the whole limits, which the
+        // share holding a payload covers too. A positive count always leaves
+        // the share one write.
+        if request_limits(self.write_limits).bytes < capabilities.max_payload {
             return Err(BindError::invalid_config(
-                "write_limits.bytes must hold the backend's largest payload",
+                "three quarters of write_limits.bytes must hold the backend's \
+                 largest payload",
             ));
         }
 
@@ -323,6 +329,7 @@ impl Builder {
             ingress: Some(ingress),
             registrations: HashMap::new(),
             tap: None,
+            publisher: Publisher { shared: shared.clone(), outcome: None },
         };
 
         Ok((
@@ -515,7 +522,9 @@ struct Shared {
     context_limits: Budget,
     stats: Counters,
     reception: Arc<ReceptionCounters>,
-    /// The earliest deadline any close asked for, once one has.
+    /// The earliest deadline any close asked for. It stays `None` while
+    /// every close came with a timeout too large to add to now, which is no
+    /// deadline.
     close: Mutex<Option<Instant>>,
     /// Wakes the port's task for a close request. Only that task waits on
     /// it, and its one stored permit stands for every request since the task
@@ -551,14 +560,15 @@ impl Shared {
     }
 
     /// Asks the port's task to close by `deadline`, or sooner if another
-    /// request asked for sooner.
+    /// request asked for sooner. `None` asks for no deadline, which brings
+    /// none forward.
     ///
     /// The deadline is kept here rather than in a message, so that however
     /// many times `close` is called, the request holds one deadline and one
     /// wakeup. `notify_one` keeps a permit when the task is not waiting, so
     /// a request made before the task looks is not lost.
-    fn request_close(&self, deadline: Instant) {
-        {
+    fn request_close(&self, deadline: Option<Instant>) {
+        if let Some(deadline) = deadline {
             let mut close = self.close.lock().expect("not poisoned");
             *close =
                 Some(close.map_or(deadline, |earlier| earlier.min(deadline)));
@@ -566,7 +576,7 @@ impl Shared {
         self.closer.notify_one();
     }
 
-    /// The earliest deadline asked for so far.
+    /// The earliest deadline asked for so far, or `None` for no deadline.
     fn close_deadline(&self) -> Option<Instant> {
         *self.close.lock().expect("not poisoned")
     }
@@ -837,6 +847,9 @@ impl DatagramPort {
     /// registered endpoints, which see their writes end the same way. Stop
     /// them first.
     ///
+    /// A `timeout` too large to add to now means no deadline, as for
+    /// [`Endpoint::shutdown`](super::Endpoint::shutdown).
+    ///
     /// Another call can bring the deadline forward, even while the port is
     /// already draining or closing its backend, and never pushes it back.
     /// Every caller gets the same outcome, and a call after the close
@@ -851,7 +864,7 @@ impl DatagramPort {
         &self,
         timeout: Duration,
     ) -> impl Future<Output = ShutdownOutcome> + Send + 'static {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now().checked_add(timeout);
         self.shared.set_phase(CLOSING);
         self.shared.request_close(deadline);
         let mut done = self.shared.done.subscribe();
@@ -901,6 +914,7 @@ impl DatagramPort {
             completions: completions_rx,
             withdrawal: withdrawal.clone(),
             unregistering: None,
+            passed: BTreeSet::new(),
         };
         Ok(Registration {
             io: Box::new(proxy),
@@ -1033,6 +1047,9 @@ struct Proxy {
     /// The port's task offers none of the endpoint's writes after that.
     withdrawal: Arc<Withdrawal>,
     unregistering: Option<oneshot::Receiver<()>>,
+    /// The writes passed to the port's task whose outcomes have not come
+    /// back, for a task that stops without reporting them.
+    passed: BTreeSet<WriteId>,
 }
 
 fn closing_error() -> io::Error {
@@ -1074,6 +1091,7 @@ impl DatagramIo for Proxy {
         if self.shared.closing() || self.withdrawal.is_withdrawn() {
             return Submit::Rejected(write, closing_error());
         }
+        let id = write.id();
         let len = write.payload().len();
         let permit =
             match self.shared.writes.admit(self.registration, len, cx.waker())
@@ -1087,7 +1105,10 @@ impl DatagramIo for Proxy {
         let command =
             Command::Write { registration: self.registration, write, permit };
         match self.commands.send(command) {
-            Ok(()) => Submit::Accepted,
+            Ok(()) => {
+                self.passed.insert(id);
+                Submit::Accepted
+            }
             Err(mpsc::error::SendError(Command::Write { write, .. })) => {
                 Submit::Rejected(write, closing_error())
             }
@@ -1095,15 +1116,37 @@ impl DatagramIo for Proxy {
         }
     }
 
+    /// Passes on the outcomes the port's task routed back.
+    ///
+    /// The task ends the registration's completions only once it has
+    /// reported every write it took, unless it stopped unfinished, such as
+    /// when the backend panicked. The writes it took then may have gone out,
+    /// so their outcomes are unknown. Writes the endpoint still holds are
+    /// refused as the port closes, so they end not written.
+    ///
+    /// An endpoint that is stopping withdrew itself first, and the task
+    /// reports nothing of its writes after that. It counts what is left as
+    /// lost when it stops, as over a backend of its own.
     fn poll_complete(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<(WriteId, WriteOutcome)> {
         match ready!(self.completions.poll_recv(cx)) {
-            Some(completion) => Poll::Ready(completion),
-            // The port's task has ended. What it never reported stays
-            // unreported, and the endpoint counts it lost when it stops.
-            None => Poll::Pending,
+            Some((id, outcome)) => {
+                self.passed.remove(&id);
+                Poll::Ready((id, outcome))
+            }
+            None if self.withdrawal.is_withdrawn() => Poll::Pending,
+            None => match self.passed.pop_first() {
+                Some(id) => Poll::Ready((
+                    id,
+                    WriteOutcome::Unknown(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "the port stopped without reporting the write",
+                    )),
+                )),
+                None => Poll::Pending,
+            },
         }
     }
 
@@ -1188,6 +1231,52 @@ struct PortTask {
     registrations: HashMap<u64, Registered>,
     /// The observer's tap, while one is attached.
     tap: Option<Tap>,
+    /// Publishes the outcome as the task drops. It is the last field, since
+    /// fields drop in order, so the backend in `port` and everything else the
+    /// task owns has dropped by the time it publishes.
+    publisher: Publisher,
+}
+
+/// Publishes the port's close outcome once the task that owns the backend has
+/// dropped, however it ends.
+///
+/// A closer that sees the outcome may rebind the address at once, or count on
+/// the backend's tasks having stopped. The backend's `Drop` is the last thing
+/// that stops them when `poll_close` did not finish, and the built-in socket
+/// closes only as it drops. So the outcome comes after the backend. This does
+/// not join a task the backend spawned and left running. That stays the
+/// backend's to stop, as `DatagramIo::poll_close` says.
+///
+/// A task that stops without an outcome, as when the backend panics or the
+/// runtime drops the task, before or after its first poll, publishes
+/// `DeadlineExpired`, as an endpoint task that stops unfinished leaves its
+/// shutdown waiters. The port then refuses everything a close refuses, and
+/// the endpoints waiting for room in its limits are woken to find it closing.
+/// Their proxies see their completions end and settle what the task held. See
+/// [`Proxy::poll_complete`].
+struct Publisher {
+    shared: Arc<Shared>,
+    /// The close's outcome, once the task has one.
+    outcome: Option<ShutdownOutcome>,
+}
+
+impl Drop for Publisher {
+    fn drop(&mut self) {
+        let shared = &self.shared;
+        // The task may have unwound with the lock held, so a poisoned lock is
+        // still taken. Closing is the last phase, so this never moves the
+        // phase back, and a task that finished set it already.
+        {
+            let _lifecycle = shared
+                .lifecycle
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            shared.phase.store(CLOSING, Ordering::Release);
+        }
+        shared.writes.close();
+        let outcome = self.outcome.unwrap_or(ShutdownOutcome::DeadlineExpired);
+        shared.done.send_replace(Some(outcome));
+    }
 }
 
 /// What the port's task keeps of a registered endpoint.
@@ -1199,29 +1288,17 @@ struct Registered {
 }
 
 impl PortTask {
+    /// Serves, then closes, then drops itself, which publishes the outcome
+    /// after the backend has dropped. See [`Publisher`].
     async fn run(mut self) {
         let deadline = poll_fn(|cx| self.poll_serve(cx)).await;
         let outcome = self.close(deadline).await;
-
-        // A closer that sees the outcome may rebind the address at once, or
-        // count on the backend's tasks having stopped. The backend's `Drop`
-        // is the last thing that stops them when `poll_close` did not
-        // finish, and the built-in socket closes only as it drops. So the
-        // task drops everything it owns, the backend through `Port` with it,
-        // before it publishes. `Port` is the backend's only owner, and the
-        // handles keep only `Shared`.
-        //
-        // This orders the outcome after what the port owns. It does not join
-        // a task the backend spawned and left running. That stays the
-        // backend's to stop, as `DatagramIo::poll_close` says.
-        let shared = self.shared.clone();
-        drop(self);
-        shared.done.send_replace(Some(outcome));
+        self.publisher.outcome = Some(outcome);
     }
 
     /// Serves until a close or until every handle is gone, and returns the
-    /// close's deadline.
-    fn poll_serve(&mut self, cx: &mut Context<'_>) -> Poll<Instant> {
+    /// close's deadline, if it has one.
+    fn poll_serve(&mut self, cx: &mut Context<'_>) -> Poll<Option<Instant>> {
         // The commands still queued are left to `close`, which takes them in
         // batches and checks the deadline before it offers any.
         if let Some(deadline) = self.poll_close_request(cx) {
@@ -1235,7 +1312,9 @@ impl PortTask {
             match self.commands.poll_recv(cx) {
                 Poll::Ready(Some(command)) => self.on_command(command),
                 Poll::Ready(None) => {
-                    return Poll::Ready(Instant::now() + ABANDONED_FLUSH);
+                    return Poll::Ready(
+                        Instant::now().checked_add(ABANDONED_FLUSH),
+                    );
                 }
                 Poll::Pending => {
                     more = false;
@@ -1268,12 +1347,16 @@ impl PortTask {
     }
 
     /// Returns the earliest deadline asked for, once a close request has
-    /// come since the task last looked, and arms the next look.
+    /// come since the task last looked, and arms the next look. `Some(None)`
+    /// is a request without a deadline.
     ///
     /// `None` leaves the task's waker with the request. After `Some` it is
     /// not left yet, so a caller that goes on to wait polls again until
     /// `None`.
-    fn poll_close_request(&mut self, cx: &mut Context<'_>) -> Option<Instant> {
+    fn poll_close_request(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Option<Option<Instant>> {
         if self.close_requested.as_mut().poll(cx).is_pending() {
             return None;
         }
@@ -1281,11 +1364,7 @@ impl PortTask {
         self.close_requested.set(closer.notified_owned());
         // The request stored its deadline before it notified, so the read
         // sees it, and any request since.
-        Some(
-            self.shared
-                .close_deadline()
-                .expect("a request stores its deadline before it notifies"),
-        )
+        Some(self.shared.close_deadline())
     }
 
     fn on_command(&mut self, command: Command) {
@@ -1401,12 +1480,15 @@ impl PortTask {
     /// task were admitted before the close, since admission refuses once it
     /// has started, and they get until the deadline like those the backend
     /// already holds. Once the deadline has passed, nothing more is offered.
-    async fn close(&mut self, deadline: Instant) -> ShutdownOutcome {
+    async fn close(&mut self, deadline: Option<Instant>) -> ShutdownOutcome {
         // An endpoint waiting for room in the limits is woken, tries again
         // and finds the port closing.
         self.shared.set_phase(CLOSING);
         self.ingress = None;
-        let mut sleep = Box::pin(sleep_until(deadline));
+        // Without a deadline there is no timer, until a later request brings
+        // one.
+        let mut sleep =
+            deadline.map(|deadline| Box::pin(sleep_until(deadline)));
         // Set once the backend has been told to close, or the deadline has
         // passed. No write is offered after that.
         let mut closing = false;
@@ -1423,16 +1505,26 @@ impl PortTask {
             // draining or closing alike. Looking until there is none leaves
             // the waker for the next.
             while let Some(deadline) = self.poll_close_request(cx) {
-                if deadline < sleep.deadline() {
-                    sleep.as_mut().reset(deadline);
+                match (&mut sleep, deadline) {
+                    (_, None) => {}
+                    (Some(sleep), Some(deadline)) => {
+                        if deadline < sleep.deadline() {
+                            sleep.as_mut().reset(deadline);
+                        }
+                    }
+                    (None, Some(deadline)) => {
+                        sleep = Some(Box::pin(sleep_until(deadline)));
+                    }
                 }
             }
             // The timer fires on its own tick, which can come after the
             // deadline, so the clock decides too. A deadline already past
             // when the close was asked for stops the very first poll.
             if !overdue
-                && (sleep.deadline() <= Instant::now()
-                    || sleep.as_mut().poll(cx).is_ready())
+                && sleep.as_mut().is_some_and(|sleep| {
+                    sleep.deadline() <= Instant::now()
+                        || sleep.as_mut().poll(cx).is_ready()
+                })
             {
                 overdue = true;
                 if !closing {
@@ -1516,13 +1608,11 @@ impl PortTask {
     fn on_closing_command(&mut self, command: Command, drains: bool) -> bool {
         match command {
             // Its endpoint was bound before the close, and its writes queued
-            // behind this were admitted before it too.
-            command @ Command::Register { .. } if drains => {
-                self.on_command(command);
-            }
-            Command::Register { .. } => {
-                *self.shared.lifecycle.lock().expect("not poisoned") -= 1;
-            }
+            // behind this were admitted before it too. After the deadline it
+            // still joins, so that those writes fail to their endpoint below
+            // and count as refused. Left out, they would get no outcome at
+            // all, and the close would report them drained.
+            command @ Command::Register { .. } => self.on_command(command),
             Command::Unregister { registration, done } => {
                 self.unregister(registration);
                 let _ = done.send(());
@@ -1910,6 +2000,25 @@ impl fmt::Debug for EndpointIngress {
 /// every endpoint refuses it, and it is not a [`SendPath`](super::SendPath).
 /// It is invalid once the port closes. Clones share one path, which counts
 /// against [`Builder::context_limits`] until the last drops.
+///
+/// The two kinds of path do not mix, so a raw path cannot carry a transaction
+/// and an endpoint's path cannot carry a raw send:
+///
+/// ```compile_fail
+/// use signa_core::endpoint::{Target, port::RawPath};
+///
+/// fn transaction_on(path: RawPath) -> Target {
+///     Target::path(path)
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use signa_core::endpoint::{SendPath, port::DatagramPort};
+///
+/// fn raw_send_on(port: &DatagramPort, path: &SendPath) {
+///     let _ = port.send_bytes(bytes::Bytes::new(), path);
+/// }
+/// ```
 #[derive(Clone)]
 pub struct RawPath(Arc<Path>);
 
@@ -1972,7 +2081,8 @@ impl Future for RawWrite {
                 Err(Error::outcome_unknown(error))
             }
             // The port settles every raw write it took. Its task ends without
-            // doing so only when its runtime drops it.
+            // doing so only when the backend panics or the runtime drops it,
+            // and the write may have gone out by then.
             Err(_) => Err(Error::outcome_unknown(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "the port stopped without reporting the write",
@@ -2047,7 +2157,10 @@ impl Capture {
                     return Poll::Ready(Some(CapturedDatagram {
                         payload,
                         flow,
-                        context,
+                        // A backend may slice its context out of a capture
+                        // buffer, which a held datagram would keep alive, as
+                        // for `ReceivedDatagram`.
+                        context: context.detached(),
                     }));
                 }
                 Err(RecvError::Truncated) => {
@@ -2194,6 +2307,8 @@ mod tests {
         mode: Mode,
         offered: Vec<Bytes>,
         completions: VecDeque<(WriteId, WriteOutcome)>,
+        /// The writes taken in `Mode::Keep`, oldest first, until reported.
+        kept: VecDeque<WriteId>,
         /// Told when a blocking `poll_submit` has started.
         entered: Option<std_mpsc::Sender<()>>,
         /// What a blocking `poll_submit` waits on.
@@ -2212,6 +2327,14 @@ mod tests {
 
         fn offered(&self) -> Vec<Bytes> {
             self.0.lock().unwrap().offered.clone()
+        }
+
+        /// Reports the oldest write taken in `Mode::Keep`, if any.
+        fn report(&self, outcome: WriteOutcome) {
+            let mut state = self.0.lock().unwrap();
+            if let Some(id) = state.kept.pop_front() {
+                state.completions.push_back((id, outcome));
+            }
         }
     }
 
@@ -2252,7 +2375,9 @@ mod tests {
                 }
             }
             let mut state = self.0.lock().unwrap();
-            if mode != Mode::Keep {
+            if mode == Mode::Keep {
+                state.kept.push_back(write.id());
+            } else {
                 state
                     .completions
                     .push_back((write.id(), WriteOutcome::Written));
@@ -2309,7 +2434,7 @@ mod tests {
 
     /// The task's turn that sees a close request, which hands the close its
     /// deadline.
-    fn closing(task: &mut PortTask) -> Instant {
+    fn closing(task: &mut PortTask) -> Option<Instant> {
         let mut cx = Context::from_waker(Waker::noop());
         match task.poll_serve(&mut cx) {
             Poll::Ready(deadline) => deadline,
@@ -2372,7 +2497,7 @@ mod tests {
         let deadline = port.shared.close_deadline().unwrap();
         assert!(deadline <= by);
         let mut cx = Context::from_waker(Waker::noop());
-        assert_eq!(task.poll_serve(&mut cx), Poll::Ready(deadline));
+        assert_eq!(task.poll_serve(&mut cx), Poll::Ready(Some(deadline)));
         assert!(task.poll_close_request(&mut cx).is_none());
     }
 
@@ -2654,5 +2779,255 @@ mod tests {
         assert_eq!(backend.offered(), ["taken first"]);
         serve(&mut task);
         assert!(task.registrations.is_empty());
+    }
+
+    // A timeout too large to add to now is no deadline, as for an endpoint's
+    // shutdown, where adding it used to panic. The close drains for as long
+    // as it takes, and a later close can still set a deadline.
+    #[tokio::test(start_paused = true)]
+    async fn an_unrepresentable_timeout_is_no_deadline() {
+        let backend = Backend::default();
+        let (port, _ingress, mut task) = port(&backend);
+        let mut endpoint = port.register().unwrap();
+        serve(&mut task);
+        backend.mode(Mode::Keep);
+        submit(&mut endpoint, 0, "kept");
+        serve(&mut task);
+
+        drop(port.close(Duration::MAX));
+        let deadline = closing(&mut task);
+        assert_eq!(deadline, None);
+        let mut close = pin!(task.close(deadline));
+        assert!(step(close.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_secs(24 * 60 * 60)).await;
+        assert!(step(close.as_mut()).is_pending());
+        drop(port.close(Duration::from_secs(1)));
+
+        assert_eq!(close.await, ShutdownOutcome::DeadlineExpired);
+        assert_eq!(outcomes(&mut endpoint), [(WriteId::new(0), "unknown")]);
+    }
+
+    // An endpoint bound just before the close, whose registration still
+    // waits in the task's queue at the deadline, joins all the same. Its
+    // write queued behind the registration fails to it, and the port did not
+    // drain. Dropping the registration there left the write without an
+    // outcome and the close reporting a drain.
+    #[tokio::test]
+    async fn a_registration_queued_past_the_deadline_still_learns_its_writes()
+    {
+        let backend = Backend::default();
+        let (port, _ingress, mut task) = port(&backend);
+        let mut endpoint = port.register().unwrap();
+        submit(&mut endpoint, 0, "queued");
+
+        drop(port.close(Duration::ZERO));
+        let deadline = closing(&mut task);
+        let outcome = task.close(deadline).await;
+
+        assert_eq!(outcome, ShutdownOutcome::DeadlineExpired);
+        assert!(backend.offered().is_empty());
+        assert_eq!(
+            outcomes(&mut endpoint),
+            [(WriteId::new(0), "not written")]
+        );
+    }
+
+    // A task that stops before it publishes an outcome, here dropped as a
+    // runtime drops its tasks, still settles the port. That holds for a task
+    // never polled, as when the runtime is dropped right after `intercept`,
+    // as well as for one that ran. Every close resolves, as expired, and the
+    // port admits nothing more.
+    #[tokio::test]
+    async fn a_task_that_stops_unfinished_settles_the_port() {
+        for polled in [false, true] {
+            let backend = Backend::default();
+            let (port, _ingress, task) = port(&backend);
+            let mut run = Box::pin(task.run());
+            if polled {
+                assert!(step(run.as_mut()).is_pending());
+            }
+
+            drop(run);
+
+            assert!(port.shared.closing(), "{polled}");
+            let raw = port.shared.writes.admit_raw(1);
+            assert!(matches!(raw, Admission::Closed), "{polled}");
+            let close = port.close(Duration::from_secs(60));
+            let outcome = tokio::time::timeout(Duration::from_secs(1), close);
+            let outcome = outcome.await.unwrap();
+            assert_eq!(outcome, ShutdownOutcome::DeadlineExpired, "{polled}");
+        }
+    }
+
+    /// One step of the write property.
+    #[derive(Clone, Copy, Debug)]
+    enum Op {
+        /// An endpoint offers a write to its proxy.
+        Submit(u8),
+        /// One turn of the port's task.
+        Serve,
+        /// What the backend does with the writes offered next.
+        Mode(u8),
+        /// The backend reports the oldest write it kept, written, not
+        /// written or unknown.
+        Report(u8),
+        /// An endpoint stops, as its driver does at its deadline, but its
+        /// proxy is kept to read what still reaches it.
+        Withdraw(u8),
+    }
+
+    impl quickcheck::Arbitrary for Op {
+        fn arbitrary(g: &mut quickcheck::Gen) -> Op {
+            let value = u8::arbitrary(g);
+            match u8::arbitrary(g) % 10 {
+                0..=2 => Op::Submit(value),
+                3..=5 => Op::Serve,
+                6 => Op::Mode(value),
+                7 | 8 => Op::Report(value),
+                _ => Op::Withdraw(value),
+            }
+        }
+    }
+
+    /// An endpoint of the write property, with what it passed to the port
+    /// and what came back.
+    struct Writer {
+        registration: Registration,
+        next: u64,
+        passed: Vec<WriteId>,
+        learned: Vec<WriteId>,
+        withdrawn: bool,
+    }
+
+    impl Writer {
+        fn learn(&mut self) {
+            let mut cx = Context::from_waker(Waker::noop());
+            while let Poll::Ready((id, _)) =
+                self.registration.io.poll_complete(&mut cx)
+            {
+                self.learned.push(id);
+            }
+        }
+    }
+
+    // Whatever the endpoints write, however the backend takes and reports
+    // the writes, whichever endpoint withdraws and however soon the forced
+    // close comes, every write ends once. A running endpoint learns how each
+    // write it passed to the port ended, exactly once. A withdrawn one learns
+    // at most that. Every write returns its room in the port's limits. The
+    // endpoints register before the task first runs, so a close can find a
+    // registration still queued.
+    #[test]
+    fn every_write_ends_once_and_returns_its_room() {
+        fn property(ops: Vec<Op>, wait: u8) -> bool {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .start_paused(true)
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let backend = Backend::default();
+                let (port, _ingress, mut task) = Builder::new()
+                    .udp_io(backend.clone())
+                    .write_limits(Limits { count: 3, bytes: 4096 })
+                    .build()
+                    .unwrap();
+                let mut writers: Vec<Writer> = (0..2)
+                    .map(|_| Writer {
+                        registration: port.register().unwrap(),
+                        next: 0,
+                        passed: Vec::new(),
+                        learned: Vec::new(),
+                        withdrawn: false,
+                    })
+                    .collect();
+                let mut cx = Context::from_waker(Waker::noop());
+
+                for op in ops {
+                    match op {
+                        Op::Submit(n) => {
+                            let writer = &mut writers[usize::from(n) % 2];
+                            let id = WriteId::new(writer.next);
+                            writer.next += 1;
+                            let write = DatagramWrite::new(
+                                id,
+                                Bytes::from_static(b"write"),
+                                LOCAL,
+                                PEER,
+                                None,
+                            );
+                            let io = &mut writer.registration.io;
+                            if let Submit::Accepted =
+                                io.poll_submit(&mut cx, write)
+                            {
+                                writer.passed.push(id);
+                            }
+                        }
+                        Op::Serve => serve(&mut task),
+                        Op::Mode(n) => backend.mode(
+                            [Mode::Take, Mode::Hold, Mode::Keep]
+                                [usize::from(n) % 3],
+                        ),
+                        Op::Report(n) => backend.report(match n % 3 {
+                            0 => WriteOutcome::Written,
+                            1 => WriteOutcome::NotWritten(io::Error::other(
+                                "failed",
+                            )),
+                            _ => WriteOutcome::Unknown(io::Error::other(
+                                "unknown",
+                            )),
+                        }),
+                        Op::Withdraw(n) => {
+                            let writer = &mut writers[usize::from(n) % 2];
+                            if !writer.withdrawn {
+                                writer.withdrawn = true;
+                                let io = &mut writer.registration.io;
+                                let _ = io.poll_close(&mut cx);
+                            }
+                        }
+                    }
+                    writers.iter_mut().for_each(Writer::learn);
+                }
+
+                // One close in four is forced at once, the rest drain for a
+                // while first.
+                let wait = Duration::from_millis(u64::from(wait % 4) * 10);
+                drop(port.close(wait));
+                let deadline = closing(&mut task);
+                task.close(deadline).await;
+                writers.iter_mut().for_each(Writer::learn);
+
+                // A running endpoint is still registered, so what it learned
+                // came from the task, not from a proxy whose completions
+                // ended.
+                let registered = writers.iter().all(|writer| {
+                    writer.withdrawn
+                        || task
+                            .registrations
+                            .contains_key(&writer.registration.registration)
+                });
+                let once = writers.iter_mut().all(|writer| {
+                    writer.passed.sort();
+                    writer.learned.sort();
+                    let unique = writer
+                        .learned
+                        .windows(2)
+                        .all(|pair| pair[0] != pair[1]);
+                    let passed = writer
+                        .learned
+                        .iter()
+                        .all(|id| writer.passed.binary_search(id).is_ok());
+                    unique
+                        && passed
+                        && (writer.withdrawn
+                            || writer.learned == writer.passed)
+                });
+                registered && once && port.shared.writes.is_idle()
+            })
+        }
+
+        quickcheck::QuickCheck::new()
+            .tests(500)
+            .quickcheck(property as fn(Vec<Op>, u8) -> bool);
     }
 }

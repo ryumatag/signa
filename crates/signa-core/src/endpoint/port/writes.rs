@@ -142,7 +142,7 @@ impl WriteAdmission {
         let waiters = {
             let mut state = self.0.state();
             state.closed = true;
-            mem::take(&mut state.waiters)
+            take_waiters(&mut state)
         };
         wake(waiters);
     }
@@ -175,9 +175,23 @@ impl Drop for WritePermit {
             let mut state = self.limits.state();
             state.count -= 1;
             state.bytes -= self.bytes;
-            mem::take(&mut state.waiters)
+            take_waiters(&mut state)
         };
         wake(waiters);
+    }
+}
+
+/// Takes the waiters out from under the lock, to be woken once it is
+/// released.
+///
+/// Most releases find nobody waiting, and then the map stays in place with
+/// whatever it has allocated, so that the next waiter does not allocate it
+/// again.
+fn take_waiters(state: &mut State) -> Option<HashMap<u64, Waker>> {
+    if state.waiters.is_empty() {
+        None
+    } else {
+        Some(mem::take(&mut state.waiters))
     }
 }
 
@@ -187,8 +201,8 @@ impl fmt::Debug for WritePermit {
     }
 }
 
-fn wake(waiters: HashMap<u64, Waker>) {
-    for waker in waiters.into_values() {
+fn wake(waiters: Option<HashMap<u64, Waker>>) {
+    for waker in waiters.into_iter().flat_map(HashMap::into_values) {
         waker.wake();
     }
 }
@@ -313,6 +327,25 @@ mod tests {
 
         drop(held);
         assert_eq!(usage(&admission), (0, 0));
+    }
+
+    // A release with nobody waiting leaves the waiters' map as it is, so the
+    // room it allocated is there for the next waiter. Taking it every time
+    // dropped that allocation on each release.
+    #[test]
+    fn a_release_with_nobody_waiting_keeps_the_waiters_map() {
+        let admission = WriteAdmission::new(Limits { count: 1, bytes: 10 });
+        let (_, waker) = counter();
+        let held = admitted(admission.admit(1, 10, &waker));
+        assert!(matches!(admission.admit(2, 1, &waker), Admission::Full));
+        admission.forget(2);
+        let capacity = admission.0.state().waiters.capacity();
+        assert!(capacity > 0);
+
+        drop(held);
+        drop(admitted(admission.admit(1, 10, &waker)));
+
+        assert_eq!(admission.0.state().waiters.capacity(), capacity);
     }
 
     #[test]

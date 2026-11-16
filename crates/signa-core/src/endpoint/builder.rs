@@ -15,7 +15,7 @@ use crate::{
     transaction::Timers,
     transport::{
         Limits, MessageLimits,
-        budget::Budget,
+        budget::{Budget, request_limits},
         datagram::{Binding, DatagramIo, Owner},
         next_id, tcp, udp,
     },
@@ -436,6 +436,10 @@ impl Builder {
     /// (rounded down) for existing transaction output and responses. These
     /// limits do not promise delivery to a peer.
     ///
+    /// With a [backend](Builder::udp_io) or on a [port](Builder::port), the
+    /// three quarters must hold one write of the backend's largest payload,
+    /// or [`bind`](Builder::bind) refuses the configuration.
+    ///
     /// # Example
     ///
     /// ```
@@ -748,8 +752,10 @@ impl Builder {
     /// instead. [`Reception::Stateless`] without a UDP socket is invalid, and
     /// with a TCP listener it is [`BindError::is_unsupported_config`]. A
     /// [backend](Builder::udp_io) whose local address or port is unspecified,
-    /// or whose maximum payload is zero, is invalid. These are refused before
-    /// any socket is bound.
+    /// or whose maximum payload is zero, is invalid, as is a backend or
+    /// [port](Builder::port) whose maximum payload does not fit in three
+    /// quarters of [`Builder::udp_write_limits`]. These are refused before any
+    /// socket is bound.
     pub fn bind(mut self) -> Result<(Endpoint, Incoming), BindError> {
         if self.config.reception == Reception::Stateless {
             if self.tcp.is_some() {
@@ -773,6 +779,25 @@ impl Builder {
             if io.capabilities().max_payload == 0 {
                 return Err(BindError::invalid_config(
                     "a UDP backend must send a payload of at least one byte",
+                ));
+            }
+        }
+        // New requests take three quarters of the UDP write limits. A share
+        // without a write, or one smaller than the backend's largest payload,
+        // would refuse such writes as busy however idle the endpoint was. A
+        // socket of its own keeps zero limits valid, as a way to refuse its
+        // writes.
+        let max_payload = match &self.udp {
+            Some(Udp::Io(io)) => Some(io.capabilities().max_payload),
+            Some(Udp::Port(port)) => Some(port.capabilities().max_payload),
+            Some(Udp::Bind(_)) | None => None,
+        };
+        if let Some(max_payload) = max_payload {
+            let share = request_limits(self.config.udp_write_limits);
+            if share.count == 0 || share.bytes < max_payload {
+                return Err(BindError::invalid_config(
+                    "three quarters of udp_write_limits must hold one write \
+                     of the backend's largest payload",
                 ));
             }
         }
