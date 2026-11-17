@@ -8,6 +8,11 @@ its receive loop and handler tasks. Incoming requests carry their
 Ports that several endpoints share are in [`port`], and observers in
 [`observe`].
 
+The envelopes, such as [`ServerRequest`] and [`ReceivedResponse`], have public
+fields and are not `#[non_exhaustive]`, so that a TU can take one apart and
+own each piece. A new field in one is a breaking change. Code that only reads
+some fields can match with `..` to keep compiling across it.
+
 # Reception
 
 [`IncomingEvent::Request`] owns a request and its [`ServerTransaction`]. Split

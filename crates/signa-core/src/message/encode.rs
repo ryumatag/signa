@@ -89,7 +89,6 @@ pub(super) fn response_with_len<T>(
 }
 
 /// Checked wire length for admission before allocating an encoded response.
-#[cfg(any(feature = "tokio", test))]
 pub(crate) fn response_len<T>(
     response: &Response<T>,
     body_len: usize,
@@ -121,7 +120,6 @@ pub(crate) fn response_len<T>(
 }
 
 /// Checked wire length for admission before a request is encoded.
-#[cfg(any(feature = "tokio", test))]
 pub(crate) fn request_len<T>(
     request: &Request<T>,
     body_len: usize,

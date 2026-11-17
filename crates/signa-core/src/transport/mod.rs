@@ -178,6 +178,15 @@ impl ReceiveId {
     pub fn sequence(&self) -> u64 {
         self.sequence
     }
+
+    /// An ID in domain zero, which no receive point is given, so that it
+    /// equals the ID of no message received in this process.
+    ///
+    /// It stands in for a received message's ID in a test of code that keeps
+    /// IDs without an endpoint, such as a protocol model driven by hand.
+    pub fn placeholder(sequence: u64) -> ReceiveId {
+        ReceiveId { domain: 0, sequence }
+    }
 }
 
 impl fmt::Display for ReceiveId {
@@ -229,7 +238,8 @@ impl Stamps {
 }
 
 /// A number that nothing else in this process gets: for a port, an endpoint
-/// registration or a receive domain.
+/// registration or a receive domain. It starts at one, so that
+/// [`ReceiveId::placeholder`] has domain zero to itself.
 #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
 pub(crate) fn next_id() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -268,6 +278,18 @@ mod tests {
         let id = Stamps::in_domain(7).stamp(Instant::now()).id;
 
         assert_eq!(id.to_string(), "7:0");
+    }
+
+    // A placeholder stands in for a received ID in a test without ever
+    // equalling one: no receive point is given domain zero.
+    #[test]
+    fn a_placeholder_id_is_in_a_domain_of_its_own() {
+        let placeholder = ReceiveId::placeholder(0);
+        let received = Stamps::new().stamp(Instant::now()).id;
+
+        assert_eq!(placeholder.domain(), 0);
+        assert_ne!(received.domain(), 0);
+        assert_eq!(placeholder.to_string(), "0:0");
     }
 
     #[test]

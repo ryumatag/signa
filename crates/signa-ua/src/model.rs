@@ -70,7 +70,6 @@ use std::{
 
 use signa_core::{
     Method, Request, Response, StatusCode, message::header::Tag,
-    transport::Flow,
 };
 
 use crate::{
@@ -82,10 +81,11 @@ use crate::{
     error::Error,
     header::{self, Field, Malformed},
     invite::{
-        AttemptKey, AttemptResult, ByeIntent, CancelIntent, CancelResult,
-        Direction, EndReason, ExchangeKey, ExchangeState, InviteAttempt,
-        InviteExchange, InviteUsage, MergeKey, Provisional, Received, Retry,
-        Scope, SentReinvite, UsageKey, UsagePhase, Withdrawal,
+        Arrival, AttemptKey, AttemptResult, ByeIntent, CancelIntent,
+        CancelResult, Direction, EndReason, ExchangeKey, ExchangeState,
+        InviteAttempt, InviteExchange, InviteUsage, MergeKey, Provisional,
+        Received, Retry, Scope, SentReinvite, UsageKey, UsagePhase,
+        Withdrawal,
     },
     negotiation::{Body, Description, Negotiation},
     operation::{Completion, OperationId, Operations, Stage, SubmitError},
@@ -1671,8 +1671,8 @@ impl<R: Random> Model<R> {
         // as it starts. The 2xx still goes out again until its ACK, as RFC
         // 3261 section 13.3.1.4 asks. A CANCEL has no effect on a final
         // already sent (section 9.2).
-        if let Some(Withdrawal::Bye { flow }) = withdrawn {
-            self.end_usage(usage, EndReason::RemoteBye { flow });
+        if let Some(Withdrawal::Bye { arrival }) = withdrawn {
+            self.end_usage(usage, arrival.remote_bye());
         }
         usage
     }
@@ -1912,7 +1912,7 @@ impl<R: Random> Model<R> {
     pub(crate) fn receive_request<B>(
         &mut self,
         request: &Request<B>,
-        flow: Flow,
+        arrival: Arrival,
     ) -> Result<InDialog, Refusal> {
         let Some(id) = request_dialog(request)? else {
             return Ok(InDialog::Other);
@@ -1943,7 +1943,7 @@ impl<R: Random> Model<R> {
                 return Ok(InDialog::Other);
             }
 
-            self.end_usage(usage, EndReason::RemoteBye { flow });
+            self.end_usage(usage, arrival.remote_bye());
             return Ok(InDialog::Bye);
         }
 
@@ -1965,7 +1965,7 @@ impl<R: Random> Model<R> {
         };
         dialog.remote_request(cseq).map_err(out_of_order)?;
         if bye {
-            self.withdraw(key, Withdrawal::Bye { flow });
+            self.withdraw(key, Withdrawal::Bye { arrival });
             return Ok(InDialog::Bye);
         }
         Ok(InDialog::Other)
@@ -7557,12 +7557,15 @@ mod tests {
         assert!(state.sessions.contains(&third));
     }
 
-    /// Where the peer's requests arrive in these tests.
-    fn flow() -> Flow {
-        Flow {
-            transport: signa_core::transport::Transport::Udp,
-            local: "192.0.2.4:5060".parse().unwrap(),
-            remote: "192.0.2.1:5060".parse().unwrap(),
+    /// How the peer's requests arrive in these tests.
+    fn arrival() -> Arrival {
+        Arrival {
+            id: signa_core::transport::ReceiveId::placeholder(1),
+            flow: signa_core::transport::Flow {
+                transport: signa_core::transport::Transport::Udp,
+                local: "192.0.2.4:5060".parse().unwrap(),
+                remote: "192.0.2.1:5060".parse().unwrap(),
+            },
         }
     }
 
@@ -7752,7 +7755,8 @@ Contact: <sip:bob@192.0.2.4>
             .receive_invite(&request(INVITE), offer(), clock.now())
             .unwrap();
 
-        let taken = model.receive_request(&from_caller("BYE", 314160), flow());
+        let taken =
+            model.receive_request(&from_caller("BYE", 314160), arrival());
         model.check();
         assert_eq!(taken, Ok(InDialog::Bye));
         assert_eq!(statuses(&model.take_effects()), [487]);
@@ -7765,16 +7769,17 @@ Contact: <sip:bob@192.0.2.4>
         let exchange = authority.exchange;
         run(&mut model, Command::Accept { authority, answer: answer() });
         model.take_effects();
-        let lower = model.receive_request(&from_caller("BYE", 1), flow());
+        let lower = model.receive_request(&from_caller("BYE", 1), arrival());
         assert_eq!(lower, Err(Refusal::OutOfOrder));
-        let taken = model.receive_request(&from_caller("BYE", 314160), flow());
+        let taken =
+            model.receive_request(&from_caller("BYE", 314160), arrival());
         assert_eq!(taken, Ok(InDialog::Bye));
         model.final_committed(exchange, clock.now());
         model.check();
 
         let effects = model.take_effects();
         let (_, usage) = confirmed(&effects);
-        let reason = EndReason::RemoteBye { flow: flow() };
+        let reason = arrival().remote_bye();
         assert!(
             notices(&effects).contains(&Event::UsageEnded { usage, reason })
         );
@@ -7798,21 +7803,24 @@ Contact: <sip:bob@192.0.2.4>
         model.take_effects();
 
         let options =
-            model.receive_request(&from_caller("OPTIONS", 314160), flow());
-        let stale = model.receive_request(&from_caller("BYE", 314160), flow());
-        let taken = model.receive_request(&from_caller("BYE", 314170), flow());
+            model.receive_request(&from_caller("OPTIONS", 314160), arrival());
+        let stale =
+            model.receive_request(&from_caller("BYE", 314160), arrival());
+        let taken =
+            model.receive_request(&from_caller("BYE", 314170), arrival());
         model.check();
 
         assert_eq!(options, Ok(InDialog::Other));
         assert_eq!(stale, Err(Refusal::OutOfOrder));
         assert_eq!(taken, Ok(InDialog::Bye));
-        let reason = EndReason::RemoteBye { flow: flow() };
+        let reason = arrival().remote_bye();
         assert_eq!(
             notices(&model.take_effects()),
             [Event::UsageEnded { usage, reason }],
         );
         assert_eq!(model.dialogs.len(), 0);
-        let again = model.receive_request(&from_caller("BYE", 314171), flow());
+        let again =
+            model.receive_request(&from_caller("BYE", 314171), arrival());
         assert_eq!(again, Err(Refusal::NoDialog));
     }
 
@@ -8102,9 +8110,9 @@ Contact: <sip:bob@192.0.2.4>
         model.take_effects();
 
         let bye =
-            model.receive_request(&from_callee("BYE", "callee", 7), flow());
-        let info =
-            model.receive_request(&from_callee("INFO", "callee", 8), flow());
+            model.receive_request(&from_callee("BYE", "callee", 7), arrival());
+        let info = model
+            .receive_request(&from_callee("INFO", "callee", 8), arrival());
         let reinvite = model.receive_invite(
             &from_callee("INVITE", "callee", 9),
             offer(),
@@ -8122,8 +8130,8 @@ Contact: <sip:bob@192.0.2.4>
         assert!(notices(&model.take_effects()).is_empty(), "no second end");
         model.bye_answered(started, Ok(()));
         model.check();
-        let late =
-            model.receive_request(&from_callee("BYE", "callee", 10), flow());
+        let late = model
+            .receive_request(&from_callee("BYE", "callee", 10), arrival());
         assert_eq!(late, Err(Refusal::NoDialog));
 
         // The peer's BYE first, while this user agent's is on its way.
@@ -8132,7 +8140,7 @@ Contact: <sip:bob@192.0.2.4>
         let terminate = run(&mut model, Command::Terminate { usage: session });
         model.take_effects();
         let bye =
-            model.receive_request(&from_callee("BYE", "callee", 7), flow());
+            model.receive_request(&from_callee("BYE", "callee", 7), arrival());
         assert_eq!(bye, Ok(InDialog::Bye));
         let started = model.bye_started(session, Ok(())).unwrap();
         let gone = Error::RemoteFailure(StatusCode::from_u16(481).unwrap());
@@ -8266,7 +8274,7 @@ Contact: <sip:bob@192.0.2.4>
                 callee_with("a84b4c76e66710@pc33.atlanta.example.com", &call);
             model.receive_2xx(attempt, &ok, Some(answer())).unwrap();
             let session = confirmations(&model.take_effects())[0];
-            model.end_usage(session, EndReason::RemoteBye { flow: flow() });
+            model.end_usage(session, arrival().remote_bye());
             ended.push(session);
         }
         model.check();
@@ -8274,7 +8282,7 @@ Contact: <sip:bob@192.0.2.4>
         assert_eq!(end_of(&model, ended[0]), None, "the oldest went");
         for &session in &ended[1..] {
             let (reason, _) = end_of(&model, session).unwrap();
-            assert_eq!(reason, EndReason::RemoteBye { flow: flow() });
+            assert_eq!(reason, arrival().remote_bye());
         }
     }
 
@@ -9666,7 +9674,8 @@ CSeq: {cseq} INVITE
             )
             .unwrap();
         let exchange = authority.exchange;
-        let taken = model.receive_request(&from_caller("BYE", 314161), flow());
+        let taken =
+            model.receive_request(&from_caller("BYE", 314161), arrival());
         model.check();
 
         assert_eq!(taken, Ok(InDialog::Bye));
@@ -9678,10 +9687,7 @@ CSeq: {cseq} INVITE
             .collect();
         assert_eq!(
             ended,
-            [Event::UsageEnded {
-                usage,
-                reason: EndReason::RemoteBye { flow: flow() }
-            }],
+            [Event::UsageEnded { usage, reason: arrival().remote_bye() }],
         );
         let late =
             run(&mut model, Command::Accept { authority, answer: answer() });
@@ -9740,7 +9746,7 @@ CSeq: {cseq} INVITE
         let (operation, exchange, cseq) =
             reinvited(&mut model, usage, Some(answer()), clock.now());
         let bye = from_callee("BYE", "callee", 1);
-        assert_eq!(model.receive_request(&bye, flow()), Ok(InDialog::Bye));
+        assert_eq!(model.receive_request(&bye, arrival()), Ok(InDialog::Bye));
         model.check();
         assert_eq!(model.dialogs.len(), 0);
         assert_eq!(outcome(&model, operation), Some(Err(Error::SessionEnded)));
@@ -10073,7 +10079,7 @@ Contact: <sip:alice@192.0.2.1>
         run(&mut model, Command::Accept { authority, answer: answer() });
         model.take_effects();
         let bye = from_callee("BYE", "callee", 4);
-        assert_eq!(model.receive_request(&bye, flow()), Ok(InDialog::Bye));
+        assert_eq!(model.receive_request(&bye, arrival()), Ok(InDialog::Bye));
         model.final_committed(exchange, clock.now());
         model.check();
         let effects = model.take_effects();
@@ -10403,7 +10409,7 @@ Contact: <sip:alice@192.0.2.1>
             } else {
                 let bye = from_callee("BYE", "callee", 1);
                 assert_eq!(
-                    model.receive_request(&bye, flow()),
+                    model.receive_request(&bye, arrival()),
                     Ok(InDialog::Bye)
                 );
             }
@@ -11167,7 +11173,7 @@ Contact: <sip:{host}@192.0.2.9>
             } else {
                 let _ = self.model.classify(request);
                 let _ = self.model.knows_dialog(request);
-                let _ = self.model.receive_request(request, flow());
+                let _ = self.model.receive_request(request, arrival());
             }
         }
 
@@ -11396,12 +11402,14 @@ Contact: <sip:{host}@192.0.2.9>
                     match b % 3 {
                         0 => {
                             let bye = peer_request(&id, "BYE", cseq);
-                            let _ = self.model.receive_request(&bye, flow());
+                            let _ =
+                                self.model.receive_request(&bye, arrival());
                         }
                         1 => {
                             let options = peer_request(&id, "OPTIONS", cseq);
-                            let _ =
-                                self.model.receive_request(&options, flow());
+                            let _ = self
+                                .model
+                                .receive_request(&options, arrival());
                         }
                         _ => {
                             let reinvite = peer_request(&id, "INVITE", cseq);

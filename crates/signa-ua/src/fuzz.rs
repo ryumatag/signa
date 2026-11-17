@@ -24,13 +24,13 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use signa_core::{
     HeaderValue, Method, Request, StatusCode,
-    transport::{Flow, Transport},
+    transport::{Flow, ReceiveId, Transport},
 };
 
 use crate::{
     error::Error,
     header,
-    invite::{CancelResult, ExchangeKey},
+    invite::{Arrival, CancelResult, ExchangeKey},
     model::{
         Authority, ByeStarted, Command, Effect, Event, Limits, Model, Random,
     },
@@ -215,7 +215,7 @@ impl Fuzzed {
                     ))
                 });
                 if let Ok((true, false)) = checked {
-                    let _ = self.model.receive_request(&request, flow());
+                    let _ = self.model.receive_request(&request, arrival());
                 }
             }
             _ => {}
@@ -409,12 +409,15 @@ impl Fuzzed {
     }
 }
 
-/// The flow a request arrived on, which the model only passes on.
-fn flow() -> Flow {
-    Flow {
-        transport: Transport::Udp,
-        local: "192.0.2.1:5060".parse().expect("a literal address"),
-        remote: "192.0.2.9:5060".parse().expect("a literal address"),
+/// How a request arrived, which the model only passes on.
+fn arrival() -> Arrival {
+    Arrival {
+        id: ReceiveId::placeholder(1),
+        flow: Flow {
+            transport: Transport::Udp,
+            local: "192.0.2.1:5060".parse().expect("a literal address"),
+            remote: "192.0.2.9:5060".parse().expect("a literal address"),
+        },
     }
 }
 

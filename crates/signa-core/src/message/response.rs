@@ -255,9 +255,25 @@ impl<T: AsRef<[u8]>> Response<T> {
         crate::message::encode::response(self, dst);
     }
 
-    /// Wire length for transport admission before encoding a second copy.
-    #[cfg(feature = "tokio")]
-    pub(crate) fn encoded_len(&self) -> Option<usize> {
+    /// The length [`Response::encode`] writes, without encoding, or `None`
+    /// if it does not fit in a `usize`.
+    ///
+    /// It is what signa counts of the response against byte limits, such as
+    /// a client response stream's, and it lets a caller do the same without
+    /// a copy.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bytes::Bytes;
+    /// use signa_core::Response;
+    ///
+    /// let response = Response::builder().status(200).body(Bytes::new())?;
+    ///
+    /// assert_eq!(response.encoded_len(), Some(response.to_bytes().len()));
+    /// # Ok::<(), signa_core::message::BuildError>(())
+    /// ```
+    pub fn encoded_len(&self) -> Option<usize> {
         crate::message::encode::response_len(self, self.body().as_ref().len())
     }
 

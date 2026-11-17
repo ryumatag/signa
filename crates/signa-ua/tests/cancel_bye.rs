@@ -436,12 +436,13 @@ async fn cancel_481_does_not_terminate_confirmed_usage() {
     assert_eq!(snapshot.end_reason, None);
 }
 
-/// The flow a request arrived on reaches the application: that of an
-/// INVITE through [`IncomingInvite::flow`], and that of the BYE that ends
-/// its session in the reason the session ended. Over UDP and TCP, the BYE
-/// gets a 200 (RFC 3261 section 15.1.2).
+/// How a request arrived reaches the application: that of an INVITE
+/// through [`IncomingInvite::received`], and the ID and flow of the BYE
+/// that ends its session in the reason the session ended. The BYE arrived
+/// later on the same socket, so its ID follows the INVITE's in the same
+/// domain. Over UDP and TCP, the BYE gets a 200 (RFC 3261 section 15.1.2).
 #[tokio::test]
-async fn incoming_requests_report_their_flow() {
+async fn incoming_requests_report_how_they_arrived() {
     let (mut ua, udp, tcp) = start_fast();
     tokio::spawn(ua.driver);
     let transport = signa_core::transport::Transport::Udp;
@@ -449,7 +450,8 @@ async fn incoming_requests_report_their_flow() {
     let peer = Peer::new().await;
     peer.send(&invite_to_ua(peer.address(), "flow-udp"), udp).await;
     let incoming = invite(&mut ua.events).await;
-    let flow = incoming.flow();
+    let invite_id = incoming.received().id();
+    let flow = incoming.received().flow();
     assert_eq!(flow.transport, transport);
     assert_eq!((flow.local, flow.remote), (udp, peer.address()));
     let session = incoming.try_accept(sdp()).unwrap().await.unwrap();
@@ -466,16 +468,18 @@ async fn incoming_requests_report_their_flow() {
     })
     .await;
     assert_eq!(ended, session);
-    let EndReason::RemoteBye { flow, .. } = reason else {
+    let EndReason::RemoteBye { id, flow, .. } = reason else {
         panic!("not ended by the peer: {reason:?}");
     };
     assert_eq!((flow.local, flow.remote), (udp, peer.address()));
+    assert_eq!(id.domain(), invite_id.domain(), "{id} {invite_id}");
+    assert!(id.sequence() > invite_id.sequence(), "{id} after {invite_id}");
 
     let mut peer = TcpPeer::connect(tcp).await;
     let address = peer.address();
     peer.send(&invite_over("TCP", address, "flow-tcp")).await;
     let incoming = invite(&mut ua.events).await;
-    let flow = incoming.flow();
+    let flow = incoming.received().flow();
     assert_eq!(flow.transport, signa_core::transport::Transport::Tcp);
     assert_eq!((flow.local, flow.remote), (tcp, address));
     incoming.try_accept(sdp()).unwrap().await.unwrap();

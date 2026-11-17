@@ -109,7 +109,7 @@ use crate::{
     capability,
     error::Error,
     header,
-    invite::{AttemptKey, CancelResult, ExchangeKey, UsageKey},
+    invite::{Arrival, AttemptKey, CancelResult, ExchangeKey, UsageKey},
     model::{
         self, ByeStarted, Effect, InDialog, Model, Random, Refusal, Released,
     },
@@ -144,6 +144,29 @@ enum Client {
 /// whose response does not fit waits, and the endpoint holds the rest under
 /// its own limits.
 const RESPONSE_QUEUE: usize = 64;
+
+/// How many bytes those responses may take together, as signa-core counts a
+/// response's bytes. It is the default of one stream's
+/// `client_response_limits` in signa-core, which stops counting a response
+/// once a reader has read it. A response larger than this takes all of it.
+const RESPONSE_QUEUE_BYTES: u32 = 1024 * 1024;
+
+/// The share of [`RESPONSE_QUEUE_BYTES`] that `response` takes: its length
+/// on the wire, as signa-core counts it, up to all of them.
+fn charge(response: &Response<Bytes>) -> u32 {
+    response
+        .encoded_len()
+        .and_then(|len| u32::try_from(len).ok())
+        .map_or(RESPONSE_QUEUE_BYTES, |len| len.min(RESPONSE_QUEUE_BYTES))
+}
+
+/// A response on its way from a reader to the driver, or the end of its
+/// stream, with its share of [`RESPONSE_QUEUE_BYTES`].
+struct Queued {
+    client: Client,
+    item: ResponseItem,
+    _bytes: OwnedSemaphorePermit,
+}
 
 /// Room for the Via the endpoint adds to a request it sends, which the size
 /// that picks the transport counts (RFC 3261 section 18.1.1). The endpoint
@@ -202,8 +225,11 @@ pub(super) struct Driver<R, N> {
     /// The replies that wait for one of `replies`.
     waiting: Waiting<Job>,
     readers: JoinSet<()>,
-    response_sender: mpsc::Sender<(Client, ResponseItem)>,
-    responses: mpsc::Receiver<(Client, ResponseItem)>,
+    response_sender: mpsc::Sender<Queued>,
+    responses: mpsc::Receiver<Queued>,
+    /// The bytes of the responses in `responses`, see
+    /// [`RESPONSE_QUEUE_BYTES`].
+    response_bytes: Arc<Semaphore>,
     /// The INVITE and responder of each incoming exchange, until its final
     /// response is done with.
     servers: HashMap<ExchangeKey, Server>,
@@ -616,6 +642,9 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             readers: JoinSet::new(),
             response_sender,
             responses,
+            response_bytes: Arc::new(Semaphore::new(
+                RESPONSE_QUEUE_BYTES as usize,
+            )),
             servers: HashMap::new(),
             invite_bytes: Arc::new(Semaphore::new(config.invite_bytes)),
             max_description: config.description_bytes,
@@ -700,12 +729,17 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
                 {
                     self.expire_answers();
                 }
-                Some((client, item)) = self.responses.recv() => match client {
-                    Client::Attempt(attempt) => self.on_response(attempt, item),
-                    Client::Reinvite(exchange) => {
-                        self.on_reinvite_response(exchange, item);
+                // The response's bytes go back once it has been handled.
+                Some(Queued { client, item, _bytes }) = self.responses.recv() => {
+                    match client {
+                        Client::Attempt(attempt) => {
+                            self.on_response(attempt, item);
+                        }
+                        Client::Reinvite(exchange) => {
+                            self.on_reinvite_response(exchange, item);
+                        }
                     }
-                },
+                }
                 Some(_) = self.readers.join_next(), if !self.readers.is_empty() => {}
                 // Notifications were dropped, and the count waits for room,
                 // so that the application learns of the loss even if nothing
@@ -1051,8 +1085,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
     }
 
     fn on_invite(&mut self, request: ServerRequest) {
-        let ServerRequest { request, transaction, received } = request;
-        let flow = received.flow();
+        let ServerRequest { request, transaction, received, .. } = request;
         // TODO: Watch the server events, for a failed write of the first 2xx
         // and for the end of the transaction. The end would also bound how
         // long a merged INVITE is detected, which is now only while the UA
@@ -1123,7 +1156,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
                 let invite = IncomingInvite {
                     request,
                     _bytes: bytes,
-                    flow,
+                    received,
                     session,
                     offer,
                     preview: None,
@@ -1186,8 +1219,11 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
     /// The answer to a BYE in a dialog the UA keeps goes first, see
     /// [`Lane`].
     fn on_other(&mut self, request: ServerRequest) {
-        let ServerRequest { request, transaction, received } = request;
-        let flow = received.flow();
+        let ServerRequest { request, transaction, received, .. } = request;
+        // The UA keeps only the request's ID and flow, so its copy of the
+        // context goes now.
+        let arrival = Arrival { id: received.id(), flow: received.flow() };
+        drop(received);
         let (responder, _events) = transaction.into_parts();
         let responder = Arc::new(responder);
         let lane = if *request.method() == Method::BYE
@@ -1233,7 +1269,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         };
 
         if in_dialog {
-            let taken = self.model.receive_request(&request, flow);
+            let taken = self.model.receive_request(&request, arrival);
             self.settle(None);
             match taken {
                 Ok(InDialog::Bye) => {
@@ -1480,15 +1516,41 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
 
     /// Reads the responses of an attempt or a re-INVITE in a task of their
     /// own, until the endpoint stops delivering them.
+    ///
+    /// signa-core stops counting a response once it is read, so from here on
+    /// the response waits under the queue's own bounds, [`RESPONSE_QUEUE`]
+    /// and [`RESPONSE_QUEUE_BYTES`]. Its copy of the backend's context goes
+    /// here, since the UA does not publish it yet and nothing would count it.
+    /// Each reader holds at most one response while it waits for room.
     fn read(&mut self, client: Client, mut responses: Responses) {
         let sender = self.response_sender.clone();
+        let bytes = self.response_bytes.clone();
         self.readers.spawn(async move {
-            while let Some(response) = responses.next().await {
-                if sender.send((client, Some(response))).await.is_err() {
+            loop {
+                let item = responses.next().await.map(|read| {
+                    read.map(
+                        |ReceivedResponse { response, received, .. }| {
+                            // TODO: Keep the context, counted, once the UA
+                            // publishes how a response arrived.
+                            let received = received.without_context();
+                            ReceivedResponse { response, received }
+                        },
+                    )
+                });
+                let size = match &item {
+                    Some(Ok(read)) => charge(&read.response),
+                    Some(Err(_)) | None => 0,
+                };
+                let Ok(permit) = bytes.clone().acquire_many_owned(size).await
+                else {
+                    return;
+                };
+                let end = item.is_none();
+                let queued = Queued { client, item, _bytes: permit };
+                if sender.send(queued).await.is_err() || end {
                     return;
                 }
             }
-            let _ = sender.send((client, None)).await;
         });
     }
 
@@ -1502,7 +1564,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             // TODO: Publish `received` with the response's progress, so that
             // the application learns where and when the response arrived.
             // The model keeps its own processing time apart from it.
-            Some(Ok(ReceivedResponse { response, received: _ })) => {
+            Some(Ok(ReceivedResponse { response, .. })) => {
                 let description = Body::description(
                     response.headers(),
                     response.body(),
@@ -1531,7 +1593,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         match item {
             // TODO: Publish `received` with the response's progress, as for
             // a re-INVITE's.
-            Some(Ok(ReceivedResponse { response, received: _ })) => {
+            Some(Ok(ReceivedResponse { response, .. })) => {
                 let status = response.status();
                 // An error here is a response the UA keeps no session for.
                 // The model has queued what the wire still needs, such as
@@ -2655,6 +2717,28 @@ mod tests {
                 .headers()
                 .iter()
                 .all(|(_, value)| !inside(value.as_bytes()))
+    }
+
+    /// A response waits for the driver under its length on the wire, and
+    /// one larger than the queue's bytes takes all of them, so that it still
+    /// passes on its own.
+    #[test]
+    fn a_response_takes_its_length_of_the_queue() {
+        let response = |body: usize| {
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Bytes::from(vec![b'x'; body]))
+                .unwrap()
+        };
+        let small = response(100);
+        let large = response(RESPONSE_QUEUE_BYTES as usize + 1);
+
+        assert_eq!(
+            charge(&small) as usize,
+            small.to_bytes().len(),
+            "the length on the wire"
+        );
+        assert_eq!(charge(&large), RESPONSE_QUEUE_BYTES);
     }
 
     /// A request keeps nothing of the buffer it arrived in once copied,

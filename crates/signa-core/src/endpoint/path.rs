@@ -244,6 +244,18 @@ impl ReceiveInfo {
         self.path.as_deref().map_or(&EMPTY, |path| &path.context)
     }
 
+    /// The same description without its copy of the context, which it then
+    /// no longer keeps alive.
+    ///
+    /// A response's copy is charged to its stream's
+    /// [`client_response_limits`](super::Builder::client_response_limits)
+    /// only until it is read. Code that keeps responses after that, and has
+    /// no use for their context, drops it here so that it keeps nothing
+    /// the endpoint does not count.
+    pub fn without_context(self) -> ReceiveInfo {
+        ReceiveInfo { path: None, ..self }
+    }
+
     /// The bytes the copy of the context takes, as the context limits would
     /// count them, for a budget that charges it instead.
     pub(super) fn retained_len(&self) -> usize {

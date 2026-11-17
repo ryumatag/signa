@@ -201,9 +201,27 @@ impl<T: AsRef<[u8]>> Request<T> {
         super::encode::request(self, dst);
     }
 
-    /// Wire length for transport admission before encoding.
-    #[cfg(feature = "tokio")]
-    pub(crate) fn encoded_len(&self) -> Option<usize> {
+    /// The length [`Request::encode`] writes, without encoding, or `None`
+    /// if it does not fit in a `usize`.
+    ///
+    /// It is what signa counts of the request against byte limits, and it
+    /// lets a caller do the same without a copy.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bytes::Bytes;
+    /// use signa_core::Request;
+    ///
+    /// let request = Request::builder()
+    ///     .method("OPTIONS")
+    ///     .uri("sip:carol@chicago.example.com")
+    ///     .body(Bytes::new())?;
+    ///
+    /// assert_eq!(request.encoded_len(), Some(request.to_bytes().len()));
+    /// # Ok::<(), signa_core::message::BuildError>(())
+    /// ```
+    pub fn encoded_len(&self) -> Option<usize> {
         super::encode::request_len(self, self.body().as_ref().len())
     }
 

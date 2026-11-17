@@ -31,7 +31,10 @@ response collection.
 
 use std::time::Instant;
 
-use signa_core::{StatusCode, transport::Flow};
+use signa_core::{
+    StatusCode,
+    transport::{Flow, ReceiveId},
+};
 
 use crate::{
     dialog::{Dialog, DialogId, DialogKey, Origin, Outgoing},
@@ -149,8 +152,15 @@ pub enum EndReason {
     /// not reach the endpoint.
     LocalBye,
     /// The peer ended it with a BYE (RFC 3261 section 15.1.2).
+    ///
+    /// It names the BYE by its ID and flow, not its whole
+    /// [`ReceiveInfo`](signa_core::endpoint::ReceiveInfo), so that the reason
+    /// stays `Copy` and keeps no copy of the context for as long as the UA
+    /// remembers it.
     #[non_exhaustive]
     RemoteBye {
+        /// The BYE's ID, as its envelope carried it in signa-core.
+        id: ReceiveId,
         /// Where the BYE arrived.
         flow: Flow,
     },
@@ -490,17 +500,32 @@ pub(crate) struct Provisional {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Withdrawal {
     Cancel,
-    /// A BYE in the early dialog, which arrived on `flow`. RFC 3261 section
-    /// 15 lets the caller send one, and section 15.1.2 has the UAS answer
-    /// the INVITE it leaves pending with a 487.
+    /// A BYE in the early dialog, which arrived as `arrival` says. RFC 3261
+    /// section 15 lets the caller send one, and section 15.1.2 has the UAS
+    /// answer the INVITE it leaves pending with a 487.
     Bye {
-        flow: Flow,
+        arrival: Arrival,
     },
     /// The session of a re-INVITE ended, by a BYE in either direction. RFC
     /// 3261 section 15.1.2 recommends a 487 for each request the dialog
     /// leaves pending, and I answer one of this user agent's own BYE the
     /// same way.
     Ended,
+}
+
+/// How a request in a dialog arrived, as far as the UA keeps it: its ID and
+/// flow, which [`EndReason::RemoteBye`] names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Arrival {
+    pub(crate) id: ReceiveId,
+    pub(crate) flow: Flow,
+}
+
+impl Arrival {
+    /// The reason a session ends for the BYE that arrived so.
+    pub(crate) fn remote_bye(self) -> EndReason {
+        EndReason::RemoteBye { id: self.id, flow: self.flow }
+    }
 }
 
 /// What RFC 3261 section 8.2.2.2 compares to tell a merged request: the From

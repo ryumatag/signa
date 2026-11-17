@@ -3671,6 +3671,15 @@ async fn each_response_keeps_how_it_arrived() {
         );
         assert_eq!(received.context().as_bytes(), on);
         ids.push((received.id(), received.received_at()));
+
+        // Code that keeps the response longer can let the context go and
+        // keep the rest.
+        let kept = received.clone().without_context();
+        assert!(kept.context().is_empty());
+        assert_eq!(
+            (kept.id(), kept.received_at(), kept.flow()),
+            (received.id(), received.received_at(), received.flow())
+        );
     }
     for pair in ids.windows(2) {
         let ((before, at), (after, then)) = (pair[0], pair[1]);

@@ -19,9 +19,8 @@ use std::{
 use bytes::Bytes;
 use signa_core::{
     Request, StatusCode,
-    endpoint::{Endpoint, Incoming, Reception, Target},
+    endpoint::{Endpoint, Incoming, ReceiveInfo, Reception, Target},
     transaction::Timers,
-    transport::Flow,
 };
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
@@ -1684,7 +1683,7 @@ pub struct IncomingInvite {
     /// The INVITE's share of [`Config::max_invite_bytes`], which goes back
     /// once neither this nor the UA keeps the INVITE.
     _bytes: Arc<OwnedSemaphorePermit>,
-    flow: Flow,
+    received: ReceiveInfo,
     /// The session of a re-INVITE.
     session: Option<Session>,
     /// The offer and the preview are boxed, so that an INVITE without them
@@ -1718,12 +1717,16 @@ impl IncomingInvite {
         self.session.as_ref()
     }
 
-    /// Returns where the INVITE arrived: the transport, the local address
-    /// it reached and the address it came from. It describes the flow, and
-    /// sends nothing. An application that serves several networks on one
-    /// endpoint can tell them apart by it.
-    pub fn flow(&self) -> Flow {
-        self.flow
+    /// Returns how the INVITE arrived, as signa-core's envelope gave it:
+    /// its ID and time, the flow, and the UDP backend's context. It
+    /// describes the arrival, and sends nothing.
+    ///
+    /// An application that serves several networks on one endpoint tells
+    /// them apart by the flow, and by the context where their addresses
+    /// overlap. The INVITE keeps its copy of the context, charged to the
+    /// endpoint's context limits, for as long as it lives.
+    pub fn received(&self) -> &ReceiveInfo {
+        &self.received
     }
 
     /// Returns the offer the INVITE carries: its body, if that is a session
