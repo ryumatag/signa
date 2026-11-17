@@ -63,6 +63,7 @@ jobs:
           - invite-uac
           - fork-proxy
           - stateless-proxy
+          - datagram-port
           - ua-call
           - ua-late-offer
           - ua-fork

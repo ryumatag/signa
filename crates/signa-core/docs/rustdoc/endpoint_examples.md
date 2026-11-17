@@ -81,6 +81,9 @@ which it leaves out:
   relays every 2xx, and cancels the other branches.
 * [`stateless-proxy`]: a UDP stateless proxy with a stable branch for an
   INVITE, its CANCEL and its ACK.
+* [`datagram-port`]: a shared [`DatagramPort`](endpoint::port::DatagramPort)
+  whose classifier delivers an OPTIONS to an endpoint and forwards a REGISTER
+  upstream unchanged, with an observer of the port.
 
 [`tower_fixture.rs`] builds a Tower adapter and a bounded dispatcher against
 the public API only, as a crate outside signa would.
@@ -90,5 +93,6 @@ the public API only, as a crate outside signa would.
 [`invite-uac`]: https://github.com/ryumatag/signa/tree/main/examples/invite-uac
 [`fork-proxy`]: https://github.com/ryumatag/signa/tree/main/examples/fork-proxy
 [`stateless-proxy`]: https://github.com/ryumatag/signa/tree/main/examples/stateless-proxy
+[`datagram-port`]: https://github.com/ryumatag/signa/tree/main/examples/datagram-port
 [`tower_fixture.rs`]: https://github.com/ryumatag/signa/blob/main/crates/signa-core/tests/tower_fixture.rs
 

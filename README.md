@@ -48,6 +48,16 @@ signa-ua depends on signa-core, which depends on neither of the others.
   RFC 6026, and the non-INVITE changes of RFC 4320.
 * The ACK of a non-2xx final response, and CANCEL as a transaction of its own.
 * UDP stateless reception and forwarding primitives for a stateless proxy.
+* UDP over a backend of the application's own, through the `DatagramIo`
+  trait, such as a capture of a network it intercepts. Each datagram may
+  carry an opaque context, such as the interface it came in on, and a
+  response goes back the same way.
+* Shared ports. A `DatagramPort` owns one UDP socket or backend for several
+  endpoints and hands every datagram to the application first. It delivers
+  each to an endpoint, forwards it unchanged, or drops it, and the port
+  bounds what the application holds and writes. A `Capture` only receives.
+* Observers: a bounded, lossy record of what an endpoint or a port receives
+  and of each write it makes, which never holds up the protocol.
 * Bounded protocol work, explicit errors, and a graceful shutdown that waits
   for transactions and for work the application registers with a guard.
 
@@ -78,14 +88,36 @@ API:
   and `ServerEvents`, which reports write failures and termination.
 * `Endpoint::start` sends a request to an explicit `Target` and returns a
   `ClientControl`, which can cancel an INVITE, and a `Responses` stream.
+* `Endpoint::prepare` measures a request with its Via before anything is
+  sent, so the TU can pick TCP for one too large for UDP, and
+  `Endpoint::start_prepared` sends it. `Endpoint::prepare_path` makes a
+  `SendPath` from a chosen source address and backend context, which
+  `Target::on_path` sends on.
 * `Endpoint::send_request`, `Endpoint::forward_response` and
   `ReplyRoute::send` send one message without a transaction.
 * `Endpoint::shutdown` drains and reports `Drained` or `DeadlineExpired`.
   `Endpoint::work_guard` holds it for the TU's own work.
+* `Endpoint::observe` attaches an `Observer` of the endpoint's records.
 
 Reception is fixed per endpoint. `Reception::Stateful`, the default, runs
 transactions over UDP and TCP. `Reception::Stateless` delivers every message
-over UDP without transactions, for a stateless proxy.
+over UDP without transactions, for a stateless proxy. Every envelope carries
+a `ReceiveInfo`: the message's ID and time, the flow it arrived on and the
+backend's context.
+
+The `endpoint::port` module has the shared ports:
+
+* `DatagramPort::builder()` binds a socket or takes a `DatagramIo`, and
+  `intercept()` returns the port and its one `Ingress`. An endpoint joins it
+  with `Endpoint::builder().bind_on(&port)`, which also returns the
+  `EndpointIngress` that delivers to it.
+* `Ingress::recv` yields each `ReceivedDatagram`, which the application
+  delivers with `try_deliver`, forwards along a `RawPath` with `try_forward`,
+  or discards. `DatagramPort::send_bytes` sends a raw datagram of its own.
+* `DatagramPort::observe` records what the backend receives and every write
+  it is offered. `DatagramPort::close` drains the port's writes and closes
+  its backend, after its endpoints have shut down.
+* `Capture::builder()` opens a backend only to receive, with no way to send.
 
 ### Dialogs and INVITE usage
 
@@ -207,6 +239,9 @@ CI runs them with RFC 3261's timers. `--t1-ms 50` makes most of them quicker.
   branches.
 * [`examples/stateless-proxy`](examples/stateless-proxy): a UDP
   stateless proxy with a stable branch for an INVITE, its CANCEL and its ACK.
+* [`examples/datagram-port`](examples/datagram-port): a shared port whose
+  classifier delivers an OPTIONS to an endpoint and forwards a REGISTER
+  upstream unchanged, with an observer of the port.
 
 The `ua-` examples build on signa-ua instead, through the facade's `ua`
 feature. The UA takes on the dialogs and the INVITE usage, and the example
@@ -251,10 +286,11 @@ signa-core has no dialog or call layer, which signa-ua adds for INVITE
 sessions. Neither has TLS, and so SIPS, nor RFC 3263 resolution, PRACK,
 session timers, authentication, SDP or media, and neither has proxy routing
 logic. Stateless reception is UDP-only and cannot share an endpoint with
-stateful reception. RFC 2543 transactions are not matched. signa-core refuses
-`sips:` Request-URIs, but checks nothing else about SIPS, Route or the target,
-which signa-ua does for the requests it sends. A `sip:` URI does not make
-plaintext safe.
+stateful reception. A shared port carries UDP only, and a forward is one
+datagram sent unchanged that signa does not track. RFC 2543 transactions are
+not matched. signa-core refuses `sips:` Request-URIs, but checks nothing else
+about SIPS, Route or the target, which signa-ua does for the requests it
+sends. A `sip:` URI does not make plaintext safe.
 
 ### Features and MSRV
 
