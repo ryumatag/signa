@@ -70,7 +70,7 @@ impl Target {
     /// Sends over UDP on a path the endpoint prepared, to its destination,
     /// from its source and with the `sent-by` it advertises. See
     /// [`Endpoint::prepare_path`].
-    pub fn path(path: SendPath) -> Target {
+    pub fn on_path(path: SendPath) -> Target {
         Target {
             transport: Transport::Udp,
             address: path.destination(),
@@ -89,7 +89,7 @@ impl Target {
     }
 
     /// The prepared path, if the target names one.
-    pub fn send_path(&self) -> Option<&SendPath> {
+    pub fn path(&self) -> Option<&SendPath> {
         self.path.as_ref()
     }
 }

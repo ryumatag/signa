@@ -118,18 +118,20 @@ use super::{Stamp, budget::Permit};
 /// limit bounds what the endpoint keeps for each datagram.
 pub const MAX_CONTEXT_LEN: usize = 256;
 
-/// A backend that sends and receives UDP payloads for one endpoint.
+/// A backend that sends and receives UDP payloads for one endpoint, or for
+/// a shared port.
 ///
 /// The endpoint's driver owns the backend and polls it from its own task, or a
-/// shared port's task does for the endpoints on it. Either way one task polls
-/// it, so a backend that needs a task of its own, such as a NIC reader, talks
-/// to it through channels and wakes the waker it was last polled with. Every
-/// `Pending` registers that waker. Nothing here retries a write.
+/// shared port's task does for the endpoints on it and its raw sends. Either
+/// way one task polls it, so a backend that needs a task of its own, such as
+/// a NIC reader, talks to it through channels and wakes the waker it was last
+/// polled with. Every `Pending` registers that waker. Nothing here retries a
+/// write.
 ///
-/// The driver may also poll with a waker that does nothing, to send at once
-/// when the backend can take a datagram right away. It polls again with its
-/// real waker before it waits, so a backend only has to keep the last waker
-/// it was given.
+/// The driver or the port's task may also poll with a waker that does
+/// nothing, to send at once when the backend can take a datagram right away.
+/// It polls again with its real waker before it waits, so a backend only has
+/// to keep the last waker it was given.
 ///
 /// See the [module docs](self) for the stages of a write.
 pub trait DatagramIo: Send + 'static {
@@ -186,11 +188,12 @@ pub trait DatagramIo: Send + 'static {
     ) -> Poll<(WriteId, WriteOutcome)>;
 
     /// Checks that the backend can send from `source` to `destination` along
-    /// `context`, before the endpoint makes a path of them.
+    /// `context`, before the endpoint or the port makes a path of them.
     ///
-    /// The endpoint calls it on its driver's task when the application
-    /// prepares a path, and offers that path's writes as
-    /// [`WritePath::Prepared`] later. It must not block. The backend refuses
+    /// The endpoint's driver calls it on its task when the application
+    /// prepares a path, or a shared port's task does on its own, for a path
+    /// of an endpoint on the port or a raw path of the port. That path's
+    /// writes come as [`WritePath::Prepared`] later. It must not block. The backend refuses
     /// a source address it may not send from, a context it cannot read, or a
     /// destination it cannot reach. A link-local IPv6 address names its
     /// interface by its scope ID, which is the backend's to check too. A path
@@ -666,7 +669,8 @@ pub enum WritePath<'a> {
     Reply(&'a TransportContext),
     /// A path the application prepared, with the context it named, which
     /// [`DatagramIo::check_path`] accepted. A request on it, its
-    /// retransmissions and an INVITE's ACK and CANCEL all go this way.
+    /// retransmissions and an INVITE's ACK and CANCEL all go this way, and so
+    /// do a shared port's raw sends and forwards along a raw path.
     Prepared(&'a TransportContext),
 }
 

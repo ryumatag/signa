@@ -140,7 +140,9 @@ impl Observer {
     /// every record has been received.
     ///
     /// Dropping this future consumes nothing.
-    pub fn recv(&mut self) -> impl Future<Output = Option<Record>> + '_ {
+    pub fn recv(
+        &mut self,
+    ) -> impl Future<Output = Option<Record>> + Send + '_ {
         poll_fn(|cx| self.poll_recv(cx))
     }
 

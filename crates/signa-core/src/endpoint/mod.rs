@@ -122,13 +122,14 @@ and a queued submission may still run after its waiting future is dropped.
 
 # Shared ports
 
-An endpoint built with [`Builder::port`] has no socket of its own. It is
+An endpoint built with [`Builder::bind_on`] has no socket of its own. It is
 registered on a [`DatagramPort`], which owns one backend for several
 endpoints and lets the application decide what becomes of each datagram
-before any endpoint sees it. What the application delivers through
-[`Endpoint::ingress`] is received as from the endpoint's own socket, and
-everything above holds for it. See [`DatagramPort`] for the port's limits
-and the order in which a port and its endpoints stop.
+before any endpoint sees it. What the application delivers through the
+[`EndpointIngress`] that `bind_on` returns is received as from the
+endpoint's own socket, and everything above holds for it. See
+[`DatagramPort`] for the port's limits and the order in which a port and its
+endpoints stop.
 
 # Client operations
 
@@ -155,6 +156,7 @@ carries its [`ReceiveInfo`] whether or not an observer is attached, and
 nothing a TU acts on depends on one.
 
 [`DatagramPort`]: port::DatagramPort
+[`EndpointIngress`]: port::EndpointIngress
 [`DatagramPort::observe`]: port::DatagramPort::observe
 [`Observer`]: observe::Observer
 
@@ -251,9 +253,7 @@ use tokio::sync::{Semaphore, mpsc, watch};
 
 #[cfg(test)]
 use self::client::compatibility::Client;
-use self::{
-    admission::ClientAdmission, driver::Command, port::EndpointIngress,
-};
+use self::{admission::ClientAdmission, driver::Command};
 #[cfg(feature = "__bench")]
 use self::{builder::Config, driver::Driver};
 #[cfg(test)]
@@ -345,7 +345,6 @@ pub struct Endpoint {
     /// The shared port the endpoint is registered on, if it has no UDP
     /// socket of its own, and where the application delivers to it.
     port: Option<port::PortClient>,
-    ingress: Option<EndpointIngress>,
     /// The context copies and prepared paths alive at once.
     context_limits: Budget,
     timers: Timers,
@@ -436,14 +435,6 @@ impl Endpoint {
     /// Returns how this endpoint receives messages.
     pub fn reception(&self) -> Reception {
         self.reception
-    }
-
-    /// Returns where the application delivers datagrams to this endpoint,
-    /// for an endpoint registered on a [`DatagramPort`](port::DatagramPort)
-    /// with [`Builder::port`]. `None` for any other endpoint, whose own
-    /// socket or backend delivers to it.
-    pub fn ingress(&self) -> Option<EndpointIngress> {
-        self.ingress.clone()
     }
 
     /// Returns connection-admission and ordinary fallback counters.
@@ -1898,7 +1889,6 @@ mod tests {
             registration: crate::transport::next_id(),
             binding: None,
             port: None,
-            ingress: None,
             context_limits: fixture.context_limits(),
             timers: Timers::default(),
             observing: Default::default(),

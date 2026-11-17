@@ -305,7 +305,7 @@ impl Endpoint {
             if target.address().ip().is_multicast() || unavailable {
                 return Err(Error::unsupported_routing());
             }
-            if let Some(path) = target.send_path() {
+            if let Some(path) = target.path() {
                 if Some(path.binding()) != self.binding {
                     return Err(Error::stale_path());
                 }

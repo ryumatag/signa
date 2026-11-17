@@ -172,30 +172,39 @@ impl fmt::Debug for WorkGuard {
 pub struct Shutdown {
     /// Keeps the driver alive, see above.
     _commands: mpsc::UnboundedSender<Command>,
-    done: Pin<Box<dyn Future<Output = ShutdownOutcome> + Send + Sync>>,
+    done: Outcome,
 }
 
 impl Shutdown {
     pub(super) fn new(
         commands: mpsc::UnboundedSender<Command>,
-        mut done: watch::Receiver<Option<ShutdownOutcome>>,
+        done: watch::Receiver<Option<ShutdownOutcome>>,
     ) -> Shutdown {
-        Shutdown {
-            _commands: commands,
-            done: Box::pin(async move {
-                loop {
-                    if let Some(outcome) = *done.borrow_and_update() {
-                        return outcome;
-                    }
-                    if done.changed().await.is_err() {
-                        return done
-                            .borrow()
-                            .unwrap_or(ShutdownOutcome::DeadlineExpired);
-                    }
-                }
-            }),
-        }
+        Shutdown { _commands: commands, done: outcome(done) }
     }
+}
+
+/// Waits for the outcome a stopping task publishes.
+pub(super) type Outcome =
+    Pin<Box<dyn Future<Output = ShutdownOutcome> + Send + Sync>>;
+
+/// Waits until `done` holds an outcome. A task that ends without publishing
+/// one was dropped with its runtime, and may have left work undone.
+pub(super) fn outcome(
+    mut done: watch::Receiver<Option<ShutdownOutcome>>,
+) -> Outcome {
+    Box::pin(async move {
+        loop {
+            if let Some(outcome) = *done.borrow_and_update() {
+                return outcome;
+            }
+            if done.changed().await.is_err() {
+                return done
+                    .borrow()
+                    .unwrap_or(ShutdownOutcome::DeadlineExpired);
+            }
+        }
+    })
 }
 
 impl Future for Shutdown {

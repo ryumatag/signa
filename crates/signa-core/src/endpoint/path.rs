@@ -118,14 +118,14 @@ impl PathSelection {
 
 /// A way to send requests that the UDP backend has accepted.
 ///
-/// [`Endpoint::prepare_path`] makes one, and [`Target::path`] sends on it. A
+/// [`Endpoint::prepare_path`] makes one, and [`Target::on_path`] sends on it. A
 /// path belongs to the endpoint that prepared it. Any other endpoint refuses
 /// it with [`Error::is_stale_path`], and nothing derives one from a [`Flow`]
 /// or a received [`ReceiveInfo`]. Clones share one path, which counts against
 /// [`Builder::context_limits`] until the last of them, and the last
 /// transaction sent on it, has dropped.
 ///
-/// [`Target::path`]: super::Target::path
+/// [`Target::on_path`]: super::Target::on_path
 /// [`Builder::context_limits`]: super::Builder::context_limits
 #[derive(Clone)]
 pub struct SendPath(pub(super) Arc<Path>);
@@ -326,7 +326,7 @@ impl Endpoint {
     ///
     /// The driver asks the backend through [`DatagramIo::check_path`], which
     /// refuses a source it may not send from, a context it cannot read or a
-    /// destination it cannot reach. The path then sends with [`Target::path`],
+    /// destination it cannot reach. The path then sends with [`Target::on_path`],
     /// for as many requests as the caller likes, until it drops. It does not
     /// look up anything or write to the network.
     ///
@@ -374,12 +374,12 @@ impl Endpoint {
     ///     let path: SendPath = endpoint
     ///         .prepare_path(PathSelection::new(source, next_hop))
     ///         .await?;
-    ///     Ok(Target::path(path))
+    ///     Ok(Target::on_path(path))
     /// }
     /// ```
     ///
     /// [`DatagramIo::check_path`]: crate::transport::datagram::DatagramIo::check_path
-    /// [`Target::path`]: super::Target::path
+    /// [`Target::on_path`]: super::Target::on_path
     /// [`Builder::context_limits`]: super::Builder::context_limits
     #[allow(clippy::manual_async_fn)] // State the Send guarantee.
     pub fn prepare_path(

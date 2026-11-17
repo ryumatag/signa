@@ -42,6 +42,7 @@ use super::{
     driver::{ABANDONED_FLUSH, ReceptionCounters, increment, now},
     observe::{self, Observer, Tap},
     path::{self, PathSelection, ReceiveInfo},
+    shutdown,
 };
 use crate::{
     message::{Message, error::InvalidMessage},
@@ -74,7 +75,7 @@ const OPEN: u8 = 0;
 const QUIESCED: u8 = 1;
 const CLOSING: u8 = 2;
 
-/// Configures and starts a [`DatagramPort`] or a [`Capture`].
+/// Configures and starts a [`DatagramPort`].
 ///
 /// # Example
 ///
@@ -91,8 +92,8 @@ const CLOSING: u8 = 2;
 /// let (port, mut ingress) = DatagramPort::builder()
 ///     .udp("192.0.2.10:5060".parse()?)
 ///     .intercept()?;
-/// let (endpoint, _incoming) = Endpoint::builder().port(&port).bind()?;
-/// let to_endpoint = endpoint.ingress().expect("an endpoint on a port");
+/// let (_endpoint, _incoming, to_endpoint) =
+///     Endpoint::builder().bind_on(&port)?;
 /// let upstream = port
 ///     .prepare_path(PathSelection::new(
 ///         "192.0.2.10:5060".parse()?,
@@ -230,7 +231,9 @@ impl Builder {
 
     /// Starts the port's task and returns the port and its one [`Ingress`].
     ///
-    /// Must be called within a tokio runtime.
+    /// # Panics
+    ///
+    /// Panics outside a tokio runtime, since the port runs as a task on it.
     ///
     /// # Errors
     ///
@@ -341,25 +344,6 @@ impl Builder {
             task,
         ))
     }
-
-    /// Opens the backend for passive capture, which only receives.
-    ///
-    /// No task starts. [`Capture::recv`] polls the backend in the caller's
-    /// task, and nothing is buffered beyond what the backend holds. The
-    /// limits, deadline and queue settings do not apply.
-    ///
-    /// # Errors
-    ///
-    /// As for [`Builder::intercept`], for the backend.
-    pub fn capture(self) -> Result<Capture, BindError> {
-        let io = open(self.backend)?;
-        Ok(Capture {
-            io,
-            reception: Arc::default(),
-            stamps: Stamps::new(),
-            closed: false,
-        })
-    }
 }
 
 impl fmt::Debug for Builder {
@@ -427,12 +411,12 @@ fn open(backend: Option<Backend>) -> Result<Box<dyn DatagramIo>, BindError> {
 ///   [`RawPath`], unchanged, with no SIP processing at all.
 /// * [`ReceivedDatagram::discard`], or dropping it, drops it.
 ///
-/// [`Builder::capture`] makes a receive-only [`Capture`] instead, which can
+/// [`Capture::builder`] makes a receive-only [`Capture`] instead, which can
 /// neither deliver nor send.
 ///
 /// # Endpoints on a port
 ///
-/// [`endpoint::Builder::port`] registers an endpoint on the port. Each
+/// [`endpoint::Builder::bind_on`] registers an endpoint on the port. Each
 /// registration has its own transactions, reception policy and paths, so
 /// endpoints for network domains whose addresses overlap stay apart. A path
 /// one endpoint prepared, or a [`RawPath`] of the port, is refused by every
@@ -497,7 +481,7 @@ fn open(backend: Option<Backend>) -> Result<Box<dyn DatagramIo>, BindError> {
 ///
 /// [`endpoint::Builder::udp`]: super::Builder::udp
 /// [`endpoint::Builder::udp_io`]: super::Builder::udp_io
-/// [`endpoint::Builder::port`]: super::Builder::port
+/// [`endpoint::Builder::bind_on`]: super::Builder::bind_on
 /// [`endpoint::Error::is_stale_path`]: super::Error::is_stale_path
 /// [`endpoint::Builder::udp_write_limits`]: super::Builder::udp_write_limits
 /// [`Endpoint::shutdown`]: super::Endpoint::shutdown
@@ -874,23 +858,11 @@ impl DatagramPort {
     ///
     /// The close starts when this is called, not when the future is first
     /// polled, and dropping the future does not stop it.
-    #[allow(clippy::manual_async_fn)] // State the Send guarantee.
-    pub fn close(
-        &self,
-        timeout: Duration,
-    ) -> impl Future<Output = ShutdownOutcome> + Send + 'static {
+    pub fn close(&self, timeout: Duration) -> Close {
         let deadline = Instant::now().checked_add(timeout);
         self.shared.set_phase(CLOSING);
         self.shared.request_close(deadline);
-        let mut done = self.shared.done.subscribe();
-        async move {
-            match done.wait_for(Option::is_some).await {
-                Ok(outcome) => outcome.expect("waited for one"),
-                // The task ended without an outcome only if it was dropped
-                // with its runtime.
-                Err(_) => ShutdownOutcome::DeadlineExpired,
-            }
-        }
+        Close(shutdown::outcome(self.shared.done.subscribe()))
     }
 
     /// Registers an endpoint, for
@@ -1685,8 +1657,11 @@ impl Ingress {
     /// nothing is left.
     ///
     /// It is cancellation-safe.
-    pub async fn recv(&mut self) -> Option<ReceivedDatagram> {
-        self.receiver.recv().await
+    #[allow(clippy::manual_async_fn)] // State the Send guarantee.
+    pub fn recv(
+        &mut self,
+    ) -> impl Future<Output = Option<ReceivedDatagram>> + Send + '_ {
+        poll_fn(|cx| self.receiver.poll_recv(cx))
     }
 
     /// Polls for the next datagram, as [`Ingress::recv`] does.
@@ -1928,7 +1903,7 @@ impl fmt::Debug for ReceivedDatagram {
 }
 
 /// Where [`ReceivedDatagram::try_deliver`] gives datagrams to one endpoint on
-/// a port, from [`Endpoint::ingress`](super::Endpoint::ingress).
+/// a port, from [`endpoint::Builder::bind_on`](super::Builder::bind_on).
 ///
 /// It names a target, not a datagram, so clones are fine. It refuses
 /// datagrams of another port, and once its endpoint has stopped.
@@ -1960,7 +1935,7 @@ impl fmt::Debug for EndpointIngress {
 /// use signa_core::endpoint::{Target, port::RawPath};
 ///
 /// fn transaction_on(path: RawPath) -> Target {
-///     Target::path(path)
+///     Target::on_path(path)
 /// }
 /// ```
 ///
@@ -2049,6 +2024,32 @@ impl fmt::Debug for RawWrite {
     }
 }
 
+/// The close of a [`DatagramPort`], which resolves with its outcome once
+/// the backend has closed and been dropped.
+///
+/// [`DatagramPort::close`] returns it, and the close has started by then.
+/// Dropping it gives up the wait, not the close. Every waiter gets the same
+/// [`ShutdownOutcome`].
+#[must_use = "the close goes on without it, but its outcome is lost"]
+pub struct Close(shutdown::Outcome);
+
+impl Future for Close {
+    type Output = ShutdownOutcome;
+
+    fn poll(
+        mut self: Pin<&mut Close>,
+        cx: &mut Context<'_>,
+    ) -> Poll<ShutdownOutcome> {
+        self.0.as_mut().poll(cx)
+    }
+}
+
+impl fmt::Debug for Close {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Close").finish_non_exhaustive()
+    }
+}
+
 /// A backend opened for passive capture, which only receives.
 ///
 /// It has no send, path or delivery operation, and its datagrams carry no
@@ -2075,29 +2076,46 @@ impl fmt::Debug for RawWrite {
 /// ```
 pub struct Capture {
     io: Box<dyn DatagramIo>,
+    local: SocketAddr,
+    capabilities: Capabilities,
     reception: Arc<ReceptionCounters>,
     /// A domain of the capture's own, which no port or endpoint shares.
     stamps: Stamps,
-    closed: bool,
 }
 
 impl Capture {
-    /// Receives the next datagram, or `None` once the capture is closed.
+    /// Returns a builder for a capture.
+    pub fn builder() -> CaptureBuilder {
+        CaptureBuilder { backend: None }
+    }
+
+    /// The address the backend names as its own.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local
+    }
+
+    /// What the backend can do.
+    pub fn capabilities(&self) -> Capabilities {
+        self.capabilities
+    }
+
+    /// Receives the next datagram. A capture receives until it is closed,
+    /// which takes it.
     ///
     /// A truncated datagram or a receive error is counted and skipped. It
     /// is cancellation-safe as far as the backend's `poll_recv` is.
-    pub async fn recv(&mut self) -> Option<CapturedDatagram> {
-        poll_fn(|cx| self.poll_recv(cx)).await
+    #[allow(clippy::manual_async_fn)] // State the Send guarantee.
+    pub fn recv(
+        &mut self,
+    ) -> impl Future<Output = CapturedDatagram> + Send + '_ {
+        poll_fn(|cx| self.poll_recv(cx))
     }
 
     /// Polls for the next datagram, as [`Capture::recv`] does.
     pub fn poll_recv(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<CapturedDatagram>> {
-        if self.closed {
-            return Poll::Ready(None);
-        }
+    ) -> Poll<CapturedDatagram> {
         for _ in 0..BATCH {
             match ready!(self.io.poll_recv(cx)) {
                 Ok(datagram) => {
@@ -2113,10 +2131,10 @@ impl Capture {
                     // buffer, which a held datagram would keep alive, so the
                     // datagram keeps a copy, as `ReceivedDatagram` does.
                     let context = path::transient(&context);
-                    return Poll::Ready(Some(CapturedDatagram {
+                    return Poll::Ready(CapturedDatagram {
                         payload,
                         received: ReceiveInfo::new(flow, stamp, context),
-                    }));
+                    });
                 }
                 Err(RecvError::Truncated) => {
                     increment(&self.reception.truncated_datagrams);
@@ -2148,17 +2166,18 @@ impl Capture {
         }
     }
 
-    /// Closes the backend, giving it `timeout` before it is dropped.
-    pub async fn close(mut self, timeout: Duration) -> ShutdownOutcome {
-        self.closed = true;
-        let closed = tokio::time::timeout(
-            timeout,
-            poll_fn(|cx| self.io.poll_close(cx)),
-        )
-        .await;
-        match closed {
-            Ok(()) => ShutdownOutcome::Drained,
-            Err(_) => ShutdownOutcome::DeadlineExpired,
+    /// Closes the backend, giving it `timeout` from now before it is
+    /// dropped, and resolves once it has closed or been dropped.
+    ///
+    /// # Cancellation
+    ///
+    /// The deadline starts when this is called. Dropping the future drops
+    /// the backend at once, without waiting for it to close.
+    pub fn close(self, timeout: Duration) -> CaptureClose {
+        CaptureClose {
+            io: Some(self.io),
+            deadline: Instant::now().checked_add(timeout),
+            sleep: None,
         }
     }
 }
@@ -2166,9 +2185,113 @@ impl Capture {
 impl fmt::Debug for Capture {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Capture")
-            .field("local_addr", &self.io.local_addr())
-            .field("closed", &self.closed)
-            .finish()
+            .field("local_addr", &self.local)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Configures and opens a [`Capture`].
+///
+/// It takes only a backend. A capture holds nothing for the application and
+/// sends nothing, so none of the limits of a [`DatagramPort`] apply to it.
+pub struct CaptureBuilder {
+    backend: Option<Backend>,
+}
+
+impl CaptureBuilder {
+    /// Binds a UDP socket of the capture's own to `addr`.
+    ///
+    /// This replaces a backend set with [`CaptureBuilder::udp_io`].
+    pub fn udp(mut self, addr: SocketAddr) -> CaptureBuilder {
+        self.backend = Some(Backend::Bind(addr));
+        self
+    }
+
+    /// Receives over `io`.
+    ///
+    /// This replaces an address set with [`CaptureBuilder::udp`].
+    pub fn udp_io(mut self, io: impl DatagramIo) -> CaptureBuilder {
+        self.backend = Some(Backend::Io(Box::new(io)));
+        self
+    }
+
+    /// Opens the backend for passive capture.
+    ///
+    /// No task starts. [`Capture::recv`] polls the backend in the caller's
+    /// task, and nothing is buffered beyond what the backend holds.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Builder::intercept`], for the backend.
+    pub fn open(self) -> Result<Capture, BindError> {
+        let io = open(self.backend)?;
+        Ok(Capture {
+            local: io.local_addr(),
+            capabilities: io.capabilities(),
+            io,
+            reception: Arc::default(),
+            stamps: Stamps::new(),
+        })
+    }
+}
+
+impl fmt::Debug for CaptureBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let backend = match &self.backend {
+            None => "none".to_owned(),
+            Some(Backend::Bind(addr)) => addr.to_string(),
+            Some(Backend::Io(io)) => format!("backend at {}", io.local_addr()),
+        };
+        f.debug_struct("CaptureBuilder").field("backend", &backend).finish()
+    }
+}
+
+/// The close of a [`Capture`], which resolves once its backend has closed
+/// or the deadline has passed, and the backend has been dropped.
+///
+/// [`Capture::close`] returns it. Dropping it drops the backend at once.
+#[must_use = "the backend is dropped with it, without waiting to close"]
+pub struct CaptureClose {
+    /// The backend until it is closed or given up on.
+    io: Option<Box<dyn DatagramIo>>,
+    /// `None` for a timeout too large to add to the time of the call.
+    deadline: Option<Instant>,
+    /// Made on the first poll, so that `Capture::close` works outside a
+    /// runtime.
+    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl Future for CaptureClose {
+    type Output = ShutdownOutcome;
+
+    fn poll(
+        mut self: Pin<&mut CaptureClose>,
+        cx: &mut Context<'_>,
+    ) -> Poll<ShutdownOutcome> {
+        let this = &mut *self;
+        let io = this.io.as_mut().expect("polled after it resolved");
+        if io.poll_close(cx).is_ready() {
+            this.io = None;
+            return Poll::Ready(ShutdownOutcome::Drained);
+        }
+        if let Some(deadline) = this.deadline {
+            let sleep = this
+                .sleep
+                .get_or_insert_with(|| Box::pin(sleep_until(deadline)));
+            if sleep.as_mut().poll(cx).is_ready() {
+                this.io = None;
+                return Poll::Ready(ShutdownOutcome::DeadlineExpired);
+            }
+        }
+        Poll::Pending
+    }
+}
+
+impl fmt::Debug for CaptureClose {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CaptureClose")
+            .field("deadline", &self.deadline)
+            .finish_non_exhaustive()
     }
 }
 

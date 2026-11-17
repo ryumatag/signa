@@ -169,9 +169,8 @@ async fn an_application_classifies_a_shared_port_through_the_facade() {
     let backend = Backend::default();
     let (port, mut ingress) =
         DatagramPort::builder().udp_io(backend.clone()).intercept().unwrap();
-    let (endpoint, mut incoming) =
-        Endpoint::builder().port(&port).bind().unwrap();
-    let to_endpoint = endpoint.ingress().unwrap();
+    let (endpoint, mut incoming, to_endpoint) =
+        Endpoint::builder().bind_on(&port).unwrap();
     let upstream =
         port.prepare_path(PathSelection::new(LOCAL, UPSTREAM)).await.unwrap();
 

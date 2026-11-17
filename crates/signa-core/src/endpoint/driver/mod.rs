@@ -2035,7 +2035,7 @@ impl Driver {
     /// The UDP link to `target`: its prepared path, or the flow from this
     /// endpoint's socket to its address.
     fn udp_link(&mut self, target: &Target) -> Result<Link, Error> {
-        if let Some(path) = target.send_path() {
+        if let Some(path) = target.path() {
             if self.udp.is_none() {
                 return Err(Error::unsupported_routing());
             }

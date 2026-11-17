@@ -18,7 +18,8 @@ use signa_core::{
     endpoint::{
         Branch, Builder, CancelOutcome, Endpoint, Error, Incoming,
         IncomingEvent, PathSelection, Reception, ReplyRoute, Responder,
-        Target, ViaMode, observe, port::DatagramPort,
+        Target, ViaMode, observe,
+        port::{DatagramPort, EndpointIngress},
     },
     message::header::{CSEQ, HeaderValue, VIA},
     transaction::Timers,
@@ -999,60 +1000,92 @@ trait Serve {
             + Send
             + 'static,
         S::Future: Send + 'static;
+
+    /// As [`Serve::serve`], on a shared port.
+    fn serve_on<S>(
+        self,
+        port: &DatagramPort,
+        service: S,
+    ) -> io::Result<(Endpoint, EndpointIngress)>
+    where
+        S: Service<Request<Bytes>, Response = Response<Bytes>>
+            + Send
+            + 'static,
+        S::Future: Send + 'static;
 }
 
 impl Serve for Builder {
-    fn serve<S>(self, mut service: S) -> io::Result<Endpoint>
+    fn serve<S>(self, service: S) -> io::Result<Endpoint>
     where
         S: Service<Request<Bytes>, Response = Response<Bytes>>
             + Send
             + 'static,
         S::Future: Send + 'static,
     {
-        let (endpoint, mut incoming) = self.bind()?;
-        tokio::spawn(async move {
-            while let Some(event) = incoming.recv().await {
-                let (request, responder, route) = match event {
-                    IncomingEvent::Request(envelope) => {
-                        let (responder, _) = envelope.transaction.into_parts();
-                        (envelope.request, Some(responder), None)
-                    }
-                    IncomingEvent::Untracked(envelope) => {
-                        (envelope.request, None, Some(envelope.reply))
-                    }
-                    _ => continue,
-                };
-                if std::future::poll_fn(|cx| service.poll_ready(cx))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-                let response = service.call(request).await.ok();
-
-                if let Some(mut response) = response {
-                    let to = response
-                        .headers()
-                        .get("To")
-                        .expect("fixture To")
-                        .as_str();
-                    let tagged = format!("{to};tag=bench");
-                    response.headers_mut().insert(
-                        signa_core::message::header::TO,
-                        signa_core::HeaderValue::from_bytes(tagged.as_bytes())
-                            .unwrap(),
-                    );
-                    if let Some(responder) = responder {
-                        responder.respond(response).await.unwrap();
-                    } else if let Some(route) = route {
-                        route.send(response).await.unwrap();
-                    }
-                }
-            }
-        });
-
+        let (endpoint, incoming) = self.bind()?;
+        answer(incoming, service);
         Ok(endpoint)
     }
+
+    fn serve_on<S>(
+        self,
+        port: &DatagramPort,
+        service: S,
+    ) -> io::Result<(Endpoint, EndpointIngress)>
+    where
+        S: Service<Request<Bytes>, Response = Response<Bytes>>
+            + Send
+            + 'static,
+        S::Future: Send + 'static,
+    {
+        let (endpoint, incoming, ingress) = self.bind_on(port)?;
+        answer(incoming, service);
+        Ok((endpoint, ingress))
+    }
+}
+
+/// Answers every request `incoming` delivers with `service`, in a task of
+/// its own.
+fn answer<S>(mut incoming: Incoming, mut service: S)
+where
+    S: Service<Request<Bytes>, Response = Response<Bytes>> + Send + 'static,
+    S::Future: Send + 'static,
+{
+    tokio::spawn(async move {
+        while let Some(event) = incoming.recv().await {
+            let (request, responder, route) = match event {
+                IncomingEvent::Request(envelope) => {
+                    let (responder, _) = envelope.transaction.into_parts();
+                    (envelope.request, Some(responder), None)
+                }
+                IncomingEvent::Untracked(envelope) => {
+                    (envelope.request, None, Some(envelope.reply))
+                }
+                _ => continue,
+            };
+            if std::future::poll_fn(|cx| service.poll_ready(cx)).await.is_err()
+            {
+                break;
+            }
+            let response = service.call(request).await.ok();
+
+            if let Some(mut response) = response {
+                let to =
+                    response.headers().get("To").expect("fixture To").as_str();
+                let tagged = format!("{to};tag=bench");
+                response.headers_mut().insert(
+                    signa_core::message::header::TO,
+                    signa_core::HeaderValue::from_bytes(tagged.as_bytes())
+                        .unwrap(),
+                );
+                if let Some(responder) = responder {
+                    responder.respond(response).await.unwrap();
+                } else if let Some(route) = route {
+                    route.send(response).await.unwrap();
+                }
+            }
+        }
+    });
 }
 
 // A benchmark-local client that waits for the final response. signa exposes
@@ -1134,13 +1167,11 @@ pub(super) fn intercepted_round_trip(c: &mut Criterion) {
                     }
                 });
             }
-            let server = Endpoint::builder()
-                .port(&port)
+            let (server, to_server) = Endpoint::builder()
                 .timers(short_timers())
                 .max_server_transactions(1 << 20)
-                .serve(Ok200)
+                .serve_on(&port, Ok200)
                 .unwrap();
-            let to_server = server.ingress().unwrap();
             tokio::spawn(async move {
                 // The port stays open as long as the classifier runs.
                 let _port = port;

@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use super::{
     BindError, Endpoint, Incoming,
     driver::{Driver, TCP_INBOUND},
-    port::{DatagramPort, Registration},
+    port::{DatagramPort, EndpointIngress, Registration},
 };
 use crate::{
     transaction::Timers,
@@ -244,28 +244,6 @@ impl Builder {
         self
     }
 
-    /// Registers the endpoint on `port`, which it shares with other
-    /// endpoints, in place of a UDP socket of its own.
-    ///
-    /// The endpoint receives only what the application delivers to it
-    /// through [`Endpoint::ingress`], and receives that as from a socket of
-    /// its own. Its writes go through the port's task, within the port's
-    /// write limits and its own [`Builder::udp_write_limits`]. Its paths and
-    /// transactions are its own, and other endpoints on the port refuse its
-    /// paths. When it stops, its registration ends and the port goes on. See
-    /// the [`DatagramPort`] docs.
-    ///
-    /// [`bind`](Builder::bind) fails with [`BindError::is_closed`] once the
-    /// port is quiesced or closing, and with [`BindError::is_busy`] when it
-    /// has as many endpoints as it takes.
-    ///
-    /// This replaces a socket or backend set with [`Builder::udp`] or
-    /// [`Builder::udp_io`].
-    pub fn port(mut self, port: &DatagramPort) -> Builder {
-        self.udp = Some(Udp::Port(port.clone()));
-        self
-    }
-
     /// Binds a TCP listener to `addr`.
     ///
     /// The listener also takes the responses to requests this endpoint sends
@@ -436,7 +414,7 @@ impl Builder {
     /// (rounded down) for existing transaction output and responses. These
     /// limits do not promise delivery to a peer.
     ///
-    /// With a [backend](Builder::udp_io) or on a [port](Builder::port), the
+    /// With a [backend](Builder::udp_io) or on a [port](Builder::bind_on), the
     /// three quarters must hold one write of the backend's largest payload,
     /// or [`bind`](Builder::bind) refuses the configuration.
     ///
@@ -753,10 +731,70 @@ impl Builder {
     /// with a TCP listener it is [`BindError::is_unsupported_config`]. A
     /// [backend](Builder::udp_io) whose local address or port is unspecified,
     /// or whose maximum payload is zero, is invalid, as is a backend or
-    /// [port](Builder::port) whose maximum payload does not fit in three
+    /// [port](Builder::bind_on) whose maximum payload does not fit in three
     /// quarters of [`Builder::udp_write_limits`]. These are refused before any
     /// socket is bound.
-    pub fn bind(mut self) -> Result<(Endpoint, Incoming), BindError> {
+    pub fn bind(self) -> Result<(Endpoint, Incoming), BindError> {
+        let (endpoint, incoming, _) = self.start()?;
+        Ok((endpoint, incoming))
+    }
+
+    /// Registers the endpoint on `port`, which it shares with other
+    /// endpoints, in place of a UDP socket of its own, and starts it as
+    /// [`Builder::bind`] does. It returns where the application delivers
+    /// datagrams to it as well.
+    ///
+    /// The endpoint receives only what the application delivers to it
+    /// through the [`EndpointIngress`], and receives that as from a socket of
+    /// its own. Its writes go through the port's task, within the port's
+    /// write limits and its own [`Builder::udp_write_limits`]. Its paths and
+    /// transactions are its own, and other endpoints on the port refuse its
+    /// paths. When it stops, its registration ends and the port goes on. See
+    /// the [`DatagramPort`] docs.
+    ///
+    /// A socket or backend set with [`Builder::udp`] or [`Builder::udp_io`]
+    /// is not bound. A TCP listener is, as for [`Builder::bind`].
+    ///
+    /// # Panics
+    ///
+    /// Panics outside a tokio runtime, as [`Builder::bind`] does.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Builder::bind`], and [`BindError::is_closed`] once the port
+    /// is quiesced or closing, or [`BindError::is_busy`] when it has as many
+    /// endpoints as it takes.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use signa_core::endpoint::{Endpoint, port::DatagramPort};
+    ///
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let (port, mut ingress) = DatagramPort::builder()
+    ///     .udp("127.0.0.1:0".parse()?)
+    ///     .intercept()?;
+    /// let (endpoint, _incoming, to_endpoint) =
+    ///     Endpoint::builder().bind_on(&port)?;
+    /// # drop((endpoint, ingress.recv(), to_endpoint));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn bind_on(
+        mut self,
+        port: &DatagramPort,
+    ) -> Result<(Endpoint, Incoming, EndpointIngress), BindError> {
+        self.udp = Some(Udp::Port(port.clone()));
+        let (endpoint, incoming, ingress) = self.start()?;
+        Ok((endpoint, incoming, ingress.expect("an endpoint on a port")))
+    }
+
+    /// Checks the configuration, binds or registers, and starts the driver.
+    /// The ingress is there for an endpoint on a port.
+    fn start(
+        mut self,
+    ) -> Result<(Endpoint, Incoming, Option<EndpointIngress>), BindError> {
         if self.config.reception == Reception::Stateless {
             if self.tcp.is_some() {
                 return Err(BindError::unsupported_config(
@@ -961,7 +999,6 @@ impl Builder {
             registration,
             binding,
             port,
-            ingress,
             context_limits: driver.context_limits(),
             timers: self.config.timers,
             observing: Default::default(),
@@ -973,6 +1010,6 @@ impl Builder {
         );
         tokio::spawn(driver.run());
 
-        Ok((endpoint, incoming))
+        Ok((endpoint, incoming, ingress))
     }
 }

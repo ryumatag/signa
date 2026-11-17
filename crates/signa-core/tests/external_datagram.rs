@@ -33,7 +33,9 @@ use signa_core::{
         observe::{
             self, Observed, Observer, Record, WriteEnd, WriteOrigin, WriteRef,
         },
-        port::{self, DatagramPort, Ingress, RawPath, ReceivedDatagram},
+        port::{
+            self, Capture, DatagramPort, Ingress, RawPath, ReceivedDatagram,
+        },
     },
     message::header::{Tag, VIA},
     transaction::Timers,
@@ -1229,7 +1231,7 @@ async fn a_prepared_path_carries_a_whole_transaction() {
     );
     assert_eq!(path.context().as_bytes(), "vlan 200");
     let (control, mut responses) = endpoint
-        .start(outgoing_invite("path"), Target::path(path))
+        .start(outgoing_invite("path"), Target::on_path(path))
         .await
         .unwrap()
         .into_parts();
@@ -1317,7 +1319,7 @@ async fn paths_are_checked_before_anything_is_sent() {
     let (b, _b_incoming) = bind(&b_wire);
     let path = a.prepare_path(PathSelection::new(LOCAL, PEER)).await.unwrap();
 
-    let on_path = || Target::path(path.clone());
+    let on_path = || Target::on_path(path.clone());
     assert!(
         b.start(outgoing("1"), on_path()).await.unwrap_err().is_stale_path()
     );
@@ -1363,7 +1365,8 @@ async fn paths_are_checked_before_anything_is_sent() {
         PathSelection::new(ALTERNATE, PEER).context(context("pppoe 7"));
     let path = a.prepare_path(selection).await.unwrap();
     a_wire.stale("pppoe 7");
-    let error = a.start(outgoing("5"), Target::path(path)).await.unwrap_err();
+    let error =
+        a.start(outgoing("5"), Target::on_path(path)).await.unwrap_err();
     assert!(error.is_transport());
 }
 
@@ -1454,7 +1457,11 @@ async fn the_socket_takes_paths_from_its_own_address() {
         .await
         .unwrap();
     endpoint
-        .send_request(outgoing("socket"), Target::path(path), ViaMode::Fresh)
+        .send_request(
+            outgoing("socket"),
+            Target::on_path(path),
+            ViaMode::Fresh,
+        )
         .await
         .unwrap();
     let mut buffer = [0; 2048];
@@ -1581,7 +1588,7 @@ async fn a_path_is_counted_until_nothing_holds_it() {
 
     // The transaction keeps its path until Timer F ends it, 64 T1 later.
     let (_control, mut responses) = endpoint
-        .start(outgoing("held"), Target::path(paths.remove(0)))
+        .start(outgoing("held"), Target::on_path(paths.remove(0)))
         .await
         .unwrap()
         .into_parts();
@@ -1664,7 +1671,7 @@ async fn a_dual_stack_socket_takes_ipv4_paths() {
     }
     let path = prepared.unwrap();
     endpoint
-        .send_request(outgoing("dual"), Target::path(path), ViaMode::Fresh)
+        .send_request(outgoing("dual"), Target::on_path(path), ViaMode::Fresh)
         .await
         .unwrap();
 
@@ -1748,7 +1755,7 @@ async fn a_scoped_path_keeps_its_scope_and_advertises_none() {
     assert_eq!(path.sent_by(), "[fe80::10]:5060".parse().unwrap());
 
     let (_control, mut responses) = endpoint
-        .start(outgoing("scoped-path"), Target::path(path))
+        .start(outgoing("scoped-path"), Target::on_path(path))
         .await
         .unwrap()
         .into_parts();
@@ -2065,9 +2072,8 @@ async fn next(ingress: &mut Ingress) -> ReceivedDatagram {
 async fn a_delivered_datagram_is_received_and_answered_by_its_endpoint() {
     let wire = Wire::default();
     let (port, mut ingress) = intercept(&wire);
-    let (endpoint, mut incoming) =
-        Endpoint::builder().port(&port).bind().unwrap();
-    let to_endpoint = endpoint.ingress().unwrap();
+    let (endpoint, mut incoming, to_endpoint) =
+        Endpoint::builder().bind_on(&port).unwrap();
     assert_eq!(endpoint.udp_addr(), Some(LOCAL));
     // The Via names another host, so the endpoint marks its copy with
     // `received`, and without `rport` the response goes to that address at
@@ -2153,8 +2159,8 @@ fn send_options(
 async fn forwarding_sends_the_bytes_once_and_nothing_else() {
     let wire = Wire::default();
     let (port, mut ingress) = intercept(&wire);
-    let (_endpoint, mut incoming) =
-        Endpoint::builder().port(&port).bind().unwrap();
+    let (_endpoint, mut incoming, _) =
+        Endpoint::builder().bind_on(&port).unwrap();
     let upstream = upstream(&port).await;
     let compact = Bytes::from_static(
         b"INVITE sip:bob@192.0.2.10 SIP/2.0\r\n\
@@ -2197,8 +2203,7 @@ async fn forwarding_sends_the_bytes_once_and_nothing_else() {
 async fn a_raw_send_has_only_the_backend_s_size_limit() {
     let wire = Wire::default();
     let (port, _ingress) = intercept(&wire);
-    let (endpoint, _incoming) =
-        Endpoint::builder().port(&port).bind().unwrap();
+    let (endpoint, _incoming, _) = Endpoint::builder().bind_on(&port).unwrap();
     let upstream = upstream(&port).await;
     let mut large = outgoing("large");
     *large.body_mut() = Bytes::from(vec![b'x'; 1250]);
@@ -2235,9 +2240,8 @@ async fn a_full_endpoint_queue_hands_the_datagram_back() {
         .delivery_queue(1)
         .intercept()
         .unwrap();
-    let (endpoint, mut incoming) =
-        Endpoint::builder().port(&port).bind().unwrap();
-    let to_endpoint = endpoint.ingress().unwrap();
+    let (_endpoint, mut incoming, to_endpoint) =
+        Endpoint::builder().bind_on(&port).unwrap();
     wire.deliver(datagram(options("first")));
     wire.deliver(datagram(options("second")));
     let first = next(&mut ingress).await;
@@ -2279,9 +2283,8 @@ async fn an_expired_datagram_is_refused_but_still_counted() {
         .decision_deadline(Duration::from_millis(500))
         .intercept()
         .unwrap();
-    let (endpoint, _incoming) =
-        Endpoint::builder().port(&port).bind().unwrap();
-    let to_endpoint = endpoint.ingress().unwrap();
+    let (_endpoint, _incoming, to_endpoint) =
+        Endpoint::builder().bind_on(&port).unwrap();
     let upstream = upstream(&port).await;
     wire.deliver(datagram(options("late")));
     let held = next(&mut ingress).await;
@@ -2341,12 +2344,10 @@ async fn a_slow_classifier_loses_what_is_beyond_the_ingress_limits() {
 async fn endpoints_on_one_port_stay_apart() {
     let wire = Wire::default();
     let (port, mut ingress) = intercept(&wire);
-    let bind = || {
-        Endpoint::builder().port(&port).timers(short_timers()).bind().unwrap()
-    };
-    let (a, mut a_incoming) = bind();
-    let (b, mut b_incoming) = bind();
-    let (to_a, to_b) = (a.ingress().unwrap(), b.ingress().unwrap());
+    let bind =
+        || Endpoint::builder().timers(short_timers()).bind_on(&port).unwrap();
+    let (a, mut a_incoming, to_a) = bind();
+    let (b, mut b_incoming, to_b) = bind();
 
     for (to, incoming) in [(&to_a, &mut a_incoming), (&to_b, &mut b_incoming)]
     {
@@ -2361,7 +2362,7 @@ async fn endpoints_on_one_port_stay_apart() {
 
     let path = a.prepare_path(PathSelection::new(LOCAL, PEER)).await.unwrap();
     let refused =
-        b.start(outgoing("stale"), Target::path(path)).await.unwrap_err();
+        b.start(outgoing("stale"), Target::on_path(path)).await.unwrap_err();
     assert!(refused.is_stale_path());
 
     let outcome = a.shutdown(Duration::from_secs(2)).await;
@@ -2382,14 +2383,15 @@ async fn a_port_refuses_the_targets_of_another_port() {
     let (wire, other_wire) = (Wire::default(), Wire::default());
     let (port, mut ingress) = intercept(&wire);
     let (other, _other_ingress) = intercept(&other_wire);
-    let (endpoint, mut incoming) =
-        Endpoint::builder().port(&port).bind().unwrap();
-    let (stranger, _) = Endpoint::builder().port(&other).bind().unwrap();
+    let (_endpoint, mut incoming, to_endpoint) =
+        Endpoint::builder().bind_on(&port).unwrap();
+    let (_stranger, _, to_stranger) =
+        Endpoint::builder().bind_on(&other).unwrap();
     let foreign_path = upstream(&other).await;
     wire.deliver(datagram(options("foreign")));
     let held = next(&mut ingress).await;
 
-    let refused = held.try_deliver(&stranger.ingress().unwrap()).unwrap_err();
+    let refused = held.try_deliver(&to_stranger).unwrap_err();
     assert!(refused.error().is_foreign());
     let refused = refused.into_datagram().try_forward(&foreign_path);
     let refused = refused.unwrap_err();
@@ -2402,7 +2404,6 @@ async fn a_port_refuses_the_targets_of_another_port() {
     let error = port.send_bytes(raw, &foreign_path).unwrap_err();
     assert!(error.is_foreign());
 
-    let to_endpoint = endpoint.ingress().unwrap();
     refused.into_datagram().try_deliver(&to_endpoint).unwrap();
     let taken = request(&mut incoming).await;
     assert_eq!(taken.request.headers().get("Call-ID").unwrap(), "foreign");
@@ -2418,8 +2419,8 @@ async fn a_port_refuses_the_targets_of_another_port() {
 async fn each_write_outcome_goes_back_to_its_own_write() {
     let wire = Wire::default();
     let (port, _ingress) = intercept(&wire);
-    let (a, _a_incoming) = Endpoint::builder().port(&port).bind().unwrap();
-    let (b, _b_incoming) = Endpoint::builder().port(&port).bind().unwrap();
+    let (a, _a_incoming, _) = Endpoint::builder().bind_on(&port).unwrap();
+    let (b, _b_incoming, _) = Endpoint::builder().bind_on(&port).unwrap();
     let upstream = upstream(&port).await;
     wire.writes(Writes::Delay);
 
@@ -2449,8 +2450,8 @@ async fn each_write_outcome_goes_back_to_its_own_write() {
 async fn an_endpoint_that_stops_withdraws_its_queued_writes() {
     let wire = Wire::default();
     let (port, _ingress) = intercept(&wire);
-    let (a, _a_incoming) = Endpoint::builder().port(&port).bind().unwrap();
-    let (b, _b_incoming) = Endpoint::builder().port(&port).bind().unwrap();
+    let (a, _a_incoming, _) = Endpoint::builder().bind_on(&port).unwrap();
+    let (b, _b_incoming, _) = Endpoint::builder().bind_on(&port).unwrap();
     wire.writes(Writes::Hold);
 
     let from_a = send_options(&a, "a");
@@ -2476,13 +2477,13 @@ async fn an_endpoint_that_stops_withdraws_its_queued_writes() {
 async fn quiescing_refuses_only_new_endpoints_and_raw_paths() {
     let wire = Wire::default();
     let (port, mut ingress) = intercept(&wire);
-    let (endpoint, mut incoming) =
-        Endpoint::builder().port(&port).bind().unwrap();
+    let (endpoint, mut incoming, to_endpoint) =
+        Endpoint::builder().bind_on(&port).unwrap();
     let upstream = upstream(&port).await;
 
     port.quiesce();
 
-    let refused = Endpoint::builder().port(&port).bind().unwrap_err();
+    let refused = Endpoint::builder().bind_on(&port).unwrap_err();
     assert!(refused.is_closed());
     let selection = PathSelection::new(LOCAL, PEER);
     let refused = port.prepare_path(selection.clone()).await.unwrap_err();
@@ -2493,7 +2494,6 @@ async fn quiescing_refuses_only_new_endpoints_and_raw_paths() {
     );
     assert!(endpoint.prepare_path(selection).await.is_ok());
     wire.deliver(datagram(options("quiet")));
-    let to_endpoint = endpoint.ingress().unwrap();
     next(&mut ingress).await.try_deliver(&to_endpoint).unwrap();
     let request = request(&mut incoming).await;
     let (responder, _) = request.transaction.into_parts();
@@ -2510,8 +2510,8 @@ async fn quiescing_refuses_only_new_endpoints_and_raw_paths() {
 async fn closing_the_port_drains_its_writes_then_closes_the_backend() {
     let wire = Wire::default();
     let (port, mut ingress) = intercept(&wire);
-    let (endpoint, _incoming) =
-        Endpoint::builder().port(&port).bind().unwrap();
+    let (_endpoint, _incoming, to_endpoint) =
+        Endpoint::builder().bind_on(&port).unwrap();
     let upstream = upstream(&port).await;
     wire.deliver(datagram(options("held")));
     let held = next(&mut ingress).await;
@@ -2529,7 +2529,7 @@ async fn closing_the_port_drains_its_writes_then_closes_the_backend() {
     assert!(wire.closed());
     let refused = port.send_bytes(Bytes::from_static(b"late"), &upstream);
     assert!(refused.unwrap_err().is_closed());
-    let refused = held.try_deliver(&endpoint.ingress().unwrap()).unwrap_err();
+    let refused = held.try_deliver(&to_endpoint).unwrap_err();
     assert!(refused.error().is_closed());
     assert!(ingress.recv().await.is_none());
 }
@@ -2703,11 +2703,52 @@ async fn a_close_resolves_after_its_backend_has_dropped() {
         assert_eq!(resolves_after_drop(gate, closing, &case).await, expected);
 
         let (gated, gate) = backend();
-        let capture = DatagramPort::builder().udp_io(gated).capture().unwrap();
+        let capture = Capture::builder().udp_io(gated).open().unwrap();
         let closing = tokio::spawn(capture.close(Duration::from_millis(50)));
         let case = format!("capture {stuck}");
         assert_eq!(resolves_after_drop(gate, closing, &case).await, expected);
     }
+}
+
+// Both closes start when they are called, not when their futures are first
+// polled. A port takes no new endpoint from the call on, and a capture's
+// deadline runs from it, so a close first polled after the deadline gives up
+// at once on a backend that never finishes closing.
+#[tokio::test(start_paused = true)]
+async fn a_close_starts_when_it_is_called() {
+    let (port, _ingress) = intercept(&Wire::default());
+    let stuck = Wire::default();
+    stuck.state.lock().unwrap().stuck = true;
+    let capture = Capture::builder().udp_io(stuck).open().unwrap();
+
+    let port_close = port.close(Duration::from_secs(1));
+    let capture_close = capture.close(Duration::from_millis(50));
+    advance(Duration::from_millis(60)).await;
+
+    assert!(Endpoint::builder().bind_on(&port).unwrap_err().is_closed());
+    let mut capture_close = pin!(capture_close);
+    let mut cx = Context::from_waker(Waker::noop());
+    assert_eq!(
+        capture_close.as_mut().poll(&mut cx),
+        Poll::Ready(ShutdownOutcome::DeadlineExpired)
+    );
+    assert_eq!(port_close.await, ShutdownOutcome::Drained);
+}
+
+// A task that receives or closes can move between threads.
+#[tokio::test]
+async fn the_receive_and_close_futures_are_send() {
+    fn send<T: Send>(_: T) {}
+    let (port, mut ingress) = intercept(&Wire::default());
+    let mut capture =
+        Capture::builder().udp_io(Wire::default()).open().unwrap();
+    let mut observer = port.observe(observe::Config::new()).await.unwrap();
+
+    send(ingress.recv());
+    send(capture.recv());
+    send(observer.recv());
+    send(capture.close(Duration::ZERO));
+    send(port.close(Duration::ZERO));
 }
 
 /// A backend that panics in `poll_recv` once its fuse is lit, as an adapter
@@ -2806,8 +2847,7 @@ async fn an_endpoint_learns_its_writes_when_the_port_s_backend_panics() {
         .write_limits(Limits { count: 1, bytes: 64 * 1024 })
         .intercept()
         .unwrap();
-    let (endpoint, _incoming) =
-        Endpoint::builder().port(&port).bind().unwrap();
+    let (endpoint, _incoming, _) = Endpoint::builder().bind_on(&port).unwrap();
     wire.writes(Writes::Delay);
     let taken = send_options(&endpoint, "taken");
     wire.sent(1).await;
@@ -2934,15 +2974,14 @@ async fn a_later_close_brings_the_deadline_forward() {
 #[tokio::test]
 async fn a_capture_receives_and_sends_nothing() {
     let wire = Wire::default();
-    let mut capture =
-        DatagramPort::builder().udp_io(wire.clone()).capture().unwrap();
+    let mut capture = Capture::builder().udp_io(wire.clone()).open().unwrap();
 
     wire.deliver(arriving(invite("captured"), "tap0"));
-    let captured = timeout(Duration::from_secs(2), capture.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let captured =
+        timeout(Duration::from_secs(2), capture.recv()).await.unwrap();
 
+    assert_eq!(capture.local_addr(), LOCAL);
+    assert_eq!(capture.capabilities().max_payload, 1472);
     assert_eq!(captured.payload(), invite("captured").as_bytes());
     assert_eq!(captured.received().context().as_bytes(), "tap0");
     assert!(matches!(captured.parse(), Ok(Message::Request(_))));
@@ -2958,8 +2997,7 @@ async fn a_capture_receives_and_sends_nothing() {
 #[tokio::test]
 async fn a_captured_datagram_does_not_hold_the_capture_buffer() {
     let wire = Wire::default();
-    let mut capture =
-        DatagramPort::builder().udp_io(wire.clone()).capture().unwrap();
+    let mut capture = Capture::builder().udp_io(wire.clone()).open().unwrap();
     let buffer =
         Bytes::from(b"nic0 vlan 100, then the rest of a frame".to_vec());
     let context = TransportContext::new(buffer.slice(..13)).unwrap();
@@ -2968,10 +3006,8 @@ async fn a_captured_datagram_does_not_hold_the_capture_buffer() {
         datagram(options("buffer"))
             .map(|datagram| datagram.with_context(context)),
     );
-    let captured = timeout(Duration::from_secs(2), capture.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let captured =
+        timeout(Duration::from_secs(2), capture.recv()).await.unwrap();
 
     assert_eq!(captured.received().context().as_bytes(), "nic0 vlan 100");
     assert!(buffer.is_unique(), "the captured datagram holds the buffer");
@@ -2983,8 +3019,7 @@ async fn a_captured_datagram_does_not_hold_the_capture_buffer() {
 async fn a_port_closes_once_nothing_uses_it() {
     let wire = Wire::default();
     let (port, ingress) = intercept(&wire);
-    let (endpoint, _incoming) =
-        Endpoint::builder().port(&port).bind().unwrap();
+    let (endpoint, _incoming, _) = Endpoint::builder().bind_on(&port).unwrap();
     drop(port);
     drop(ingress);
     sleep(Duration::from_millis(50)).await;
@@ -3012,14 +3047,14 @@ async fn registrations_are_bounded() {
         .max_registrations(1)
         .intercept()
         .unwrap();
-    let (first, _first_incoming) =
-        Endpoint::builder().port(&port).bind().unwrap();
+    let (first, _first_incoming, _) =
+        Endpoint::builder().bind_on(&port).unwrap();
 
-    assert!(Endpoint::builder().port(&port).bind().unwrap_err().is_busy());
+    assert!(Endpoint::builder().bind_on(&port).unwrap_err().is_busy());
     let outcome = first.shutdown(Duration::from_secs(1)).await;
     assert_eq!(outcome, ShutdownOutcome::Drained);
     yield_now().await;
-    assert!(Endpoint::builder().port(&port).bind().is_ok());
+    assert!(Endpoint::builder().bind_on(&port).is_ok());
 }
 
 /// What becomes of one datagram in the disposition property.
@@ -3071,9 +3106,8 @@ fn every_datagram_ends_once_and_gives_back_its_share() {
                 .decision_deadline(Duration::from_millis(500))
                 .intercept()
                 .unwrap();
-            let (endpoint, _incoming) =
-                Endpoint::builder().port(&port).bind().unwrap();
-            let to_endpoint = endpoint.ingress().unwrap();
+            let (_endpoint, _incoming, to_endpoint) =
+                Endpoint::builder().bind_on(&port).unwrap();
             let upstream = upstream(&port).await;
             let mut held = Vec::new();
 
@@ -3146,9 +3180,8 @@ async fn a_socket_port_carries_a_round_trip() {
         .udp("127.0.0.1:0".parse().unwrap())
         .intercept()
         .unwrap();
-    let (server, mut incoming) =
-        Endpoint::builder().port(&port).bind().unwrap();
-    let to_server = server.ingress().unwrap();
+    let (_server, mut incoming, to_server) =
+        Endpoint::builder().bind_on(&port).unwrap();
     let (client, _client_incoming) = Endpoint::builder()
         .udp("127.0.0.1:0".parse().unwrap())
         .bind()
@@ -3181,8 +3214,8 @@ async fn a_closing_port_ends_the_writes_of_its_endpoints() {
     for stuck in [false, true] {
         let wire = Wire::default();
         let (port, _ingress) = intercept(&wire);
-        let (endpoint, _incoming) =
-            Endpoint::builder().port(&port).bind().unwrap();
+        let (endpoint, _incoming, _) =
+            Endpoint::builder().bind_on(&port).unwrap();
         wire.writes(Writes::Delay);
         let taken = send_options(&endpoint, "taken");
         wire.sent(1).await;
@@ -3257,8 +3290,7 @@ async fn a_raw_write_tells_a_failure_from_an_unknown_outcome() {
 async fn an_endpoint_on_a_port_learns_each_write_outcome() {
     let wire = Wire::default();
     let (port, _ingress) = intercept(&wire);
-    let (endpoint, _incoming) =
-        Endpoint::builder().port(&port).bind().unwrap();
+    let (endpoint, _incoming, _) = Endpoint::builder().bind_on(&port).unwrap();
     wire.writes(Writes::Delay);
 
     let written = send_options(&endpoint, "written");
@@ -3291,11 +3323,11 @@ async fn an_endpoint_on_a_port_learns_each_write_outcome() {
 async fn a_forced_port_close_leaves_an_endpoint_s_response_unknown() {
     let wire = Wire::default();
     let (port, mut ingress) = intercept(&wire);
-    let (endpoint, mut incoming) =
-        Endpoint::builder().port(&port).bind().unwrap();
+    let (endpoint, mut incoming, to_endpoint) =
+        Endpoint::builder().bind_on(&port).unwrap();
     wire.deliver(arriving(options("forced"), "nic0"));
     let datagram = next(&mut ingress).await;
-    datagram.try_deliver(&endpoint.ingress().unwrap()).unwrap();
+    datagram.try_deliver(&to_endpoint).unwrap();
     let request = request(&mut incoming).await;
     let (responder, mut events) = request.transaction.into_parts();
     wire.writes(Writes::Delay);
@@ -3327,10 +3359,10 @@ async fn a_forced_port_close_leaves_an_endpoint_s_response_unknown() {
 async fn a_forced_stop_leaves_the_port_to_the_other_endpoints() {
     let wire = Wire::default();
     let (port, _ingress) = intercept(&wire);
-    let (stopping, _stopping_incoming) =
-        Endpoint::builder().port(&port).bind().unwrap();
-    let (sibling, _sibling_incoming) =
-        Endpoint::builder().port(&port).bind().unwrap();
+    let (stopping, _stopping_incoming, _) =
+        Endpoint::builder().bind_on(&port).unwrap();
+    let (sibling, _sibling_incoming, _) =
+        Endpoint::builder().bind_on(&port).unwrap();
     wire.writes(Writes::Delay);
     let from_stopping = send_options(&stopping, "stopping");
     wire.sent(1).await;
@@ -3341,8 +3373,8 @@ async fn a_forced_stop_leaves_the_port_to_the_other_endpoints() {
             .unwrap();
 
     assert_eq!(stopped, ShutdownOutcome::DeadlineExpired);
-    let (late, _late_incoming) =
-        Endpoint::builder().port(&port).bind().unwrap();
+    let (late, _late_incoming, _) =
+        Endpoint::builder().bind_on(&port).unwrap();
     let mut from_late = send_options(&late, "late");
     wire.sent(2).await;
     let from_sibling = send_options(&sibling, "sibling");
@@ -3404,7 +3436,7 @@ async fn an_endpoint_s_write_limits_must_hold_a_whole_payload() {
             .udp_write_limits(limits)
             .bind();
         let shared =
-            Endpoint::builder().port(&port).udp_write_limits(limits).bind();
+            Endpoint::builder().udp_write_limits(limits).bind_on(&port);
 
         assert!(own.unwrap_err().is_invalid_config(), "{limits:?}");
         assert!(shared.unwrap_err().is_invalid_config(), "{limits:?}");
@@ -3416,7 +3448,7 @@ async fn an_endpoint_s_write_limits_must_hold_a_whole_payload() {
         .udp_write_limits(fits)
         .bind()
         .unwrap();
-    Endpoint::builder().port(&port).udp_write_limits(fits).bind().unwrap();
+    Endpoint::builder().udp_write_limits(fits).bind_on(&port).unwrap();
     Endpoint::builder()
         .udp("127.0.0.1:0".parse().unwrap())
         .udp_write_limits(Limits { count: 0, bytes: 0 })
@@ -3434,8 +3466,8 @@ async fn endpoints_wait_for_room_in_the_port_s_limits() {
         .write_limits(Limits { count: 1, bytes: 64 * 1024 })
         .intercept()
         .unwrap();
-    let (a, _a_incoming) = Endpoint::builder().port(&port).bind().unwrap();
-    let (b, _b_incoming) = Endpoint::builder().port(&port).bind().unwrap();
+    let (a, _a_incoming, _) = Endpoint::builder().bind_on(&port).unwrap();
+    let (b, _b_incoming, _) = Endpoint::builder().bind_on(&port).unwrap();
     wire.writes(Writes::Delay);
 
     let from_a = send_options(&a, "a");
@@ -3462,8 +3494,8 @@ async fn a_refused_raw_send_does_not_hold_back_a_waiting_endpoint() {
         .write_limits(Limits { count: 1, bytes: 2000 })
         .intercept()
         .unwrap();
-    let (a, _a_incoming) = Endpoint::builder().port(&port).bind().unwrap();
-    let (b, _b_incoming) = Endpoint::builder().port(&port).bind().unwrap();
+    let (a, _a_incoming, _) = Endpoint::builder().bind_on(&port).unwrap();
+    let (b, _b_incoming, _) = Endpoint::builder().bind_on(&port).unwrap();
     let upstream = upstream(&port).await;
     // Within the three quarters that raw sends may take, but not beside the
     // endpoint's write.
@@ -3499,11 +3531,11 @@ async fn endpoints_on_several_threads_share_the_port_s_limits() {
         .unwrap();
     let mut endpoints = Vec::new();
     for _ in 0..4 {
-        endpoints.push(Endpoint::builder().port(&port).bind().unwrap());
+        endpoints.push(Endpoint::builder().bind_on(&port).unwrap());
     }
 
     let mut sends = Vec::new();
-    for (endpoint, _incoming) in &endpoints {
+    for (endpoint, _incoming, _) in &endpoints {
         for _ in 0..25 {
             sends.push(send_options(endpoint, "busy"));
         }
@@ -3526,8 +3558,7 @@ async fn raw_sends_leave_endpoints_room() {
         .write_limits(Limits { count: 4, bytes: 64 * 1024 })
         .intercept()
         .unwrap();
-    let (endpoint, _incoming) =
-        Endpoint::builder().port(&port).bind().unwrap();
+    let (endpoint, _incoming, _) = Endpoint::builder().bind_on(&port).unwrap();
     let upstream = upstream(&port).await;
     wire.writes(Writes::Delay);
 
@@ -3556,9 +3587,8 @@ async fn raw_sends_leave_endpoints_room() {
 async fn a_held_datagram_keeps_its_id_and_arrival_time() {
     let wire = Wire::default();
     let (port, mut ingress) = intercept(&wire);
-    let (endpoint, mut incoming) =
-        Endpoint::builder().port(&port).bind().unwrap();
-    let to_endpoint = endpoint.ingress().unwrap();
+    let (_endpoint, mut incoming, to_endpoint) =
+        Endpoint::builder().bind_on(&port).unwrap();
 
     wire.deliver(arriving(options("held"), "nic0"));
     let datagram = next(&mut ingress).await;
@@ -3767,7 +3797,7 @@ async fn each_receive_point_numbers_in_a_domain_of_its_own() {
     let (_second, mut second_incoming) = bind(&wires[1]);
     let (_port, mut ingress) = intercept(&wires[2]);
     let mut capture =
-        DatagramPort::builder().udp_io(wires[3].clone()).capture().unwrap();
+        Capture::builder().udp_io(wires[3].clone()).open().unwrap();
     let mut observer = first.observe(observe::Config::new()).await.unwrap();
 
     wires[0].deliver(datagram(invite("first")));
@@ -3777,10 +3807,8 @@ async fn each_receive_point_numbers_in_a_domain_of_its_own() {
     let first_request = request(&mut first_incoming).await;
     let second_request = request(&mut second_incoming).await;
     let held = next(&mut ingress).await;
-    let captured = timeout(Duration::from_secs(2), capture.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let captured =
+        timeout(Duration::from_secs(2), capture.recv()).await.unwrap();
 
     let ids = [
         first_request.received.id(),
@@ -4411,8 +4439,8 @@ async fn a_port_observer_ties_each_backend_write_to_its_endpoint() {
     let mut on_port = port.observe(observe::Config::new()).await.unwrap();
     let mut endpoints = Vec::new();
     for _ in 0..2 {
-        let (endpoint, incoming) =
-            Endpoint::builder().port(&port).bind().unwrap();
+        let (endpoint, incoming, _) =
+            Endpoint::builder().bind_on(&port).unwrap();
         let observer = endpoint.observe(observe::Config::new()).await.unwrap();
         endpoints.push((endpoint, incoming, observer));
     }
@@ -4459,9 +4487,8 @@ async fn a_port_observer_sees_arrivals_raw_sends_and_forwards() {
         .ingress_limits(Limits { count: 1, bytes: 64 * 1024 })
         .intercept()
         .unwrap();
-    let (endpoint, mut incoming) =
-        Endpoint::builder().port(&port).bind().unwrap();
-    let to_endpoint = endpoint.ingress().unwrap();
+    let (_endpoint, mut incoming, to_endpoint) =
+        Endpoint::builder().bind_on(&port).unwrap();
     let upstream = upstream(&port).await;
     let config = observe::Config::new().payload(1500);
     let mut on_port = port.observe(config).await.unwrap();
@@ -4529,8 +4556,7 @@ async fn a_port_observer_sees_arrivals_raw_sends_and_forwards() {
 async fn a_port_observer_sees_late_unknown_and_withdrawn_writes() {
     let wire = Wire::default();
     let (port, _ingress) = intercept(&wire);
-    let (endpoint, _incoming) =
-        Endpoint::builder().port(&port).bind().unwrap();
+    let (endpoint, _incoming, _) = Endpoint::builder().bind_on(&port).unwrap();
     let mut on_port = port.observe(observe::Config::new()).await.unwrap();
     let end = |record: &Record| match record.observed() {
         Observed::WriteEnded { end, accepted, .. } => Some((*end, *accepted)),
