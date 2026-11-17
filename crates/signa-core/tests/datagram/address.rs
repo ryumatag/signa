@@ -7,7 +7,7 @@ use std::{net::SocketAddr, time::Duration};
 
 use bytes::Bytes;
 use signa_core::{
-    Request, Response,
+    Request,
     endpoint::{Endpoint, PathSelection, Target, ViaMode},
     message::header::VIA,
     transport::{Transport, datagram::Datagram},
@@ -206,6 +206,10 @@ async fn a_scoped_path_keeps_its_scope_and_advertises_none() {
 ))]
 #[tokio::test]
 async fn a_dual_stack_socket_names_ipv4_peers_in_their_own_form() {
+    // Imported here, as no other test in this module reads a response, so
+    // that the import is gated with the test.
+    use signa_core::Response;
+
     let Ok((endpoint, mut incoming)) =
         Endpoint::builder().udp("[::]:0".parse().unwrap()).bind()
     else {
