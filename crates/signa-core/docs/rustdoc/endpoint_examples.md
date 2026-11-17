@@ -85,7 +85,7 @@ which it leaves out:
   whose classifier delivers an OPTIONS to an endpoint and forwards a REGISTER
   upstream unchanged, with an observer of the port.
 
-[`tower_fixture.rs`] builds a Tower adapter and a bounded dispatcher against
+[`tests/tower`] builds a Tower adapter and a bounded dispatcher against
 the public API only, as a crate outside signa would.
 
 [`options`]: https://github.com/ryumatag/signa/tree/main/examples/options
@@ -94,5 +94,5 @@ the public API only, as a crate outside signa would.
 [`fork-proxy`]: https://github.com/ryumatag/signa/tree/main/examples/fork-proxy
 [`stateless-proxy`]: https://github.com/ryumatag/signa/tree/main/examples/stateless-proxy
 [`datagram-port`]: https://github.com/ryumatag/signa/tree/main/examples/datagram-port
-[`tower_fixture.rs`]: https://github.com/ryumatag/signa/blob/main/crates/signa-core/tests/tower_fixture.rs
+[`tests/tower`]: https://github.com/ryumatag/signa/tree/main/crates/signa-core/tests/tower
 

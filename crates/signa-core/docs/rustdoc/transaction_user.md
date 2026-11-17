@@ -24,7 +24,7 @@ module is its side of the boundary, as owned events, handles and operations:
 The TU is whatever code uses these. It is not a trait, and signa defines no
 service trait for it to implement. A receive loop is enough. An adapter to
 Tower or another framework lives outside signa, and the crate's
-`tests/tower_fixture.rs` builds one against the public API.
+`tests/tower/` builds one against the public API.
 
 signa:
 
