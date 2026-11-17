@@ -209,13 +209,41 @@ impl Default for Config {
     }
 }
 
+/// What a connection hands the endpoint.
+#[derive(Debug)]
+pub enum Inbound {
+    /// A message the connection framed, with how to answer it.
+    Message(Framed),
+    /// The connection has closed, and nothing more comes from it.
+    Closed {
+        /// The connection.
+        flow: Flow,
+        /// The way to send on it, which no longer writes.
+        writer: Writer,
+    },
+}
+
+#[cfg(test)]
+impl Inbound {
+    /// The framed message, for a test that expects one rather than the
+    /// connection's close.
+    pub(crate) fn framed(self) -> Framed {
+        match self {
+            Inbound::Message(framed) => framed,
+            Inbound::Closed { flow, .. } => {
+                panic!("expected a message, but {flow:?} closed")
+            }
+        }
+    }
+}
+
 /// A message received on a connection, with how to answer it.
 #[derive(Debug)]
-pub struct Inbound {
-    /// The message, or `None` once this connection has closed.
-    pub message: Option<Message<Bytes>>,
+pub struct Framed {
+    /// The message.
+    pub message: Message<Bytes>,
     /// The message's receive stamp, made as the connection framed it.
-    pub(crate) stamp: Option<Stamp>,
+    pub(crate) stamp: Stamp,
     /// The message's head as it arrived, for an observer. The message's
     /// header values share its buffer, so it keeps nothing more alive.
     pub(crate) head: Bytes,
@@ -774,13 +802,7 @@ fn start(
         .await;
         if let Some(writer) = closed_writer.upgrade() {
             let _ = closed_inbound
-                .send(Inbound {
-                    message: None,
-                    stamp: None,
-                    head: Bytes::new(),
-                    flow,
-                    writer: Writer(writer),
-                })
+                .send(Inbound::Closed { flow, writer: Writer(writer) })
                 .await;
         }
         drop(closed_permit);
@@ -898,13 +920,13 @@ async fn read_loop(
                     // A message arrives when it is framed whole, which can be
                     // well after its first segment.
                     let at = tokio::time::Instant::now().into_std();
-                    let inbound_message = Inbound {
-                        message: Some(message),
-                        stamp: Some(stamps.stamp(at)),
+                    let inbound_message = Inbound::Message(Framed {
+                        message,
+                        stamp: stamps.stamp(at),
                         head: decoder.take_head(),
                         flow,
                         writer: writer.clone(),
-                    };
+                    });
                     if inbound.send(inbound_message).await.is_err() {
                         return End::Endpoint;
                     }
@@ -1371,7 +1393,7 @@ mod tests {
         for _ in 0..3 {
             client.write_all(REQUEST).await.unwrap();
         }
-        assert!(rx.recv().await.unwrap().message.is_some());
+        assert!(matches!(rx.recv().await.unwrap(), Inbound::Message(_)));
         // The channel holds one message, and the reader waits to send the
         // third.
         sleep(Duration::from_millis(50)).await;
@@ -1840,8 +1862,8 @@ mod tests {
         let mut client = TcpStream::connect(addr).await.unwrap();
 
         client.write_all(REQUEST).await.unwrap();
-        let inbound = rx.recv().await.unwrap();
-        let Some(Message::Request(request)) = &inbound.message else {
+        let inbound = rx.recv().await.unwrap().framed();
+        let Message::Request(request) = &inbound.message else {
             panic!("expected a request");
         };
         assert_eq!(request.method(), Method::OPTIONS);
@@ -1865,8 +1887,8 @@ mod tests {
         sleep(Duration::from_millis(20)).await;
         client.write_all(rest).await.unwrap();
 
-        let inbound = rx.recv().await.unwrap();
-        assert!(matches!(inbound.message, Some(Message::Request(_))));
+        let inbound = rx.recv().await.unwrap().framed();
+        assert!(matches!(inbound.message, Message::Request(_)));
     }
 
     #[tokio::test]
@@ -1875,7 +1897,7 @@ mod tests {
         let mut client = TcpStream::connect(addr).await.unwrap();
 
         client.write_all(REQUEST).await.unwrap();
-        let inbound = rx.recv().await.unwrap();
+        let inbound = rx.recv().await.unwrap().framed();
         for _ in 0..3 {
             inbound.writer.send(Bytes::from_static(RESPONSE)).unwrap();
         }
@@ -1923,7 +1945,7 @@ mod tests {
         let mut client = TcpStream::connect(addr).await.unwrap();
 
         client.write_all(REQUEST).await.unwrap();
-        let inbound = rx.recv().await.unwrap();
+        let inbound = rx.recv().await.unwrap().framed();
 
         drop(client);
 
@@ -1958,6 +1980,7 @@ mod tests {
 
         let inbound =
             timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+        let inbound = inbound.framed();
         assert_eq!(inbound.flow.remote, second.local_addr().unwrap());
     }
 
@@ -1970,12 +1993,12 @@ mod tests {
         assert_eq!(flow.remote, addr);
 
         writer.send(Bytes::from_static(REQUEST)).unwrap();
-        let inbound = server_rx.recv().await.unwrap();
+        let inbound = server_rx.recv().await.unwrap().framed();
         assert_eq!(inbound.flow.remote, flow.local);
         inbound.writer.send(Bytes::from_static(RESPONSE)).unwrap();
 
-        let inbound = client_rx.recv().await.unwrap();
-        let Some(Message::Response(response)) = &inbound.message else {
+        let inbound = client_rx.recv().await.unwrap().framed();
+        let Message::Response(response) = &inbound.message else {
             panic!("expected a response");
         };
         assert_eq!(response.status(), StatusCode::OK);
@@ -2000,8 +2023,8 @@ mod tests {
         // A pong, then a response. Only the response reaches the channel.
         server.write_all(b"\r\n").await.unwrap();
         server.write_all(RESPONSE).await.unwrap();
-        let inbound = rx.recv().await.unwrap();
-        assert!(matches!(inbound.message, Some(Message::Response(_))));
+        let inbound = rx.recv().await.unwrap().framed();
+        assert!(matches!(inbound.message, Message::Response(_)));
     }
 
     #[test]

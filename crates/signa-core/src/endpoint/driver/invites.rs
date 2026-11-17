@@ -69,7 +69,7 @@ impl Driver {
                 // The machine stopped retransmitting and dropped the request.
                 permit.release_bytes();
                 if let Some(delivery) = respond {
-                    delivery.response(arrival.response(response));
+                    delivery.response(response, &arrival);
                 }
                 cancel = matches!(invite.cancel, Cancel::Waiting(..));
             }
@@ -80,13 +80,12 @@ impl Driver {
                 if invite.mark_answered() {
                     self.unanswered -= 1;
                 }
-                let response = arrival.response(response);
-                if response.response.status().is_success() {
+                if response.status().is_success() {
                     if let Some(delivery) = respond {
-                        delivery.response(response);
+                        delivery.response(response, &arrival);
                     }
                 } else {
-                    completion = respond.take().map(|d| (d, Ok(response)));
+                    completion = respond.take().map(|d| (d, response));
                 }
                 ack = bytes.map(|bytes| (link.clone(), bytes));
             }
@@ -110,8 +109,8 @@ impl Driver {
             self.send_waiting_cancel(id);
         }
         self.settle_client(id, before);
-        if let Some((delivery, result)) = completion {
-            delivery.send(result);
+        if let Some((delivery, response)) = completion {
+            delivery.finish(response, &arrival);
         }
     }
 
@@ -221,8 +220,7 @@ impl Driver {
                 None
             }
             None => {
-                match send_on(self.udp.as_mut(), tap, link, &ack, false, note)
-                {
+                match send_on(self.udp.as_mut(), tap, link, ack, false, note) {
                     Err(Unwritten::Failed(error)) => Some(error),
                     Ok(()) | Err(Unwritten::Busy(_)) => None,
                 }

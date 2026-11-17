@@ -20,8 +20,13 @@ use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 
 use super::{
-    Endpoint, Error, admission, builder::Reception, driver::Command,
-    path::SendPath, routing::Link, server::ReceivedResponse, table::Id,
+    Endpoint, Error, admission,
+    builder::Reception,
+    driver::{Arrival, Command},
+    path::{ReceiveInfo, SendPath, transient_len},
+    routing::Link,
+    server::ReceivedResponse,
+    table::Id,
 };
 use crate::{
     message::{
@@ -31,6 +36,7 @@ use crate::{
             cseq::CSeq,
         },
         request::Request,
+        response::Response,
         uri::{InvalidSipUriKind, SipUri},
     },
     transport::{
@@ -587,23 +593,66 @@ impl Delivery {
         Observation(Arc::downgrade(&self.0))
     }
 
-    /// Queues `response`, or ends the stream with an overflow if it does not
-    /// fit.
+    /// Queues `response`, which arrived as `arrival` says, or ends the
+    /// stream with an overflow if it does not fit.
     ///
     /// The copy of its context counts with its encoded bytes, so a response
-    /// never arrives without the context it came with.
-    pub(super) fn response(&self, response: ReceivedResponse) {
+    /// never arrives without the context it came with. The copy is made only
+    /// once the stream takes the response, so a response that an ended or
+    /// unread stream drops, or that overflows it, copies nothing.
+    pub(super) fn response(
+        &self,
+        response: Response<Bytes>,
+        arrival: &Arrival<'_>,
+    ) {
+        let retained = transient_len(arrival.context);
+        self.queue(response, retained, || arrival.info());
+    }
+
+    /// Ends the stream with the final `response`, which arrived as `arrival`
+    /// says, as [`Delivery::response`] queues it.
+    pub(super) fn finish(
+        self,
+        response: Response<Bytes>,
+        arrival: &Arrival<'_>,
+    ) {
+        self.response(response, arrival);
+        self.update(|state| state.ended = true);
+    }
+
+    /// Ends the stream with `result`.
+    pub(super) fn send(self, result: Result<ReceivedResponse, Error>) {
+        match result {
+            Ok(ReceivedResponse { response, received }) => {
+                let retained = received.retained_len();
+                self.queue(response, retained, || received);
+            }
+            Err(error) => self.update(|state| {
+                if !state.ended && !state.detached {
+                    state.terminal = Some(error);
+                }
+            }),
+        }
+        self.update(|state| state.ended = true);
+    }
+
+    /// Queues `response`, whose `received` keeps `retained` bytes of
+    /// context, or ends the stream with an overflow. `received` runs only
+    /// once the response has its room.
+    fn queue(
+        &self,
+        response: Response<Bytes>,
+        retained: usize,
+        received: impl FnOnce() -> ReceiveInfo,
+    ) {
         self.update(|state| {
             if state.ended || state.detached {
                 return;
             }
 
             let bytes = response
-                .response
                 .encoded_len()
-                .and_then(|len| {
-                    len.checked_add(response.received.retained_len())
-                })
+                .and_then(|len| len.checked_add(retained))
                 .unwrap_or(usize::MAX);
             let permit = if state.queue.len() < state.limits.count
                 && bytes <= state.limits.bytes.saturating_sub(state.bytes)
@@ -614,6 +663,8 @@ impl Delivery {
             };
             if let Some(permit) = permit {
                 state.bytes += bytes;
+                let response =
+                    ReceivedResponse { response, received: received() };
                 state.queue.push_back(Queued {
                     response,
                     _permit: permit,
@@ -624,18 +675,6 @@ impl Delivery {
                 state.ended = true;
             }
         });
-    }
-
-    pub(super) fn send(self, result: Result<ReceivedResponse, Error>) {
-        match result {
-            Ok(response) => self.response(response),
-            Err(error) => self.update(|state| {
-                if !state.ended && !state.detached {
-                    state.terminal = Some(error);
-                }
-            }),
-        }
-        self.update(|state| state.ended = true);
     }
 
     fn update(&self, update: impl FnOnce(&mut State)) {
@@ -1031,7 +1070,7 @@ impl Endpoint {
     ///         println!(
     ///             "{} from {}",
     ///             received.response.status(),
-    ///             received.received.source(),
+    ///             received.received.flow().remote,
     ///         );
     ///     }
     ///     Ok(())
@@ -1498,8 +1537,8 @@ pub(super) mod compatibility {
 mod tests {
     use super::*;
     use crate::{
-        endpoint::path::ReceiveInfo, message::response::Response,
-        transport::Stamps,
+        message::response::Response,
+        transport::{Stamps, datagram::TransportContext},
     };
 
     // These stream tests need an executor but no I/O driver.
@@ -1517,20 +1556,34 @@ mod tests {
         (Delivery(responses.shared.clone()), responses)
     }
 
-    /// A response with `status`, as it arrives over UDP now.
-    fn response(status: u16) -> ReceivedResponse {
+    /// A response with `status`.
+    fn response(status: u16) -> Response<Bytes> {
+        Response::builder().status(status).body(Bytes::new()).unwrap()
+    }
+
+    /// How a response arrives over UDP now, with `context`.
+    fn arrival(context: &TransportContext) -> Arrival<'_> {
         let flow = Flow {
             transport: Transport::Udp,
             local: "192.0.2.1:5060".parse().unwrap(),
             remote: "192.0.2.2:5060".parse().unwrap(),
         };
         let stamp = Stamps::new().stamp(std::time::Instant::now());
+        Arrival { flow, context, stamp }
+    }
+
+    /// Queues a response with `status` that arrives with no context.
+    fn arrive(delivery: &Delivery, status: u16) {
+        delivery
+            .response(response(status), &arrival(&TransportContext::EMPTY));
+    }
+
+    /// A response with `status` as the stream yields it.
+    fn received(status: u16) -> ReceivedResponse {
+        let context = TransportContext::EMPTY;
         ReceivedResponse {
-            response: Response::builder()
-                .status(status)
-                .body(Bytes::new())
-                .unwrap(),
-            received: ReceiveInfo::new(flow, stamp, None),
+            response: response(status),
+            received: arrival(&context).info(),
         }
     }
 
@@ -1545,13 +1598,13 @@ mod tests {
                 Limits { count: 1, bytes: 4096 },
                 Limits {
                     count: 10,
-                    bytes: response(100).response.encoded_len().unwrap(),
+                    bytes: response(100).encoded_len().unwrap(),
                 },
             ] {
                 let (delivery, mut responses) = stream(limits, budget());
 
-                delivery.response(response(100));
-                delivery.response(response(200));
+                arrive(&delivery, 100);
+                arrive(&delivery, 200);
                 delivery.send(Err(Error::timeout()));
 
                 assert_eq!(
@@ -1586,11 +1639,11 @@ mod tests {
             let limits = Limits { count: 10, bytes: 4096 };
             let (delivery, mut responses) = stream(limits, budget.clone());
 
-            delivery.send(Ok(response(200)));
+            delivery.send(Ok(received(200)));
             assert!(budget.acquire(0).is_none());
 
             let (other, mut overflow) = stream(limits, budget.clone());
-            other.send(Ok(response(200)));
+            other.send(Ok(received(200)));
             assert!(
                 overflow
                     .next()
@@ -1619,7 +1672,7 @@ mod tests {
                 .await;
             }
 
-            delivery.response(response(100));
+            arrive(&delivery, 100);
             drop(delivery);
 
             assert_eq!(
@@ -1638,17 +1691,40 @@ mod tests {
         });
     }
 
+    // A queued response's copy of its context counts against the budget with
+    // its encoded bytes, and dropping the stream with the response unread
+    // returns both.
+    #[test]
+    fn a_dropped_stream_returns_its_context_charge() {
+        let context =
+            TransportContext::new(Bytes::from_static(b"nic0 vlan 100"))
+                .unwrap();
+        let charge =
+            response(200).encoded_len().unwrap() + transient_len(&context);
+        let budget = Budget::new(Limits { count: 10, bytes: charge });
+        let (delivery, responses) =
+            stream(Limits { count: 10, bytes: 4096 }, budget.clone());
+
+        delivery.response(response(200), &arrival(&context));
+
+        assert!(!budget.is_idle());
+        assert!(budget.acquire(1).is_none(), "the context is charged");
+        drop(responses);
+        assert!(budget.is_idle());
+        drop(delivery);
+    }
+
     #[test]
     fn detached_consumer_releases_bytes_without_affecting_delivery_owner() {
         let budget = budget();
         let (delivery, responses) =
             stream(Limits { count: 10, bytes: 4096 }, budget.clone());
-        delivery.response(response(100));
+        arrive(&delivery, 100);
 
         drop(responses);
         assert!(budget.is_idle());
 
-        delivery.response(response(200));
+        arrive(&delivery, 200);
         assert!(budget.is_idle());
     }
 

@@ -3000,7 +3000,7 @@ mod tests {
 
         let original = route_request(&via);
         peer.write_all(&original.to_bytes()).await.unwrap();
-        let inbound = rx.recv().await.unwrap();
+        let inbound = rx.recv().await.unwrap().framed();
         let (request, route) = driver
             .prepare_reply(
                 original,
@@ -3072,7 +3072,7 @@ mod tests {
             address.port()
         ));
         peer.write_all(&request.to_bytes()).await.unwrap();
-        let inbound = rx.recv().await.unwrap();
+        let inbound = rx.recv().await.unwrap().framed();
         let (request, route) = driver
             .prepare_reply(
                 request,
@@ -6105,8 +6105,8 @@ mod tests {
         assert_eq!(second.id().sequence(), first.id().sequence() + 2);
         assert!(before <= first.received_at());
         assert!(first.received_at() <= second.received_at());
-        assert_eq!(second.source(), peer.addr());
-        assert_eq!(second.destination(), to);
+        assert_eq!(second.flow().remote, peer.addr());
+        assert_eq!(second.flow().local, to);
     }
 
     // A TCP message arrives when its connection has framed it whole, which

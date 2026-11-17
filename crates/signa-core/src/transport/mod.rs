@@ -155,6 +155,13 @@ pub struct Flow {
 /// a retransmission, get two IDs.
 ///
 /// It is a name, not a capability. Nothing sends with it.
+///
+/// IDs order by domain, then by sequence. Only the order within one domain
+/// means anything: it is the order the messages arrived in. Domains are
+/// numbered as they are made, so the order of two IDs of different domains
+/// says nothing about which message came first.
+///
+/// It displays as the domain and the sequence, as in `7:42`.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ReceiveId {
     domain: u64,
@@ -170,6 +177,12 @@ impl ReceiveId {
     /// The message's place among those of its domain, from zero.
     pub fn sequence(&self) -> u64 {
         self.sequence
+    }
+}
+
+impl fmt::Display for ReceiveId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.domain, self.sequence)
     }
 }
 
@@ -247,6 +260,15 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV6};
 
     use super::*;
+
+    // A receive ID reads as its domain and sequence, which is what a log
+    // needs to find the message in an observer's records.
+    #[test]
+    fn a_receive_id_displays_its_domain_and_sequence() {
+        let id = Stamps::in_domain(7).stamp(Instant::now()).id;
+
+        assert_eq!(id.to_string(), "7:0");
+    }
 
     #[test]
     fn unmap_turns_a_mapped_address_back() {

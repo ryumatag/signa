@@ -1047,8 +1047,8 @@ async fn server_output_goes_back_with_the_request_s_context() {
     wire.deliver(arriving(invite("busy"), "nic0"));
     let busy_invite = request(&mut incoming).await;
     assert_eq!(busy_invite.received.context().as_bytes(), "nic0");
-    assert_eq!(busy_invite.received.source(), PEER);
-    assert_eq!(busy_invite.received.destination(), LOCAL);
+    assert_eq!(busy_invite.received.flow().remote, PEER);
+    assert_eq!(busy_invite.received.flow().local, LOCAL);
     let (responder, _) = busy_invite.transaction.into_parts();
     let busy = Response::reply_to(&busy_invite.request)
         .status(486)
@@ -1092,7 +1092,7 @@ async fn a_response_without_rport_goes_to_the_via_port_with_the_context() {
 
     wire.deliver(arriving(text, "nic0"));
     let request = request(&mut incoming).await;
-    assert_eq!(request.received.source(), PEER);
+    assert_eq!(request.received.flow().remote, PEER);
     let (responder, _) = request.transaction.into_parts();
     responder.respond(ok(&request.request)).await.unwrap();
 
@@ -1628,8 +1628,8 @@ async fn mapped_ipv4_addresses_are_named_in_their_own_form() {
     )));
 
     let request = request(&mut incoming).await;
-    assert_eq!(request.received.source(), PEER);
-    assert_eq!(request.received.destination(), LOCAL);
+    assert_eq!(request.received.flow().remote, PEER);
+    assert_eq!(request.received.flow().local, LOCAL);
     let via = request.request.headers().get(VIA).unwrap().as_str();
     assert!(!via.contains("received="), "{via}");
 }
@@ -1700,8 +1700,8 @@ async fn a_link_local_peer_is_answered_on_its_interface() {
         let text = Bytes::from(text);
         wire.deliver(Ok(Datagram::new(text.clone(), LINK_PEER, LINK_LOCAL)));
         let request = request(&mut incoming).await;
-        assert_eq!(request.received.source(), LINK_PEER);
-        assert_eq!(request.received.destination(), LINK_LOCAL);
+        assert_eq!(request.received.flow().remote, LINK_PEER);
+        assert_eq!(request.received.flow().local, LINK_LOCAL);
 
         let (responder, _) = request.transaction.into_parts();
         responder.respond(ok(&request.request)).await.unwrap();
@@ -1803,8 +1803,8 @@ async fn a_dual_stack_socket_names_ipv4_peers_in_their_own_form() {
     peer.send_to(text.as_bytes(), local).await.unwrap();
 
     let request = request(&mut incoming).await;
-    assert_eq!(request.received.source(), peer_addr);
-    assert_eq!(request.received.destination(), local);
+    assert_eq!(request.received.flow().remote, peer_addr);
+    assert_eq!(request.received.flow().local, local);
 
     let (responder, _) = request.transaction.into_parts();
     responder.respond(ok(&request.request)).await.unwrap();
@@ -2080,12 +2080,15 @@ async fn a_delivered_datagram_is_received_and_answered_by_its_endpoint() {
     wire.deliver(arriving(text.clone(), "nic0"));
     let datagram = next(&mut ingress).await;
     assert_eq!(datagram.payload(), text.as_bytes());
-    assert_eq!((datagram.source(), datagram.destination()), (PEER, LOCAL));
-    assert_eq!(datagram.context().as_bytes(), "nic0");
+    assert_eq!(
+        (datagram.received().flow().remote, datagram.received().flow().local),
+        (PEER, LOCAL)
+    );
+    assert_eq!(datagram.received().context().as_bytes(), "nic0");
     datagram.try_deliver(&to_endpoint).unwrap();
 
     let request = request(&mut incoming).await;
-    assert_eq!(request.received.source(), PEER);
+    assert_eq!(request.received.flow().remote, PEER);
     assert_eq!(request.received.context().as_bytes(), "nic0");
     let via = request.request.headers().get(VIA).unwrap().as_str();
     assert!(via.contains("received=192.0.2.20"), "{via}");
@@ -2898,7 +2901,7 @@ async fn a_capture_receives_and_sends_nothing() {
         .unwrap();
 
     assert_eq!(captured.payload(), invite("captured").as_bytes());
-    assert_eq!(captured.context().as_bytes(), "tap0");
+    assert_eq!(captured.received().context().as_bytes(), "tap0");
     assert!(matches!(captured.parse(), Ok(Message::Request(_))));
     sleep(Duration::from_millis(50)).await;
     assert_eq!(wire.count(), 0);
@@ -2927,7 +2930,7 @@ async fn a_captured_datagram_does_not_hold_the_capture_buffer() {
         .unwrap()
         .unwrap();
 
-    assert_eq!(captured.context().as_bytes(), "nic0 vlan 100");
+    assert_eq!(captured.received().context().as_bytes(), "nic0 vlan 100");
     assert!(buffer.is_unique(), "the captured datagram holds the buffer");
 }
 
@@ -3510,7 +3513,8 @@ async fn a_held_datagram_keeps_its_id_and_arrival_time() {
 
     wire.deliver(arriving(options("held"), "nic0"));
     let datagram = next(&mut ingress).await;
-    let (id, arrived) = (datagram.receive_id(), datagram.received_at());
+    let (id, arrived) =
+        (datagram.received().id(), datagram.received().received_at());
     assert_eq!(datagram.deadline(), arrived + Duration::from_secs(1));
     advance(Duration::from_millis(300)).await;
     datagram.try_deliver(&to_endpoint).unwrap();
@@ -3524,8 +3528,8 @@ async fn a_held_datagram_keeps_its_id_and_arrival_time() {
 
     wire.deliver(arriving(options("after"), "nic0"));
     let after = next(&mut ingress).await;
-    assert_eq!(after.receive_id().domain(), id.domain());
-    assert_eq!(after.receive_id().sequence(), id.sequence() + 1);
+    assert_eq!(after.received().id().domain(), id.domain());
+    assert_eq!(after.received().id().sequence(), id.sequence() + 1);
 }
 
 /// A second peer of the wire, which a response may come from.
@@ -3583,7 +3587,7 @@ async fn each_response_keeps_how_it_arrived() {
         let to = response.headers().get("To").unwrap().as_str();
         assert!(to.ends_with(&format!(";tag={tag}")), "{to}");
         assert_eq!(
-            (received.source(), received.destination()),
+            (received.flow().remote, received.flow().local),
             (source, LOCAL)
         );
         assert_eq!(received.context().as_bytes(), on);
@@ -3596,6 +3600,157 @@ async fn each_response_keeps_how_it_arrived() {
         assert!(at <= then);
     }
     assert!(wire.sent(1).await.iter().all(|sent| sent.path == Way::Default));
+}
+
+// A 2xx and its retransmission reach the TU apart (RFC 6026 section 8.4),
+// each with its own ID and context. Each is charged to the stream's limits
+// with its context, so a retransmission that cannot keep its context ends
+// the stream rather than arriving without it.
+#[tokio::test]
+async fn each_2xx_retransmission_arrives_with_its_own_id_and_charge() {
+    let target = Target::new(Transport::Udp, PEER);
+    // The limits hold two 200s with small contexts, whose copies take well
+    // under 128 bytes each, and not with the large one. The 200's length
+    // comes from one exchange.
+    let ok_len = {
+        let wire = Wire::default();
+        let (endpoint, _incoming) = bind(&wire);
+        let call = outgoing_invite("retransmitted");
+        let _call = endpoint.start(call, target.clone()).await.unwrap();
+        let sent = wire.sent(1).await;
+        ok(&Request::from_bytes(&sent[0].payload).unwrap()).to_bytes().len()
+    };
+    let limit = 2 * ok_len + 2 * 128;
+    let large =
+        TransportContext::new(Bytes::from(vec![b'x'; MAX_CONTEXT_LEN]))
+            .unwrap();
+
+    for again in [context("nic1"), large] {
+        let wire = Wire::default();
+        let (endpoint, _incoming) = Endpoint::builder()
+            .udp_io(wire.clone())
+            .client_response_limits(Limits { count: 8, bytes: limit })
+            .bind()
+            .unwrap();
+        let (_control, mut responses) = endpoint
+            .start(outgoing_invite("retransmitted"), target.clone())
+            .await
+            .unwrap()
+            .into_parts();
+        let sent = wire.sent(1).await;
+        let invite = Request::from_bytes(&sent[0].payload).unwrap();
+        let ok = ok(&invite).to_bytes();
+        assert_eq!(ok.len(), ok_len);
+        let first = Datagram::new(ok.clone(), PEER, LOCAL)
+            .with_context(context("nic0"));
+        let second =
+            Datagram::new(ok, PEER, LOCAL).with_context(again.clone());
+
+        wire.deliver(Ok(first));
+        wire.deliver(Ok(second));
+        // Both wait in the stream before it is read.
+        sleep(Duration::from_millis(100)).await;
+
+        let mut next = async || {
+            timeout(Duration::from_secs(2), responses.next())
+                .await
+                .unwrap()
+                .unwrap()
+        };
+        let first = next().await.unwrap();
+        assert_eq!(first.received.context().as_bytes(), "nic0");
+        let second = next().await;
+        if again.len() == MAX_CONTEXT_LEN {
+            assert!(second.unwrap_err().is_delivery_overflow());
+            continue;
+        }
+        let second = second.unwrap();
+        assert_eq!(second.response.status().as_u16(), 200);
+        assert_eq!(second.received.context().as_bytes(), "nic1");
+        let (before, after) = (first.received.id(), second.received.id());
+        assert_eq!(after.domain(), before.domain());
+        assert_eq!(after.sequence(), before.sequence() + 1);
+    }
+}
+
+// A non-2xx final that overflows its stream still gets its ACK. The
+// transaction acknowledges the response whatever becomes of its delivery
+// (RFC 3261 section 17.1.1.3).
+#[tokio::test]
+async fn a_final_that_overflows_its_stream_still_gets_its_ack() {
+    let wire = Wire::default();
+    let (endpoint, _incoming) = Endpoint::builder()
+        .udp_io(wire.clone())
+        .client_response_limits(Limits { count: 8, bytes: 1 })
+        .bind()
+        .unwrap();
+    let target = Target::new(Transport::Udp, PEER);
+    let (_control, mut responses) = endpoint
+        .start(outgoing_invite("overflowed"), target)
+        .await
+        .unwrap()
+        .into_parts();
+    let sent = wire.sent(1).await;
+    let invite = Request::from_bytes(&sent[0].payload).unwrap();
+    let busy = Response::reply_to(&invite)
+        .status(486)
+        .to_tag(Tag::random())
+        .body(Bytes::new())
+        .unwrap();
+
+    wire.deliver(Ok(Datagram::new(busy.to_bytes(), PEER, LOCAL)));
+
+    let ended = timeout(Duration::from_secs(2), responses.next()).await;
+    assert!(ended.unwrap().unwrap().unwrap_err().is_delivery_overflow());
+    let sent = wire.sent(2).await;
+    assert_eq!(method(&sent[1]).as_deref(), Some("ACK"));
+}
+
+// Each receive point numbers what it receives in a domain of its own: two
+// endpoints, an endpoint and a shared port, and a capture never share one.
+// An endpoint's own backend numbers its arrivals in the domain of its
+// writes, as a shared port does, so an observer's records of one backend
+// name one domain.
+#[tokio::test]
+async fn each_receive_point_numbers_in_a_domain_of_its_own() {
+    let wires: [Wire; 4] = Default::default();
+    let (first, mut first_incoming) = bind(&wires[0]);
+    let (_second, mut second_incoming) = bind(&wires[1]);
+    let (_port, mut ingress) = intercept(&wires[2]);
+    let mut capture =
+        DatagramPort::builder().udp_io(wires[3].clone()).capture().unwrap();
+    let mut observer = first.observe(observe::Config::new()).await.unwrap();
+
+    wires[0].deliver(datagram(invite("first")));
+    wires[1].deliver(datagram(options("second")));
+    wires[2].deliver(datagram(options("port")));
+    wires[3].deliver(datagram(options("capture")));
+    let first_request = request(&mut first_incoming).await;
+    let second_request = request(&mut second_incoming).await;
+    let held = next(&mut ingress).await;
+    let captured = timeout(Duration::from_secs(2), capture.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let ids = [
+        first_request.received.id(),
+        second_request.received.id(),
+        held.received().id(),
+        captured.received().id(),
+    ];
+    for (n, id) in ids.iter().enumerate() {
+        for other in &ids[n + 1..] {
+            assert_ne!(id.domain(), other.domain(), "{ids:?}");
+        }
+    }
+    let arrival = record(&mut observer).await;
+    assert!(matches!(arrival.observed(), Observed::Received { .. }));
+    let trying = record(&mut observer).await;
+    let Observed::WriteStarted { write, .. } = trying.observed() else {
+        panic!("the 100 Trying's write, got {trying:?}");
+    };
+    assert_eq!(write.domain(), ids[0].domain());
 }
 
 // A response's context counts against its stream's limits with its bytes.
@@ -4247,7 +4402,7 @@ async fn a_port_observer_sees_arrivals_raw_sends_and_forwards() {
     else {
         unreachable!()
     };
-    assert_eq!(held.receive_id(), held_id);
+    assert_eq!(held.received().id(), held_id);
     assert_eq!(arrivals[1].payload().unwrap(), options("dropped").as_bytes());
 
     held.try_forward(&upstream).unwrap().await.unwrap();

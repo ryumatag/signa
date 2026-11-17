@@ -252,7 +252,7 @@ async fn forked_answers(
     while answers < 3 {
         let ReceivedResponse { response, received } =
             responses.next().await.ok_or("stream ended")??;
-        println!("uac: {} from {}", response.status(), received.source());
+        println!("uac: {} from {}", response.status(), received.flow().remote);
         if response.status().is_success() {
             answers += 1;
             let created = call.acknowledge(uac, &response).await?;

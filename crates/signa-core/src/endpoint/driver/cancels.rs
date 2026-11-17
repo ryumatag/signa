@@ -152,9 +152,9 @@ impl Driver {
         let sent = if self.client_writes.len()
             < self.config.max_client_transactions
         {
-            send_client(udp, tap, &link, &bytes, false, note)
+            send_client(udp, tap, &link, bytes.clone(), false, note)
         } else {
-            send_on(udp, tap, &link, &bytes, false, note).map(|()| None)
+            send_on(udp, tap, &link, bytes.clone(), false, note).map(|()| None)
         };
         let now = now();
         let timers = self.config.timers;

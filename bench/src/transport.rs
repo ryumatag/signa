@@ -127,15 +127,24 @@ pub(super) fn tcp(c: &mut Criterion) {
     let response = Bytes::from_static(RESPONSE_TYPICAL);
     let len = (REQUEST_TYPICAL.len() + RESPONSE_TYPICAL.len()) as u64;
 
+    /// The framed message a connection handed over. Nothing here closes a
+    /// connection while the benchmark runs.
+    fn framed(inbound: tcp::Inbound) -> tcp::Framed {
+        match inbound {
+            tcp::Inbound::Message(framed) => framed,
+            tcp::Inbound::Closed { .. } => panic!("the connection closed"),
+        }
+    }
+
     benchmark(c, "transport/tcp/round_trip", len, |b| {
         b.iter(|| {
             rt.block_on(async {
                 client.send(bb(request.clone())).unwrap();
-                let inbound = server_rx.recv().await.unwrap();
-                assert!(matches!(inbound.message, Some(Message::Request(_))));
+                let inbound = framed(server_rx.recv().await.unwrap());
+                assert!(matches!(inbound.message, Message::Request(_)));
                 inbound.writer.send(bb(response.clone())).unwrap();
-                let inbound = client_rx.recv().await.unwrap();
-                assert!(matches!(inbound.message, Some(Message::Response(_))));
+                let inbound = framed(client_rx.recv().await.unwrap());
+                assert!(matches!(inbound.message, Message::Response(_)));
             });
         });
     });
@@ -144,16 +153,16 @@ pub(super) fn tcp(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 client.submit(bb(request.clone())).unwrap().await.unwrap();
-                let inbound = server_rx.recv().await.unwrap();
-                assert!(matches!(inbound.message, Some(Message::Request(_))));
+                let inbound = framed(server_rx.recv().await.unwrap());
+                assert!(matches!(inbound.message, Message::Request(_)));
                 inbound
                     .writer
                     .submit(bb(response.clone()))
                     .unwrap()
                     .await
                     .unwrap();
-                let inbound = client_rx.recv().await.unwrap();
-                assert!(matches!(inbound.message, Some(Message::Response(_))));
+                let inbound = framed(client_rx.recv().await.unwrap());
+                assert!(matches!(inbound.message, Message::Response(_)));
             });
         });
     });
@@ -167,19 +176,13 @@ pub(super) fn tcp(c: &mut Criterion) {
                     client.send(bb(request.clone())).unwrap();
                 }
                 for _ in 0..8 {
-                    let inbound = server_rx.recv().await.unwrap();
-                    assert!(matches!(
-                        inbound.message,
-                        Some(Message::Request(_))
-                    ));
+                    let inbound = framed(server_rx.recv().await.unwrap());
+                    assert!(matches!(inbound.message, Message::Request(_)));
                     inbound.writer.send(bb(response.clone())).unwrap();
                 }
                 for _ in 0..8 {
-                    let inbound = client_rx.recv().await.unwrap();
-                    assert!(matches!(
-                        inbound.message,
-                        Some(Message::Response(_))
-                    ));
+                    let inbound = framed(client_rx.recv().await.unwrap());
+                    assert!(matches!(inbound.message, Message::Response(_)));
                 }
             });
         });

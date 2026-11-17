@@ -40,7 +40,6 @@ use super::{
         Capabilities, Datagram, DatagramIo, DatagramWrite, RecvError, Submit,
         TransportContext, WriteId, WriteOutcome,
     },
-    unmap,
 };
 
 #[cfg(any(
@@ -110,6 +109,11 @@ impl Socket {
 
     /// Receives one datagram and returns it with the flow it arrived on.
     ///
+    /// The addresses are the kernel's. A dual-stack socket names an IPv4 peer
+    /// by its IPv4-mapped IPv6 address. The endpoint names it in its IPv4
+    /// form as it takes the datagram from any backend, so the socket leaves
+    /// that to it rather than do it twice.
+    ///
     /// `buf` is scratch for the socket. The call clears it, reads into it, and
     /// cuts the datagram off, so consecutive datagrams share one allocation of
     /// [`CHUNK`] bytes until it is used up. Each returned `Bytes` keeps its
@@ -151,14 +155,13 @@ impl Socket {
         };
         let datagram = buf.split_to(received.len).freeze();
 
-        // A dual-stack socket reports IPv4 peers as mapped IPv6 addresses.
-        // The `Via` of such a peer names the IPv4 address, so `received` and
-        // the key comparisons want it in that form.
-        let remote = unmap(received.remote);
+        // A dual-stack socket reports IPv4 peers as mapped IPv6 addresses,
+        // which the endpoint names in their IPv4 form. See `Socket::recv`.
+        let remote = received.remote;
         let local = match received.local {
-            Some((IpAddr::V6(ip), scope)) => unmap(SocketAddr::V6(
+            Some((IpAddr::V6(ip), scope)) => SocketAddr::V6(
                 SocketAddrV6::new(ip, self.local.port(), 0, scope),
-            )),
+            ),
             Some((ip, _)) => SocketAddr::new(ip, self.local.port()),
             None => self.local,
         };

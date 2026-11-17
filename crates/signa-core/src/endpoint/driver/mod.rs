@@ -80,8 +80,8 @@ use crate::{
         },
         send::ViaMode,
         server::{
-            self, IncomingEvent, ReceivedRequest, ReceivedResponse,
-            ServerRequest, ServerTransactionId, SubmitError,
+            self, IncomingEvent, ReceivedRequest, ServerRequest,
+            ServerTransactionId, SubmitError,
         },
         shutdown::{self, ShutdownOutcome},
         table::{Id, Table},
@@ -102,7 +102,7 @@ use crate::{
         non_invite::{ClientEvent, ClientTransaction, ServerTransaction},
     },
     transport::{
-        Flow, Limits, ReceiveId, Stamp, Stamps, Transport,
+        Flow, Limits, ReceiveId, Stamp, Transport,
         budget::Budget,
         datagram::{DatagramIo, Path, TransportContext, WriteOutcome},
         tcp,
@@ -336,13 +336,12 @@ impl ClientEntry {
     /// Takes a completion once, after the machine has dropped its request.
     /// The driver settles the table before delivering it. Otherwise a reliable
     /// final can wake a new call while its last slot is still charged.
-    fn answer(
-        &mut self,
-        result: Result<ReceivedResponse, Error>,
-    ) -> Option<(Responder, Result<ReceivedResponse, Error>)> {
+    /// Takes the stream to answer with `answer`, a final response or the
+    /// error that ended the transaction, unless it was answered already.
+    fn answer<T>(&mut self, answer: T) -> Option<(Responder, T)> {
         let respond = self.respond.take()?;
         self.permit.release_bytes();
-        Some((respond, result))
+        Some((respond, answer))
     }
 }
 
@@ -567,7 +566,9 @@ enum Event {
     Timer(Key),
     Command(Command),
     Inbound(tcp::Inbound),
-    Datagram(Received),
+    /// A datagram, with the clock reading it was stamped with, if the
+    /// endpoint's own backend gave it, which is the driver's `now` for it.
+    Datagram(Received, Instant),
     /// Every handle is gone.
     Stop,
     /// A shutdown request, or the last work guard's drop.
@@ -595,14 +596,6 @@ impl Arrival<'_> {
     /// `Delivery::response`.
     pub(super) fn info(&self) -> ReceiveInfo {
         ReceiveInfo::new(self.flow, self.stamp, transient(self.context))
-    }
-
-    /// A client transaction's envelope of `response`, which arrived this way.
-    pub(super) fn response(
-        &self,
-        response: Response<Bytes>,
-    ) -> ReceivedResponse {
-        ReceivedResponse { response, received: self.info() }
     }
 }
 
@@ -906,7 +899,6 @@ impl Driver {
                     io,
                     config.udp_write_limits,
                     reception_counters.clone(),
-                    Stamps::new(),
                     registration,
                 )
             }),
@@ -1008,33 +1000,28 @@ impl Driver {
                 Event::Timer(Key::Shutdown) => return self.at_deadline(),
                 Event::Timer(key) => self.on_timer(key),
                 Event::Command(command) => self.on_command(command),
-                Event::Inbound(inbound) => {
-                    let flow = inbound.flow;
-                    let link = Link {
-                        flow,
-                        writer: Some(inbound.writer),
-                        path: None,
-                    };
-                    if let Some(message) = inbound.message {
-                        let stamp = inbound.stamp.expect("a message's stamp");
-                        let context = &TransportContext::EMPTY;
-                        if let Some(tap) = &self.tap {
-                            let body = message_body(&message);
-                            let parts = [&inbound.head[..], &body[..]];
-                            tap.received(stamp, flow, parts, context);
-                        }
-                        drop(inbound.head);
-                        let arrival = Arrival { flow, context, stamp };
-                        self.cause = Some(stamp.id);
-                        self.on_message(message, link, arrival, now());
-                        self.cause = None;
-                    } else {
-                        self.on_connection_closed(&link);
+                Event::Inbound(tcp::Inbound::Message(framed)) => {
+                    let tcp::Framed { message, stamp, head, flow, writer } =
+                        framed;
+                    let context = &TransportContext::EMPTY;
+                    if let Some(tap) = &self.tap {
+                        let body = message_body(&message);
+                        let parts = [&head[..], &body[..]];
+                        tap.received(stamp, flow, parts, context);
                     }
+                    drop(head);
+                    let link = Link { flow, writer: Some(writer), path: None };
+                    let arrival = Arrival { flow, context, stamp };
+                    self.cause = Some(stamp.id);
+                    self.on_message(message, link, arrival, now());
+                    self.cause = None;
                 }
-                Event::Datagram(received) => {
-                    let Received { payload, flow, context, stamp, fresh } =
-                        received;
+                Event::Inbound(tcp::Inbound::Closed { flow, writer }) => {
+                    let link = Link { flow, writer: Some(writer), path: None };
+                    self.on_connection_closed(&link);
+                }
+                Event::Datagram(received, now) => {
+                    let Received { payload, flow, context, stamp } = received;
                     // Before parsing, so that what does not parse is seen
                     // too, with the bytes as they arrived.
                     if let Some(tap) = &self.tap {
@@ -1047,11 +1034,6 @@ impl Driver {
                     // would answer with a 400, but the parse error keeps no
                     // head to answer with.
                     if let Ok(message) = Message::from_shared(payload) {
-                        // A datagram the endpoint's own backend gave just now
-                        // was stamped with the current time. One a shared
-                        // port delivered arrived earlier, and timers run on
-                        // the endpoint's own clock, never on that time.
-                        let now = if fresh { stamp.at } else { now() };
                         let link = Link { flow, writer: None, path: None };
                         let context = &context;
                         let arrival = Arrival { flow, context, stamp };
@@ -1319,8 +1301,15 @@ impl Driver {
                 4 => {
                     if let Some(udp) = &mut self.udp {
                         udp.poll_flush(cx);
-                        udp.poll_recv(cx)
-                            .map(|received| Some(Event::Datagram(received)))
+                        // One reading of the clock is both the stamp of a
+                        // datagram the backend gives now and the driver's
+                        // `now` for it, so the two agree by construction. A
+                        // datagram a shared port delivered keeps the port's
+                        // stamp, and the driver still runs on this reading.
+                        let now = now();
+                        udp.poll_recv(cx, now).map(|received| {
+                            Some(Event::Datagram(received, now))
+                        })
                     } else {
                         Poll::Pending
                     }
@@ -1543,8 +1532,9 @@ impl Driver {
         let result = if self.client_writes.len()
             < self.config.max_client_transactions
         {
-            send_client(udp, tap, &entry.link, request, false, note)
+            send_client(udp, tap, &entry.link, request.clone(), false, note)
         } else {
+            let request = request.clone();
             send_on(udp, tap, &entry.link, request, false, note).map(|()| None)
         };
         match result {
@@ -2127,13 +2117,19 @@ impl Driver {
     fn send_reply(
         &mut self,
         link: &Link,
-        bytes: &Bytes,
+        bytes: Bytes,
         note: Note,
     ) -> io::Result<()> {
         let tap = self.tap.as_ref();
-        match send_on(self.udp.as_mut(), tap, link, bytes, false, note) {
+        if link.writer.is_none() {
+            return send_on(self.udp.as_mut(), tap, link, bytes, false, note)
+                .map_err(Unwritten::into_error);
+        }
+        // The fallback below still needs the bytes.
+        match send_on(self.udp.as_mut(), tap, link, bytes.clone(), false, note)
+        {
             // Over TCP only a closed connection fails a write.
-            Err(Unwritten::Failed(_)) if link.writer.is_some() => {
+            Err(Unwritten::Failed(_)) => {
                 let target = link.flow.remote;
                 let Some(permit) = self.fallback.acquire(bytes.len()) else {
                     increment(&self.connection_stats.dropped);
@@ -2142,11 +2138,11 @@ impl Driver {
                         "response fallback budget is full",
                     ));
                 };
-                let write = self.park(target, note, bytes);
+                let write = self.park(target, note, &bytes);
                 if self.send_over_tcp(
                     target,
                     Pending::Response(
-                        bytes.clone(),
+                        bytes,
                         Fallback {
                             _permit: permit,
                             stats: self.connection_stats.clone(),
@@ -2300,7 +2296,7 @@ impl Driver {
             self.udp.as_mut(),
             tap,
             &link,
-            &bytes,
+            bytes,
             true,
             note,
         ) {
@@ -2509,10 +2505,12 @@ impl Driver {
         }
     }
 
-    /// Handles a received message, with the context the UDP backend gave it.
-    /// The context is the backend's own bytes until a handler keeps a copy.
-    /// Handles a received message. `now` is the driver's current time,
-    /// which its timers use, and not necessarily when the message arrived.
+    /// Handles a received message. `arrival` says how it arrived, with the
+    /// backend's own context bytes, which a handler copies only to keep them.
+    /// `now` is the driver's current time, which its timers use. For a
+    /// datagram of the endpoint's own UDP backend it is also the receive
+    /// time. A message a shared port delivered or a TCP connection framed
+    /// arrived before it.
     fn on_message(
         &mut self,
         message: Message<Bytes>,
@@ -2588,12 +2586,10 @@ impl Driver {
         };
         let completion =
             match tx.on_response(response, &self.config.timers, now) {
-                ClientEvent::Final(response) => {
-                    entry.answer(Ok(arrival.response(response)))
-                }
+                ClientEvent::Final(response) => entry.answer(response),
                 ClientEvent::Provisional(response) => {
                     if let Some(delivery) = &entry.respond {
-                        delivery.response(arrival.response(response));
+                        delivery.response(response, &arrival);
                     }
                     None
                 }
@@ -2605,8 +2601,8 @@ impl Driver {
             self.unanswered -= 1;
         }
         self.settle_client(id, before);
-        if let Some((respond, result)) = completion {
-            respond.send(result);
+        if let Some((respond, response)) = completion {
+            respond.finish(response, &arrival);
         }
     }
 
@@ -2819,7 +2815,7 @@ impl Driver {
             // this copy is refused now or fails later, the transaction keeps
             // its state until its timer, as in `send_generated` (RFC 6026
             // section 8.8).
-            let _ = self.send_reply(&link, &response, self.note(origin));
+            let _ = self.send_reply(&link, response, self.note(origin));
         }
     }
 
@@ -2920,11 +2916,11 @@ impl Driver {
         let note = self.note(WriteOrigin::Stateless);
         match transient(context) {
             None => {
-                let _ = self.send_reply(link, &response, note);
+                let _ = self.send_reply(link, response, note);
             }
             Some(path) => {
                 let link = Link { path: Some(path), ..link.clone() };
-                let _ = self.send_reply(&link, &response, note);
+                let _ = self.send_reply(&link, response, note);
             }
         }
     }
@@ -3441,12 +3437,12 @@ fn send_client(
     udp: Option<&mut Port>,
     tap: Option<&Tap>,
     link: &Link,
-    bytes: &Bytes,
+    bytes: Bytes,
     initial: bool,
     note: Note,
 ) -> Result<Option<ClientReceipt>, Unwritten> {
     if let Some(writer) = &link.writer {
-        tcp_write(tap, link.flow, note, bytes, |hook| {
+        tcp_write(tap, link.flow, note, &bytes, |hook| {
             writer.submit_request(bytes.clone(), hook)
         })
         .map(|receipt| Some(ClientReceipt::Tcp(receipt)))
@@ -3464,12 +3460,12 @@ fn send_on(
     udp: Option<&mut Port>,
     tap: Option<&Tap>,
     link: &Link,
-    bytes: &Bytes,
+    bytes: Bytes,
     new_request: bool,
     note: Note,
 ) -> Result<(), Unwritten> {
     match (&link.writer, udp) {
-        (Some(writer), _) => tcp_write(tap, link.flow, note, bytes, |hook| {
+        (Some(writer), _) => tcp_write(tap, link.flow, note, &bytes, |hook| {
             if new_request {
                 writer.send_request(bytes.clone(), hook)
             } else {
@@ -3562,6 +3558,7 @@ mod tests {
             },
         },
         transaction::Timers,
+        transport::Stamps,
     };
 
     /// What tests' writes are noted as.
@@ -3813,17 +3810,17 @@ mod tests {
             },
         );
 
-        driver.send_reply(&link, &Bytes::from_static(b"abc"), NOTE).unwrap();
+        driver.send_reply(&link, Bytes::from_static(b"abc"), NOTE).unwrap();
         assert_eq!(
             driver
-                .send_reply(&link, &Bytes::from_static(b"d"), NOTE)
+                .send_reply(&link, Bytes::from_static(b"d"), NOTE)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::WouldBlock
         );
-        driver.send_reply(&link, &Bytes::new(), NOTE).unwrap();
+        driver.send_reply(&link, Bytes::new(), NOTE).unwrap();
         assert_eq!(
-            driver.send_reply(&link, &Bytes::new(), NOTE).unwrap_err().kind(),
+            driver.send_reply(&link, Bytes::new(), NOTE).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
         let TcpState::Connecting(waiting) = &driver.routes[&remote].tcp else {
@@ -3845,7 +3842,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             driver
-                .send_reply(&link, &Bytes::from_static(b"abc"), NOTE)
+                .send_reply(&link, Bytes::from_static(b"abc"), NOTE)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::WouldBlock
@@ -3922,7 +3919,7 @@ mod tests {
             Duration::from_secs(1),
             poll_fn(|cx| {
                 for _ in 0..12 {
-                    if let Poll::Ready(Event::Datagram(received)) =
+                    if let Poll::Ready(Event::Datagram(received, _)) =
                         driver.poll_event(cx)
                     {
                         return Poll::Ready(received.payload);

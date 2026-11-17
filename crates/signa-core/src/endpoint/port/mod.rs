@@ -38,9 +38,9 @@ use tokio::{
 use super::{
     BindError, Error, ShutdownOutcome,
     datagram::{Port, Received},
-    driver::{ABANDONED_FLUSH, ReceptionCounters, increment},
+    driver::{ABANDONED_FLUSH, ReceptionCounters, increment, now},
     observe::{self, Observer, Tap},
-    path::{self, PathSelection},
+    path::{self, PathSelection, ReceiveInfo},
 };
 use crate::{
     message::{Message, error::InvalidMessage},
@@ -296,7 +296,6 @@ impl Builder {
             io,
             Limits { count: usize::MAX, bytes: usize::MAX },
             reception.clone(),
-            Stamps::in_domain(id),
             id,
         );
         let shared = Arc::new(Shared {
@@ -350,7 +349,12 @@ impl Builder {
     /// As for [`Builder::intercept`], for the backend.
     pub fn capture(self) -> Result<Capture, BindError> {
         let io = open(self.backend)?;
-        Ok(Capture { io, reception: Arc::default(), closed: false })
+        Ok(Capture {
+            io,
+            reception: Arc::default(),
+            stamps: Stamps::new(),
+            closed: false,
+        })
     }
 }
 
@@ -1331,7 +1335,7 @@ impl PortTask {
 
         let mut received = 0;
         while received < BATCH {
-            match self.port.poll_recv(cx) {
+            match self.port.poll_recv(cx, now()) {
                 Poll::Ready(datagram) => {
                     self.on_datagram(datagram);
                     received += 1;
@@ -1451,11 +1455,11 @@ impl PortTask {
         };
         let datagram = ReceivedDatagram {
             payload,
-            flow,
             // A backend may slice its context out of a capture buffer, which
-            // a held datagram would keep alive. See `path::retain`.
-            context: context.detached(),
-            stamp,
+            // a held datagram would keep alive, so the datagram keeps a copy.
+            // The ingress limits count it, not the context limits of an
+            // endpoint.
+            received: ReceiveInfo::new(flow, stamp, path::transient(&context)),
             // The deadline counts from when the datagram arrived, the time
             // `Port::poll_recv` stamped it with.
             deadline: Instant::from_std(stamp.at) + self.shared.deadline,
@@ -1705,9 +1709,7 @@ impl fmt::Debug for Ingress {
 /// ```
 pub struct ReceivedDatagram {
     payload: Bytes,
-    flow: Flow,
-    context: TransportContext,
-    stamp: Stamp,
+    received: ReceiveInfo,
     deadline: Instant,
     /// The disposition, until one is made.
     held: Option<Held>,
@@ -1725,45 +1727,20 @@ impl ReceivedDatagram {
         &self.payload
     }
 
-    /// The flow the datagram arrived on, with the address it came from as
-    /// its remote end. For an intercepting backend the local end need not be
-    /// an address of this host.
-    pub fn flow(&self) -> Flow {
-        self.flow
-    }
-
-    /// The address the datagram came from.
-    pub fn source(&self) -> SocketAddr {
-        self.flow.remote
-    }
-
-    /// The address the datagram was sent to.
-    pub fn destination(&self) -> SocketAddr {
-        self.flow.local
-    }
-
-    /// The backend's context, which may share its buffer.
-    pub fn context(&self) -> &TransportContext {
-        &self.context
-    }
-
-    /// The datagram's ID, which the endpoint it is delivered to keeps in
-    /// the [`ReceiveInfo`] of what it makes of it.
+    /// How the datagram arrived: its ID and time, the flow and the
+    /// backend's context, which is a copy of its own.
     ///
-    /// [`ReceiveInfo`]: super::ReceiveInfo
-    pub fn receive_id(&self) -> ReceiveId {
-        self.stamp.id
-    }
-
-    /// When the port's task took the datagram from the backend, before the
-    /// application held it. The endpoint it is delivered to keeps this
-    /// time too.
-    pub fn received_at(&self) -> std::time::Instant {
-        self.stamp.at
+    /// The port's task stamped it as it took the datagram from the backend,
+    /// before the application held it. The endpoint it is delivered to keeps
+    /// the same ID, time, flow and context in the [`ReceiveInfo`] of what it
+    /// makes of it.
+    pub fn received(&self) -> &ReceiveInfo {
+        &self.received
     }
 
     /// When the datagram stops being deliverable or forwardable, the
-    /// decision deadline after [`ReceivedDatagram::received_at`].
+    /// decision deadline after it was
+    /// [received](ReceiveInfo::received_at).
     pub fn deadline(&self) -> std::time::Instant {
         self.deadline.into_std()
     }
@@ -1847,7 +1824,7 @@ impl ReceivedDatagram {
         };
         let shared = held.shared.clone();
         let payload = self.payload.clone();
-        let cause = Some(self.stamp.id);
+        let cause = Some(self.received.id());
         match submit_raw(&shared, &commands, payload, path, cause) {
             Ok(write) => {
                 self.held = None;
@@ -1895,11 +1872,14 @@ impl ReceivedDatagram {
     }
 
     /// Takes the parts an endpoint's driver receives, ending the datagram
-    /// without counting it again.
+    /// without counting it again. The context is the datagram's own copy,
+    /// shared, not copied again.
     fn into_delivered(mut self) -> (Bytes, Flow, TransportContext, Stamp) {
         self.held = None;
         let payload = mem::take(&mut self.payload);
-        (payload, self.flow, mem::take(&mut self.context), self.stamp)
+        let received = &self.received;
+        let stamp = Stamp { id: received.id(), at: received.received_at() };
+        (payload, received.flow(), received.context().clone(), stamp)
     }
 }
 
@@ -1922,10 +1902,7 @@ impl fmt::Debug for ReceivedDatagram {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ReceivedDatagram")
             .field("len", &self.payload.len())
-            .field("receive_id", &self.stamp.id)
-            .field("received_at", &self.stamp.at)
-            .field("flow", &self.flow)
-            .field("context", &self.context)
+            .field("received", &self.received)
             .finish()
     }
 }
@@ -2124,6 +2101,8 @@ impl fmt::Debug for RawWrite {
 pub struct Capture {
     io: Box<dyn DatagramIo>,
     reception: Arc<ReceptionCounters>,
+    /// A domain of the capture's own, which no port or endpoint shares.
+    stamps: Stamps,
     closed: bool,
 }
 
@@ -2154,13 +2133,14 @@ impl Capture {
                         local: unmap(destination),
                         remote: unmap(source),
                     };
+                    let stamp = self.stamps.stamp(now());
+                    // A backend may slice its context out of a capture
+                    // buffer, which a held datagram would keep alive, so the
+                    // datagram keeps a copy, as `ReceivedDatagram` does.
+                    let context = path::transient(&context);
                     return Poll::Ready(Some(CapturedDatagram {
                         payload,
-                        flow,
-                        // A backend may slice its context out of a capture
-                        // buffer, which a held datagram would keep alive, as
-                        // for `ReceivedDatagram`.
-                        context: context.detached(),
+                        received: ReceiveInfo::new(flow, stamp, context),
                     }));
                 }
                 Err(RecvError::Truncated) => {
@@ -2221,8 +2201,7 @@ impl fmt::Debug for Capture {
 #[derive(Clone)]
 pub struct CapturedDatagram {
     payload: Bytes,
-    flow: Flow,
-    context: TransportContext,
+    received: ReceiveInfo,
 }
 
 impl CapturedDatagram {
@@ -2231,25 +2210,13 @@ impl CapturedDatagram {
         &self.payload
     }
 
-    /// The flow the datagram arrived on, with the address it came from as
-    /// its remote end.
-    pub fn flow(&self) -> Flow {
-        self.flow
-    }
-
-    /// The address the datagram came from.
-    pub fn source(&self) -> SocketAddr {
-        self.flow.remote
-    }
-
-    /// The address the datagram was sent to.
-    pub fn destination(&self) -> SocketAddr {
-        self.flow.local
-    }
-
-    /// The backend's context.
-    pub fn context(&self) -> &TransportContext {
-        &self.context
+    /// How the datagram arrived: its ID and time, the flow and a copy of the
+    /// backend's context.
+    ///
+    /// The capture stamps its datagrams as it takes them from the backend,
+    /// in a domain of its own that no port or endpoint shares.
+    pub fn received(&self) -> &ReceiveInfo {
+        &self.received
     }
 
     /// Parses the payload as a SIP message, without changing anything.
@@ -2263,8 +2230,7 @@ impl fmt::Debug for CapturedDatagram {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CapturedDatagram")
             .field("len", &self.payload.len())
-            .field("flow", &self.flow)
-            .field("context", &self.context)
+            .field("received", &self.received)
             .finish()
     }
 }

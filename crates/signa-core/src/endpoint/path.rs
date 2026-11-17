@@ -217,8 +217,12 @@ impl ReceiveInfo {
         self.stamp.at
     }
 
-    /// The flow the message arrived on, with the address it came from as its
-    /// remote end and the one it was sent to as its local end.
+    /// The flow the message arrived on.
+    ///
+    /// Its remote end is the address the message came from, and its local
+    /// end the address it was sent to, the packet's destination. On a shared
+    /// port with an intercepting backend, that need not be an address of
+    /// this host.
     pub fn flow(&self) -> Flow {
         self.flow
     }
@@ -226,16 +230,6 @@ impl ReceiveInfo {
     /// The transport the message arrived over.
     pub fn transport(&self) -> Transport {
         self.flow.transport
-    }
-
-    /// The address the message came from.
-    pub fn source(&self) -> SocketAddr {
-        self.flow.remote
-    }
-
-    /// The address the message was sent to.
-    pub fn destination(&self) -> SocketAddr {
-        self.flow.local
     }
 
     /// The UDP backend's context, empty for TCP and the endpoint's own
@@ -251,9 +245,7 @@ impl ReceiveInfo {
     /// The bytes the copy of the context takes, as the context limits would
     /// count them, for a budget that charges it instead.
     pub(super) fn retained_len(&self) -> usize {
-        self.path
-            .as_deref()
-            .map_or(0, |path| Path::charge(&path.context, false))
+        self.path.as_deref().map_or(0, |path| transient_len(&path.context))
     }
 }
 
@@ -304,6 +296,12 @@ pub(super) fn retain(
         prepared: None,
         _permit: Some(permit),
     })))
+}
+
+/// The bytes [`transient`] keeps for `context`, as the context limits would
+/// count them, without making the copy.
+pub(super) fn transient_len(context: &TransportContext) -> usize {
+    if context.is_empty() { 0 } else { Path::charge(context, false) }
 }
 
 /// A received context for one write made now, such as a stateless 503. It
