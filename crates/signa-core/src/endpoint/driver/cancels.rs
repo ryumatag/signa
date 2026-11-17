@@ -26,7 +26,7 @@ use crate::{
         admission::request_bytes,
         client::{CancelError, CancelOutcome, Intent, Reserved},
         datagram::Unwritten,
-        error::Error,
+        error::{Busy, Error},
         observe::WriteOrigin,
         path::{ReceiveInfo, retain},
         server::{self, IncomingCancel, IncomingEvent},
@@ -194,7 +194,7 @@ impl Driver {
                 let entry = self.clients.get_mut(id).expect("just inserted");
                 entry.tx.end_on_transport_error();
                 let completion = entry.answer(Err(match error {
-                    Unwritten::Busy(_) => Error::busy(),
+                    Unwritten::Busy(_) => Error::busy(Busy::Writes),
                     Unwritten::Failed(error) => Error::transport(error),
                 }));
                 self.unanswered -= 1;

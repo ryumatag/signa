@@ -36,7 +36,9 @@ use std::{
 
 use tokio::sync::oneshot;
 
-use super::{Endpoint, Error, driver::Command, routing::advertised};
+use super::{
+    Endpoint, Error, driver::Command, error::Busy, routing::advertised,
+};
 use crate::transport::{
     Flow, ReceiveId, Stamp, Transport,
     budget::Budget,
@@ -405,6 +407,24 @@ impl Endpoint {
     }
 }
 
+/// Why [`unchecked`] made no path. An endpoint and a port each report it as
+/// an error of their own.
+pub(super) enum Unchecked {
+    /// An address cannot be a datagram's.
+    Refused(io::Error),
+    /// The context limits are full.
+    Full,
+}
+
+impl From<Unchecked> for Error {
+    fn from(unchecked: Unchecked) -> Error {
+        match unchecked {
+            Unchecked::Refused(error) => Error::path_refused(error),
+            Unchecked::Full => Error::busy(Busy::Contexts),
+        }
+    }
+}
+
 /// Makes a path of `selection` for `binding`, charged to `limits`, for the
 /// backend to check.
 ///
@@ -416,7 +436,7 @@ pub(super) fn unchecked(
     selection: PathSelection,
     binding: Binding,
     limits: &Budget,
-) -> Result<Path, Error> {
+) -> Result<Path, Unchecked> {
     let PathSelection { source, destination, context, sent_by } = selection;
     // A Via names an IPv4 host in its own form, see `Datagram::new`. The
     // source and destination keep an IPv6 scope for the backend. The
@@ -426,14 +446,14 @@ pub(super) fn unchecked(
     let destination = unmap(destination);
     let sent_by = advertised(sent_by.map_or(source, unmap));
     if ![source, destination, sent_by].into_iter().all(unicast) {
-        return Err(Error::path_refused(io::Error::new(
+        return Err(Unchecked::Refused(io::Error::new(
             io::ErrorKind::InvalidInput,
             "a path needs unicast addresses with a port",
         )));
     }
     let permit = limits
         .acquire_request(Path::charge(&context, true))
-        .ok_or_else(Error::busy)?;
+        .ok_or(Unchecked::Full)?;
 
     Ok(Path {
         context: context.detached(),

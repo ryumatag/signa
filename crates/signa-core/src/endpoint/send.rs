@@ -19,7 +19,7 @@ use tokio::sync::oneshot;
 
 use super::{
     Endpoint, Error, builder::Reception, client::Target, driver::Command,
-    reply::Completion, routing::forward_destination,
+    error::Busy, reply::Completion, routing::forward_destination,
 };
 use crate::{
     message::{
@@ -328,8 +328,10 @@ impl Endpoint {
                 .acquire_owned()
                 .await
                 .map_err(|_| Error::closed())?;
-            let reservation =
-                self.oneshot_bytes.acquire(len).ok_or_else(Error::busy)?;
+            let reservation = self
+                .oneshot_bytes
+                .acquire(len)
+                .ok_or(Error::busy(Busy::Replies))?;
 
             let (done, result) = oneshot::channel();
             self.commands
@@ -461,8 +463,10 @@ impl Endpoint {
                 .acquire_owned()
                 .await
                 .map_err(|_| Error::closed())?;
-            let reservation =
-                self.oneshot_bytes.acquire(len).ok_or_else(Error::busy)?;
+            let reservation = self
+                .oneshot_bytes
+                .acquire(len)
+                .ok_or(Error::busy(Busy::Replies))?;
 
             let bytes = response.to_bytes_reserved(len);
             drop(response);

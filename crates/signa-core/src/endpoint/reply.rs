@@ -8,7 +8,8 @@ use bytes::Bytes;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 use super::{
-    Error, driver::Command, routing::Link, send::SentRequest, server,
+    Error, driver::Command, error::Busy, routing::Link, send::SentRequest,
+    server,
 };
 use crate::{
     message::{
@@ -317,11 +318,12 @@ impl fmt::Display for ReplyError {
             ReplyError::Unsupported => f.write_str("cannot respond to ACK"),
             ReplyError::Busy => f.write_str("write capacity is exhausted"),
             ReplyError::Closed => f.write_str("endpoint is closed"),
-            ReplyError::Transport(error) => {
-                write!(f, "response transport failed: {error}")
+            // The I/O error is the source, which a report prints after this.
+            ReplyError::Transport(_) => {
+                f.write_str("response transport failed")
             }
-            ReplyError::OutcomeUnknown(error) => {
-                write!(f, "the response's write outcome is unknown: {error}")
+            ReplyError::OutcomeUnknown(_) => {
+                f.write_str("the response's write outcome is unknown")
             }
         }
     }
@@ -428,7 +430,7 @@ impl Completion {
 /// result. Only `Busy`, `Transport` and `OutcomeUnknown` come from a write.
 fn request_error(error: ReplyError) -> Error {
     match error {
-        ReplyError::Busy => Error::busy(),
+        ReplyError::Busy => Error::busy(Busy::Writes),
         ReplyError::Transport(error) => Error::transport(error),
         ReplyError::OutcomeUnknown(error) => Error::outcome_unknown(error),
         ReplyError::Closed

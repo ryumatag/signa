@@ -70,7 +70,7 @@ use crate::{
             Intent, Observation, Reserved, Starting, Target,
         },
         datagram::{Port, Received, Unwritten},
-        error::Error,
+        error::{Busy, Error},
         observe::{self, Note, Tap, WriteOrigin, WriteRef},
         path::{ReceiveInfo, retain, transient},
         reply::{Admission, Completion, ReplyError, ReplyRoute},
@@ -1810,7 +1810,7 @@ impl Driver {
             Pending::Request(request, admitted, permit) => {
                 drop(request);
                 drop(permit);
-                admitted.fail(Error::busy());
+                admitted.fail(Error::busy(Busy::Connections));
             }
             Pending::Response(..) | Pending::Ack(..) => {}
             // Server output reserves its route and connection before commit
@@ -2248,7 +2248,7 @@ impl Driver {
 
         if self.client_writes.len() >= self.config.max_client_transactions {
             drop(permit);
-            respond.send(Err(Error::busy()));
+            respond.send(Err(Error::busy(Busy::Client)));
             return;
         }
 
@@ -2304,7 +2304,7 @@ impl Driver {
             Err(unwritten) => {
                 drop((tx, permit));
                 let _ = accepted.send(Err(match unwritten {
-                    Unwritten::Busy(_) => Error::busy(),
+                    Unwritten::Busy(_) => Error::busy(Busy::Writes),
                     Unwritten::Failed(err) => Error::transport(err),
                 }));
                 return;

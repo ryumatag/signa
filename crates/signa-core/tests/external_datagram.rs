@@ -2249,6 +2249,10 @@ async fn a_full_endpoint_queue_hands_the_datagram_back() {
     let refused = second.try_deliver(&to_endpoint).unwrap_err();
 
     assert!(refused.error().is_busy());
+    assert_eq!(
+        refused.error().to_string(),
+        "the endpoint's delivery queue is full"
+    );
     let second = refused.into_datagram();
     assert_eq!(second.payload(), options("second").as_bytes());
     let taken = request(&mut incoming).await;
@@ -2371,6 +2375,42 @@ async fn endpoints_on_one_port_stay_apart() {
     assert_eq!(request.request.headers().get("Call-ID").unwrap(), "after");
 }
 
+// A datagram goes only to an endpoint or along a path of the port that
+// received it. One of another port is foreign, and the datagram comes back
+// with its disposition, so it can still go where it belongs.
+#[tokio::test]
+async fn a_port_refuses_the_targets_of_another_port() {
+    let (wire, other_wire) = (Wire::default(), Wire::default());
+    let (port, mut ingress) = intercept(&wire);
+    let (other, _other_ingress) = intercept(&other_wire);
+    let (endpoint, mut incoming) =
+        Endpoint::builder().port(&port).bind().unwrap();
+    let (stranger, _) = Endpoint::builder().port(&other).bind().unwrap();
+    let foreign_path = upstream(&other).await;
+    wire.deliver(datagram(options("foreign")));
+    let held = next(&mut ingress).await;
+
+    let refused = held.try_deliver(&stranger.ingress().unwrap()).unwrap_err();
+    assert!(refused.error().is_foreign());
+    let refused = refused.into_datagram().try_forward(&foreign_path);
+    let refused = refused.unwrap_err();
+    assert!(refused.error().is_foreign());
+    assert_eq!(
+        refused.error().to_string(),
+        "the endpoint ingress or path belongs to another port"
+    );
+    let raw = Bytes::from_static(b"raw");
+    let error = port.send_bytes(raw, &foreign_path).unwrap_err();
+    assert!(error.is_foreign());
+
+    let to_endpoint = endpoint.ingress().unwrap();
+    refused.into_datagram().try_deliver(&to_endpoint).unwrap();
+    let taken = request(&mut incoming).await;
+    assert_eq!(taken.request.headers().get("Call-ID").unwrap(), "foreign");
+    assert_eq!(port.stats().delivered, 1);
+    assert_eq!(other_wire.count(), 0);
+}
+
 // The port numbers every write, the endpoints' and its raw sends, in one
 // sequence of its own, and sends each outcome back to the write that made it.
 // The wire here reports three writes in reverse order and fails the middle
@@ -2448,6 +2488,10 @@ async fn quiescing_refuses_only_new_endpoints_and_raw_paths() {
     let selection = PathSelection::new(LOCAL, PEER);
     let refused = port.prepare_path(selection.clone()).await.unwrap_err();
     assert!(refused.is_closed());
+    assert_eq!(
+        refused.to_string(),
+        "the port is quiesced and takes no new paths"
+    );
     assert!(endpoint.prepare_path(selection).await.is_ok());
     wire.deliver(datagram(options("quiet")));
     let to_endpoint = endpoint.ingress().unwrap();
@@ -3332,7 +3376,13 @@ async fn the_port_s_write_limits_must_hold_a_whole_payload() {
         match bound {
             Ok(_) => assert!(valid, "{bytes}"),
             Err(error) => {
-                assert!(!valid && error.is_invalid_config(), "{bytes}")
+                assert!(!valid && error.is_invalid_config(), "{bytes}");
+                assert!(
+                    error
+                        .to_string()
+                        .starts_with("invalid port configuration"),
+                    "{error}"
+                );
             }
         }
     }

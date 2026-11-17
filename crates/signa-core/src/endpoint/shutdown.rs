@@ -17,7 +17,7 @@ use std::{
 
 use tokio::sync::{mpsc, watch};
 
-use super::{Error, driver::Command};
+use super::{Error, driver::Command, error::Busy};
 
 /// How an endpoint stopped, as [`Shutdown`] reports it.
 ///
@@ -287,7 +287,7 @@ impl Control {
             // A count that would reach the closed bit would read as a closed
             // endpoint. Only leaked guards get there.
             if current + 1 == CLOSED {
-                return Err(Error::busy());
+                return Err(Error::busy(Busy::Guards));
             }
             match self.guards.compare_exchange_weak(
                 current,

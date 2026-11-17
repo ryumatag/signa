@@ -26,7 +26,7 @@ use std::sync::{
 
 use bytes::Bytes;
 
-use super::Error;
+use super::{Error, error::Busy};
 use crate::{
     Request,
     message::header::{CALL_ID, CSEQ, FROM, MAX_FORWARDS, ROUTE, TO},
@@ -65,7 +65,7 @@ impl ClientAdmission {
 
         reserve(&self.0.count, 1, self.0.max_count)?;
         let mut permit = Permit { admission: self.clone(), bytes: 0 };
-        let bytes = request_bytes(request).ok_or_else(Error::busy)?;
+        let bytes = request_bytes(request).ok_or(Error::busy(Busy::Client))?;
         reserve(&self.0.bytes, bytes, self.0.max_bytes)?;
         permit.bytes = bytes;
 
@@ -87,7 +87,7 @@ impl ClientAdmission {
 
         reserve(&self.0.count, 1, self.0.max_count)?;
         let mut cancel = Permit { admission: self.clone(), bytes: 0 };
-        let bytes = cancel_bytes(request).ok_or_else(Error::busy)?;
+        let bytes = cancel_bytes(request).ok_or(Error::busy(Busy::Client))?;
         reserve(&self.0.bytes, bytes, self.0.max_bytes)?;
         cancel.bytes = bytes;
 
@@ -143,7 +143,7 @@ fn reserve(
         let total = used
             .checked_add(amount)
             .filter(|&total| total <= max)
-            .ok_or_else(Error::busy)?;
+            .ok_or(Error::busy(Busy::Client))?;
         match counter.compare_exchange_weak(
             used,
             total,

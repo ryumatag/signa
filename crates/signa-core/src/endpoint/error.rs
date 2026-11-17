@@ -24,9 +24,12 @@ use crate::message::HeaderName;
 /// large for UDP, a missing request header, an invalid `CSeq`, INVITE
 /// identity header or forwarded `Via`, a method the operation cannot send, an
 /// operation the endpoint's [`Reception`] does not offer, a destination signa
-/// cannot route to, exhausted request or connection admission, or an endpoint
-/// that has stopped. Response delivery overflow is reported after already
-/// queued responses, without ending the underlying SIP machine.
+/// cannot route to, a full limit, or an endpoint that has stopped. Response
+/// delivery overflow is reported after already queued responses, without
+/// ending the underlying SIP machine.
+///
+/// The operations of a [`DatagramPort`] have an error of their own,
+/// [`port::Error`].
 ///
 /// # Example
 ///
@@ -58,6 +61,8 @@ use crate::message::HeaderName;
 /// [`Endpoint::start`]: super::Endpoint::start
 /// [`Reception`]: super::Reception
 /// [`Responses`]: super::Responses
+/// [`DatagramPort`]: super::port::DatagramPort
+/// [`port::Error`]: super::port::Error
 pub struct Error {
     kind: Kind,
 }
@@ -69,7 +74,6 @@ enum Kind {
     Transport(io::Error),
     OutcomeUnknown(io::Error),
     TooLarge(usize),
-    OverPayload { len: usize, max: usize },
     Missing(HeaderName),
     InvalidCSeq,
     InvalidHeader(HeaderName),
@@ -78,9 +82,46 @@ enum Kind {
     UnsupportedReception,
     StalePath,
     PathRefused(io::Error),
-    Busy,
+    Busy(Busy),
     Closed,
-    Expired,
+}
+
+/// What was full when an operation was refused as busy, for the message.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Busy {
+    /// Client request admission: requests, response streams or client
+    /// transactions.
+    Client,
+    /// The bytes of one-shot sends, [`Builder::max_reply_bytes`].
+    ///
+    /// [`Builder::max_reply_bytes`]: super::Builder::max_reply_bytes
+    Replies,
+    /// Routes, connections or connection attempts.
+    Connections,
+    /// The transport's write limits or queue.
+    Writes,
+    /// The bytes and count of contexts the endpoint keeps.
+    Contexts,
+    /// Another observer of the endpoint is alive.
+    Observer,
+    /// As many work guards as the endpoint can count.
+    Guards,
+}
+
+impl Busy {
+    fn message(self) -> &'static str {
+        match self {
+            Busy::Client => "client admission capacity is exhausted",
+            Busy::Replies => "the bytes for one-shot sends are exhausted",
+            Busy::Connections => {
+                "the route, connection or connection attempt limits are full"
+            }
+            Busy::Writes => "the transport's write capacity is exhausted",
+            Busy::Contexts => "the context limits are full",
+            Busy::Observer => "another observer of the endpoint is alive",
+            Busy::Guards => "the endpoint holds as many work guards as it can",
+        }
+    }
 }
 
 impl Error {
@@ -106,10 +147,6 @@ impl Error {
 
     pub(super) fn too_large(len: usize) -> Error {
         Error { kind: Kind::TooLarge(len) }
-    }
-
-    pub(super) fn over_payload(len: usize, max: usize) -> Error {
-        Error { kind: Kind::OverPayload { len, max } }
     }
 
     pub(super) fn missing(name: HeaderName) -> Error {
@@ -144,16 +181,12 @@ impl Error {
         Error { kind: Kind::PathRefused(err) }
     }
 
-    pub(super) fn busy() -> Error {
-        Error { kind: Kind::Busy }
+    pub(super) fn busy(what: Busy) -> Error {
+        Error { kind: Kind::Busy(what) }
     }
 
     pub(super) fn closed() -> Error {
         Error { kind: Kind::Closed }
-    }
-
-    pub(super) fn expired() -> Error {
-        Error { kind: Kind::Expired }
     }
 
     /// Returns `true` if no response arrived in time: no final response
@@ -192,9 +225,10 @@ impl Error {
     /// [`Error::source`] says why.
     ///
     /// A UDP backend reports this when it can no longer account for a write,
-    /// and a [`DatagramPort`] when it closes with a write its backend took
-    /// and never reported. It is not [`Error::is_transport`], which means the
-    /// write did not go out.
+    /// and a [`DatagramPort`] an endpoint is registered on when it closes
+    /// with a write of the endpoint's that its backend took and never
+    /// reported. It is not [`Error::is_transport`], which means the write did
+    /// not go out.
     ///
     /// [`Error::source`]: error::Error::source
     /// [`DatagramPort`]: super::port::DatagramPort
@@ -208,14 +242,8 @@ impl Error {
     /// transport when it is within 200 bytes of the path MTU, or over 1300
     /// bytes when the MTU is unknown, as it is here. The caller starts such a
     /// request with a TCP target instead.
-    ///
-    /// A raw send through a [`DatagramPort`] has no such rule. It is too large
-    /// only when it is over the backend's
-    /// [`max_payload`](crate::transport::datagram::Capabilities::max_payload).
-    ///
-    /// [`DatagramPort`]: super::port::DatagramPort
     pub fn is_too_large(&self) -> bool {
-        matches!(self.kind, Kind::TooLarge(_) | Kind::OverPayload { .. })
+        matches!(self.kind, Kind::TooLarge(_))
     }
 
     /// Returns `true` if a request has no CSeq, or an INVITE has no From, To
@@ -295,32 +323,26 @@ impl Error {
         matches!(self.kind, Kind::PathRefused(_))
     }
 
-    /// Returns `true` if request or connection admission is exhausted.
+    /// Returns `true` if a limit the operation needs is full. Nothing was
+    /// sent, and [`fmt::Display`] names the limit.
     ///
-    /// Request count and logical-byte limits refuse before command enqueue.
-    /// Route, connection and connect-attempt limits refuse in the driver. In
-    /// either case the request was not sent.
+    /// That covers client admission (requests, response streams and client
+    /// transactions), the bytes of one-shot sends, routes, connections and
+    /// connection attempts, the transport's write limits, the contexts paths
+    /// keep, and an observer that is still alive. Request admission refuses
+    /// before the command is queued, the others in the driver.
     pub fn is_busy(&self) -> bool {
-        matches!(self.kind, Kind::Busy)
+        matches!(self.kind, Kind::Busy(_))
     }
 
     /// Returns `true` if the endpoint has stopped or closed client admission
     /// for shutdown.
     ///
-    /// Through a [`DatagramPort`] it also means the port is closing, or the
-    /// endpoint a datagram was delivered to has stopped.
+    /// On a [`DatagramPort`] it also means the port is closing.
     ///
     /// [`DatagramPort`]: super::port::DatagramPort
     pub fn is_closed(&self) -> bool {
         matches!(self.kind, Kind::Closed)
-    }
-
-    /// Returns `true` if a [`ReceivedDatagram`]'s decision deadline has
-    /// passed, so that it can no longer be delivered or forwarded.
-    ///
-    /// [`ReceivedDatagram`]: super::port::ReceivedDatagram
-    pub fn is_expired(&self) -> bool {
-        matches!(self.kind, Kind::Expired)
     }
 }
 
@@ -338,9 +360,6 @@ impl fmt::Debug for Error {
             Kind::TooLarge(len) => {
                 debug.field(&format_args!("TooLarge({len})"))
             }
-            Kind::OverPayload { len, max } => {
-                debug.field(&format_args!("OverPayload({len}, {max})"))
-            }
             Kind::Missing(name) => {
                 debug.field(&format_args!("Missing({name:?})"))
             }
@@ -355,9 +374,8 @@ impl fmt::Debug for Error {
             Kind::PathRefused(err) => {
                 debug.field(&format_args!("PathRefused({err:?})"))
             }
-            Kind::Busy => debug.field(&"Busy"),
+            Kind::Busy(what) => debug.field(&format_args!("Busy({what:?})")),
             Kind::Closed => debug.field(&"Closed"),
-            Kind::Expired => debug.field(&"Expired"),
         };
         debug.finish()
     }
@@ -373,18 +391,15 @@ impl fmt::Display for Error {
             Kind::DeliveryOverflow => {
                 f.write_str("client response delivery capacity is exhausted")
             }
-            Kind::Transport(err) => write!(f, "transport error: {err}"),
-            Kind::OutcomeUnknown(err) => {
-                write!(f, "the write's outcome is unknown: {err}")
+            // The I/O error is the source, which a report prints after this.
+            Kind::Transport(_) => f.write_str("the transport failed"),
+            Kind::OutcomeUnknown(_) => {
+                f.write_str("the write's outcome is unknown")
             }
             Kind::TooLarge(len) => write!(
                 f,
                 "the request is {len} bytes, over the {MAX_UDP_REQUEST} \
                  that go over UDP"
-            ),
-            Kind::OverPayload { len, max } => write!(
-                f,
-                "the datagram is {len} bytes, over the {max} its backend sends"
             ),
             Kind::Missing(name) => write!(f, "the request has no {name}"),
             Kind::InvalidCSeq => f.write_str(
@@ -406,16 +421,11 @@ impl fmt::Display for Error {
                 "the path or prepared request belongs to another endpoint or \
                  connection",
             ),
-            Kind::PathRefused(err) => {
-                write!(f, "the UDP backend refused the path: {err}")
+            Kind::PathRefused(_) => {
+                f.write_str("the UDP backend refused the path")
             }
-            Kind::Busy => {
-                f.write_str("client admission capacity is exhausted")
-            }
+            Kind::Busy(what) => f.write_str(what.message()),
             Kind::Closed => f.write_str("the endpoint is closed"),
-            Kind::Expired => {
-                f.write_str("the datagram's decision deadline has passed")
-            }
         }
     }
 }
@@ -448,6 +458,7 @@ pub struct BindError {
 enum BindKind {
     Io(io::Error),
     InvalidConfig(&'static str),
+    InvalidPortConfig(&'static str),
     UnsupportedConfig(&'static str),
     PortClosed,
     PortFull,
@@ -460,6 +471,10 @@ impl BindError {
 
     pub(super) fn invalid_config(reason: &'static str) -> BindError {
         BindError { kind: BindKind::InvalidConfig(reason) }
+    }
+
+    pub(super) fn invalid_port_config(reason: &'static str) -> BindError {
+        BindError { kind: BindKind::InvalidPortConfig(reason) }
     }
 
     pub(super) fn unsupported_config(reason: &'static str) -> BindError {
@@ -475,9 +490,15 @@ impl BindError {
     }
 
     /// Returns `true` if the configuration is invalid, such as a zero
-    /// capacity where the endpoint needs a positive one. No socket was bound.
+    /// capacity where the endpoint or the [`DatagramPort`] needs a positive
+    /// one. No socket was bound.
+    ///
+    /// [`DatagramPort`]: super::port::DatagramPort
     pub fn is_invalid_config(&self) -> bool {
-        matches!(self.kind, BindKind::InvalidConfig(_))
+        matches!(
+            self.kind,
+            BindKind::InvalidConfig(_) | BindKind::InvalidPortConfig(_)
+        )
     }
 
     /// Returns `true` if the configuration asks for something signa does not
@@ -523,6 +544,9 @@ impl fmt::Debug for BindError {
             BindKind::InvalidConfig(reason) => {
                 debug.field(&format_args!("InvalidConfig({reason:?})"))
             }
+            BindKind::InvalidPortConfig(reason) => {
+                debug.field(&format_args!("InvalidPortConfig({reason:?})"))
+            }
             BindKind::UnsupportedConfig(reason) => {
                 debug.field(&format_args!("UnsupportedConfig({reason:?})"))
             }
@@ -536,9 +560,13 @@ impl fmt::Debug for BindError {
 impl fmt::Display for BindError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.kind {
-            BindKind::Io(err) => write!(f, "binding a socket failed: {err}"),
+            // The I/O error is the source, which a report prints after this.
+            BindKind::Io(_) => f.write_str("binding a socket failed"),
             BindKind::InvalidConfig(reason) => {
                 write!(f, "invalid endpoint configuration: {reason}")
+            }
+            BindKind::InvalidPortConfig(reason) => {
+                write!(f, "invalid port configuration: {reason}")
             }
             BindKind::UnsupportedConfig(reason) => {
                 write!(f, "unsupported endpoint configuration: {reason}")
@@ -558,6 +586,7 @@ impl error::Error for BindError {
         match &self.kind {
             BindKind::Io(err) => Some(err),
             BindKind::InvalidConfig(_)
+            | BindKind::InvalidPortConfig(_)
             | BindKind::UnsupportedConfig(_)
             | BindKind::PortClosed
             | BindKind::PortFull => None,
@@ -569,7 +598,7 @@ impl From<BindError> for io::Error {
     fn from(err: BindError) -> io::Error {
         match err.kind {
             BindKind::Io(err) => err,
-            BindKind::InvalidConfig(_) => {
+            BindKind::InvalidConfig(_) | BindKind::InvalidPortConfig(_) => {
                 io::Error::new(io::ErrorKind::InvalidInput, err)
             }
             BindKind::UnsupportedConfig(_) => {
@@ -581,5 +610,58 @@ impl From<BindError> for io::Error {
             // Not `WouldBlock`, since only an endpoint that stops makes room.
             BindKind::PortFull => io::Error::other(err),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::endpoint::{CancelError, ReplyError};
+
+    // A report prints the source after the error, so an error that also
+    // printed it would say it twice.
+    #[test]
+    fn an_error_with_a_source_does_not_repeat_it() {
+        let io = || io::Error::other("the cable is out");
+        let errors: [Box<dyn error::Error>; 7] = [
+            Box::new(Error::transport(io())),
+            Box::new(Error::outcome_unknown(io())),
+            Box::new(Error::path_refused(io())),
+            Box::new(BindError::io(io())),
+            Box::new(ReplyError::Transport(io())),
+            Box::new(ReplyError::OutcomeUnknown(io())),
+            Box::new(CancelError::Transport(io())),
+        ];
+
+        for error in errors {
+            assert!(error.source().is_some(), "{error}");
+            assert!(!error.to_string().contains("cable"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_busy_error_names_what_was_full() {
+        let all = [
+            Busy::Client,
+            Busy::Replies,
+            Busy::Connections,
+            Busy::Writes,
+            Busy::Contexts,
+            Busy::Observer,
+            Busy::Guards,
+        ];
+
+        let messages = all.map(|what| {
+            let error = Error::busy(what);
+            assert!(error.is_busy());
+            error.to_string()
+        });
+        for (i, message) in messages.iter().enumerate() {
+            assert!(!messages[..i].contains(message), "{message}");
+        }
+        assert_eq!(
+            Error::busy(Busy::Observer).to_string(),
+            "another observer of the endpoint is alive"
+        );
     }
 }

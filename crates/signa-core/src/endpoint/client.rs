@@ -23,6 +23,7 @@ use super::{
     Endpoint, Error, admission,
     builder::Reception,
     driver::{Arrival, Command},
+    error::Busy,
     path::{ReceiveInfo, SendPath, transient_len},
     routing::Link,
     server::ReceivedResponse,
@@ -365,8 +366,9 @@ impl fmt::Display for CancelError {
             CancelError::Busy => {
                 f.write_str("no connection to the next hop could be admitted")
             }
-            CancelError::Transport(error) => {
-                write!(f, "the next hop could not be reached: {error}")
+            // The I/O error is the source, which a report prints after this.
+            CancelError::Transport(_) => {
+                f.write_str("the next hop could not be reached")
             }
             CancelError::Closed => f.write_str("the endpoint is closed"),
         }
@@ -1301,7 +1303,8 @@ impl Endpoint {
 
     /// Reserves one `max_client_handles` slot for a response stream.
     fn observing(&self) -> Result<Observing, Error> {
-        let handle = self.client_handles.acquire(0).ok_or_else(Error::busy)?;
+        let handle =
+            self.client_handles.acquire(0).ok_or(Error::busy(Busy::Client))?;
         let responses = Responses::new(
             self.client_response_budget.clone(),
             self.client_response_limits,

@@ -5,7 +5,8 @@ their datagrams.
 A [`DatagramPort`] owns one UDP socket or backend for several endpoints. The
 application receives each datagram through [`Ingress`] and delivers it to an
 endpoint, forwards it unchanged or discards it. [`Capture`] only receives.
-[`DatagramPort`] states the contract, [`Builder`] its limits.
+[`DatagramPort`] states the contract, [`Builder`] its limits, and [`Error`]
+how the port's own operations fail.
 */
 
 // Inside, the port's task owns the backend through a `Port` with no limits of
@@ -36,7 +37,7 @@ use tokio::{
 };
 
 use super::{
-    BindError, Error, ShutdownOutcome,
+    BindError, Error as EndpointError, ShutdownOutcome,
     datagram::{Port, Received},
     driver::{ABANDONED_FLUSH, ReceptionCounters, increment, now},
     observe::{self, Observer, Tap},
@@ -55,9 +56,12 @@ use crate::{
     },
 };
 
+mod error;
 mod withdrawal;
 mod writes;
 
+use error::{Busy, Closed};
+pub use error::{DispositionError, Error};
 pub(super) use withdrawal::Withdrawal;
 pub(super) use writes::WritePermit;
 use writes::{Admission, WriteAdmission};
@@ -267,11 +271,11 @@ impl Builder {
             ("max_registrations must be positive", self.max_registrations),
         ] {
             if value == 0 {
-                return Err(BindError::invalid_config(reason));
+                return Err(BindError::invalid_port_config(reason));
             }
         }
         if self.decision_deadline.is_zero() {
-            return Err(BindError::invalid_config(
+            return Err(BindError::invalid_port_config(
                 "decision_deadline must be positive",
             ));
         }
@@ -284,7 +288,7 @@ impl Builder {
         // share holding a payload covers too. A positive count always leaves
         // the share one write.
         if request_limits(self.write_limits).bytes < capabilities.max_payload {
-            return Err(BindError::invalid_config(
+            return Err(BindError::invalid_port_config(
                 "three quarters of write_limits.bytes must hold the backend's \
                  largest payload",
             ));
@@ -380,9 +384,9 @@ impl fmt::Debug for Builder {
 /// Opens a builder's backend, with the checks an endpoint's builder makes.
 fn open(backend: Option<Backend>) -> Result<Box<dyn DatagramIo>, BindError> {
     match backend {
-        None => {
-            Err(BindError::invalid_config("a port needs `udp` or `udp_io`"))
-        }
+        None => Err(BindError::invalid_port_config(
+            "a port needs `udp` or `udp_io`",
+        )),
         Some(Backend::Bind(addr)) => udp::Socket::bind(addr)
             .map(|socket| {
                 Box::new(udp::Io::new(socket)) as Box<dyn DatagramIo>
@@ -391,12 +395,12 @@ fn open(backend: Option<Backend>) -> Result<Box<dyn DatagramIo>, BindError> {
         Some(Backend::Io(io)) => {
             let local = io.local_addr();
             if local.ip().is_unspecified() || local.port() == 0 {
-                return Err(BindError::invalid_config(
+                return Err(BindError::invalid_port_config(
                     "a UDP backend needs a specified local address and port",
                 ));
             }
             if io.capabilities().max_payload == 0 {
-                return Err(BindError::invalid_config(
+                return Err(BindError::invalid_port_config(
                     "a UDP backend must send a payload of at least one byte",
                 ));
             }
@@ -432,9 +436,9 @@ fn open(backend: Option<Backend>) -> Result<Box<dyn DatagramIo>, BindError> {
 /// registration has its own transactions, reception policy and paths, so
 /// endpoints for network domains whose addresses overlap stay apart. A path
 /// one endpoint prepared, or a [`RawPath`] of the port, is refused by every
-/// other endpoint ([`Error::is_stale_path`]). The endpoint's writes go
-/// through the port's task, which numbers them in one sequence with the raw
-/// sends, and their outcomes come back to the endpoint that made them.
+/// other endpoint ([`endpoint::Error::is_stale_path`]). The endpoint's writes
+/// go through the port's task, which numbers them in one sequence with the
+/// raw sends, and their outcomes come back to the endpoint that made them.
 ///
 /// A datagram reaches an endpoint through two queues, the port's ingress and
 /// the endpoint's, with the application deciding in between. An endpoint's
@@ -494,6 +498,7 @@ fn open(backend: Option<Backend>) -> Result<Box<dyn DatagramIo>, BindError> {
 /// [`endpoint::Builder::udp`]: super::Builder::udp
 /// [`endpoint::Builder::udp_io`]: super::Builder::udp_io
 /// [`endpoint::Builder::port`]: super::Builder::port
+/// [`endpoint::Error::is_stale_path`]: super::Error::is_stale_path
 /// [`endpoint::Builder::udp_write_limits`]: super::Builder::udp_write_limits
 /// [`Endpoint::shutdown`]: super::Endpoint::shutdown
 ///
@@ -629,7 +634,7 @@ enum Command {
     },
     CheckPath {
         path: Path,
-        done: oneshot::Sender<Result<Path, Error>>,
+        done: oneshot::Sender<io::Result<Path>>,
     },
 }
 
@@ -722,8 +727,10 @@ impl DatagramPort {
         selection: PathSelection,
     ) -> impl Future<Output = Result<RawPath, Error>> + Send + '_ {
         async move {
-            if self.shared.phase() != OPEN {
-                return Err(Error::closed());
+            match self.shared.phase() {
+                OPEN => {}
+                QUIESCED => return Err(Error::closed(Closed::Quiesced)),
+                _ => return Err(Error::closed(Closed::Port)),
             }
             let binding = Binding { port: self.shared.id, owner: Owner::Port };
             let path = path::unchecked(
@@ -731,9 +738,13 @@ impl DatagramPort {
                 binding,
                 &self.shared.context_limits,
             )?;
-            let path = check_path(&self.commands, path).await?;
+            let path = match check_path(&self.commands, path).await {
+                Some(Ok(path)) => path,
+                Some(Err(error)) => return Err(Error::path_refused(error)),
+                None => return Err(Error::closed(Closed::Port)),
+            };
             if self.shared.closing() {
-                return Err(Error::closed());
+                return Err(Error::closed(Closed::Port));
             }
             Ok(RawPath(Arc::new(path)))
         }
@@ -754,7 +765,7 @@ impl DatagramPort {
     ///
     /// # Errors
     ///
-    /// * [`Error::is_stale_path`] for a path of another port.
+    /// * [`Error::is_foreign`] for a path of another port.
     /// * [`Error::is_too_large`] for a payload over the backend's maximum.
     /// * [`Error::is_busy`] when [`Builder::write_limits`] is full.
     /// * [`Error::is_closed`] once the port is closing.
@@ -800,7 +811,7 @@ impl DatagramPort {
     ) -> impl Future<Output = Result<Observer, Error>> + Send + '_ {
         async move {
             if self.commands.is_closed() {
-                return Err(Error::closed());
+                return Err(Error::closed(Closed::Port));
             }
             let observing = &self.shared.observing;
             if observing
@@ -812,7 +823,7 @@ impl DatagramPort {
                 )
                 .is_err()
             {
-                return Err(Error::busy());
+                return Err(Error::busy(Busy::Observer));
             }
 
             // From here on a failure drops the observer, which clears the
@@ -821,8 +832,8 @@ impl DatagramPort {
             let (attached, done) = oneshot::channel();
             self.commands
                 .send(Command::Observe { tap, attached })
-                .map_err(|_| Error::closed())?;
-            done.await.map_err(|_| Error::closed())?;
+                .map_err(|_| Error::closed(Closed::Port))?;
+            done.await.map_err(|_| Error::closed(Closed::Port))?;
             Ok(observer)
         }
     }
@@ -946,16 +957,17 @@ impl fmt::Debug for DatagramPort {
     }
 }
 
-/// Asks the port's task to have the backend check `path`.
+/// Asks the port's task to have the backend check `path`, and returns the
+/// backend's answer, or `None` once the port is closing.
+///
+/// The caller, a raw path or an endpoint's, turns it into its own error.
 async fn check_path(
     commands: &mpsc::UnboundedSender<Command>,
     path: Path,
-) -> Result<Path, Error> {
+) -> Option<io::Result<Path>> {
     let (done, result) = oneshot::channel();
-    commands
-        .send(Command::CheckPath { path, done })
-        .map_err(|_| Error::closed())?;
-    result.await.map_err(|_| Error::closed())?
+    commands.send(Command::CheckPath { path, done }).ok()?;
+    result.await.ok()
 }
 
 /// Admits a raw send and hands it to the port's task.
@@ -967,15 +979,15 @@ fn submit_raw(
     cause: Option<ReceiveId>,
 ) -> Result<RawWrite, Error> {
     if path.binding().port != shared.id {
-        return Err(Error::stale_path());
+        return Err(Error::foreign());
     }
     if shared.closing() {
-        return Err(Error::closed());
+        return Err(Error::closed(Closed::Port));
     }
     let len = payload.len();
     let max = shared.capabilities.max_payload;
     if len > max {
-        return Err(Error::over_payload(len, max));
+        return Err(Error::too_large(len, max));
     }
     // A raw send leaves a quarter of the limits to the endpoints' writes, so
     // that a busy forwarder cannot hold back their responses and
@@ -983,15 +995,15 @@ fn submit_raw(
     // transaction output is.
     let permit = match shared.writes.admit_raw(len) {
         Admission::Admitted(permit) => permit,
-        Admission::Full => return Err(Error::busy()),
-        Admission::Closed => return Err(Error::closed()),
+        Admission::Full => return Err(Error::busy(Busy::Writes)),
+        Admission::Closed => return Err(Error::closed(Closed::Port)),
     };
 
     let (done, receipt) = oneshot::channel();
     let path = path.0.clone();
     commands
         .send(Command::Raw { payload, path, done, permit, cause })
-        .map_err(|_| Error::closed())?;
+        .map_err(|_| Error::closed(Closed::Port))?;
     Ok(RawWrite(receipt))
 }
 
@@ -1023,11 +1035,18 @@ impl PortClient {
     pub(super) async fn check_path(
         &self,
         path: Path,
-    ) -> Result<Arc<Path>, Error> {
-        let commands = self.commands.upgrade().ok_or_else(Error::closed)?;
-        let path = check_path(&commands, path).await?;
+    ) -> Result<Arc<Path>, EndpointError> {
+        let commands =
+            self.commands.upgrade().ok_or_else(EndpointError::closed)?;
+        let path = match check_path(&commands, path).await {
+            Some(Ok(path)) => path,
+            Some(Err(error)) => {
+                return Err(EndpointError::path_refused(error));
+            }
+            None => return Err(EndpointError::closed()),
+        };
         if self.withdrawal.is_withdrawn() || self.shared.closing() {
-            return Err(Error::closed());
+            return Err(EndpointError::closed());
         }
         Ok(Arc::new(path))
     }
@@ -1406,11 +1425,7 @@ impl PortTask {
                 let _ = attached.send(());
             }
             Command::CheckPath { path, done } => {
-                let result = match self.port.check_path(&path) {
-                    Ok(()) => Ok(path),
-                    Err(error) => Err(Error::path_refused(error)),
-                };
-                let _ = done.send(result);
+                let _ = done.send(self.port.check_path(&path).map(|()| path));
             }
         }
         self.route();
@@ -1646,10 +1661,9 @@ impl PortTask {
                 )));
                 return true;
             }
-            // Every path turned invalid as the close started.
-            Command::CheckPath { done, .. } => {
-                let _ = done.send(Err(Error::closed()));
-            }
+            // Every path turned invalid as the close started. The waiter
+            // learns so as the request drops unanswered.
+            Command::CheckPath { .. } => {}
             // An observer still sees the drain.
             command @ Command::Observe { .. } => self.on_command(command),
         }
@@ -1769,15 +1783,18 @@ impl ReceivedDatagram {
     ///
     /// # Errors
     ///
-    /// The datagram comes back undelivered in [`Refused`], with:
+    /// The datagram comes back undelivered in a [`DispositionError`], with:
     ///
-    /// * [`Error::is_stale_path`] for an endpoint on another port.
+    /// * [`Error::is_foreign`] for an endpoint on another port.
     /// * [`Error::is_expired`] after the deadline.
     /// * [`Error::is_busy`] when the endpoint's
     ///   [queue](Builder::delivery_queue) is full.
     /// * [`Error::is_closed`] when the endpoint has stopped or the port is
     ///   closing.
-    pub fn try_deliver(self, to: &EndpointIngress) -> Result<(), Refused> {
+    pub fn try_deliver(
+        self,
+        to: &EndpointIngress,
+    ) -> Result<(), DispositionError> {
         if let Err(error) = self.check(to.port) {
             return Err(self.refuse(error));
         }
@@ -1788,10 +1805,10 @@ impl ReceivedDatagram {
                 Ok(())
             }
             Err(mpsc::error::TrySendError::Full(datagram)) => {
-                Err(datagram.refuse(Error::busy()))
+                Err(datagram.refuse(Error::busy(Busy::Deliveries)))
             }
             Err(mpsc::error::TrySendError::Closed(datagram)) => {
-                Err(datagram.refuse(Error::closed()))
+                Err(datagram.refuse(Error::closed(Closed::Endpoint)))
             }
         }
     }
@@ -1807,20 +1824,23 @@ impl ReceivedDatagram {
     ///
     /// # Errors
     ///
-    /// The datagram comes back unsent in [`Refused`], with:
+    /// The datagram comes back unsent in a [`DispositionError`], with:
     ///
-    /// * [`Error::is_stale_path`] for a path of another port.
+    /// * [`Error::is_foreign`] for a path of another port.
     /// * [`Error::is_expired`] after the deadline.
     /// * [`Error::is_too_large`] for a payload over the backend's maximum.
     /// * [`Error::is_busy`] when [`Builder::write_limits`] is full.
     /// * [`Error::is_closed`] once the port is closing.
-    pub fn try_forward(mut self, path: &RawPath) -> Result<RawWrite, Refused> {
+    pub fn try_forward(
+        mut self,
+        path: &RawPath,
+    ) -> Result<RawWrite, DispositionError> {
         if let Err(error) = self.check(path.binding().port) {
             return Err(self.refuse(error));
         }
         let held = self.held.as_ref().expect("held");
         let Some(commands) = held.commands.upgrade() else {
-            return Err(self.refuse(Error::closed()));
+            return Err(self.refuse(Error::closed(Closed::Port)));
         };
         let shared = held.shared.clone();
         let payload = self.payload.clone();
@@ -1857,9 +1877,9 @@ impl ReceivedDatagram {
     fn check(&self, port: u64) -> Result<(), Error> {
         let shared = &self.held.as_ref().expect("held").shared;
         if shared.closing() {
-            Err(Error::closed())
+            Err(Error::closed(Closed::Port))
         } else if port != shared.id {
-            Err(Error::stale_path())
+            Err(Error::foreign())
         } else if self.is_expired() {
             Err(Error::expired())
         } else {
@@ -1867,8 +1887,8 @@ impl ReceivedDatagram {
         }
     }
 
-    fn refuse(self, error: Error) -> Refused {
-        Refused(Box::new((self, error)))
+    fn refuse(self, error: Error) -> DispositionError {
+        DispositionError::new(self, error)
     }
 
     /// Takes the parts an endpoint's driver receives, ending the datagram
@@ -1904,51 +1924,6 @@ impl fmt::Debug for ReceivedDatagram {
             .field("len", &self.payload.len())
             .field("received", &self.received)
             .finish()
-    }
-}
-
-/// A datagram that was not delivered or forwarded, with the reason.
-///
-/// The datagram still holds its disposition, unless it
-/// [expired](Error::is_expired), and can be tried again or discarded.
-// Boxed, since a refusal is rare and the datagram is large for an `Err`.
-pub struct Refused(Box<(ReceivedDatagram, Error)>);
-
-impl Refused {
-    /// Why the datagram was refused.
-    pub fn error(&self) -> &Error {
-        &self.0.1
-    }
-
-    /// Takes the datagram back.
-    pub fn into_datagram(self) -> ReceivedDatagram {
-        self.0.0
-    }
-
-    /// Takes the datagram and the reason apart.
-    pub fn into_parts(self) -> (ReceivedDatagram, Error) {
-        *self.0
-    }
-}
-
-impl fmt::Debug for Refused {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Refused")
-            .field("datagram", &self.0.0)
-            .field("error", &self.0.1)
-            .finish()
-    }
-}
-
-impl fmt::Display for Refused {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "the datagram was refused: {}", self.0.1)
-    }
-}
-
-impl std::error::Error for Refused {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.0.1)
     }
 }
 

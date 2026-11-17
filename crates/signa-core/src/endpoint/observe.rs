@@ -37,6 +37,7 @@ use tokio::sync::{mpsc, oneshot};
 use super::{
     Endpoint, Error, ResponseId, ServerTransactionId,
     driver::{Command, increment, now},
+    error::Busy,
 };
 use crate::transport::{
     Flow, Limits, ReceiveId, Stamp, Transport,
@@ -813,7 +814,7 @@ impl Endpoint {
                 )
                 .is_err()
             {
-                return Err(Error::busy());
+                return Err(Error::busy(Busy::Observer));
             }
 
             // From here on a failure drops the observer, which clears the
