@@ -5,9 +5,9 @@ writes.
 [`Endpoint::observe`] and [`DatagramPort::observe`] attach one [`Observer`].
 The endpoint's driver, or the port's task, records each message it
 receives, before it parses it, and the stages of each write it makes: when
-it starts, when the backend takes it, and how it ends. Records are copies.
-None of them can send, answer, deliver or hold a transaction, and dropping
-the observer changes nothing on the wire.
+it starts, when the backend or the TCP connection's writer takes it, and how
+it ends. Records are copies. None of them can send, answer, deliver or hold a
+transaction, and dropping the observer changes nothing on the wire.
 
 Observation never holds up the protocol. A record that does not fit the
 observer's limits is dropped and counted, and the driver goes on. The
@@ -35,7 +35,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::sync::{mpsc, oneshot};
 
 use super::{
-    Endpoint, Error, ResponseId, ServerTransactionId,
+    ClientTransactionNumber, Endpoint, Error, ResponseId, ServerTransactionId,
     driver::{Command, increment, now},
     error::Busy,
 };
@@ -60,7 +60,7 @@ use crate::transport::{
 ///     .bytes(4 * 1024 * 1024)
 ///     .payload(512);
 /// ```
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Config {
     limits: Limits,
     payload: usize,
@@ -191,7 +191,7 @@ pub struct Stats {
     /// Records dropped because the observer's limits were full.
     pub lost: u64,
     /// The lengths of the messages those records would have described, as
-    /// [`Record::len`] gives them, whether or not [`Config::payload`] would
+    /// [`Record::message_len`] gives them, whether or not [`Config::payload`] would
     /// have copied them. Write stages that carry no message add nothing.
     pub lost_bytes: u64,
     /// Bytes past [`Config::payload`] that delivered records did not copy,
@@ -208,7 +208,7 @@ pub struct Record {
     lost_before: u64,
     at: Instant,
     observed: Observed,
-    len: usize,
+    message_len: usize,
     payload: Option<Bytes>,
     context: Option<TransportContext>,
     _permit: Permit,
@@ -240,15 +240,11 @@ impl Record {
         &self.observed
     }
 
-    /// The length of the message received or written. Zero for a write
-    /// stage that carries no message.
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Returns `true` if [`Record::len`] is zero.
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
+    /// The length of the message received or written, whether or not
+    /// [`Config::payload`] copied it. Zero for a write stage that carries no
+    /// message.
+    pub fn message_len(&self) -> usize {
+        self.message_len
     }
 
     /// The copy of the message's first bytes, up to the configured payload
@@ -272,7 +268,7 @@ impl fmt::Debug for Record {
             .field("lost_before", &self.lost_before)
             .field("at", &self.at)
             .field("observed", &self.observed)
-            .field("len", &self.len)
+            .field("message_len", &self.message_len)
             .field("payload", &self.payload.as_ref().map(Bytes::len))
             .field(
                 "context",
@@ -285,8 +281,8 @@ impl fmt::Debug for Record {
 /// What a [`Record`] saw.
 ///
 /// A write has up to three records, which share its [`WriteRef`]: it
-/// started, the backend took it, and it ended. A write that failed before
-/// the backend took it has no `WriteAccepted`. One started before the
+/// started, it was taken, and it ended. A write that failed before it was
+/// taken has no `WriteAccepted`. One started before the
 /// observer was attached may show only its later stages, or none, and the
 /// last stage of a write can come after its transaction has ended.
 #[derive(Clone, Debug)]
@@ -295,6 +291,7 @@ pub enum Observed {
     /// A message arrived, before the endpoint parsed it: a whole UDP
     /// datagram, or one message a TCP connection framed. A datagram that is
     /// not a SIP message is recorded too.
+    #[non_exhaustive]
     Received {
         /// The message's ID, which its envelope carries in its
         /// [`ReceiveInfo`](super::ReceiveInfo).
@@ -303,6 +300,7 @@ pub enum Observed {
         flow: Flow,
     },
     /// A write started, with its encoded message.
+    #[non_exhaustive]
     WriteStarted {
         /// Names the write in its later records.
         write: WriteRef,
@@ -317,20 +315,26 @@ pub enum Observed {
         /// response answers again.
         cause: Option<ReceiveId>,
     },
-    /// The backend, or the TCP connection's queue, took the write. On an
-    /// endpoint registered on a shared port, this is the port taking it.
+    /// The write was taken to be written: by the UDP backend, or by the
+    /// writer of the TCP connection, which took it from the connection's
+    /// queue. On an endpoint registered on a shared port, this is the port
+    /// taking it.
+    #[non_exhaustive]
     WriteAccepted {
         /// The write.
         write: WriteRef,
     },
     /// The write ended.
+    #[non_exhaustive]
     WriteEnded {
         /// The write.
         write: WriteRef,
         /// How it ended.
-        result: WriteResult,
-        /// Whether the backend had taken it. A write that ends before that,
-        /// such as one the write limits refused, was never offered.
+        end: WriteEnd,
+        /// Whether it was taken first, so that a `WriteAccepted` was
+        /// recorded for it. A write that ends before that, such as one the
+        /// write limits refused or one a closing TCP connection dropped from
+        /// its queue, was never offered to the network.
         accepted: bool,
     },
 }
@@ -372,26 +376,30 @@ impl WriteRef {
 #[non_exhaustive]
 pub enum WriteOrigin {
     /// The first write of a client transaction's request, a CANCEL included.
+    #[non_exhaustive]
     Request {
         /// The client transaction, see [`ClientControl::number`].
         ///
         /// [`ClientControl::number`]: super::ClientControl::number
-        transaction: u64,
+        transaction: ClientTransactionNumber,
     },
     /// A client transaction's request again, on Timer A or E.
+    #[non_exhaustive]
     RequestRetransmission {
         /// The client transaction.
-        transaction: u64,
+        transaction: ClientTransactionNumber,
     },
     /// The ACK an INVITE client transaction sends for a non-2xx final,
     /// or again for its retransmission.
+    #[non_exhaustive]
     Ack {
         /// The client transaction.
-        transaction: u64,
+        transaction: ClientTransactionNumber,
     },
     /// A server transaction's response: one the TU submitted, or one the
     /// endpoint made, such as the automatic 100 or the 500 for a dropped
     /// responder.
+    #[non_exhaustive]
     Response {
         /// The server transaction.
         transaction: ServerTransactionId,
@@ -400,6 +408,7 @@ pub enum WriteOrigin {
     },
     /// A server transaction's response again, for a retransmitted request or
     /// on Timer G.
+    #[non_exhaustive]
     ResponseRetransmission {
         /// The server transaction.
         transaction: ServerTransactionId,
@@ -418,6 +427,7 @@ pub enum WriteOrigin {
     /// the backend, not a second write.
     ///
     /// [`DatagramPort`]: super::port::DatagramPort
+    #[non_exhaustive]
     Endpoint {
         /// The endpoint's name for the write.
         write: WriteRef,
@@ -433,8 +443,25 @@ pub enum WriteOrigin {
 ///
 /// Over UDP these are the backend's [`WriteOutcome`]s. Over TCP a failure
 /// can follow a partial write, and the endpoint treats it as not written.
+///
+/// The error kind is the backend's or the socket's, apart from those signa
+/// reports itself:
+///
+/// * [`io::ErrorKind::WouldBlock`]: the write limits, or the TCP
+///   connection's write queue, were full, so the write was never offered.
+/// * [`io::ErrorKind::BrokenPipe`]: the TCP connection had closed, or
+///   closed before it wrote the write.
+/// * [`io::ErrorKind::Interrupted`]: the write was dropped before it was
+///   queued, as a prepared request that was never sent is, or the endpoint
+///   stopped before it went out.
+/// * [`io::ErrorKind::InvalidInput`]: the datagram was larger than the UDP
+///   backend sends.
+/// * [`io::ErrorKind::NotConnected`]: on a [`DatagramPort`], the port
+///   closed before it offered the write, or with the write unreported.
+///
+/// [`DatagramPort`]: super::port::DatagramPort
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WriteResult {
+pub enum WriteEnd {
     /// It was written whole to the local network or stream.
     Written,
     /// It did not go out, for a reason of this kind.
@@ -443,23 +470,23 @@ pub enum WriteResult {
     Unknown(io::ErrorKind),
 }
 
-impl From<&WriteOutcome> for WriteResult {
-    fn from(outcome: &WriteOutcome) -> WriteResult {
+impl From<&WriteOutcome> for WriteEnd {
+    fn from(outcome: &WriteOutcome) -> WriteEnd {
         match outcome {
-            WriteOutcome::Written => WriteResult::Written,
+            WriteOutcome::Written => WriteEnd::Written,
             WriteOutcome::NotWritten(error) => {
-                WriteResult::NotWritten(error.kind())
+                WriteEnd::NotWritten(error.kind())
             }
-            WriteOutcome::Unknown(error) => WriteResult::Unknown(error.kind()),
+            WriteOutcome::Unknown(error) => WriteEnd::Unknown(error.kind()),
         }
     }
 }
 
-impl From<&io::Result<()>> for WriteResult {
-    fn from(result: &io::Result<()>) -> WriteResult {
+impl From<&io::Result<()>> for WriteEnd {
+    fn from(result: &io::Result<()>) -> WriteEnd {
         match result {
-            Ok(()) => WriteResult::Written,
-            Err(error) => WriteResult::NotWritten(error.kind()),
+            Ok(()) => WriteEnd::Written,
+            Err(error) => WriteEnd::NotWritten(error.kind()),
         }
     }
 }
@@ -561,10 +588,10 @@ impl Tap {
     pub(super) fn ended(
         &self,
         write: WriteRef,
-        result: WriteResult,
+        end: WriteEnd,
         accepted: bool,
     ) {
-        let observed = Observed::WriteEnded { write, result, accepted };
+        let observed = Observed::WriteEnded { write, end, accepted };
         self.record(now(), observed, [&[]; 2], None);
     }
 
@@ -599,8 +626,8 @@ impl Tap {
         self.tcp_started(flow, note, bytes)
     }
 
-    /// The hook that records the end of `write` from the connection's writer
-    /// task, or `None` if this tap did not start it, as when another observer
+    /// The hook that records, from the connection's writer task, when it
+    /// takes `write` from the queue and how the write ends, or `None` if this tap did not start it, as when another observer
     /// has replaced the one that did.
     ///
     /// The hook holds the tap weakly. A write can stay queued on a connection
@@ -611,9 +638,17 @@ impl Tap {
             return None;
         }
         let tap = Arc::downgrade(&self.0);
-        Some(tcp::Hook::new(move |result, queued| {
-            if let Some(tap) = Weak::upgrade(&tap) {
-                Tap(tap).ended(write, WriteResult::from(result), queued);
+        let mut taken = false;
+        Some(tcp::Hook::new(move |stage| {
+            if let tcp::Stage::Taken = stage {
+                taken = true;
+            }
+            let Some(tap) = Weak::upgrade(&tap) else { return };
+            match stage {
+                tcp::Stage::Taken => Tap(tap).accepted(write),
+                tcp::Stage::Ended(result) => {
+                    Tap(tap).ended(write, WriteEnd::from(result), taken);
+                }
             }
         }))
     }
@@ -622,7 +657,7 @@ impl Tap {
     /// started it.
     pub(super) fn refused(&self, write: WriteRef, kind: io::ErrorKind) {
         if self.started_tcp(write) {
-            self.ended(write, WriteResult::NotWritten(kind), false);
+            self.ended(write, WriteEnd::NotWritten(kind), false);
         }
     }
 
@@ -670,7 +705,7 @@ impl Tap {
             lost_before: 0,
             at,
             observed,
-            len,
+            message_len: len,
             payload,
             context,
             _permit: permit,
@@ -788,7 +823,7 @@ impl Endpoint {
     ///         if record.lost_before() > 0 {
     ///             eprintln!("{} records lost", record.lost_before());
     ///         }
-    ///         if let Observed::Received { id, flow } = record.observed() {
+    ///         if let Observed::Received { id, flow, .. } = record.observed() {
     ///             println!("{id:?} from {}", flow.remote);
     ///         }
     ///     }
@@ -863,7 +898,7 @@ mod tests {
                 thread::spawn(move || {
                     for _ in 0..EACH {
                         let write = tap.tcp_started(flow(), NOTE, b"OPTIONS");
-                        tap.ended(write, WriteResult::Written, true);
+                        tap.ended(write, WriteEnd::Written, true);
                     }
                 })
             })
@@ -893,7 +928,7 @@ mod tests {
         let (tap, observer) = attach(Config::new().records(1).payload(4));
         let first = tap.tcp_started(flow(), NOTE, b"first message");
         tap.tcp_started(flow(), NOTE, b"lost message");
-        tap.ended(first, WriteResult::Written, true);
+        tap.ended(first, WriteEnd::Written, true);
 
         let stats = observer.stats();
         assert_eq!(stats.lost, 2);
@@ -916,9 +951,9 @@ mod tests {
         let write = tap.tcp_started(flow(), NOTE, b"OPTIONS");
         let held = observer.recv().await.unwrap();
 
-        tap.ended(write, WriteResult::Written, true);
+        tap.ended(write, WriteEnd::Written, true);
         drop(held);
-        tap.ended(write, WriteResult::Written, true);
+        tap.ended(write, WriteEnd::Written, true);
 
         let next = observer.recv().await.unwrap();
         assert_eq!((next.sequence(), next.lost_before()), (2, 1));
@@ -1023,15 +1058,15 @@ mod tests {
         assert_eq!(flow.local, "[::]:0".parse().unwrap());
         assert_eq!(flow.remote, v6);
         let ended = observer.recv().await.unwrap();
-        let Observed::WriteEnded { write: same, result, accepted } =
+        let Observed::WriteEnded { write: same, end, accepted } =
             *ended.observed()
         else {
             panic!("an ended write, got {ended:?}");
         };
         assert_eq!(same, write);
         assert_eq!(
-            (result, accepted),
-            (WriteResult::NotWritten(io::ErrorKind::ConnectionRefused), false)
+            (end, accepted),
+            (WriteEnd::NotWritten(io::ErrorKind::ConnectionRefused), false)
         );
     }
 }

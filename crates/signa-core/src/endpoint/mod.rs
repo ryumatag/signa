@@ -272,7 +272,8 @@ pub use self::{
     builder::{Builder, Reception},
     client::{
         CancelError, CancelOutcome, ClientControl, ClientTransaction,
-        ClientTransactionId, PreparedRequest, Responses, Target,
+        ClientTransactionId, ClientTransactionNumber, PreparedRequest,
+        Responses, Target,
     },
     error::{BindError, Error},
     path::{PathSelection, ReceiveInfo, SendPath},
@@ -753,7 +754,7 @@ mod tests {
             builder::Config,
             driver::{Command, Driver, TCP_INBOUND},
             error::Error,
-            observe::{self, Observed, WriteOrigin, WriteResult},
+            observe::{self, Observed, WriteEnd, WriteOrigin},
             routing::{Link, sent_by_is},
         },
         message::{
@@ -6227,18 +6228,24 @@ mod tests {
         assert!(write.datagram().is_none());
         assert!(matches!(origin, WriteOrigin::Response { .. }));
         assert!(started.payload().unwrap().starts_with(b"SIP/2.0 200 OK"));
+        // The connection's writer took it from the queue, then wrote it.
+        let taken = next().await;
+        let Observed::WriteAccepted { write: same } = *taken.observed() else {
+            panic!("a taken write, got {taken:?}");
+        };
+        assert_eq!(same, write);
         let ended = next().await;
-        let Observed::WriteEnded { write: same, result, accepted } =
+        let Observed::WriteEnded { write: same, end, accepted } =
             *ended.observed()
         else {
             panic!("an ended write, got {ended:?}");
         };
         assert_eq!(same, write);
-        assert_eq!((result, accepted), (WriteResult::Written, true));
+        assert_eq!((end, accepted), (WriteEnd::Written, true));
     }
 
-    // A request the endpoint queues on a TCP connection ends once, written,
-    // from the connection's writer task.
+    // A request the endpoint queues on a TCP connection is taken and ends
+    // once, written, from the connection's writer task.
     #[tokio::test]
     async fn an_observer_sees_a_queued_tcp_request_end_once() {
         let (endpoint, _incoming) =
@@ -6260,14 +6267,19 @@ mod tests {
             panic!("a started write, got {started:?}");
         };
         assert_eq!(origin, WriteOrigin::Send);
+        let taken = observer.recv().await.unwrap();
+        let Observed::WriteAccepted { write: same } = *taken.observed() else {
+            panic!("a taken write, got {taken:?}");
+        };
+        assert_eq!(same, write);
         let ended = observer.recv().await.unwrap();
-        let Observed::WriteEnded { write: same, result, accepted } =
+        let Observed::WriteEnded { write: same, end, accepted } =
             *ended.observed()
         else {
             panic!("an ended write, got {ended:?}");
         };
         assert_eq!(same, write);
-        assert_eq!((result, accepted), (WriteResult::Written, true));
+        assert_eq!((end, accepted), (WriteEnd::Written, true));
         assert!(
             timeout(Duration::from_millis(50), observer.recv()).await.is_err()
         );
@@ -6319,13 +6331,13 @@ mod tests {
         assert_eq!(flow.local, "0.0.0.0:0".parse().unwrap());
         assert_eq!(flow.remote, arrived.remote);
         let ended = observer.recv().await.unwrap();
-        let Observed::WriteEnded { write: same, result, accepted } =
+        let Observed::WriteEnded { write: same, end, accepted } =
             *ended.observed()
         else {
             panic!("an ended write, got {ended:?}");
         };
         assert_eq!(same, write);
-        assert!(matches!(result, WriteResult::NotWritten(_)), "{result:?}");
+        assert!(matches!(end, WriteEnd::NotWritten(_)), "{end:?}");
         assert!(!accepted);
         assert!(
             timeout(Duration::from_millis(50), observer.recv()).await.is_err()

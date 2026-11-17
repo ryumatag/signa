@@ -31,8 +31,7 @@ use signa_core::{
         PathSelection, ReceivedResponse, Reception, ServerEvent,
         ServerRequest, ShutdownOutcome, Target, ViaMode,
         observe::{
-            self, Observed, Observer, Record, WriteOrigin, WriteRef,
-            WriteResult,
+            self, Observed, Observer, Record, WriteEnd, WriteOrigin, WriteRef,
         },
         port::{self, DatagramPort, Ingress, RawPath, ReceivedDatagram},
     },
@@ -3876,18 +3875,19 @@ async fn stage(observer: &mut Observer) -> (WriteRef, Observed) {
     let record = record(observer).await;
     let write = match record.observed() {
         Observed::WriteStarted { write, .. }
-        | Observed::WriteAccepted { write }
+        | Observed::WriteAccepted { write, .. }
         | Observed::WriteEnded { write, .. } => *write,
         other => panic!("a write stage, got {other:?}"),
     };
     (write, record.observed().clone())
 }
 
-/// Checks that the next three records are one write that started with
-/// `origin` and `cause`, was taken, and was written, and returns its payload.
+/// Checks that the next three records are one write that started with an
+/// origin `origin` accepts and with `cause`, was taken, and was written, and
+/// returns its payload.
 async fn written(
     observer: &mut Observer,
-    origin: WriteOrigin,
+    origin: impl Fn(&WriteOrigin) -> bool,
     cause: Option<signa_core::transport::ReceiveId>,
 ) -> Bytes {
     let started = record(observer).await;
@@ -3896,17 +3896,18 @@ async fn written(
     else {
         panic!("a started write, got {started:?}");
     };
-    assert_eq!((*seen, *why), (origin, cause));
+    assert!(origin(seen), "{seen:?}");
+    assert_eq!(*why, cause);
     assert!(write.datagram().is_some());
     let (accepted, taken) = stage(observer).await;
     assert_eq!(accepted, *write);
     assert!(matches!(taken, Observed::WriteAccepted { .. }), "{taken:?}");
     let (ended, end) = stage(observer).await;
     assert_eq!(ended, *write);
-    let Observed::WriteEnded { result, accepted, .. } = end else {
+    let Observed::WriteEnded { end, accepted, .. } = end else {
         panic!("an ended write, got {end:?}");
     };
-    assert_eq!((result, accepted), (WriteResult::Written, true));
+    assert_eq!((end, accepted), (WriteEnd::Written, true));
     started.payload().cloned().unwrap_or_default()
 }
 
@@ -3928,7 +3929,7 @@ async fn an_observer_sees_arrivals_and_every_write_they_cause() {
     wire.deliver(arriving(text.clone(), "nic0"));
     let request = request(&mut incoming).await;
     let arrival = record(&mut observer).await;
-    let Observed::Received { id, flow } = arrival.observed() else {
+    let Observed::Received { id, flow, .. } = arrival.observed() else {
         panic!("an arrival, got {arrival:?}");
     };
     assert_eq!(*id, request.received.id());
@@ -3940,7 +3941,13 @@ async fn an_observer_sees_arrivals_and_every_write_they_cause() {
     let transaction = responder.id();
     let trying = written(
         &mut observer,
-        WriteOrigin::Response { transaction, operation: None },
+        |origin| {
+            matches!(
+                origin,
+                WriteOrigin::Response { transaction: t, operation: None, .. }
+                    if *t == transaction
+            )
+        },
         Some(*id),
     )
     .await;
@@ -3956,7 +3963,13 @@ async fn an_observer_sees_arrivals_and_every_write_they_cause() {
     submission.await.unwrap();
     let final_response = written(
         &mut observer,
-        WriteOrigin::Response { transaction, operation },
+        |origin| {
+            matches!(
+                origin,
+                WriteOrigin::Response { transaction: t, operation: o, .. }
+                    if (*t, *o) == (transaction, operation)
+            )
+        },
         None,
     )
     .await;
@@ -3970,7 +3983,13 @@ async fn an_observer_sees_arrivals_and_every_write_they_cause() {
     assert_ne!(again_id, id);
     let resent = written(
         &mut observer,
-        WriteOrigin::ResponseRetransmission { transaction },
+        |origin| {
+            matches!(
+                origin,
+                WriteOrigin::ResponseRetransmission { transaction: t, .. }
+                    if *t == transaction
+            )
+        },
         Some(*again_id),
     )
     .await;
@@ -3999,8 +4018,17 @@ async fn an_observer_names_client_writes_by_their_transaction() {
         .into_parts();
     let transaction = control.number();
 
-    written(&mut observer, WriteOrigin::Request { transaction }, None).await;
-    let retransmission = WriteOrigin::RequestRetransmission { transaction };
+    let request_of = |number| {
+        move |origin: &WriteOrigin| {
+            matches!(origin, WriteOrigin::Request { transaction: t, .. }
+                if *t == number)
+        }
+    };
+    written(&mut observer, request_of(transaction), None).await;
+    let retransmission = |origin: &WriteOrigin| {
+        matches!(origin, WriteOrigin::RequestRetransmission { transaction: t, .. }
+            if *t == transaction)
+    };
     written(&mut observer, retransmission, None).await;
 
     let invite = Request::from_bytes(&wire.sent(1).await[0].payload).unwrap();
@@ -4024,8 +4052,7 @@ async fn an_observer_names_client_writes_by_their_transaction() {
     };
     let (cancel, _) = cancel.into_parts();
     assert_ne!(cancel.number(), transaction);
-    let request = WriteOrigin::Request { transaction: cancel.number() };
-    written(&mut observer, request, None).await;
+    written(&mut observer, request_of(cancel.number()), None).await;
 
     let declined = Response::reply_to(&invite)
         .status(487)
@@ -4040,7 +4067,10 @@ async fn an_observer_names_client_writes_by_their_transaction() {
     };
     let ack = written(
         &mut observer,
-        WriteOrigin::Ack { transaction },
+        |origin| {
+            matches!(origin, WriteOrigin::Ack { transaction: t, .. }
+                if *t == transaction)
+        },
         Some(final_id),
     )
     .await;
@@ -4246,7 +4276,7 @@ async fn write_records_keep_each_stage_and_outcome() {
         stage_seen,
         Observed::WriteEnded {
             accepted: false,
-            result: WriteResult::NotWritten(_),
+            end: WriteEnd::NotWritten(_),
             ..
         }
     ));
@@ -4286,11 +4316,7 @@ async fn write_records_keep_each_stage_and_outcome() {
     let (_, stage_seen) = stage(&mut observer).await;
     assert!(matches!(
         stage_seen,
-        Observed::WriteEnded {
-            accepted: true,
-            result: WriteResult::Unknown(_),
-            ..
-        }
+        Observed::WriteEnded { accepted: true, end: WriteEnd::Unknown(_), .. }
     ));
 }
 
@@ -4319,7 +4345,7 @@ async fn records_copy_their_bytes_and_cut_long_ones() {
     let arrival = record(&mut observer).await;
     let copy = arrival.payload().unwrap();
     assert_eq!(&copy[..], &text.as_bytes()[..16]);
-    assert_eq!(arrival.len(), text.len());
+    assert_eq!(arrival.message_len(), text.len());
     let range = capture.as_ptr_range();
     assert!(!range.contains(&copy.as_ptr()));
     assert!(!range.contains(&arrival.context().unwrap().as_bytes().as_ptr()));
@@ -4339,13 +4365,13 @@ async fn a_stateless_refusal_names_the_arrival_it_answers() {
     wire.deliver(datagram("not SIP\r\n\r\n".to_owned()));
     let garbage = record(&mut observer).await;
     assert!(matches!(garbage.observed(), Observed::Received { .. }));
-    assert_eq!(garbage.len(), 11);
+    assert_eq!(garbage.message_len(), 11);
     wire.deliver(datagram(text));
     let arrival = record(&mut observer).await;
     let Observed::Received { id, .. } = *arrival.observed() else {
         panic!("an arrival, got {arrival:?}");
     };
-    written(&mut observer, WriteOrigin::Stateless, Some(id)).await;
+    written(&mut observer, |o| *o == WriteOrigin::Stateless, Some(id)).await;
     assert_eq!(status(&wire.sent(1).await[0]), 400);
 }
 
@@ -4407,14 +4433,14 @@ async fn a_port_observer_ties_each_backend_write_to_its_endpoint() {
         records_where(&mut on_port, 2, |r| started(r).is_some()).await;
     let physical: Vec<_> =
         physical.iter().map(|r| started(r).unwrap()).collect();
-    let origins: Vec<_> = physical.iter().map(|(_, origin)| *origin).collect();
-    assert_eq!(
-        origins,
-        local
-            .iter()
-            .map(|&write| WriteOrigin::Endpoint { write })
-            .collect::<Vec<_>>()
-    );
+    let origins: Vec<_> = physical
+        .iter()
+        .map(|(_, origin)| match origin {
+            WriteOrigin::Endpoint { write, .. } => *write,
+            other => panic!("an endpoint's write, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(origins, local);
     let (first, second) = (physical[0].0, physical[1].0);
     assert_eq!(first.domain(), second.domain());
     assert!(!local.iter().any(|write| write.domain() == first.domain()));
@@ -4507,9 +4533,7 @@ async fn a_port_observer_sees_late_unknown_and_withdrawn_writes() {
         Endpoint::builder().port(&port).bind().unwrap();
     let mut on_port = port.observe(observe::Config::new()).await.unwrap();
     let end = |record: &Record| match record.observed() {
-        Observed::WriteEnded { result, accepted, .. } => {
-            Some((*result, *accepted))
-        }
+        Observed::WriteEnded { end, accepted, .. } => Some((*end, *accepted)),
         _ => None,
     };
 
@@ -4519,7 +4543,7 @@ async fn a_port_observer_sees_late_unknown_and_withdrawn_writes() {
     wire.finish(unknown());
     assert!(late.await.unwrap().unwrap_err().is_outcome_unknown());
     let ended = records_where(&mut on_port, 1, |r| end(r).is_some()).await;
-    assert!(matches!(end(&ended[0]), Some((WriteResult::Unknown(_), true))));
+    assert!(matches!(end(&ended[0]), Some((WriteEnd::Unknown(_), true))));
 
     wire.writes(Writes::Hold);
     let held = send_options(&endpoint, "held");
@@ -4530,10 +4554,7 @@ async fn a_port_observer_sees_late_unknown_and_withdrawn_writes() {
             .unwrap();
     assert_eq!(stopped, ShutdownOutcome::DeadlineExpired);
     let ended = records_where(&mut on_port, 1, |r| end(r).is_some()).await;
-    assert!(matches!(
-        end(&ended[0]),
-        Some((WriteResult::NotWritten(_), false))
-    ));
+    assert!(matches!(end(&ended[0]), Some((WriteEnd::NotWritten(_), false))));
     wire.writes(Writes::Complete);
     assert!(held.await.unwrap().is_err());
     assert_eq!(wire.count(), 1, "nothing went out after the stop");

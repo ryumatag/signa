@@ -34,7 +34,7 @@ use tokio::sync::oneshot;
 
 use super::{
     driver::{ReceptionCounters, increment},
-    observe::{self, Note, Tap, WriteOrigin, WriteResult},
+    observe::{self, Note, Tap, WriteEnd, WriteOrigin},
     port::{Withdrawal, WritePermit},
     reply::{Completion, ReplyError},
     routing::Link,
@@ -248,7 +248,7 @@ impl Port {
     fn ended(
         &mut self,
         id: WriteId,
-        result: impl Into<WriteResult>,
+        result: impl Into<WriteEnd>,
         accepted: bool,
     ) {
         if let Some(tap) = observe::attached(&mut self.tap) {
@@ -334,13 +334,14 @@ impl Port {
             return Started::Done(outcome);
         }
         if let Err(error) = self.admit(len, limits) {
-            self.ended(id, WriteResult::NotWritten(error.kind()), false);
+            self.ended(id, WriteEnd::NotWritten(error.kind()), false);
             return Started::Busy(error);
         }
 
         self.writes += 1;
         self.bytes += len;
-        let write = DatagramWrite::new(id, bytes, source, destination, path);
+        let write =
+            DatagramWrite::routed(id, bytes, source, destination, path);
         if !self.backlog.is_empty() {
             self.backlog
                 .push_back(Queued { write, outcome: Outcome::Unobserved });

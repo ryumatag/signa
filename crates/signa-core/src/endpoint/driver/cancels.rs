@@ -24,7 +24,10 @@ use super::{
 use crate::{
     endpoint::{
         admission::request_bytes,
-        client::{CancelError, CancelOutcome, Intent, Reserved},
+        client::{
+            CancelError, CancelOutcome, ClientTransactionNumber, Intent,
+            Reserved,
+        },
         datagram::Unwritten,
         error::{Busy, Error},
         observe::WriteOrigin,
@@ -146,7 +149,7 @@ impl Driver {
         // requests leave for transaction output.
         // The CANCEL's transaction is numbered by the table entry it gets
         // below, which nothing between here and there changes.
-        let transaction = self.clients.next_id().number();
+        let transaction = ClientTransactionNumber::of(self.clients.next_id());
         let note = self.note(WriteOrigin::Request { transaction });
         let (udp, tap) = (self.udp.as_mut(), self.tap.as_ref());
         let sent = if self.client_writes.len()
@@ -179,7 +182,7 @@ impl Driver {
         let deadline = entry.deadline();
         debug_assert!(self.clients.find(&key).is_none(), "one CANCEL");
         let id = self.clients.insert(key, entry);
-        debug_assert_eq!(id.number(), transaction);
+        debug_assert_eq!(ClientTransactionNumber::of(id), transaction);
         if let Some(at) = deadline {
             self.timers.push(at, Key::Client(id));
         }
@@ -208,7 +211,7 @@ impl Driver {
         // RFC 3261 section 9.1. The INVITE stops waiting 64 T1 from now.
         self.start_cancel_deadline(invite, &intent, now);
 
-        let transaction = observation.finish(via, flow, None, id.number());
+        let transaction = observation.finish(via, flow, None, transaction);
         if let Some(done) = done {
             let _ = done.send(Ok(CancelOutcome::Sent(transaction)));
         }

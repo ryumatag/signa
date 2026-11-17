@@ -2366,7 +2366,6 @@ mod tests {
             Bytes::from_static(payload.as_bytes()),
             LOCAL,
             PEER,
-            None,
         );
         let mut cx = Context::from_waker(Waker::noop());
         let submitted = registration.io.poll_submit(&mut cx, write);
@@ -2602,7 +2601,6 @@ mod tests {
             Bytes::from_static(b"late"),
             LOCAL,
             PEER,
-            None,
         );
         let registration = endpoint.registration;
         port.commands
@@ -2895,7 +2893,6 @@ mod tests {
                                 Bytes::from_static(b"write"),
                                 LOCAL,
                                 PEER,
-                                None,
                             );
                             let io = &mut writer.registration.io;
                             if let Submit::Accepted =

@@ -66,7 +66,7 @@ use crate::transport::datagram::WritePath;
 /// let selection = PathSelection::new(source, next_hop)
 ///     .sent_by("203.0.113.5:5060".parse().unwrap());
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PathSelection {
     source: SocketAddr,
     destination: SocketAddr,

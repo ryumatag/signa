@@ -66,8 +66,9 @@ use crate::{
         admission::{AdmissionOwner, ClientAdmission, Permit},
         builder::{Config, Reception},
         client::{
-            Admitted, CancelError, CancelHandle, CancelOutcome, Delivery,
-            Intent, Observation, Reserved, Starting, Target,
+            Admitted, CancelError, CancelHandle, CancelOutcome,
+            ClientTransactionNumber, Delivery, Intent, Observation, Reserved,
+            Starting, Target,
         },
         datagram::{Port, Received, Unwritten},
         error::{Busy, Error},
@@ -1522,7 +1523,7 @@ impl Driver {
         request: &Bytes,
     ) -> Option<io::Error> {
         let entry = self.clients.get(id).expect("a live client entry");
-        let transaction = id.number();
+        let transaction = ClientTransactionNumber::of(id);
         let note =
             self.note(WriteOrigin::RequestRetransmission { transaction });
         let (udp, tap) = (self.udp.as_mut(), self.tap.as_ref());
@@ -2289,7 +2290,7 @@ impl Driver {
 
         // The transaction is numbered by the table entry it gets below,
         // which nothing between here and there changes.
-        let transaction = self.clients.next_id().number();
+        let transaction = ClientTransactionNumber::of(self.clients.next_id());
         let note = self.note(WriteOrigin::Request { transaction });
         let tap = self.tap.as_ref();
         let receipt = match send_client(
@@ -2323,7 +2324,7 @@ impl Driver {
         let entry = ClientEntry { tx, link, respond: Some(delivery), permit };
         let deadline = entry.deadline();
         let id = self.clients.insert(key, entry);
-        debug_assert_eq!(id.number(), transaction);
+        debug_assert_eq!(ClientTransactionNumber::of(id), transaction);
         if let Some(receipt) = receipt {
             self.client_writes.push((receipt, id, observation));
         }
@@ -2337,7 +2338,7 @@ impl Driver {
             via,
             flow,
             cancel,
-            id.number(),
+            transaction,
         )));
     }
 

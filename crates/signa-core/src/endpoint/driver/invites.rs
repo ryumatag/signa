@@ -26,6 +26,7 @@ use super::{
 use crate::{
     endpoint::{
         admission::request_bytes,
+        client::ClientTransactionNumber,
         datagram::Unwritten,
         error::Error,
         observe::WriteOrigin,
@@ -198,7 +199,9 @@ impl Driver {
     /// [RFC 3261 section 17.1.1.3]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17.1.1.3
     /// [RFC 3261 section 18.2.2]: https://www.rfc-editor.org/rfc/rfc3261.html#section-18.2.2
     fn send_ack(&mut self, id: Id, link: &Link, ack: Bytes) {
-        let note = self.note(WriteOrigin::Ack { transaction: id.number() });
+        let note = self.note(WriteOrigin::Ack {
+            transaction: ClientTransactionNumber::of(id),
+        });
         let tap = self.tap.as_ref();
         let error = match &link.writer {
             Some(writer) => {

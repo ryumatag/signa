@@ -288,7 +288,10 @@ pub struct ReceivedResponse {
 }
 
 /// Identifies a server transaction within this process.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+///
+/// It orders by when the endpoint made the transaction, among all the
+/// endpoints of the process.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ServerTransactionId(pub(super) u64);
 
 /// Identifies a response submission, including its transaction.

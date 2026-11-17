@@ -73,7 +73,7 @@ impl Default for MessageLimits {
 /// done with, such as at a write's completion or teardown, even when the
 /// caller drops its future. This does not cap shared backing allocations or
 /// buffers owned by the operating system.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Limits {
     /// The most items at once. Zero refuses every item.
     pub count: usize,

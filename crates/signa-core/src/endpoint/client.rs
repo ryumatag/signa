@@ -164,6 +164,27 @@ impl ClientTransaction {
     }
 }
 
+/// The number an endpoint's observation records name a client transaction
+/// by, from [`ClientControl::number`].
+///
+/// It orders by when the transaction's table slot was first used, which is
+/// not the order the transactions started in. Its `Display` is the number.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ClientTransactionNumber(u64);
+
+impl ClientTransactionNumber {
+    /// The number of the client transaction in table entry `id`.
+    pub(super) fn of(id: Id) -> ClientTransactionNumber {
+        ClientTransactionNumber(id.number())
+    }
+}
+
+impl fmt::Display for ClientTransactionNumber {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
 /// Metadata and cancellation for an accepted transaction.
 ///
 /// Dropping it does not stop the machine or send a CANCEL. An INVITE is
@@ -171,7 +192,7 @@ impl ClientTransaction {
 #[derive(Debug)]
 pub struct ClientControl {
     id: ClientTransactionId,
-    number: u64,
+    number: ClientTransactionNumber,
     via: HeaderValue,
     flow: Flow,
     cancel: Option<CancelHandle>,
@@ -191,7 +212,7 @@ impl ClientControl {
     /// endpoints. A number names one transaction at a time, and comes round
     /// again only after billions of transactions have used its table slot.
     /// It is a name, not a handle, and keeps nothing alive.
-    pub fn number(&self) -> u64 {
+    pub fn number(&self) -> ClientTransactionNumber {
         self.number
     }
 
@@ -898,7 +919,7 @@ impl Observing {
         via: HeaderValue,
         flow: Flow,
         cancel: Option<CancelHandle>,
-        number: u64,
+        number: ClientTransactionNumber,
     ) -> ClientTransaction {
         let handle = self
             .responses
@@ -1543,6 +1564,16 @@ mod tests {
         message::response::Response,
         transport::{Stamps, datagram::TransportContext},
     };
+
+    // Observation records name a client transaction by the number its
+    // control gives, which prints as that number.
+    #[test]
+    fn a_client_transaction_number_prints_as_its_number() {
+        let number = ClientTransactionNumber(1 << 32 | 7);
+
+        assert_eq!(number.to_string(), "4294967303");
+        assert!(ClientTransactionNumber(7) < number);
+    }
 
     // These stream tests need an executor but no I/O driver.
     fn run(future: impl Future<Output = ()>) {

@@ -391,7 +391,7 @@ impl Writer {
         self.0.queue.send(write).map_err(
             |mpsc::error::SendError(mut write)| {
                 if let Some(hook) = write.hook.take() {
-                    hook.fire(&Err(refusal(SendError::Closed)), false);
+                    hook.fire(&Err(refusal(SendError::Closed)));
                 }
                 SendError::Closed
             },
@@ -399,25 +399,42 @@ impl Writer {
     }
 }
 
-/// Learns once how a write ended, and whether it was queued first: when the
-/// writer finished it, when the connection dropped it unwritten, or when the
-/// connection refused it. The endpoint hooks writes only while an observer
-/// records them.
+/// Learns when the writer takes its write from the queue, and then once how
+/// the write ended: when the writer finished it, when the connection dropped
+/// it unwritten, or when the connection refused it. The endpoint hooks writes
+/// only while an observer records them.
+// One pointer pair, as `Option<Hook>` is in every queued write.
 pub(crate) struct Hook(Option<HookFn>);
 
-/// What a [`Hook`] calls, with the write's result and whether it was queued.
-type HookFn = Box<dyn FnOnce(&io::Result<()>, bool) + Send>;
+/// What a [`Hook`] calls at each stage of its write.
+type HookFn = Box<dyn FnMut(Stage<'_>) + Send>;
+
+/// A stage of a hooked write.
+pub(crate) enum Stage<'a> {
+    /// The writer took the write from the queue to write it, which happens
+    /// once at most. A write the connection refused, or dropped while still
+    /// queued, never gets here.
+    Taken,
+    /// The write ended.
+    Ended(&'a io::Result<()>),
+}
 
 impl Hook {
-    pub(crate) fn new(
-        hook: impl FnOnce(&io::Result<()>, bool) + Send + 'static,
-    ) -> Hook {
+    pub(crate) fn new(hook: impl FnMut(Stage<'_>) + Send + 'static) -> Hook {
         Hook(Some(Box::new(hook)))
     }
 
-    fn fire(mut self, result: &io::Result<()>, queued: bool) {
-        if let Some(hook) = self.0.take() {
-            hook(result, queued);
+    /// Tells the hook that the writer took its write. The writer takes each
+    /// write from the queue once.
+    fn mark_taken(&mut self) {
+        if let Some(hook) = &mut self.0 {
+            hook(Stage::Taken);
+        }
+    }
+
+    fn fire(mut self, result: &io::Result<()>) {
+        if let Some(mut hook) = self.0.take() {
+            hook(Stage::Ended(result));
         }
     }
 }
@@ -426,12 +443,12 @@ impl Hook {
 /// that was never submitted, learns that the write did not go out.
 impl Drop for Hook {
     fn drop(&mut self) {
-        if let Some(hook) = self.0.take() {
+        if let Some(mut hook) = self.0.take() {
             let error = io::Error::new(
                 io::ErrorKind::Interrupted,
                 "the write was dropped before it was queued",
             );
-            hook(&Err(error), false);
+            hook(Stage::Ended(&Err(error)));
         }
     }
 }
@@ -452,7 +469,7 @@ fn refuse(
     // would drop here and report that write as never queued.
     if let Err(error) = &reserved {
         if let Some(hook) = hook.take() {
-            hook.fire(&Err(refusal(*error)), false);
+            hook.fire(&Err(refusal(*error)));
         }
     }
     reserved
@@ -559,7 +576,7 @@ impl Write {
         self.bytes = Bytes::new();
         drop(self.permit.take());
         if let Some(hook) = self.hook.take() {
-            hook.fire(&result, true);
+            hook.fire(&result);
         }
         if let Some(done) = self.done.take() {
             let _ = done.send(result);
@@ -576,7 +593,7 @@ impl Drop for Write {
                 io::ErrorKind::BrokenPipe,
                 "connection ended before write completion",
             );
-            hook.fire(&Err(error), true);
+            hook.fire(&Err(error));
         }
     }
 }
@@ -979,9 +996,12 @@ async fn write_loop(
     while pending.recv_many(&mut queue.items, WRITE_BATCH).await > 0 {
         let mut close = false;
         queue.remaining = 0;
-        for item in &queue.items {
+        for item in &mut queue.items {
             queue.remaining += item.bytes.len();
             close |= item.close;
+            if let Some(hook) = &mut item.hook {
+                hook.mark_taken();
+            }
         }
         if close {
             pending.close();
@@ -1626,17 +1646,33 @@ mod tests {
             });
     }
 
-    /// What a hook learned: the error kind of each result, `None` when
-    /// written, and whether the write was queued.
-    type Learned = Arc<std::sync::Mutex<Vec<(Option<io::ErrorKind>, bool)>>>;
+    /// What a hook learned: whether the writer took the write, then the
+    /// error kind of its end, `None` when written, and whether it was taken.
+    type Learned = Arc<std::sync::Mutex<Vec<Learnt>>>;
+
+    #[derive(Clone, Debug, PartialEq)]
+    enum Learnt {
+        Taken,
+        Ended(Option<io::ErrorKind>, bool),
+    }
 
     fn hook() -> (Hook, Learned) {
         let learned = Learned::default();
         let hook = Hook::new({
             let learned = learned.clone();
-            move |result: &io::Result<()>, queued| {
-                let kind = result.as_ref().err().map(io::Error::kind);
-                learned.lock().unwrap().push((kind, queued));
+            let mut taken = false;
+            move |stage: Stage<'_>| {
+                let learnt = match stage {
+                    Stage::Taken => {
+                        taken = true;
+                        Learnt::Taken
+                    }
+                    Stage::Ended(result) => Learnt::Ended(
+                        result.as_ref().err().map(io::Error::kind),
+                        taken,
+                    ),
+                };
+                learned.lock().unwrap().push(learnt);
             }
         });
         (hook, learned)
@@ -1669,8 +1705,14 @@ mod tests {
                 write_loop(Vec::new(), pending).await;
                 receipt.await.unwrap();
             });
-        assert_eq!(learned(&was_written), [(None, true)]);
-        assert_eq!(learned(&was_full), [(Some(WouldBlock), false)]);
+        assert_eq!(
+            learned(&was_written),
+            [Learnt::Taken, Learnt::Ended(None, true)]
+        );
+        assert_eq!(
+            learned(&was_full),
+            [Learnt::Ended(Some(WouldBlock), false)]
+        );
 
         let (writer, pending) = test_writer(2, 64);
         let prepared = writer.prepare(Bytes::from_static(b"abc")).unwrap();
@@ -1687,13 +1729,53 @@ mod tests {
             writer.send_hooked(Bytes::new(), Some(closed)),
             Err(SendError::Closed)
         );
-        assert_eq!(learned(&was_queued), [(Some(BrokenPipe), true)]);
-        assert_eq!(learned(&was_late), [(Some(BrokenPipe), false)]);
-        assert_eq!(learned(&was_closed), [(Some(BrokenPipe), false)]);
+        // Queued, but dropped before the writer took it.
+        let dropped = [Learnt::Ended(Some(BrokenPipe), false)];
+        assert_eq!(learned(&was_queued), dropped);
+        assert_eq!(learned(&was_late), dropped);
+        assert_eq!(learned(&was_closed), dropped);
 
         let (unused, was_unused) = hook();
         drop(unused);
-        assert_eq!(learned(&was_unused), [(Some(Interrupted), false)]);
+        assert_eq!(
+            learned(&was_unused),
+            [Learnt::Ended(Some(Interrupted), false)]
+        );
+    }
+
+    // A write is taken when the writer takes it from the queue to write it,
+    // whether or not that write then succeeds. One the writer drains from the
+    // queue after a failure was never offered to the socket.
+    #[test]
+    fn a_hook_learns_whether_the_writer_took_its_write() {
+        let learned = |learned: &Learned| learned.lock().unwrap().clone();
+        let (writer, pending) = test_writer(WRITE_BATCH + 1, usize::MAX);
+        let hooks: Vec<Learned> = (0..=WRITE_BATCH)
+            .map(|_| {
+                let (hook, learned) = hook();
+                writer
+                    .send_hooked(Bytes::from_static(b"abc"), Some(hook))
+                    .unwrap();
+                learned
+            })
+            .collect();
+
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(write_loop(FailsAfter(0), pending));
+
+        let failed = Some(io::Error::from_raw_os_error(5).kind());
+        for taken in &hooks[..WRITE_BATCH] {
+            assert_eq!(
+                learned(taken),
+                [Learnt::Taken, Learnt::Ended(failed, true)]
+            );
+        }
+        assert_eq!(
+            learned(&hooks[WRITE_BATCH]),
+            [Learnt::Ended(failed, false)]
+        );
     }
 
     #[test]

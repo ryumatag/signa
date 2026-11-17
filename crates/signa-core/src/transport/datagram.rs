@@ -358,7 +358,7 @@ impl fmt::Debug for Datagram {
 /// There are at most [`MAX_CONTEXT_LEN`] of them. Copy them out of a large
 /// capture buffer rather than slicing it, since a slice keeps the whole
 /// buffer alive.
-#[derive(Clone, Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, Hash, PartialEq)]
 pub struct TransportContext(Bytes);
 
 impl TransportContext {
@@ -474,8 +474,12 @@ impl From<io::Result<()>> for WriteOutcome {
 pub struct WriteId(u64);
 
 impl WriteId {
-    #[cfg(feature = "tokio")]
-    pub(crate) fn new(n: u64) -> WriteId {
+    /// The ID numbered `n`, for a test of a backend without an endpoint.
+    ///
+    /// The endpoint and the port number their own writes. A port ignores an
+    /// outcome reported for an ID it never gave out, so a made-up one is
+    /// harmless.
+    pub fn new(n: u64) -> WriteId {
         WriteId(n)
     }
 
@@ -495,8 +499,74 @@ pub struct DatagramWrite {
 }
 
 impl DatagramWrite {
+    /// A write of `payload` from `source` to `destination` that goes the
+    /// [default](WritePath::Default) way, for a test of a backend without an
+    /// endpoint. [`DatagramWrite::reply_to`] and
+    /// [`DatagramWrite::on_prepared_path`] give it a context.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bytes::Bytes;
+    /// use signa_core::transport::datagram::{
+    ///     DatagramWrite, TransportContext, WriteId, WritePath,
+    /// };
+    ///
+    /// let context = TransportContext::new(Bytes::from_static(b"vlan-20"))?;
+    /// let write = DatagramWrite::new(
+    ///     WriteId::new(7),
+    ///     Bytes::from_static(b"SIP/2.0 200 OK\r\n\r\n"),
+    ///     "192.0.2.10:5060".parse()?,
+    ///     "198.51.100.7:5060".parse()?,
+    /// )
+    /// .reply_to(context.clone());
+    ///
+    /// assert!(matches!(write.path(), WritePath::Reply(c) if *c == context));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn new(
+        id: WriteId,
+        payload: Bytes,
+        source: SocketAddr,
+        destination: SocketAddr,
+    ) -> DatagramWrite {
+        DatagramWrite { id, payload, source, destination, path: None }
+    }
+
+    /// Makes the write a response to a request that arrived with `context`,
+    /// as [`WritePath::Reply`].
+    pub fn reply_to(mut self, context: TransportContext) -> DatagramWrite {
+        let path = Path { context, prepared: None, _permit: None };
+        self.path = Some(Arc::new(path));
+        self
+    }
+
+    /// Makes the write go along a prepared path with `context`, as
+    /// [`WritePath::Prepared`].
+    ///
+    /// The path belongs to no endpoint or port. Only a backend sees it.
+    pub fn on_prepared_path(
+        mut self,
+        context: TransportContext,
+    ) -> DatagramWrite {
+        let prepared = Prepared {
+            binding: Binding { port: 0, owner: Owner::Port },
+            source: self.source,
+            destination: self.destination,
+            sent_by: self.source,
+        };
+        let path = Path {
+            context,
+            prepared: Some(Box::new(prepared)),
+            _permit: None,
+        };
+        self.path = Some(Arc::new(path));
+        self
+    }
+
+    /// A write the endpoint or a port makes, along `path`.
     #[cfg(feature = "tokio")]
-    pub(crate) fn new(
+    pub(crate) fn routed(
         id: WriteId,
         payload: Bytes,
         source: SocketAddr,
@@ -707,5 +777,41 @@ impl Error for RecvError {
 impl From<io::Error> for RecvError {
     fn from(error: io::Error) -> RecvError {
         RecvError::Io(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write() -> DatagramWrite {
+        DatagramWrite::new(
+            WriteId::new(3),
+            Bytes::from_static(b"OPTIONS"),
+            "192.0.2.10:5060".parse().unwrap(),
+            "198.51.100.7:5060".parse().unwrap(),
+        )
+    }
+
+    // A backend's tests make the writes an endpoint would, on each path.
+    #[test]
+    fn a_made_write_goes_each_way_a_backend_sees() {
+        let context =
+            TransportContext::new(Bytes::from_static(b"nic1")).unwrap();
+
+        let plain = write();
+        let reply = write().reply_to(context.clone());
+        let prepared = write().on_prepared_path(context.clone());
+
+        assert_eq!(plain.id(), WriteId::new(3));
+        assert_eq!(plain.payload().as_ref(), b"OPTIONS");
+        assert!(matches!(plain.path(), WritePath::Default));
+        assert!(matches!(reply.path(), WritePath::Reply(c) if *c == context));
+        assert!(matches!(
+            prepared.path(),
+            WritePath::Prepared(c) if *c == context
+        ));
+        assert_eq!(prepared.source(), plain.source());
+        assert_eq!(prepared.destination(), plain.destination());
     }
 }
