@@ -1,5 +1,5 @@
 /*!
-Where a stateful endpoint sends its responses, through the public API only.
+Where a stateful endpoint sends its responses.
 
 A response goes back on the connection or local address its request came in
 on ([RFC 3261 section 18.2.2]), which the endpoint keeps in an opaque reply
@@ -12,15 +12,15 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use signa_core::{
-    Request, Response,
-    endpoint::{Endpoint, Incoming, IncomingEvent, ServerRequest},
-    message::header::Tag,
+    Request, Response, endpoint::Endpoint, message::header::Tag,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
     time::timeout,
 };
+
+use crate::support::request;
 
 fn options(via: &str, call: &str) -> String {
     format!(
@@ -33,14 +33,6 @@ fn options(via: &str, call: &str) -> String {
          CSeq: 1 OPTIONS\r\n\
          Content-Length: 0\r\n\r\n"
     )
-}
-
-async fn request(incoming: &mut Incoming) -> ServerRequest {
-    let event = timeout(Duration::from_secs(2), incoming.recv()).await;
-    match event.unwrap().unwrap() {
-        IncomingEvent::Request(request) => request,
-        other => panic!("expected a request, got {other:?}"),
-    }
 }
 
 fn ok(request: &Request<Bytes>, body: Bytes) -> Response<Bytes> {

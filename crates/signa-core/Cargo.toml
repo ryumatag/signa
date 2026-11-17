@@ -10,6 +10,9 @@ The SIP messages, transports and transactions of signa, down to the last retrans
 '''
 keywords = ["sip", "rfc3261", "voip", "telephony"]
 categories = ["network-programming"]
+# The integration tests are one binary of modules, `tests/lib.rs`, so a new
+# file under `tests/` runs only once a module declares it.
+autotests = false
 authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -68,17 +71,10 @@ tokio = { version = "1.54", features = [
 ] }
 tower = { version = "0.5.3", features = ["limit", "timeout", "util"] }
 
-# An external Tower adapter and bounded dispatcher on the public API.
+# The endpoint through its public API: reply routing over loopback, an endpoint
+# and shared ports on an in-memory UDP backend, and an external Tower adapter
+# with a bounded dispatcher. One binary links once and shares its fixtures.
 [[test]]
-name = "tower_fixture"
-required-features = ["tokio"]
-
-# Reply routing through the public API.
-[[test]]
-name = "reply_routing"
-required-features = ["tokio"]
-
-# An endpoint on an in-memory UDP backend, through the public API.
-[[test]]
-name = "external_datagram"
+name = "integration"
+path = "tests/lib.rs"
 required-features = ["tokio"]

@@ -257,9 +257,9 @@ plays the application:
 * [`examples/ua-shutdown`](examples/ua-shutdown): a UA that shuts down with
   a call up and one ringing, and ends both.
 
-signa-core's [`tests/tower_fixture.rs`](crates/signa-core/tests/tower_fixture.rs)
-builds a Tower adapter and a bounded dispatcher outside signa, against its
-public API only. signa has no Tower dependency.
+signa-core's [`tests/tower/`](crates/signa-core/tests/tower) builds a Tower
+adapter and a bounded dispatcher outside signa, against its public API only.
+signa has no Tower dependency.
 
 ### Supported RFC scope
 
