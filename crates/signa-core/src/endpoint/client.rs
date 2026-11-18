@@ -281,7 +281,9 @@ impl ClientControl {
     /// * [`CancelError::AlreadyRequested`] for every call after the first.
     /// * [`CancelError::Busy`] or [`CancelError::Transport`] when a new TCP
     ///   connection to the next hop was needed and could not be admitted or
-    ///   opened. Nothing was sent.
+    ///   opened. Nothing was sent. The intent is spent all the same, so the
+    ///   64 T1 deadline starts from the failure, since nothing else would
+    ///   end an INVITE that got a provisional response.
     /// * [`CancelError::Closed`] once the endpoint has stopped.
     ///
     /// # Example

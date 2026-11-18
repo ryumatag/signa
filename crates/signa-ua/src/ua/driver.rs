@@ -2170,9 +2170,8 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
     /// Nothing comes of the outcome. The re-INVITE's operation failed when
     /// its session ended, and its responses, a 487 or a 2xx that won the
     /// race, are read as before. A CANCEL the endpoint could not start, for
-    /// want of a connection to the next hop, leaves the re-INVITE to its
-    /// final response. The endpoint then sets it no deadline and takes no
-    /// second request to cancel it, so it may wait for good.
+    /// want of a connection to the next hop, still has the endpoint stop
+    /// waiting for the re-INVITE's final 64 T1 later.
     fn cancel_reinvite(&mut self, exchange: ExchangeKey) {
         // A final response came before the effect ran, so the CANCEL is not
         // needed.

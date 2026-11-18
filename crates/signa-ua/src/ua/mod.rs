@@ -889,7 +889,9 @@ impl UaHandle {
     /// * with [`Error::StaleDecision`] once the attempt has ended,
     /// * with [`Error::CoreSubmissionRejected`] or
     ///   [`Error::TransportFailure`] when the endpoint needed a new
-    ///   connection to the next hop and could not admit or open one, and
+    ///   connection to the next hop and could not admit or open one. The
+    ///   endpoint still stops waiting for the INVITE's final 64 T1 later,
+    ///   and the attempt then fails with [`Error::Timeout`], and
     /// * with [`Error::DriverStopped`] when the endpoint stops first.
     ///
     /// # Errors

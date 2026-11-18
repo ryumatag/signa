@@ -211,6 +211,30 @@ impl Driver {
         }
     }
 
+    /// Reports a CANCEL that could not start, for want of a connection to
+    /// the next hop, and starts its INVITE's cancellation deadline all the
+    /// same.
+    ///
+    /// RFC 3261 section 9.1 counts the 64 T1 from the CANCEL, and has
+    /// nothing for one that never went. The intent is spent, though, so the
+    /// TU cannot ask again, and an INVITE in Proceeding has no timer of its
+    /// own (section 17.1.1.2). Without the deadline, a peer that never sends
+    /// a final would keep the INVITE until the endpoint stops. So the
+    /// endpoint stops waiting 64 T1 after the failure, which is my policy.
+    /// A final that comes first still counts, a 2xx included, which the TU
+    /// has to acknowledge.
+    pub(super) fn cancel_not_started(
+        &mut self,
+        start: CancelStart,
+        error: CancelError,
+    ) {
+        let CancelStart { invite, intent, done, .. } = start;
+        if let Some(done) = done {
+            let _ = done.send(Err(error));
+        }
+        self.start_cancel_deadline(invite, &intent, now());
+    }
+
     fn start_cancel_deadline(
         &mut self,
         id: Id,

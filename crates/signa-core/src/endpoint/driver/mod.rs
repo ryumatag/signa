@@ -495,7 +495,8 @@ impl Pending {
 struct CancelStart {
     /// The CANCEL, with the INVITE's top Via as its only Via.
     request: Request<Bytes>,
-    /// The INVITE, whose cancellation deadline starts with the CANCEL.
+    /// The INVITE, whose cancellation deadline starts with the CANCEL, or
+    /// with the failure to start it.
     invite: Id,
     intent: Arc<Intent>,
     reserved: Reserved,
@@ -1838,9 +1839,7 @@ impl Driver {
                 completion.finish(Err(ReplyError::Busy));
             }
             Pending::Cancel(start) => {
-                if let Some(done) = start.done {
-                    let _ = done.send(Err(CancelError::Busy));
-                }
+                self.cancel_not_started(start, CancelError::Busy);
             }
         }
     }
@@ -2414,14 +2413,12 @@ impl Driver {
                             ));
                         }
                         Pending::Cancel(start) => {
-                            if let Some(done) = start.done {
-                                let _ = done.send(Err(
-                                    CancelError::Transport(io::Error::new(
-                                        source.kind(),
-                                        Arc::clone(&source),
-                                    )),
+                            let error =
+                                CancelError::Transport(io::Error::new(
+                                    source.kind(),
+                                    Arc::clone(&source),
                                 ));
-                            }
+                            self.cancel_not_started(start, error);
                         }
                         Pending::OneShotRequest(_, _, completion) => {
                             completion.finish(Err(ReplyError::Transport(

@@ -4648,6 +4648,44 @@ mod tests {
         assert_eq!(into_request(second.next().await).method(), Method::ACK);
     }
 
+    // A CANCEL that cannot reach the target, whose INVITE connection has
+    // closed and whose listener is gone, reports the failure. Its INVITE
+    // still stops waiting 64 T1 later, since its intent is spent and nothing
+    // else would end it after the 180.
+    #[tokio::test]
+    async fn a_tcp_cancel_that_cannot_connect_still_ends_its_invite() {
+        let timers = short_timers();
+        let (endpoint, _incoming) = invite_endpoint(timers);
+        let far = Far::new().await;
+        let target = far.target(Transport::Tcp);
+        let (control, mut responses) = endpoint
+            .start(invite(), target.clone())
+            .await
+            .unwrap()
+            .into_parts();
+        let (connection, _) = far.tcp.accept().await.unwrap();
+        let mut first = Stream::new(connection);
+        let sent = into_request(first.next().await);
+        first.send(&reply(&sent, 180, "a")).await;
+        assert_eq!(next(&mut responses).await.status().as_u16(), 180);
+        drop((first, far));
+        sleep(Duration::from_millis(50)).await;
+
+        let refused = control.cancel().await;
+        let error = timeout(timers.t1() * 64 * 4, responses.next())
+            .await
+            .expect("the INVITE ends")
+            .unwrap()
+            .unwrap_err();
+
+        assert!(matches!(refused, Err(CancelError::Transport(_))));
+        assert!(error.is_cancel_timeout(), "{error}");
+        assert!(matches!(
+            control.cancel().await,
+            Err(CancelError::AlreadyRequested)
+        ));
+    }
+
     // Without a listener, no response can reach a TCP INVITE once its
     // connection closes, so it fails at once, as any client transaction does.
     #[tokio::test]
