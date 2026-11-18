@@ -475,6 +475,12 @@ pub(crate) struct SentReinvite {
     pub(crate) reserved: bool,
     /// Whether the core dropped responses to it for want of room.
     pub(crate) incomplete: bool,
+    /// Whether the core took it, so that its transaction can be cancelled.
+    pub(crate) started: bool,
+    /// Whether its session ended while it had no final response, which
+    /// asks for its CANCEL. One the core has not taken yet gets it once the
+    /// core has it.
+    pub(crate) cancel: bool,
     /// The dialog, once its usage ended and no table keeps it, so that a 2xx
     /// that comes late can still be acknowledged (RFC 5407 section 3.2.3).
     pub(crate) kept: Option<Box<Dialog>>,

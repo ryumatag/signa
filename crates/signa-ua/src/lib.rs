@@ -83,7 +83,8 @@ This is an early stage of the crate, and much of a UA core is missing:
   the application. OPTIONS gets a 200 with the methods, body type and coding
   the UA takes, BYE gets a 481, and other methods get a 405 or a 501. There is no UPDATE (RFC 3311), REFER
   (RFC 3515) or other usage of a dialog, and no session timer (RFC 4028).
-* A re-INVITE of the UA's own cannot be cancelled. A session description in
+* The application cannot cancel a re-INVITE of the UA's own. The UA cancels
+  one only when its session ends first. A session description in
   a provisional response to one is not kept, and its 2xx has to carry the
   answer. A re-INVITE asked for while the last 2xx of the session waits for
   its ACK is refused rather than held until then. A re-INVITE that gets a 491

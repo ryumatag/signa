@@ -11,18 +11,20 @@ use std::{
 use signa_core::StatusCode;
 use signa_ua::{
     EndReason, Error, Event, InvitePlan, ReinvitePlan, ShutdownMode,
-    ShutdownOutcome, Ua,
+    ShutdownOutcome, Ua, UaHandle,
 };
 use tokio::{sync::Notify, time::timeout};
 
 use crate::{
     shutdown::{two_ua_call, ua_timed},
     support::{
-        LOADED, WAIT, brisk, brisk_with, call_from, config,
+        LOADED, WAIT, brisk, brisk_with, call_from, called_by, config,
         events::{event, invite, report_within},
+        fast,
         flood::{FLOODING, flood},
-        message::{answer, plan_to, reply_with, sdp},
-        peer::Peer,
+        message::{answer, ok_to, plan_to, reply_with, sdp},
+        peer::{Peer, Raw},
+        start_fast,
     },
 };
 
@@ -263,41 +265,80 @@ async fn terminate_needs_no_operation_of_the_application() {
     assert_eq!(report.failed_byes, 0);
 }
 
-/// The UA does not cancel a re-INVITE of its own, so one the peer answers
-/// only with a 180 goes on after a termination ended its session, and holds
-/// the shutdown until its deadline. The report counts it.
-#[tokio::test]
-async fn an_unanswered_reinvite_holds_a_termination_until_its_deadline() {
-    let (ua, _, _, _) = brisk_with(config());
-    let Ua { handle, mut events, driver } = ua;
-    tokio::spawn(driver);
-    let peer = Peer::new().await;
-    let to = peer.address().to_string();
-    let contact = format!("sip:peer@{to}");
-    handle.try_invite(plan_to(&to, "pending")).unwrap().await.unwrap();
-    let (request, from) = peer.recv_starting("INVITE").await;
-    peer.send(&answer(&request, "200", "callee", &contact), from).await;
-    peer.recv_starting("ACK").await;
-    let session = event(&mut events, |event| match event {
-        Event::Confirmed { session, .. } => Some(session),
-        _ => None,
-    })
-    .await;
+/// A UA called over TCP by a raw peer, whose own re-INVITE the peer
+/// answers with a 180 only, with the peer and the re-INVITE.
+///
+/// The UA is the callee, so that no INVITE of its own besides the
+/// re-INVITE is left in a report. Over TCP, Timer D and Timer K are zero
+/// (RFC 3261 sections 17.1.1.2 and 17.1.2.2), so the transactions end as
+/// soon as their peer is done. Over UDP, the 32 seconds of Timer D after a
+/// 487 would hold the drain longer than a test waits.
+async fn ringing_reinvite() -> (UaHandle, Raw, String) {
+    let (mut ua, udp, tcp) = start_fast();
+    tokio::spawn(ua.driver);
+    let mut peer = Raw::start("TCP", udp, tcp).await;
+    let contact = format!("sip:peer@{}", peer.address());
+    let (_, session) = called_by(&mut peer, &mut ua.events, "pending").await;
     let _reinviting =
-        handle.try_reinvite(&session, ReinvitePlan::new(sdp())).unwrap();
-    let (reinvite, from) = peer.recv_starting("INVITE").await;
-    peer.send(&answer(&reinvite, "180", "callee", &contact), from).await;
+        ua.handle.try_reinvite(&session, ReinvitePlan::new(sdp())).unwrap();
+    let reinvite = peer.recv_starting("INVITE").await;
+    peer.send(&answer(&reinvite, "180", "unused", &contact)).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
+    (ua.handle, peer, reinvite)
+}
 
-    let started = Instant::now();
-    let shutdown =
-        handle.shutdown(ShutdownMode::Terminate, Duration::from_secs(2));
-    let (bye, bye_from) = peer.recv_starting("BYE").await;
-    peer.send(&reply_with(&bye, 200, "callee"), bye_from).await;
-    let report = report_within(shutdown, Duration::from_secs(4)).await;
+/// A termination cancels a re-INVITE of the UA's that only rang, besides
+/// sending the BYE of its session. The peer answers both, and the
+/// re-INVITE with a 487, so the UA drains well before its deadline.
+#[tokio::test]
+async fn a_termination_cancels_a_ringing_reinvite_and_drains() {
+    let (handle, mut peer, reinvite) = ringing_reinvite().await;
+    let contact = format!("sip:peer@{}", peer.address());
 
-    assert!(started.elapsed() >= Duration::from_secs(2));
-    assert_eq!(report.outcome, ShutdownOutcome::DeadlineExpired);
+    let deadline = Duration::from_secs(10);
+    let shutdown = handle.shutdown(ShutdownMode::Terminate, deadline);
+    let bye = peer.recv_starting("BYE").await;
+    let cancel = peer.recv_starting("CANCEL").await;
+    peer.send(&ok_to(&bye)).await;
+    peer.send(&ok_to(&cancel)).await;
+    peer.send(&answer(&reinvite, "487", "unused", &contact)).await;
+    let report = report_within(shutdown, Duration::from_secs(5)).await;
+
+    assert_eq!(report.outcome, ShutdownOutcome::Drained);
     assert_eq!((report.terminated, report.sessions_left), (1, 0));
-    assert_eq!(report.invites_left, 1);
+    assert_eq!(report.invites_left, 0);
+}
+
+/// A peer that answers the BYE but never the CANCEL of the re-INVITE leaves
+/// the re-INVITE to the core, which gives up on it 64 T1 after the CANCEL
+/// (RFC 3261 section 9.1). A deadline before that still expires, and the
+/// report counts the re-INVITE among the INVITEs left. With a later one,
+/// the UA drains once the core gave up.
+#[tokio::test]
+async fn an_unanswered_cancel_holds_a_termination_for_64_t1() {
+    let t1 = fast().t1();
+    // One deadline comes before the endpoint gives up, the other after.
+    assert!(Duration::from_millis(500) < t1 * 64);
+    assert!(t1 * 64 < Duration::from_secs(10));
+    for deadline in [Duration::from_millis(500), Duration::from_secs(10)] {
+        let (handle, mut peer, _) = ringing_reinvite().await;
+
+        let started = Instant::now();
+        let shutdown = handle.shutdown(ShutdownMode::Terminate, deadline);
+        let bye = peer.recv_starting("BYE").await;
+        peer.send(&ok_to(&bye)).await;
+        peer.recv_starting("CANCEL").await;
+        let report = report_within(shutdown, Duration::from_secs(5)).await;
+
+        assert_eq!((report.terminated, report.sessions_left), (1, 0));
+        if deadline < t1 * 64 {
+            assert!(started.elapsed() >= deadline);
+            assert_eq!(report.outcome, ShutdownOutcome::DeadlineExpired);
+            assert_eq!(report.invites_left, 1);
+        } else {
+            assert!(started.elapsed() >= t1 * 64);
+            assert_eq!(report.outcome, ShutdownOutcome::Drained);
+            assert_eq!(report.invites_left, 0);
+        }
+    }
 }

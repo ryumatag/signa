@@ -246,6 +246,10 @@ pub(super) struct Driver<R, N> {
     /// handle the application drops can end it. A watcher shares it while
     /// it waits for the CANCEL.
     clients: HashMap<AttemptKey, Arc<ClientControl>>,
+    /// The control of each re-INVITE's client transaction until its first
+    /// final response, for the CANCEL it gets if its session ends first.
+    /// The watcher that asks for the CANCEL takes it.
+    reinvites: HashMap<ExchangeKey, ClientControl>,
     /// Waits on the core for a CANCEL to go and for the response to a BYE.
     watchers: JoinSet<Done>,
     /// The ACK of each 2xx, from when it is first built until its replay
@@ -650,6 +654,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             max_description: config.description_bytes,
             server_ids: HashMap::new(),
             clients: HashMap::new(),
+            reinvites: HashMap::new(),
             watchers: JoinSet::new(),
             acks: HashMap::new(),
             waiters: HashMap::new(),
@@ -865,6 +870,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             && self.server_ids.is_empty()
             && self.acks.is_empty()
             && self.clients.is_empty()
+            && self.reinvites.is_empty()
             && self.endings.is_empty()
             && self.waiters.is_empty()
             && self.fallbacks.is_empty()
@@ -968,6 +974,9 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         }
         for &attempt in self.clients.keys().chain(self.endings.keys()) {
             assert!(self.model.holds_attempt(attempt), "{attempt:?}");
+        }
+        for &exchange in self.reinvites.keys() {
+            assert!(self.model.holds_exchange(exchange), "{exchange:?}");
         }
         assert_eq!(self.waiters.len(), self.model.operation_count());
         let tasks = self.jobs.len()
@@ -1469,9 +1478,8 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             }
             Done::Reinvited { exchange, result } => match result {
                 Ok(transaction) => {
-                    // The UA does not cancel its re-INVITEs, so the control
-                    // goes. Dropping it ends nothing in the endpoint.
-                    let (_control, responses) = transaction.into_parts();
+                    let (control, responses) = transaction.into_parts();
+                    self.reinvites.insert(exchange, control);
                     self.read(Client::Reinvite(exchange), responses);
                     self.model.reinvite_started(exchange, Ok(()), now());
                 }
@@ -1565,6 +1573,11 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             // the application learns where and when the response arrived.
             // The model keeps its own processing time apart from it.
             Some(Ok(ReceivedResponse { response, .. })) => {
+                // A CANCEL does nothing after a final response (RFC 3261
+                // section 9.1), and the core would send none.
+                if response.status().is_final() {
+                    self.reinvites.remove(&exchange);
+                }
                 let description = Body::description(
                     response.headers(),
                     response.body(),
@@ -1581,10 +1594,14 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
                 self.model.reinvite_responses_lost(exchange);
             }
             Some(Err(error)) => {
+                self.reinvites.remove(&exchange);
                 let error = transaction_error(&error);
                 self.model.reinvite_transaction_failed(exchange, error, now());
             }
-            None => self.model.reinvite_collection_finished(exchange, now()),
+            None => {
+                self.reinvites.remove(&exchange);
+                self.model.reinvite_collection_finished(exchange, now());
+            }
         }
         self.settle(None);
     }
@@ -1697,6 +1714,9 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             Effect::SendSessionBye { usage } => self.send_session_bye(usage),
             Effect::CancelInvite { attempt, operation } => {
                 self.cancel_invite(attempt, operation);
+            }
+            Effect::CancelReinvite { exchange } => {
+                self.cancel_reinvite(exchange);
             }
             Effect::Notify(event) => self.notify(event, attempt),
             Effect::OperationEnded { operation } => self.deliver(operation),
@@ -2142,6 +2162,31 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             Done::Cancelled { operation, result }
         });
         self.fallbacks.insert(handle.id(), fallback);
+    }
+
+    /// Asks the endpoint to cancel a re-INVITE whose session ended, as
+    /// [`Driver::cancel_invite`] does for an attempt.
+    ///
+    /// Nothing comes of the outcome. The re-INVITE's operation failed when
+    /// its session ended, and its responses, a 487 or a 2xx that won the
+    /// race, are read as before. A CANCEL the endpoint could not start, for
+    /// want of a connection to the next hop, leaves the re-INVITE to its
+    /// final response. The endpoint then sets it no deadline and takes no
+    /// second request to cancel it, so it may wait for good.
+    fn cancel_reinvite(&mut self, exchange: ExchangeKey) {
+        // A final response came before the effect ran, so the CANCEL is not
+        // needed.
+        let Some(control) = self.reinvites.remove(&exchange) else {
+            return;
+        };
+
+        let handle = self.watchers.spawn(async move {
+            // The CANCEL's own transaction is left to the endpoint, as for
+            // an attempt.
+            let _ = control.cancel().await;
+            Done::Nothing
+        });
+        self.fallbacks.insert(handle.id(), Done::Nothing);
     }
 
     /// Makes a fresh branch, with the magic cookie and 64 random bits.

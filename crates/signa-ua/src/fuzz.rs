@@ -382,6 +382,7 @@ impl Fuzzed {
             }
             Effect::Resend2xx { .. }
             | Effect::ResendAck { .. }
+            | Effect::CancelReinvite { .. }
             | Effect::AttemptEnded { .. }
             | Effect::Notify(_)
             | Effect::Released(_) => {}

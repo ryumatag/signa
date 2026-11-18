@@ -10,12 +10,11 @@ use std::{net::SocketAddr, sync::atomic::Ordering, time::Duration};
 
 use signa_core::StatusCode;
 use signa_ua::{
-    Error, Event, InvitePlan, NegotiationState, ReinvitePlan, Session,
-    SessionPhase, Ua, UaEvents,
+    Error, Event, InvitePlan, NegotiationState, ReinvitePlan, SessionPhase, Ua,
 };
 
 use crate::support::{
-    WAIT, call_from, config,
+    WAIT, call_from, called_by, config,
     events::{event, events_for, invite, reinvite},
     message::{
         ack_answering, ack_for, answer, body, branch, described,
@@ -329,30 +328,12 @@ async fn a_reinvite_without_an_offer_answers_in_the_ack() {
     assert_eq!(refused.unwrap_err().error(), Error::InvalidInput);
 }
 
-/// Sets up a call from the raw `peer` to the UA, accepted and acknowledged,
-/// and returns the UA's 2xx and the session.
-async fn called_by(
-    peer: &mut Raw,
-    events: &mut UaEvents,
-    call: &str,
-) -> (String, Session) {
-    let me = peer.address();
-    peer.send(&direct_invite(me, call)).await;
-    let accepted = invite(events).await.try_accept(sdp()).unwrap();
-    let ok = peer.recv_answer("SIP/2.0 200", "1 INVITE").await;
-    peer.send(&ack_for(&ok, me, call, 1)).await;
-    // The UA sends no re-INVITE of its own before the ACK is in (RFC 3261
-    // section 14.1), so a test waits for it, and drops a copy of the 2xx
-    // that was on its way.
-    peer.drain(Duration::from_millis(60)).await;
-    (ok, accepted.await.unwrap())
-}
-
 /// The UA hangs up right after it sent a re-INVITE, and the 2xx to the
 /// re-INVITE crosses the BYE (RFC 5407 section 3.2.3). The 2xx still gets
 /// its ACK, a new transaction with the re-INVITE's CSeq number, and the
 /// re-INVITE fails with `SessionEnded`, since the session ended at the BYE.
-/// Over UDP and TCP.
+/// No provisional response came, so the re-INVITE gets no CANCEL (RFC 3261
+/// section 9.1). Over UDP and TCP.
 #[tokio::test]
 async fn a_2xx_that_crosses_the_bye_still_gets_its_ack() {
     for transport in ["UDP", "TCP"] {
@@ -379,6 +360,103 @@ async fn a_2xx_that_crosses_the_bye_still_gets_its_ack() {
         assert_eq!(reinviting.await, Err(Error::SessionEnded), "{transport}");
         assert_eq!(ending.await, Ok(()), "{transport}");
         // Over UDP the BYE went again until its 200.
+        let another_bye_or_cancel = |message: &str| {
+            message.starts_with("BYE") && branch(message) != branch(&bye)
+                || message.starts_with("CANCEL")
+        };
+        peer.quiet_where(another_bye_or_cancel, Duration::from_millis(200))
+            .await;
+        driver.abort();
+    }
+}
+
+/// The UA hangs up while its re-INVITE rings, and the re-INVITE gets a
+/// CANCEL besides the BYE, since nothing wants it any more (RFC 3261
+/// section 9.1). The CANCEL copies the re-INVITE's Request-URI, branch,
+/// Call-ID and CSeq number. The peer's 487 ends the re-INVITE, and gets
+/// its ACK in the same transaction (section 17.1.1.3). The re-INVITE fails
+/// with `SessionEnded`. Over UDP and TCP.
+#[tokio::test]
+async fn an_ended_session_cancels_its_ringing_reinvite() {
+    for transport in ["UDP", "TCP"] {
+        let (mut ua, udp, tcp) = start_fast();
+        let driver = tokio::spawn(ua.driver);
+        let mut peer = Raw::start(transport, udp, tcp).await;
+        let contact = format!("sip:peer@{}", peer.address());
+        let (_, session) = called_by(&mut peer, &mut ua.events, "ring").await;
+        let plan = ReinvitePlan::new(described(&offer_named("ring")));
+        let reinviting = ua.handle.try_reinvite(&session, plan).unwrap();
+        let request = peer.recv_starting("INVITE").await;
+        peer.send(&answer(&request, "180", "unused", &contact)).await;
+
+        let ending = ua.handle.try_terminate(&session).unwrap();
+        let bye = peer.recv_starting("BYE").await;
+        let cancel = peer.recv_starting("CANCEL").await;
+        peer.send(&ok_to(&bye)).await;
+        peer.send(&ok_to(&cancel)).await;
+        peer.send(&answer(&request, "487", "unused", &contact)).await;
+        let ack = peer.recv_starting("ACK").await;
+
+        let line = |message: &str| {
+            message
+                .lines()
+                .next()
+                .unwrap()
+                .split(' ')
+                .nth(1)
+                .map(str::to_owned)
+        };
+        let number = |message: &str| {
+            header(message, "CSeq")[0].split(' ').next().unwrap().to_owned()
+        };
+        assert_eq!(line(&cancel), line(&request), "{transport}");
+        assert_eq!(branch(&cancel), branch(&request), "{transport}");
+        assert_eq!(
+            header(&cancel, "Call-ID"),
+            header(&request, "Call-ID"),
+            "{transport}"
+        );
+        assert_eq!(number(&cancel), number(&request), "{transport}");
+        assert_eq!(branch(&ack), branch(&request), "{transport}");
+        assert_eq!(reinviting.await, Err(Error::SessionEnded), "{transport}");
+        assert_eq!(ending.await, Ok(()), "{transport}");
+        driver.abort();
+    }
+}
+
+/// The UA hangs up while its re-INVITE rings, and the peer's 2xx to the
+/// re-INVITE crosses the CANCEL (RFC 5407 section 3.1.2 for the INVITE).
+/// The 2xx still gets its ACK, with the re-INVITE's CSeq number, and the
+/// session, which the BYE ended, gets no second BYE. What the peer
+/// answers to the CANCEL changes nothing. Over UDP and TCP.
+#[tokio::test]
+async fn a_2xx_that_crosses_the_cancel_of_a_reinvite_gets_its_ack() {
+    for transport in ["UDP", "TCP"] {
+        let (mut ua, udp, tcp) = start_fast();
+        let driver = tokio::spawn(ua.driver);
+        let mut peer = Raw::start(transport, udp, tcp).await;
+        let contact = format!("sip:peer@{}", peer.address());
+        let (_, session) = called_by(&mut peer, &mut ua.events, "race").await;
+        let plan = ReinvitePlan::new(described(&offer_named("race")));
+        let reinviting = ua.handle.try_reinvite(&session, plan).unwrap();
+        let request = peer.recv_starting("INVITE").await;
+        peer.send(&answer(&request, "180", "unused", &contact)).await;
+
+        let ending = ua.handle.try_terminate(&session).unwrap();
+        let bye = peer.recv_starting("BYE").await;
+        let cancel = peer.recv_starting("CANCEL").await;
+        peer.send(&answer(&request, "200", "unused", &contact)).await;
+        peer.send(&reply_with(&cancel, 481, "unused")).await;
+        let ack = peer.recv_starting("ACK").await;
+        peer.send(&ok_to(&bye)).await;
+
+        let number = |message: &str| {
+            header(message, "CSeq")[0].split(' ').next().unwrap().to_owned()
+        };
+        assert_eq!(number(&ack), number(&request), "{transport}");
+        assert_ne!(branch(&ack), branch(&request), "{transport}");
+        assert_eq!(reinviting.await, Err(Error::SessionEnded), "{transport}");
+        assert_eq!(ending.await, Ok(()), "{transport}");
         let another_bye = |message: &str| {
             message.starts_with("BYE") && branch(message) != branch(&bye)
         };

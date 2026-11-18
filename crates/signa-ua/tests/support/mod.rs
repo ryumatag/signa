@@ -20,7 +20,7 @@ use signa_ua::{Config, Negotiate, Resolve, Session, Ua, UaEvents, attach};
 use crate::support::{
     events::invite,
     message::{ack_for, direct_invite, sdp},
-    peer::Peer,
+    peer::{Peer, Raw},
     stand_in::Sdp,
 };
 
@@ -181,4 +181,23 @@ pub(crate) async fn call_from(
     // section 14.1), and the 2xx stops once it is.
     peer.drain(Duration::from_millis(60)).await;
     (ok, session.unwrap())
+}
+
+/// Sets up a call from the raw `peer` to the UA, accepted and acknowledged,
+/// and returns the UA's 2xx and the session.
+pub(crate) async fn called_by(
+    peer: &mut Raw,
+    events: &mut UaEvents,
+    call: &str,
+) -> (String, Session) {
+    let me = peer.address();
+    peer.send(&direct_invite(me, call)).await;
+    let accepted = invite(events).await.try_accept(sdp()).unwrap();
+    let ok = peer.recv_answer("SIP/2.0 200", "1 INVITE").await;
+    peer.send(&ack_for(&ok, me, call, 1)).await;
+    // The UA sends no re-INVITE of its own before the ACK is in (RFC 3261
+    // section 14.1), so a test waits for it, and drops a copy of the 2xx
+    // that was on its way.
+    peer.drain(Duration::from_millis(60)).await;
+    (ok, accepted.await.unwrap())
 }

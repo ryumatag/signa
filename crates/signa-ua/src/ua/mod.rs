@@ -1039,7 +1039,9 @@ impl UaHandle {
     ///   offer it owed, or no answer could be had for its offer. The UA then
     ///   ends the session with a BYE after the ACK, as for an initial INVITE,
     /// * with [`Error::SessionEnded`] when the session ended first, by a BYE
-    ///   either way. A 2xx that comes later still gets its ACK,
+    ///   either way. The re-INVITE then gets a CANCEL, once a provisional
+    ///   response has come (RFC 3261 section 9.1), and a 2xx that comes
+    ///   later, across the CANCEL too, still gets its ACK,
     /// * with [`Error::InvalidTransition`], with nothing sent, when the
     ///   session is not established, is ending, or is busy as said above,
     ///   or its dialog has run out of CSeq numbers,
@@ -1050,7 +1052,8 @@ impl UaHandle {
     ///   the endpoint, or with [`Error::TransportFailure`] when its
     ///   transaction failed to write.
     ///
-    /// The UA does not cancel a re-INVITE of its own.
+    /// The application cannot cancel the re-INVITE. The UA cancels it only
+    /// when its session ends first.
     ///
     /// # Errors
     ///
@@ -1238,8 +1241,10 @@ pub enum ShutdownMode {
     ///   that waits for a decision gets a 487 once the BYE goes, as RFC 3261
     ///   section 15.1.2 recommends when the peer's BYE leaves one pending,
     ///   and a new one a 491, since the session is ending. A re-INVITE this
-    ///   UA sent goes on, since the UA does not cancel its own, and one the
-    ///   peer never answers holds the shutdown until its deadline.
+    ///   UA sent gets a CANCEL, as when any BYE ends its session. One whose
+    ///   peer answers neither it nor the CANCEL holds the shutdown until the
+    ///   endpoint gives up on it, 64 T1 after the CANCEL, or until the
+    ///   deadline if that comes first.
     ///
     /// None of this takes an operation of the application's, so it goes
     /// whatever the limit of [`Config::max_operations`]. The BYEs start

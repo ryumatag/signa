@@ -281,6 +281,10 @@ pub(crate) enum Effect {
     /// Ask the core to cancel the INVITE of an attempt, then report what it
     /// did with [`Model::cancel_done`].
     CancelInvite { attempt: AttemptKey, operation: Option<OperationId> },
+    /// Ask the core to cancel a re-INVITE whose session ended. Nothing
+    /// reports back, since the re-INVITE's operation has its outcome, and
+    /// its responses tell the rest.
+    CancelReinvite { exchange: ExchangeKey },
     /// Tell the application what an attempt came to, now that the core has
     /// finished collecting its responses. This cannot be lost, so the
     /// runtime sets room aside for it when it sends the INVITE.
@@ -3361,6 +3365,8 @@ impl<R: Random> Model<R> {
             retried,
             reserved: true,
             incomplete: false,
+            started: false,
+            cancel: false,
             kept: None,
         };
         let has_offer = sent.offer.is_some();
@@ -3398,7 +3404,8 @@ impl<R: Random> Model<R> {
 
     /// Records whether the core took a re-INVITE. One it did not take never
     /// started its transaction, and fails as a re-INVITE that got no 2xx,
-    /// which leaves the session as it was (RFC 3261 section 14.1).
+    /// which leaves the session as it was (RFC 3261 section 14.1). One whose
+    /// session ended meanwhile gets the CANCEL it waited for.
     pub(crate) fn reinvite_started(
         &mut self,
         key: ExchangeKey,
@@ -3406,13 +3413,18 @@ impl<R: Random> Model<R> {
         now: Instant,
     ) {
         let Some(InviteExchange { scope: Scope::Reinvite(sent), .. }) =
-            self.exchanges.get(key)
+            self.exchanges.get_mut(key)
         else {
             return;
         };
 
         match result {
             Ok(()) => {
+                sent.started = true;
+                if sent.cancel {
+                    self.effects
+                        .push(Effect::CancelReinvite { exchange: key });
+                }
                 if let Some(operation) = sent.operation {
                     self.operations.advance(operation, Stage::Committed);
                 }
@@ -3941,8 +3953,15 @@ impl<R: Random> Model<R> {
         // An INVITE exchange the usage held open ends with it. A re-INVITE
         // the peer sent gets a 487, which RFC 3261 section 15.1.2
         // recommends for a request a BYE leaves pending. One this user agent
-        // sent fails, though its transaction goes on, and a 2xx it gets
-        // still gets its ACK.
+        // sent fails, and gets a CANCEL, since nothing wants it any more
+        // (section 9.1). A peer that took the BYE should answer it with a
+        // 487 all the same, but one that holds it, or never got the BYE,
+        // would leave the transaction waiting for good, since an INVITE has
+        // no timer left once a provisional response came (section
+        // 17.1.1.2). The core sends the CANCEL once a provisional response
+        // came, and none once a final did. A 2xx that wins the race still
+        // gets its ACK (RFC 5407 section 3.2.3), and the CANCEL's own
+        // response decides nothing.
         if let Some(exchange) = usage.exchange {
             match self
                 .exchanges
@@ -3953,7 +3972,12 @@ impl<R: Random> Model<R> {
                     self.withdraw(exchange, Withdrawal::Ended);
                 }
                 Some(Scope::Reinvite(sent)) => {
-                    if let Some(operation) = sent.operation.take() {
+                    let operation = sent.operation.take();
+                    sent.cancel = true;
+                    if sent.started {
+                        self.effects.push(Effect::CancelReinvite { exchange });
+                    }
+                    if let Some(operation) = operation {
                         self.complete(operation, Err(Error::SessionEnded));
                     }
                 }
@@ -4415,9 +4439,10 @@ impl<R: Random> Model<R> {
     ///   of a UAS that receives a BYE, and I answer so when the BYE is this
     ///   user agent's too.
     ///
-    /// A re-INVITE this user agent sent goes on, since the UA does not cancel
-    /// its own. One the peer never answers holds the drain until the
-    /// deadline.
+    /// A re-INVITE this user agent sent gets a CANCEL when its session ends,
+    /// see [`Model::finish_usage`]. One whose peer answers neither it nor the
+    /// CANCEL holds the drain until the core gives up on it, 64 T1 after the
+    /// CANCEL (RFC 3261 section 9.1), or until the deadline.
     ///
     /// None of these takes an operation, so a UA whose operations are all in
     /// use still ends its sessions. Each session ends with
@@ -9767,6 +9792,84 @@ CSeq: {cseq} INVITE
         );
     }
 
+    /// A session that ends while its own re-INVITE has no final response
+    /// asks the core to cancel that re-INVITE, once, whichever BYE ended
+    /// it (RFC 3261 section 9.1). One the core has not taken yet gets the
+    /// CANCEL once the core has it. One with its final, or one the core
+    /// never took, gets none.
+    #[test]
+    fn an_ended_session_cancels_its_pending_reinvite() {
+        let clock = Clock(Instant::now());
+        let cancels = |effects: &[Effect]| -> Vec<ExchangeKey> {
+            effects
+                .iter()
+                .filter_map(|effect| match effect {
+                    Effect::CancelReinvite { exchange } => Some(*exchange),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // This user agent's BYE.
+        let mut model = self::model(limits());
+        let (_, usage, _) = caller_session(&mut model);
+        let (operation, exchange, _) =
+            reinvited(&mut model, usage, Some(answer()), clock.now());
+        run(&mut model, Command::Terminate { usage });
+        assert!(cancels(&model.take_effects()).is_empty());
+        model.bye_started(usage, Ok(())).unwrap();
+        model.check();
+        assert_eq!(cancels(&model.take_effects()), [exchange]);
+        assert_eq!(outcome(&model, operation), Some(Err(Error::SessionEnded)));
+
+        // The peer's BYE, before the core took the re-INVITE.
+        let mut model = self::model(limits());
+        let (_, usage, _) = caller_session(&mut model);
+        run(&mut model, Command::Reinvite { usage, offer: Some(answer()) });
+        let exchange = started(&model.take_effects());
+        model.take_reinvite(exchange).unwrap();
+        let bye = from_callee("BYE", "callee", 1);
+        assert_eq!(model.receive_request(&bye, arrival()), Ok(InDialog::Bye));
+        model.check();
+        assert!(cancels(&model.take_effects()).is_empty());
+        model.reinvite_started(exchange, Ok(()), clock.now());
+        model.check();
+        assert_eq!(cancels(&model.take_effects()), [exchange]);
+
+        // A re-INVITE the core never took has no transaction to cancel.
+        let mut model = self::model(limits());
+        let (_, usage, _) = caller_session(&mut model);
+        run(&mut model, Command::Reinvite { usage, offer: Some(answer()) });
+        let exchange = started(&model.take_effects());
+        model.take_reinvite(exchange).unwrap();
+        assert_eq!(model.receive_request(&bye, arrival()), Ok(InDialog::Bye));
+        model.reinvite_started(exchange, Err(Error::Unroutable), clock.now());
+        model.check();
+        assert!(cancels(&model.take_effects()).is_empty());
+
+        // A re-INVITE with its final response is not the session's any
+        // more.
+        let mut model = self::model(limits());
+        let (_, usage, _) = caller_session(&mut model);
+        let (_, exchange, cseq) =
+            reinvited(&mut model, usage, Some(answer()), clock.now());
+        let rejected = to_reinvite(
+            "488 Not Acceptable Here",
+            "callee",
+            "sip:bob@192.0.2.4",
+            cseq,
+        );
+        model.receive_reinvite_response(
+            exchange,
+            &rejected,
+            None,
+            clock.now(),
+        );
+        assert_eq!(model.receive_request(&bye, arrival()), Ok(InDialog::Bye));
+        model.check();
+        assert!(cancels(&model.take_effects()).is_empty());
+    }
+
     fn ok_for(cseq: u32) -> Response<Bytes> {
         to_reinvite("200 OK", "callee", "sip:bob@192.0.2.4", cseq)
     }
@@ -11147,6 +11250,7 @@ Contact: <sip:{host}@192.0.2.9>
                 }
                 Effect::Resend2xx { .. }
                 | Effect::ResendAck { .. }
+                | Effect::CancelReinvite { .. }
                 | Effect::AttemptEnded { .. }
                 | Effect::Notify(_)
                 | Effect::Released(_) => return,
