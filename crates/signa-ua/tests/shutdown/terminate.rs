@@ -62,7 +62,7 @@ async fn a_terminating_ua_ends_its_calls_either_way() {
                 sdp(),
             );
             let pending = caller.try_invite(plan).unwrap().await.unwrap();
-            let held = invite(&mut callee_events).await;
+            let mut held = invite(&mut callee_events).await;
             // The callee rings, so that the CANCEL may go.
             held.try_provisional(StatusCode::from_u16(180).unwrap())
                 .unwrap()

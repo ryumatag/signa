@@ -42,6 +42,7 @@ use crate::{
     negotiation::{Description, Negotiation},
     operation::OperationId,
     plan::PlannedInvite,
+    response::Fields,
     slot::Key,
 };
 
@@ -493,6 +494,8 @@ pub(crate) struct Provisional {
     pub(crate) status: StatusCode,
     /// The preview of the answer it carried, if any.
     pub(crate) preview: Option<Description>,
+    /// The rows the application's plan added, which each copy carries too.
+    pub(crate) fields: Fields,
     pub(crate) due: Instant,
 }
 

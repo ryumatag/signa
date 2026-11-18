@@ -368,7 +368,7 @@ async fn the_peers_early_bye_ends_its_invite() {
         let me = peer.address();
 
         peer.send(&direct_invite(me, "ringing")).await;
-        let incoming = invite(&mut ua.events).await;
+        let mut incoming = invite(&mut ua.events).await;
         let ringing = StatusCode::from_u16(180).unwrap();
         incoming.try_provisional(ringing).unwrap().await.unwrap();
         let early = peer.recv_answer("SIP/2.0 180", "1 INVITE").await;

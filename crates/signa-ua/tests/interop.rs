@@ -113,7 +113,7 @@ async fn answers_calls_from_sipp() {
     println!("ready");
 
     for call in 0..calls() {
-        let incoming = event(&mut ua.events, |event| match event {
+        let mut incoming = event(&mut ua.events, |event| match event {
             Event::Invite(invite) => Some(invite),
             _ => None,
         })

@@ -7,10 +7,13 @@ without an offer, whose answer comes in the ACK.
 
 use std::{net::SocketAddr, time::Duration};
 
-use signa_core::StatusCode;
+use signa_core::{
+    HeaderValue, StatusCode,
+    message::header::{ALERT_INFO, CONTACT, SERVER, WARNING},
+};
 use signa_ua::{
-    EndReason, Error, Event, IncomingInvite, ReinvitePlan, SessionPhase,
-    UaEvents,
+    AcceptPlan, EndReason, Error, Event, IncomingInvite, ProvisionalPlan,
+    ReinvitePlan, RejectPlan, SessionPhase, UaEvents,
 };
 use tokio::time::timeout;
 
@@ -19,10 +22,11 @@ use crate::support::{
     events::{event, invite, invite_within, reinvite},
     message::{
         ack_for, body, cancel_of, described, direct_invite, header, in_dialog,
-        invite_over, invite_to_ua, offer_named, plan_to, reinvite_of, sdp,
+        invite_over, invite_to_ua, offer_named, plan_to, reinvite_of,
+        reply_with, sdp,
     },
     peer::{Peer, TcpPeer},
-    start_fast, start_fast_with,
+    start, start_fast, start_fast_with,
 };
 
 /// Every response to an INVITE carries the To tag of its first one: the
@@ -35,7 +39,7 @@ async fn uas_to_tag_is_stable() {
     let peer = Peer::new().await;
 
     peer.send(&invite_to_ua(peer.address(), "tag"), udp).await;
-    let invite = invite(&mut ua.events).await;
+    let mut invite = invite(&mut ua.events).await;
     let ringing = StatusCode::from_u16(180).unwrap();
     invite.try_provisional(ringing).unwrap().await.unwrap();
     let (ringing, _) = peer.recv_starting("SIP/2.0 180").await;
@@ -743,7 +747,8 @@ async fn a_provisional_previews_the_answer() {
     peer.send(&invite_to_ua(peer.address(), "preview"), udp).await;
     let mut incoming = invite(&mut ua.events).await;
     assert_eq!(incoming.offer(), Some(&sdp()));
-    let sent = incoming.try_provisional_with(progress, preview.clone());
+    let plan = ProvisionalPlan::new(progress).preview(preview.clone());
+    let sent = incoming.try_provisional(plan);
     assert_eq!(sent.unwrap().await, Ok(()));
     let (early, _) = peer.recv_starting("SIP/2.0 183").await;
     assert_eq!(body(&early), "v=0\r\ns=preview\r\n");
@@ -755,4 +760,161 @@ async fn a_provisional_previews_the_answer() {
     let (ok, _) = peer.recv_starting("SIP/2.0 200").await;
     assert_eq!(body(&ok), body(&early));
     assert_eq!(header(&ok, "To"), header(&early, "To"));
+}
+
+/// Answers an INVITE from `peer` with `plan`, and returns the rejection as
+/// it went out.
+async fn rejected_with(plan: RejectPlan, call: &str) -> String {
+    let (mut ua, address) = start(config());
+    tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+    let status = format!("SIP/2.0 {}", plan.status().as_u16());
+
+    peer.send(&invite_to_ua(peer.address(), call), address).await;
+    let incoming = invite(&mut ua.events).await;
+    incoming.try_reject(plan).unwrap().await.unwrap();
+    peer.recv_starting(&status).await.0
+}
+
+fn code(code: u16) -> StatusCode {
+    StatusCode::from_u16(code).unwrap()
+}
+
+const DIGEST: &str = "Digest realm=\"biloxi.example.com\", \
+                      nonce=\"84a4cc6f3082121f32b42a2187831a9e\"";
+
+/// A redirection carries the Contacts the caller is to try (RFC 3261
+/// section 21.3), each as a row of its own, a 305 its one proxy, and a 401
+/// and a 407 their challenges (sections 21.4.2, 21.4.8 and 22.1), each as
+/// the plan gave it.
+#[tokio::test]
+async fn a_rejection_carries_the_headers_its_status_needs() {
+    let choices = RejectPlan::new(code(300))
+        .contact("sip:bob@192.0.2.4;transport=tcp".parse().unwrap())
+        .contact("sips:bob@biloxi.example.com".parse().unwrap());
+    let use_proxy = RejectPlan::new(code(305))
+        .contact("sip:proxy.example.com".parse().unwrap());
+    let unauthorized = RejectPlan::new(code(401))
+        .www_authenticate(HeaderValue::from_static(DIGEST));
+    let proxy = RejectPlan::new(code(407))
+        .proxy_authenticate(HeaderValue::from_static(DIGEST));
+
+    let choices = rejected_with(choices, "choices").await;
+    let use_proxy = rejected_with(use_proxy, "proxy-only").await;
+    let unauthorized = rejected_with(unauthorized, "unauthorized").await;
+    let proxy = rejected_with(proxy, "proxy").await;
+
+    assert_eq!(
+        header(&choices, "Contact"),
+        ["<sip:bob@192.0.2.4;transport=tcp>", "<sips:bob@biloxi.example.com>",],
+    );
+    assert_eq!(header(&use_proxy, "Contact"), ["<sip:proxy.example.com>"]);
+    assert_eq!(header(&unauthorized, "WWW-Authenticate"), [DIGEST]);
+    assert!(header(&unauthorized, "Contact").is_empty());
+    assert_eq!(header(&proxy, "Proxy-Authenticate"), [DIGEST]);
+}
+
+/// The Accept and Accept-Encoding of a 415 list the bodies the UA takes,
+/// which the UA writes rather than the application (RFC 3261 section
+/// 21.4.13). A 486 gets neither.
+#[tokio::test]
+async fn a_415_says_what_the_ua_takes() {
+    let unsupported = rejected_with(code(415).into(), "accept").await;
+    let busy = rejected_with(code(486).into(), "busy").await;
+
+    assert_eq!(header(&unsupported, "Accept"), ["application/sdp"]);
+    assert_eq!(header(&unsupported, "Accept-Encoding"), ["identity"]);
+    assert!(header(&busy, "Accept").is_empty());
+    assert!(header(&busy, "Allow").is_empty());
+}
+
+/// A plan's own headers go out with its response, after the UA's: a 503's
+/// Retry-After and Warning, a 180's Alert-Info, and a 200's Server, whose
+/// Contact and Allow stay the UA's, one each. The copy of a 180 a minute
+/// later carries the same, which the model's tests show.
+#[tokio::test]
+async fn plans_carry_the_applications_headers() {
+    let unavailable = RejectPlan::new(code(503))
+        .retry_after(120)
+        .header(WARNING, HeaderValue::from_static("399 pbx \"overloaded\""));
+    let unavailable = rejected_with(unavailable, "later").await;
+    assert_eq!(header(&unavailable, "Retry-After"), ["120"]);
+    assert_eq!(header(&unavailable, "Warning"), ["399 pbx \"overloaded\""]);
+
+    let (mut ua, address) = start(config());
+    tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+    peer.send(&invite_to_ua(peer.address(), "ringing"), address).await;
+    let mut incoming = invite(&mut ua.events).await;
+    let ring = HeaderValue::from_static("<http://example.com/ring.wav>");
+    let ringing = ProvisionalPlan::new(code(180)).header(ALERT_INFO, ring);
+    incoming.try_provisional(ringing).unwrap().await.unwrap();
+    let (early, _) = peer.recv_starting("SIP/2.0 180").await;
+    let server = HeaderValue::from_static("pbx/1.0");
+    let accept = AcceptPlan::new(sdp()).header(SERVER, server);
+    incoming.try_accept(accept).unwrap().await.unwrap();
+    let (ok, _) = peer.recv_starting("SIP/2.0 200").await;
+
+    assert_eq!(
+        header(&early, "Alert-Info"),
+        ["<http://example.com/ring.wav>"]
+    );
+    assert_eq!(header(&ok, "Server"), ["pbx/1.0"]);
+    assert!(header(&ok, "Alert-Info").is_empty());
+    assert_eq!(header(&ok, "Contact").len(), 1);
+    assert_eq!(header(&ok, "Allow"), ["INVITE, ACK, CANCEL, BYE, OPTIONS"]);
+    assert!(header(&ok, "Accept").is_empty());
+}
+
+/// A plan the UA does not send is handed back with the INVITE, and nothing
+/// goes out, so the application can decide again: a 302 without a Contact,
+/// a 401 without a challenge, a 405, a header the UA writes, and a
+/// rejection the operations had no room for.
+#[tokio::test]
+async fn a_refused_plan_hands_the_invite_back() {
+    let (mut ua, address) = start(config().max_operations(1));
+    tokio::spawn(ua.driver);
+    let peer = Peer::new().await;
+    let silent = Peer::new().await;
+    peer.send(&invite_to_ua(peer.address(), "again"), address).await;
+    let mut incoming = invite(&mut ua.events).await;
+
+    let plans = [
+        RejectPlan::new(code(302)),
+        RejectPlan::new(code(401)),
+        RejectPlan::new(code(405)),
+        RejectPlan::new(code(486))
+            .header(CONTACT, HeaderValue::from_static("<sip:x@192.0.2.9>")),
+    ];
+    for plan in plans {
+        let refused = incoming.try_reject(plan).unwrap_err();
+        assert_eq!(refused.error(), Error::InvalidInput);
+        incoming = refused.into_inner().0;
+    }
+    // A CANCEL waits for a provisional response, so it holds the one place
+    // for operations meanwhile.
+    let to = silent.address().to_string();
+    let attempt = ua.handle.try_invite(plan_to(&to, "held")).unwrap();
+    let attempt = attempt.await.unwrap();
+    let (held, from) = silent.recv_starting("INVITE").await;
+    let cancelled = ua.handle.try_cancel(&attempt).unwrap();
+    let moved = RejectPlan::new(code(302))
+        .contact("sip:bob@192.0.2.4".parse().unwrap());
+    let refused = incoming.try_reject(moved).unwrap_err();
+    assert_eq!(refused.error(), Error::Busy);
+    // Only the endpoint's 100 went out.
+    let _ = timeout(Duration::from_millis(100), async {
+        loop {
+            let (message, _) = peer.recv().await;
+            assert!(message.starts_with("SIP/2.0 100"), "{message}");
+        }
+    })
+    .await;
+
+    silent.send(&reply_with(&held, 180, "held"), from).await;
+    cancelled.await.unwrap();
+    let (incoming, plan) = refused.into_inner();
+    incoming.try_reject(plan).unwrap().await.unwrap();
+    let (moved, _) = peer.recv_starting("SIP/2.0 302").await;
+    assert_eq!(header(&moved, "Contact"), ["<sip:bob@192.0.2.4>"]);
 }

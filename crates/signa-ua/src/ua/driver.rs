@@ -118,6 +118,7 @@ use crate::{
     },
     negotiation::{Body, Description},
     operation::{Completion, OperationId},
+    response::Fields,
     retention::ReplayKey,
     timer,
 };
@@ -361,6 +362,7 @@ enum Job {
         exchange: ExchangeKey,
         operation: Option<OperationId>,
         preview: Option<Description>,
+        fields: Fields,
         responder: Arc<Responder>,
         response: Response<Bytes>,
     },
@@ -577,6 +579,7 @@ enum Done {
         operation: Option<OperationId>,
         status: StatusCode,
         preview: Option<Description>,
+        fields: Fields,
         result: Result<(), Error>,
     },
     /// The answer prepared for the ACK of a 2xx, or `None` if there was
@@ -1567,12 +1570,14 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
                 operation,
                 status,
                 preview,
+                fields,
                 result,
             } => {
                 self.model.provisional_done(
                     exchange,
                     status,
                     preview,
+                    fields,
                     operation,
                     result,
                     now(),
@@ -1839,18 +1844,19 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
 
     fn apply(&mut self, effect: Effect, attempt: Option<AttemptKey>) {
         match effect {
-            Effect::SubmitFinal { exchange, status, to_tag, body } => {
-                self.submit_final(exchange, status, to_tag, body);
+            Effect::SubmitFinal { exchange, status, to_tag, body, fields } => {
+                self.submit_final(exchange, status, to_tag, body, fields);
             }
             Effect::SubmitProvisional {
                 exchange,
                 status,
                 to_tag,
                 preview,
+                fields,
                 operation,
             } => {
                 self.submit_provisional(
-                    exchange, status, to_tag, preview, operation,
+                    exchange, status, to_tag, preview, fields, operation,
                 );
             }
             Effect::PrepareAnswer { replay, offer, usage } => {
@@ -1934,6 +1940,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         status: StatusCode,
         to_tag: Tag,
         body: Option<Description>,
+        fields: Fields,
     ) {
         // The server of an exchange goes only when the model releases the
         // exchange, after its final. Were it gone, the final could not be
@@ -1943,18 +1950,25 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             return;
         };
 
-        // TODO: Let a rejection carry the headers its status needs, such as
-        // the Allow of a 405 (RFC 3261 section 21.4.6) or the challenge of a
-        // 401 (section 21.4.2).
         let mut response =
             Response::reply_to(&server.request).status(status).to_tag(to_tag);
-        // A 2xx says which methods the UA takes (RFC 3261 section 13.3.1.4).
-        if status.is_success() {
-            response =
-                dialog_headers(response, &server.request, &self.contact)
-                    .header(ALLOW, capability::ALLOW);
+        // A 2xx says which methods the UA takes (RFC 3261 section 13.3.1.4),
+        // and a 415 which bodies it takes (section 21.4.13), from what the UA
+        // does rather than what the application says.
+        match status.as_u16() {
+            200..=299 => {
+                response =
+                    dialog_headers(response, &server.request, &self.contact)
+                        .header(ALLOW, capability::ALLOW);
+            }
+            415 => {
+                response = response
+                    .header(ACCEPT, capability::ACCEPT)
+                    .header(ACCEPT_ENCODING, capability::ACCEPT_ENCODING);
+            }
+            _ => {}
         }
-        let response = with_description(response, body);
+        let response = with_description(with_fields(response, &fields), body);
 
         match response {
             Ok(response) => {
@@ -1975,6 +1989,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         status: StatusCode,
         to_tag: Tag,
         preview: Option<Description>,
+        fields: Fields,
         operation: Option<OperationId>,
     ) {
         // As in `submit_final`, the server is there until the exchange goes,
@@ -1984,6 +1999,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
                 exchange,
                 status,
                 preview,
+                fields,
                 operation,
                 Err(Error::StaleDecision),
                 now(),
@@ -1995,10 +2011,11 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         // UAC, so it carries what a 2xx does (RFC 3261 section 12.1.1).
         let response =
             Response::reply_to(&server.request).status(status).to_tag(to_tag);
-        let response = with_description(
+        let response = with_fields(
             dialog_headers(response, &server.request, &self.contact),
-            preview.clone(),
+            &fields,
         );
+        let response = with_description(response, preview.clone());
 
         match response {
             Ok(response) => {
@@ -2006,6 +2023,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
                     exchange,
                     operation,
                     preview,
+                    fields,
                     responder: server.responder.clone(),
                     response,
                 };
@@ -2015,6 +2033,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
                 exchange,
                 status,
                 preview,
+                fields,
                 operation,
                 Err(Error::InvalidInput),
                 now(),
@@ -2654,6 +2673,7 @@ impl Job {
                 exchange,
                 operation,
                 preview,
+                fields,
                 response,
                 ..
             } => Done::Provisional {
@@ -2661,6 +2681,7 @@ impl Job {
                 operation: *operation,
                 status: response.status(),
                 preview: preview.clone(),
+                fields: fields.clone(),
                 result: Err(Error::Internal),
             },
             Job::Resend { exchange, .. } => {
@@ -2714,6 +2735,7 @@ impl Job {
                 exchange,
                 operation,
                 preview,
+                fields,
                 responder,
                 response,
             } => {
@@ -2737,6 +2759,7 @@ impl Job {
                     operation,
                     status,
                     preview,
+                    fields,
                     result,
                 }
             }
@@ -2912,6 +2935,17 @@ fn dialog_headers(
         response = response.header(RECORD_ROUTE, value.clone());
     }
     response.header(CONTACT, format!("<{contact}>").as_str())
+}
+
+/// Adds the rows of a plan to a response, after the UA's own.
+fn with_fields(
+    mut response: response::Builder,
+    fields: &Fields,
+) -> response::Builder {
+    for (name, value) in fields.iter() {
+        response = response.header(name.clone(), value.clone());
+    }
+    response
 }
 
 /// Finishes a response with a session description as its body, or without

@@ -337,7 +337,8 @@ async fn an_invalid_rejection_hands_the_invite_back() {
     let refused = invite.try_reject(StatusCode::OK).unwrap_err();
     assert_eq!(refused.error(), Error::InvalidInput);
 
-    refused.into_inner().try_accept(sdp()).unwrap().await.unwrap();
+    let (invite, _) = refused.into_inner();
+    invite.try_accept(sdp()).unwrap().await.unwrap();
     let (ok, _) = peer.recv_starting("SIP/2.0 200").await;
     assert_eq!(header(&ok, "Call-ID"), ["retry"]);
 }

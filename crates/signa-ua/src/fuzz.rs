@@ -35,6 +35,7 @@ use crate::{
         Authority, ByeStarted, Command, Effect, Event, Limits, Model, Random,
     },
     negotiation::{Body, Description},
+    response::Fields,
 };
 
 /// The bytes of a session description a UA keeps at most, as the runtime's
@@ -225,8 +226,16 @@ impl Fuzzed {
     /// Decides an INVITE as the application would, by `choice`.
     fn decide(&mut self, choice: u8, authority: Authority) {
         let command = match choice % 4 {
-            0 => Command::Accept { authority, answer: description() },
-            1 => Command::Reject { authority, status: status(486) },
+            0 => Command::Accept {
+                authority,
+                answer: description(),
+                fields: Fields::default(),
+            },
+            1 => Command::Reject {
+                authority,
+                status: status(486),
+                fields: Fields::default(),
+            },
             2 => {
                 let exchange = authority.exchange();
                 self.held.push(authority);
@@ -234,6 +243,7 @@ impl Fuzzed {
                     exchange,
                     status: status(180),
                     preview: None,
+                    fields: Fields::default(),
                 }
             }
             _ => {
@@ -255,10 +265,12 @@ impl Fuzzed {
             1 => Command::Accept {
                 authority: self.held.remove(0),
                 answer: description(),
+                fields: Fields::default(),
             },
             2 => Command::Reject {
                 authority: self.held.remove(0),
                 status: status(486),
+                fields: Fields::default(),
             },
             _ => {
                 let authority = self.held.remove(0);
@@ -328,6 +340,7 @@ impl Fuzzed {
                 exchange,
                 status,
                 preview,
+                fields,
                 operation,
                 ..
             } => {
@@ -337,7 +350,7 @@ impl Fuzzed {
                     Ok(())
                 };
                 model.provisional_done(
-                    exchange, status, preview, operation, result, now,
+                    exchange, status, preview, fields, operation, result, now,
                 );
             }
             Effect::StartInvite { attempt } => {

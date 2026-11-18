@@ -48,7 +48,7 @@ async fn main() {
     // has seen the call.
     let (seen, in_call) = oneshot::channel();
     let answering = tokio::spawn(async move {
-        let invite = next(&mut callee_events, |event| match event {
+        let mut invite = next(&mut callee_events, |event| match event {
             Event::Invite(invite) => Some(invite),
             _ => None,
         })

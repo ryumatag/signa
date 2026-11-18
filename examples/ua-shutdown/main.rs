@@ -69,7 +69,7 @@ async fn main() {
 
     // The second call: the PBX rings and holds it, undecided.
     let ringing = phone.try_invite(plan()).unwrap().await.unwrap();
-    let invite = next(&mut pbx_events, |event| match event {
+    let mut invite = next(&mut pbx_events, |event| match event {
         Event::Invite(invite) => Some(invite),
         _ => None,
     })

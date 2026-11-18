@@ -19,7 +19,7 @@ use std::{
 
 use bytes::Bytes;
 use signa_core::{
-    Request, StatusCode,
+    Request,
     endpoint::{Endpoint, Incoming, ReceiveInfo, Reception, Target},
     transaction::Timers,
 };
@@ -34,6 +34,7 @@ pub use crate::{
     invite::{AttemptResult, CancelResult, EndReason},
     negotiation::Description,
     plan::{InvitePlan, ReinvitePlan},
+    response::{AcceptPlan, ProvisionalPlan, RejectPlan},
     routing::{ResolveError, StaticResolver},
 };
 use crate::{
@@ -1787,14 +1788,21 @@ impl IncomingInvite {
         InviteId { ua: self.shared.id, exchange: authority.exchange() }
     }
 
-    /// Sends a provisional response, from 101 to 199, with the To tag every
-    /// response to this INVITE carries. The endpoint sends the 100 itself.
+    /// Sends a provisional response, from 101 to 199, as `plan` says, with
+    /// the To tag every response to this INVITE carries. The endpoint sends
+    /// the 100 itself.
     ///
     /// It decides nothing, so it keeps the authority. Until a final response
     /// is under way, the UA sends the last provisional that reached the
-    /// endpoint again every minute, as RFC 3261 section 13.3.1.1 asks of a UAS
-    /// that takes long to answer. The UA never picks a provisional of its
-    /// own.
+    /// endpoint again every minute, with its headers and preview, as RFC
+    /// 3261 section 13.3.1.1 asks of a UAS that takes long to answer. The UA
+    /// never picks a provisional of its own.
+    ///
+    /// A plan with a [`ProvisionalPlan::preview`] sends the answer to the
+    /// INVITE's offer ahead of the 2xx, as for early media, which RFC 3261
+    /// section 13.2.1 allows. The response is not reliable, so the 2xx has
+    /// to carry the same answer, and [`IncomingInvite::try_accept`] refuses
+    /// another one.
     ///
     /// The operation completes once the endpoint has the response. It fails
     /// with [`Error::AlreadyFinalized`] if a final response is under way or
@@ -1803,64 +1811,31 @@ impl IncomingInvite {
     ///
     /// # Errors
     ///
-    /// Returns `status` with [`Error::InvalidInput`] for a status outside 101
-    /// to 199, with [`Error::Busy`] when the command queue or the operations
-    /// are full, or with [`Error::Closed`] once the driver has stopped.
+    /// Returns the plan with [`Error::InvalidInput`] for a status outside 101
+    /// to 199, a header the UA writes (see [`ProvisionalPlan`]), an empty
+    /// preview, a preview for an INVITE without an offer, whose 2xx has to
+    /// carry an offer instead, or a preview other than one sent before, with
+    /// [`Error::Busy`] when the command queue or the operations are full, or
+    /// with [`Error::Closed`] once the driver has stopped.
     pub fn try_provisional(
-        &self,
-        status: StatusCode,
-    ) -> Result<Operation<()>, SubmitError<StatusCode>> {
-        if !(101..=199).contains(&status.as_u16()) {
-            return Err(SubmitError {
-                error: Error::InvalidInput,
-                value: Box::new(status),
-            });
-        }
-
-        let exchange = self
-            .authority
-            .as_ref()
-            .expect("a live invite holds its authority")
-            .exchange();
-        self.shared.submit(status, |status| model::Command::Provisional {
-            exchange,
-            status,
-            preview: None,
-        })
-    }
-
-    /// Sends a provisional response, from 101 to 199, that carries `answer`,
-    /// the answer to the INVITE's offer, ahead of the 2xx. It is a preview,
-    /// as for early media, which RFC 3261 section 13.2.1 allows. The response
-    /// is not reliable, so the 2xx has to carry the same answer, and
-    /// [`IncomingInvite::try_accept`] refuses another one.
-    ///
-    /// Otherwise it is as [`IncomingInvite::try_provisional`]. The UA sends
-    /// the preview again with the provisional response every minute.
-    ///
-    /// # Errors
-    ///
-    /// Returns `status` and `answer` with [`Error::InvalidInput`] for a status
-    /// outside 101 to 199, an empty answer, an INVITE without an offer, whose
-    /// 2xx has to carry an offer instead, or an answer other than one sent
-    /// before, with [`Error::Busy`] when the command queue or the operations
-    /// are full, or with [`Error::Closed`] once the driver has stopped.
-    pub fn try_provisional_with(
         &mut self,
-        status: StatusCode,
-        answer: Description,
-    ) -> Result<Operation<()>, SubmitError<(StatusCode, Description)>> {
-        let valid = (101..=199).contains(&status.as_u16())
-            && !answer.body().is_empty()
-            && self.offer.is_some()
-            && self
-                .preview
-                .as_deref()
-                .is_none_or(|preview| *preview == answer);
-        if !valid {
+        plan: impl Into<ProvisionalPlan>,
+    ) -> Result<Operation<()>, SubmitError<ProvisionalPlan>> {
+        let plan = plan.into();
+        let previewed = match plan.preview_ref() {
+            Some(preview) => {
+                self.offer.is_some()
+                    && self
+                        .preview
+                        .as_deref()
+                        .is_none_or(|sent| sent == preview)
+            }
+            None => true,
+        };
+        if !plan.is_valid() || !previewed {
             return Err(SubmitError {
                 error: Error::InvalidInput,
-                value: Box::new((status, answer)),
+                value: Box::new(plan),
             });
         }
 
@@ -1869,20 +1844,20 @@ impl IncomingInvite {
             .as_ref()
             .expect("a live invite holds its authority")
             .exchange();
-        let operation = self.shared.submit(
-            (status, answer.clone()),
-            |(status, answer)| model::Command::Provisional {
-                exchange,
-                status,
-                preview: Some(answer),
-            },
-        )?;
-        self.preview = Some(Box::new(answer));
+        let preview = plan.preview_ref().cloned();
+        let operation = self.shared.submit(plan, |plan| {
+            let (status, preview, fields) = plan.into_parts();
+            model::Command::Provisional { exchange, status, preview, fields }
+        })?;
+        if let Some(preview) = preview {
+            self.preview = Some(Box::new(preview));
+        }
         Ok(operation)
     }
 
-    /// Accepts the INVITE with a 200 that carries `answer`, the answer to its
-    /// offer, or an offer of the application's when it had none.
+    /// Accepts the INVITE with a 200, as `plan` says, which carries the
+    /// answer to its offer, or an offer of the application's when it had
+    /// none.
     ///
     /// For a re-INVITE, the operation completes with the session it changed,
     /// which takes its next [`SessionSnapshot::session_revision`] with the
@@ -1894,11 +1869,11 @@ impl IncomingInvite {
     /// the UA ends the session with a BYE, with
     /// [`Event::NegotiationFailed`].
     ///
-    /// The 200 copies the INVITE's Record-Route and carries the UA's Contact.
-    /// The UA sends it again until the ACK arrives, on every transport
-    /// (RFC 3261 section 13.3.1.4). If none arrives within 64 T1, the UA
-    /// reports [`Event::AckTimeout`] and ends the session, except as that
-    /// event says for a re-INVITE.
+    /// The 200 copies the INVITE's Record-Route and carries the UA's Contact
+    /// and Allow, then the plan's headers. The UA sends it again until the
+    /// ACK arrives, on every transport (RFC 3261 section 13.3.1.4). If none
+    /// arrives within 64 T1, the UA reports [`Event::AckTimeout`] and ends
+    /// the session, except as that event says for a re-INVITE.
     ///
     /// The operation completes once the endpoint has the 200, with the
     /// [`Session`] it established. That is neither the ACK nor delivery to
@@ -1915,61 +1890,78 @@ impl IncomingInvite {
     ///
     /// # Errors
     ///
-    /// Returns this INVITE and `answer` with [`Error::InvalidInput`] when the
-    /// body of `answer` is empty, or differs from the preview a provisional
-    /// response carried, with [`Error::Busy`] when the command queue or the
+    /// Returns this INVITE and the plan with [`Error::InvalidInput`] when the
+    /// answer's body is empty or differs from the preview a provisional
+    /// response carried, or the plan has a header the UA writes (see
+    /// [`AcceptPlan`]), with [`Error::Busy`] when the command queue or the
     /// operations are full, or with [`Error::Closed`] once the driver has
     /// stopped.
     pub fn try_accept(
         self,
-        answer: Description,
-    ) -> Result<Operation<Session>, SubmitError<(IncomingInvite, Description)>>
+        plan: impl Into<AcceptPlan>,
+    ) -> Result<Operation<Session>, SubmitError<(IncomingInvite, AcceptPlan)>>
     {
-        let previewed =
-            self.preview.as_deref().is_none_or(|preview| *preview == answer);
-        if answer.body().is_empty() || !previewed {
+        let plan = plan.into();
+        let previewed = self
+            .preview
+            .as_deref()
+            .is_none_or(|preview| preview == plan.answer());
+        if !plan.is_valid() || !previewed {
             return Err(SubmitError {
                 error: Error::InvalidInput,
-                value: Box::new((self, answer)),
+                value: Box::new((self, plan)),
             });
         }
 
         let shared = self.shared.clone();
-        shared.submit((self, answer), |(mut invite, answer)| {
+        shared.submit((self, plan), |(mut invite, plan)| {
+            let (answer, fields) = plan.into_parts();
             model::Command::Accept {
                 authority: invite.take_authority(),
                 answer,
+                fields,
             }
         })
     }
 
-    /// Rejects the INVITE with `status`, which must be from 300 to 699.
+    /// Rejects the INVITE with a final response from 300 to 699, as `plan`
+    /// says.
     ///
     /// The response carries the To tag and what it copies from the INVITE,
-    /// and nothing else. A status whose response needs a header of its own,
-    /// such as the Allow of a 405, the challenge of a 401 or the Contact of a
-    /// 3xx, cannot be sent as it should yet.
+    /// then what its status calls for and the plan's headers, as
+    /// [`RejectPlan`] says: the Contact of a redirection, the challenge of a
+    /// 401 or 407, a Retry-After, and the Accept of a 415, which the UA
+    /// writes from what it takes. A status alone makes a plan, as in
+    /// `try_reject(busy)`, for a status that needs no field.
     ///
     /// # Errors
     ///
-    /// Returns this INVITE with [`Error::InvalidInput`] for another status,
-    /// with [`Error::Busy`] when the command queue or the operations are
-    /// full, or with [`Error::Closed`] once the driver has stopped.
+    /// Returns this INVITE and the plan with [`Error::InvalidInput`] for a
+    /// plan the UA does not send, as [`RejectPlan`] says, such as a 302
+    /// without a Contact or a 401 without a challenge, with [`Error::Busy`]
+    /// when the command queue or the operations are full, or with
+    /// [`Error::Closed`] once the driver has stopped. Nothing is sent then,
+    /// and the application can decide again.
     pub fn try_reject(
         self,
-        status: StatusCode,
-    ) -> Result<Operation<()>, SubmitError<IncomingInvite>> {
-        if !(300..=699).contains(&status.as_u16()) {
+        plan: impl Into<RejectPlan>,
+    ) -> Result<Operation<()>, SubmitError<(IncomingInvite, RejectPlan)>> {
+        let plan = plan.into();
+        if !plan.is_valid() {
             return Err(SubmitError {
                 error: Error::InvalidInput,
-                value: Box::new(self),
+                value: Box::new((self, plan)),
             });
         }
 
         let shared = self.shared.clone();
-        shared.submit(self, |mut invite| model::Command::Reject {
-            authority: invite.take_authority(),
-            status,
+        shared.submit((self, plan), |(mut invite, plan)| {
+            let (status, fields) = plan.into_parts();
+            model::Command::Reject {
+                authority: invite.take_authority(),
+                status,
+                fields,
+            }
         })
     }
 

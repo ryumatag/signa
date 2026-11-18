@@ -4,15 +4,17 @@ What this UA tells its peers it takes, in one place.
 | Header | Value | Sent in |
 | --- | --- | --- |
 | Allow | [`ALLOW`] | each INVITE and re-INVITE, each 2xx to an INVITE, the 200 to OPTIONS, and each 405 the UA sends itself |
-| Accept | [`ACCEPT`] | the 200 to OPTIONS, and each 415 the UA sends itself |
-| Accept-Encoding | [`ACCEPT_ENCODING`] | the 200 to OPTIONS, and each 415 the UA sends itself |
+| Accept | [`ACCEPT`] | the 200 to OPTIONS, and each 415 |
+| Accept-Encoding | [`ACCEPT_ENCODING`] | the 200 to OPTIONS, and each 415 |
 | Supported | none | nothing, since the UA has no extension |
 | Unsupported | each Require row of the request | each 420 the UA sends itself |
 
 A method in [`KNOWN`] gets a 405 with the Allow above, and any other method
-the UA does not take a 501 (RFC 3261 section 21.5.2). A rejection the
-application chooses carries none of these, since
-`IncomingInvite::try_reject` takes a status alone.
+the UA does not take a 501 (RFC 3261 section 21.5.2). A 415 the application
+chooses gets the Accept and Accept-Encoding too. The application cannot
+reject an INVITE with a 405, whose Allow would leave out the INVITE the UA
+takes, and no plan of the application's sets any of these headers, so that
+the UA advertises only what it does.
 
 These values describe what the code that reads requests does. They do not
 decide it. Which methods the driver takes, which bodies carry an offer and

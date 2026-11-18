@@ -79,9 +79,9 @@ This is an early stage of the crate, and much of a UA core is missing:
 * A 2xx that cannot form a dialog, such as one without a Contact, gets no
   ACK. One beyond the UA's limits gets its ACK and a BYE, while the room
   kept for that lasts.
-* A rejection carries its status, the To tag and what it copies from the
-  INVITE, and nothing else. So a 3xx has no Contact, a 401 no challenge and
-  a 405 no Allow.
+* A rejection has no body, and its Contact takes SIP and SIPS URIs only.
+  The UA checks the syntax of a challenge the application gives, and does
+  not choose or check credentials.
 * In a dialog, the UA takes BYE itself. Requests other than INVITE are
   answered as outside a dialog, without asking the application.
 * Outside a dialog, the UA answers requests other than INVITE without asking
@@ -119,14 +119,15 @@ This is an early stage of the crate, and much of a UA core is missing:
 
 #[cfg(feature = "tokio")]
 pub use self::ua::{
-    AttachError, AttemptId, AttemptResult, AttemptSnapshot, CancelResult,
-    Config, Description, EndReason, Error, Event, IncomingInvite,
-    InvalidContact, InviteAttempt, InviteId, InvitePlan, Negotiate,
-    NegotiationState, NoNegotiator, Offer, Operation, Query, ReinvitePlan,
-    Resolve, ResolveError, Session, SessionId, SessionPhase, SessionSnapshot,
-    Settled, Settlement, ShutdownMode, ShutdownOutcome, ShutdownReport,
-    StaticResolver, SubmitError, Ua, UaDriver, UaEvents, UaHandle, UaShutdown,
-    WireEffect, attach,
+    AcceptPlan, AttachError, AttemptId, AttemptResult, AttemptSnapshot,
+    CancelResult, Config, Description, EndReason, Error, Event,
+    IncomingInvite, InvalidContact, InviteAttempt, InviteId, InvitePlan,
+    Negotiate, NegotiationState, NoNegotiator, Offer, Operation,
+    ProvisionalPlan, Query, ReinvitePlan, RejectPlan, Resolve, ResolveError,
+    Session, SessionId, SessionPhase, SessionSnapshot, Settled, Settlement,
+    ShutdownMode, ShutdownOutcome, ShutdownReport, StaticResolver,
+    SubmitError, Ua, UaDriver, UaEvents, UaHandle, UaShutdown, WireEffect,
+    attach,
 };
 
 // The private state model. `dialog` knows nothing of `invite`, so other
@@ -141,6 +142,7 @@ mod model;
 mod negotiation;
 mod operation;
 mod plan;
+mod response;
 mod retention;
 mod routing;
 mod slot;

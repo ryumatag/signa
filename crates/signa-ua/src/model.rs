@@ -90,6 +90,7 @@ use crate::{
     negotiation::{Body, Description, Negotiation},
     operation::{Completion, OperationId, Operations, Stage, SubmitError},
     plan::{Identity, InvitePlan, PlannedInvite},
+    response::Fields,
     retention::{
         AckBody, AckObligation, Bye, ReplayContext, ReplayId, ReplayKey,
         Retention, Retransmission, Source,
@@ -190,8 +191,9 @@ impl Authority {
 /// What the application asks of the UA.
 #[derive(Debug)]
 pub(crate) enum Command {
-    /// Accept an incoming INVITE with a 2xx that carries `answer`.
-    Accept { authority: Authority, answer: Description },
+    /// Accept an incoming INVITE with a 2xx that carries `answer`, and the
+    /// rows of `fields` after the UA's.
+    Accept { authority: Authority, answer: Description, fields: Fields },
     /// Send a provisional response from 101 to 199 for an incoming INVITE,
     /// with a preview of the answer to its offer if given. It takes no
     /// authority, since it decides nothing.
@@ -199,9 +201,11 @@ pub(crate) enum Command {
         exchange: ExchangeKey,
         status: StatusCode,
         preview: Option<Description>,
+        fields: Fields,
     },
-    /// Reject an incoming INVITE with a final response from 300 to 699.
-    Reject { authority: Authority, status: StatusCode },
+    /// Reject an incoming INVITE with a final response from 300 to 699,
+    /// with the rows of `fields`.
+    Reject { authority: Authority, status: StatusCode, fields: Fields },
     /// Send an initial INVITE built from a plan, which carries an offer.
     Invite { plan: Box<InvitePlan> },
     /// Cancel an INVITE this user agent sent, while it has no final
@@ -224,12 +228,14 @@ pub(crate) enum Effect {
     /// responder, with `to_tag` on its To and `body` as its body, then report
     /// the verdict with [`Model::final_committed`] or
     /// [`Model::final_refused`]. The runtime keeps a 2xx it submitted, for
-    /// [`Effect::Resend2xx`].
+    /// [`Effect::Resend2xx`]. `fields` are rows the application's plan
+    /// adds, and none for a final of the UA's own.
     SubmitFinal {
         exchange: ExchangeKey,
         status: StatusCode,
         to_tag: Tag,
         body: Option<Description>,
+        fields: Fields,
     },
     /// Submit a provisional response of an incoming INVITE through its
     /// responder, with `to_tag` on its To and `preview` as its body, then
@@ -240,6 +246,7 @@ pub(crate) enum Effect {
         status: StatusCode,
         to_tag: Tag,
         preview: Option<Description>,
+        fields: Fields,
         operation: Option<OperationId>,
     },
     /// Send the 2xx of an incoming INVITE again, as it was first submitted,
@@ -767,26 +774,31 @@ impl<R: Random> Model<R> {
     pub(crate) fn run_commands(&mut self) {
         while let Some((operation, command)) = self.commands.pop_front() {
             match command {
-                Command::Accept { authority, answer } => self.submit_final(
-                    Some(operation),
-                    authority.exchange,
-                    StatusCode::OK,
-                    Some(answer),
-                ),
-                Command::Reject { authority, status } => {
+                Command::Accept { authority, answer, fields } => self
+                    .submit_final(
+                        Some(operation),
+                        authority.exchange,
+                        StatusCode::OK,
+                        Some(answer),
+                        fields,
+                    ),
+                Command::Reject { authority, status, fields } => {
                     if (300..=699).contains(&status.as_u16()) {
                         self.submit_final(
                             Some(operation),
                             authority.exchange,
                             status,
                             None,
+                            fields,
                         );
                     } else {
                         self.complete(operation, Err(Error::InvalidInput));
                     }
                 }
-                Command::Provisional { exchange, status, preview } => {
-                    self.provisional(operation, exchange, status, preview)
+                Command::Provisional { exchange, status, preview, fields } => {
+                    self.provisional(
+                        operation, exchange, status, preview, fields,
+                    )
                 }
                 Command::Invite { plan } => self.invite(operation, *plan),
                 Command::Cancel { attempt } => {
@@ -1274,6 +1286,7 @@ impl<R: Random> Model<R> {
         key: ExchangeKey,
         status: StatusCode,
         body: Option<Description>,
+        fields: Fields,
     ) {
         let Some(exchange) = self.exchanges.get(key) else {
             if let Some(operation) = operation {
@@ -1309,7 +1322,7 @@ impl<R: Random> Model<R> {
             // the INVITE. The UA does, with the 503 of a server without room
             // (RFC 3261 section 21.5.4). Answering at all is my policy.
             let unavailable = StatusCode::from_u16(503).expect("a status");
-            self.submit_final(None, key, unavailable, None);
+            self.submit_final(None, key, unavailable, None, Fields::default());
             return;
         }
 
@@ -1324,6 +1337,7 @@ impl<R: Random> Model<R> {
             status,
             to_tag,
             body,
+            fields,
         });
     }
 
@@ -1339,7 +1353,7 @@ impl<R: Random> Model<R> {
         });
 
         if pending {
-            self.submit_final(None, exchange, status, None);
+            self.submit_final(None, exchange, status, None, Fields::default());
         }
     }
 
@@ -1398,6 +1412,7 @@ impl<R: Random> Model<R> {
         key: ExchangeKey,
         status: StatusCode,
         preview: Option<Description>,
+        fields: Fields,
     ) {
         let Some(exchange) = self.exchanges.get(key) else {
             self.complete(operation, Err(Error::StaleDecision));
@@ -1426,6 +1441,7 @@ impl<R: Random> Model<R> {
             status,
             to_tag,
             preview,
+            fields,
             operation: Some(operation),
         });
     }
@@ -1435,13 +1451,16 @@ impl<R: Random> Model<R> {
     /// The last provisional the application got into the core is the one the
     /// UA sends again a minute later, and every minute after, until a final
     /// is under way. RFC 3261 section 13.3.1.1 asks for that of a UAS that
-    /// takes long to answer. The UA does not pick a provisional of its own,
-    /// since only the application knows whether the phone rings.
+    /// takes long to answer, with the same headers. The UA does not pick a
+    /// provisional of its own, since only the application knows whether the
+    /// phone rings.
+    #[allow(clippy::too_many_arguments)] // What the runtime reports back.
     pub(crate) fn provisional_done(
         &mut self,
         key: ExchangeKey,
         status: StatusCode,
         preview: Option<Description>,
+        fields: Fields,
         operation: Option<OperationId>,
         result: Result<(), Error>,
         now: Instant,
@@ -1470,7 +1489,8 @@ impl<R: Random> Model<R> {
             self.timers.cancel(last.due, Timer::Provisional(key));
         }
         let due = later(now, PROVISIONAL_INTERVAL);
-        *provisional = Some(Box::new(Provisional { status, preview, due }));
+        *provisional =
+            Some(Box::new(Provisional { status, preview, fields, due }));
         self.timers.set(due, Timer::Provisional(key));
     }
 
@@ -1504,6 +1524,7 @@ impl<R: Random> Model<R> {
             status: provisional.status,
             to_tag,
             preview: provisional.preview.clone(),
+            fields: provisional.fields.clone(),
             operation: None,
         });
     }
@@ -4811,6 +4832,7 @@ impl<R: Random> Model<R> {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use signa_core::{HeaderValue, message::header::ALERT_INFO};
 
     use super::*;
     use crate::{
@@ -4818,6 +4840,7 @@ mod tests {
         error::WireEffect,
         invite::UsagePhase,
         operation::Snapshot,
+        response::ProvisionalPlan,
         tests::{INVITE, invite, reply, request, response},
     };
 
@@ -5412,7 +5435,11 @@ mod tests {
             .unwrap();
         let exchange = authority.exchange;
         model
-            .try_submit(Command::Accept { authority, answer: answer() })
+            .try_submit(Command::Accept {
+                authority,
+                answer: answer(),
+                fields: Fields::default(),
+            })
             .unwrap();
         model.run_commands();
         model.final_committed(exchange, clock.now());
@@ -5462,7 +5489,11 @@ mod tests {
         let exchange = authority.exchange;
 
         model
-            .try_submit(Command::Accept { authority, answer: answer() })
+            .try_submit(Command::Accept {
+                authority,
+                answer: answer(),
+                fields: Fields::default(),
+            })
             .unwrap();
         model.run_commands();
         assert_eq!(finals(model.take_effects()), [(exchange, 200)]);
@@ -5670,7 +5701,11 @@ mod tests {
         let exchange = authority.exchange;
 
         let operation = model
-            .try_submit(Command::Accept { authority, answer: answer() })
+            .try_submit(Command::Accept {
+                authority,
+                answer: answer(),
+                fields: Fields::default(),
+            })
             .unwrap();
         model.run_commands();
         assert_eq!(finals(model.take_effects()), [(exchange, 200)]);
@@ -5705,13 +5740,18 @@ mod tests {
             .unwrap();
         let exchange = second.exchange;
         model
-            .try_submit(Command::Accept { authority: first, answer: answer() })
+            .try_submit(Command::Accept {
+                authority: first,
+                answer: answer(),
+                fields: Fields::default(),
+            })
             .unwrap();
 
         let refused = model
             .try_submit(Command::Accept {
                 authority: second,
                 answer: answer(),
+                fields: Fields::default(),
             })
             .unwrap_err();
 
@@ -5745,11 +5785,16 @@ mod tests {
         let exchange = authority.exchange;
         let forged = Authority { exchange };
         model
-            .try_submit(Command::Accept { authority, answer: answer() })
+            .try_submit(Command::Accept {
+                authority,
+                answer: answer(),
+                fields: Fields::default(),
+            })
             .unwrap();
         let losing = model.try_submit(Command::Accept {
             authority: forged,
             answer: answer(),
+            fields: Fields::default(),
         });
 
         model.run_commands();
@@ -5763,6 +5808,7 @@ mod tests {
                     status: StatusCode::OK,
                     to_tag: "0000000000000001".parse().unwrap(),
                     body: Some(answer()),
+                    fields: Fields::default(),
                 },
                 Effect::OperationEnded { operation: losing },
             ],
@@ -5779,6 +5825,7 @@ mod tests {
             .try_submit(Command::Accept {
                 authority: Authority { exchange },
                 answer: answer(),
+                fields: Fields::default(),
             })
             .unwrap();
         model.run_commands();
@@ -5807,7 +5854,11 @@ mod tests {
         let exchange = authority.exchange;
 
         let operation = model
-            .try_submit(Command::Accept { authority, answer: answer() })
+            .try_submit(Command::Accept {
+                authority,
+                answer: answer(),
+                fields: Fields::default(),
+            })
             .unwrap();
         model.run_commands();
         model.check();
@@ -5833,7 +5884,11 @@ mod tests {
             .unwrap();
         let exchange = authority.exchange;
         model
-            .try_submit(Command::Accept { authority, answer: answer() })
+            .try_submit(Command::Accept {
+                authority,
+                answer: answer(),
+                fields: Fields::default(),
+            })
             .unwrap();
         model.run_commands();
         model.final_committed(exchange, clock.now());
@@ -5869,7 +5924,11 @@ mod tests {
         let exchange = authority.exchange;
 
         model
-            .try_submit(Command::Accept { authority, answer: answer() })
+            .try_submit(Command::Accept {
+                authority,
+                answer: answer(),
+                fields: Fields::default(),
+            })
             .unwrap();
         model.run_commands();
         model.final_committed(exchange, clock.now());
@@ -5912,7 +5971,11 @@ mod tests {
             .unwrap();
         let exchange = authority.exchange;
         model
-            .try_submit(Command::Accept { authority, answer: answer() })
+            .try_submit(Command::Accept {
+                authority,
+                answer: answer(),
+                fields: Fields::default(),
+            })
             .unwrap();
         model.run_commands();
         model.final_committed(exchange, clock.now());
@@ -6064,7 +6127,11 @@ mod tests {
         let busy = StatusCode::from_u16(486).unwrap();
 
         let operation = model
-            .try_submit(Command::Reject { authority, status: busy })
+            .try_submit(Command::Reject {
+                authority,
+                status: busy,
+                fields: Fields::default(),
+            })
             .unwrap();
         model.run_commands();
         assert_eq!(finals(model.take_effects()), [(exchange, 486)]);
@@ -6093,7 +6160,11 @@ mod tests {
             .unwrap();
 
         let operation = model
-            .try_submit(Command::Reject { authority, status: StatusCode::OK })
+            .try_submit(Command::Reject {
+                authority,
+                status: StatusCode::OK,
+                fields: Fields::default(),
+            })
             .unwrap();
         model.run_commands();
 
@@ -6129,6 +6200,7 @@ mod tests {
             .try_submit(Command::Accept {
                 authority: decided,
                 answer: answer(),
+                fields: Fields::default(),
             })
             .unwrap();
         model.run_commands();
@@ -6157,7 +6229,11 @@ mod tests {
                 .unwrap();
             let exchange = authority.exchange;
             let operation = model
-                .try_submit(Command::Accept { authority, answer: answer() })
+                .try_submit(Command::Accept {
+                    authority,
+                    answer: answer(),
+                    fields: Fields::default(),
+                })
                 .unwrap();
             model.run_commands();
             model.take_effects();
@@ -6309,7 +6385,11 @@ mod tests {
             .unwrap();
         let exchange = authority.exchange;
         model
-            .try_submit(Command::Accept { authority, answer: answer() })
+            .try_submit(Command::Accept {
+                authority,
+                answer: answer(),
+                fields: Fields::default(),
+            })
             .unwrap();
         model.run_commands();
         model.final_committed(exchange, clock.now());
@@ -6389,7 +6469,11 @@ mod tests {
             .unwrap();
         let exchange = authority.exchange;
         model
-            .try_submit(Command::Accept { authority, answer: answer() })
+            .try_submit(Command::Accept {
+                authority,
+                answer: answer(),
+                fields: Fields::default(),
+            })
             .unwrap();
         model.run_commands();
         model.take_effects();
@@ -6425,7 +6509,11 @@ mod tests {
             .unwrap();
         let exchange = authority.exchange;
         model
-            .try_submit(Command::Accept { authority, answer: answer() })
+            .try_submit(Command::Accept {
+                authority,
+                answer: answer(),
+                fields: Fields::default(),
+            })
             .unwrap();
         model.run_commands();
         model.take_effects();
@@ -6461,7 +6549,11 @@ mod tests {
         model.check();
 
         model
-            .try_submit(Command::Accept { authority, answer: answer() })
+            .try_submit(Command::Accept {
+                authority,
+                answer: answer(),
+                fields: Fields::default(),
+            })
             .unwrap();
         model.run_commands();
         model.check();
@@ -6487,7 +6579,11 @@ mod tests {
             .unwrap();
         let exchange = authority.exchange;
         model
-            .try_submit(Command::Accept { authority, answer: answer() })
+            .try_submit(Command::Accept {
+                authority,
+                answer: answer(),
+                fields: Fields::default(),
+            })
             .unwrap();
         model.run_commands();
         model.check();
@@ -6564,7 +6660,11 @@ mod tests {
             .unwrap();
         let exchange = authority.exchange;
         model
-            .try_submit(Command::Accept { authority, answer: answer() })
+            .try_submit(Command::Accept {
+                authority,
+                answer: answer(),
+                fields: Fields::default(),
+            })
             .unwrap();
         model.run_commands();
         assert_eq!(finals(model.take_effects()), [(exchange, 200)]);
@@ -6576,6 +6676,7 @@ mod tests {
             .try_submit(Command::Reject {
                 authority: Authority { exchange },
                 status: StatusCode::from_u16(486).unwrap(),
+                fields: Fields::default(),
             })
             .unwrap();
         model.run_commands();
@@ -6754,7 +6855,11 @@ mod tests {
         assert_eq!(finals(effects), [(exchange, 500)]);
 
         let late = model
-            .try_submit(Command::Accept { authority, answer: answer() })
+            .try_submit(Command::Accept {
+                authority,
+                answer: answer(),
+                fields: Fields::default(),
+            })
             .unwrap();
         model.run_commands();
         assert_eq!(
@@ -6771,7 +6876,7 @@ mod tests {
     }
 
     /// A provisional the application chose goes out again every minute,
-    /// with the same To tag, until a final is under way. The UA picks none
+    /// with the same To tag and headers, until a final is under way. The UA picks none
     /// of its own. The application rings for longer than the default
     /// decision timeout here, as one that lets a phone ring would.
     #[test]
@@ -6789,11 +6894,16 @@ mod tests {
         assert!(advance_to(&mut model, &mut clock, start + minute).is_empty());
 
         let ringing = StatusCode::from_u16(180).unwrap();
+        let ring = HeaderValue::from_static("<http://example.com/ring.wav>");
+        let (_, _, fields) = ProvisionalPlan::new(ringing)
+            .header(ALERT_INFO, ring)
+            .into_parts();
         let operation = model
             .try_submit(Command::Provisional {
                 exchange,
                 status: ringing,
                 preview: None,
+                fields: fields.clone(),
             })
             .unwrap();
         model.run_commands();
@@ -6805,12 +6915,14 @@ mod tests {
                 to_tag: tag.clone(),
                 preview: None,
                 operation: Some(operation),
+                fields: fields.clone(),
             }],
         );
         model.provisional_done(
             exchange,
             ringing,
             None,
+            fields.clone(),
             Some(operation),
             Ok(()),
             clock.now(),
@@ -6834,12 +6946,17 @@ mod tests {
                     to_tag: tag.clone(),
                     preview: None,
                     operation: None,
+                    fields: fields.clone(),
                 }],
             );
         }
 
         model
-            .try_submit(Command::Accept { authority, answer: answer() })
+            .try_submit(Command::Accept {
+                authority,
+                answer: answer(),
+                fields: Fields::default(),
+            })
             .unwrap();
         model.run_commands();
         model.take_effects();
@@ -6866,17 +6983,23 @@ mod tests {
                 exchange,
                 status: StatusCode::from_u16(100).unwrap(),
                 preview: None,
+                fields: Fields::default(),
             })
             .unwrap();
         model.run_commands();
         model
-            .try_submit(Command::Accept { authority, answer: answer() })
+            .try_submit(Command::Accept {
+                authority,
+                answer: answer(),
+                fields: Fields::default(),
+            })
             .unwrap();
         let late = model
             .try_submit(Command::Provisional {
                 exchange,
                 status: StatusCode::from_u16(180).unwrap(),
                 preview: None,
+                fields: Fields::default(),
             })
             .unwrap();
         model.run_commands();
@@ -6917,6 +7040,7 @@ mod tests {
             .try_submit(Command::Reject {
                 authority,
                 status: StatusCode::from_u16(486).unwrap(),
+                fields: Fields::default(),
             })
             .unwrap();
         model.run_commands();
@@ -7994,13 +8118,20 @@ Contact: <sip:bob@192.0.2.4>
                     status: StatusCode::from_u16(487).unwrap(),
                     to_tag: tag,
                     body: None,
+                    fields: Fields::default(),
                 },
                 Effect::Notify(Event::InviteWithdrawn { exchange }),
             ],
         );
 
-        let accept =
-            run(&mut model, Command::Accept { authority, answer: answer() });
+        let accept = run(
+            &mut model,
+            Command::Accept {
+                authority,
+                answer: answer(),
+                fields: Fields::default(),
+            },
+        );
         assert_eq!(
             model.take_effects(),
             [Effect::OperationEnded { operation: accept }],
@@ -8028,8 +8159,14 @@ Contact: <sip:bob@192.0.2.4>
             .receive_invite(&request(INVITE), offer(), clock.now())
             .unwrap();
         let exchange = authority.exchange;
-        let accept =
-            run(&mut model, Command::Accept { authority, answer: answer() });
+        let accept = run(
+            &mut model,
+            Command::Accept {
+                authority,
+                answer: answer(),
+                fields: Fields::default(),
+            },
+        );
         assert_eq!(statuses(&model.take_effects()), [200]);
 
         assert!(model.receive_cancel(exchange).is_some());
@@ -8054,7 +8191,14 @@ Contact: <sip:bob@192.0.2.4>
             .receive_invite(&request(INVITE), offer(), clock.now())
             .unwrap();
         let exchange = authority.exchange;
-        run(&mut model, Command::Accept { authority, answer: answer() });
+        run(
+            &mut model,
+            Command::Accept {
+                authority,
+                answer: answer(),
+                fields: Fields::default(),
+            },
+        );
         model.receive_cancel(exchange);
         model.take_effects();
         model.final_refused(exchange, false);
@@ -8093,7 +8237,14 @@ Contact: <sip:bob@192.0.2.4>
             .receive_invite(&request(INVITE), offer(), clock.now())
             .unwrap();
         let exchange = authority.exchange;
-        run(&mut model, Command::Accept { authority, answer: answer() });
+        run(
+            &mut model,
+            Command::Accept {
+                authority,
+                answer: answer(),
+                fields: Fields::default(),
+            },
+        );
         model.take_effects();
         let lower = model.receive_request(&from_caller("BYE", 1), arrival());
         assert_eq!(lower, Err(Refusal::OutOfOrder));
@@ -9097,7 +9248,14 @@ Contact: <sip:bob@192.0.2.4>
             .receive_invite(&request(INVITE), Ok(Body::Other), clock.now())
             .unwrap();
         let exchange = authority.exchange;
-        run(&mut model, Command::Accept { authority, answer: answer() });
+        run(
+            &mut model,
+            Command::Accept {
+                authority,
+                answer: answer(),
+                fields: Fields::default(),
+            },
+        );
         model.final_committed(exchange, clock.now());
         let (_, usage) = confirmed(&model.take_effects());
 
@@ -9153,6 +9311,7 @@ Contact: <sip:bob@192.0.2.4>
                 exchange: authority.exchange,
                 status: StatusCode::from_u16(183).unwrap(),
                 preview: Some(answer()),
+                fields: Fields::default(),
             },
         );
         assert_eq!(
@@ -9415,7 +9574,11 @@ Contact: <sip:bob@192.0.2.4>
             .unwrap();
         let exchange = authority.exchange;
         model
-            .try_submit(Command::Reject { authority, status: status(488) })
+            .try_submit(Command::Reject {
+                authority,
+                status: status(488),
+                fields: Fields::default(),
+            })
             .unwrap();
         model.run_commands();
         assert_eq!(finals(model.take_effects()), [(exchange, 488)]);
@@ -9459,8 +9622,14 @@ Contact: <sip:bob@192.0.2.4>
         let effects = model.take_effects();
         assert_eq!(statuses(&effects), [487]);
         assert_eq!(notices(&effects), [Event::InviteWithdrawn { exchange }]);
-        let late =
-            run(&mut model, Command::Accept { authority, answer: answer() });
+        let late = run(
+            &mut model,
+            Command::Accept {
+                authority,
+                answer: answer(),
+                fields: Fields::default(),
+            },
+        );
         assert_eq!(outcome(&model, late), Some(Err(Error::AlreadyFinalized)));
         model.final_committed(exchange, clock.now());
         model.check();
@@ -9680,7 +9849,14 @@ CSeq: {cseq} INVITE
             )
             .unwrap();
         let exchange = authority.exchange;
-        run(&mut model, Command::Accept { authority, answer: answer() });
+        run(
+            &mut model,
+            Command::Accept {
+                authority,
+                answer: answer(),
+                fields: Fields::default(),
+            },
+        );
         model.final_committed(exchange, clock.now());
         let id = model.replays.iter().next().map(|(_, r)| r.id.clone());
         let id = id.unwrap();
@@ -9726,8 +9902,14 @@ CSeq: {cseq} INVITE
             "not before the 2xx"
         );
 
-        let accept =
-            run(&mut model, Command::Accept { authority, answer: answer() });
+        let accept = run(
+            &mut model,
+            Command::Accept {
+                authority,
+                answer: answer(),
+                fields: Fields::default(),
+            },
+        );
         model.final_committed(exchange, clock.now());
         model.check();
         let effects = model.take_effects();
@@ -9762,7 +9944,14 @@ CSeq: {cseq} INVITE
             )
             .unwrap();
         let exchange = authority.exchange;
-        run(&mut model, Command::Accept { authority, answer: answer() });
+        run(
+            &mut model,
+            Command::Accept {
+                authority,
+                answer: answer(),
+                fields: Fields::default(),
+            },
+        );
         model.final_committed(exchange, clock.now());
         model.take_effects();
         model.receive_ack(&uas_dialog(), 314161, None);
@@ -9869,7 +10058,14 @@ CSeq: {cseq} INVITE
             )
             .unwrap();
         let exchange = authority.exchange;
-        run(&mut model, Command::Accept { authority, answer: answer() });
+        run(
+            &mut model,
+            Command::Accept {
+                authority,
+                answer: answer(),
+                fields: Fields::default(),
+            },
+        );
         model.final_committed(exchange, clock.now());
         let early = model.receive_invite(
             &reinvite_from_caller(314161, "sip:alice@192.0.2.1"),
@@ -10024,8 +10220,14 @@ CSeq: {cseq} INVITE
             ended,
             [Event::UsageEnded { usage, reason: arrival().remote_bye() }],
         );
-        let late =
-            run(&mut model, Command::Accept { authority, answer: answer() });
+        let late = run(
+            &mut model,
+            Command::Accept {
+                authority,
+                answer: answer(),
+                fields: Fields::default(),
+            },
+        );
         assert_eq!(outcome(&model, late), Some(Err(Error::AlreadyFinalized)));
         model.final_committed(exchange, clock.now());
         model.check();
@@ -10351,7 +10553,14 @@ CSeq: {cseq} INVITE
             .receive_invite(&request(INVITE), Ok(Body::Empty), clock.now())
             .unwrap();
         let exchange = authority.exchange;
-        run(&mut model, Command::Accept { authority, answer: answer() });
+        run(
+            &mut model,
+            Command::Accept {
+                authority,
+                answer: answer(),
+                fields: Fields::default(),
+            },
+        );
         model.final_committed(exchange, clock.now());
         model.take_effects();
 
@@ -10393,7 +10602,11 @@ CSeq: {cseq} INVITE
         let exchange = second.exchange;
         run(
             &mut model,
-            Command::Accept { authority: second, answer: answer() },
+            Command::Accept {
+                authority: second,
+                answer: answer(),
+                fields: Fields::default(),
+            },
         );
         model.final_committed(exchange, clock.now());
         model.take_effects();
@@ -10486,7 +10699,14 @@ Contact: <sip:alice@192.0.2.1>
             .unwrap();
         let exchange = authority.exchange;
         assert_eq!(model.reinvite_session(exchange), Some(usage));
-        run(&mut model, Command::Accept { authority, answer: answer() });
+        run(
+            &mut model,
+            Command::Accept {
+                authority,
+                answer: answer(),
+                fields: Fields::default(),
+            },
+        );
         model.final_committed(exchange, clock.now());
         model.check();
         model.receive_ack(&uac_dialog(), 2, None);
@@ -10501,7 +10721,14 @@ Contact: <sip:alice@192.0.2.1>
             )
             .unwrap();
         let exchange = authority.exchange;
-        run(&mut model, Command::Accept { authority, answer: answer() });
+        run(
+            &mut model,
+            Command::Accept {
+                authority,
+                answer: answer(),
+                fields: Fields::default(),
+            },
+        );
         model.take_effects();
         let bye = from_callee("BYE", "callee", 4);
         assert!(matches!(
@@ -10612,7 +10839,14 @@ Contact: <sip:alice@192.0.2.1>
                 )
                 .unwrap();
             let exchange = authority.exchange;
-            run(&mut model, Command::Accept { authority, answer: answer() });
+            run(
+                &mut model,
+                Command::Accept {
+                    authority,
+                    answer: answer(),
+                    fields: Fields::default(),
+                },
+            );
             model.take_effects();
 
             let terminate = run(&mut model, Command::Terminate { usage });
@@ -10714,7 +10948,11 @@ Contact: <sip:alice@192.0.2.1>
             let exchange = first.exchange;
             run(
                 &mut model,
-                Command::Accept { authority: first, answer: answer() },
+                Command::Accept {
+                    authority: first,
+                    answer: answer(),
+                    fields: Fields::default(),
+                },
             );
             model.final_committed(exchange, clock.now());
             model.take_effects();
@@ -10736,6 +10974,7 @@ Contact: <sip:alice@192.0.2.1>
                         Command::Accept {
                             authority: second,
                             answer: answer(),
+                            fields: Fields::default(),
                         },
                     );
                     model.final_committed(exchange, clock.now());
@@ -10793,7 +11032,11 @@ Contact: <sip:alice@192.0.2.1>
         let exchange = first.exchange;
         run(
             &mut model,
-            Command::Accept { authority: first, answer: answer() },
+            Command::Accept {
+                authority: first,
+                answer: answer(),
+                fields: Fields::default(),
+            },
         );
         model.final_committed(exchange, clock.now());
         let deadline = clock.now() + T1 * 64;
@@ -11000,6 +11243,7 @@ Contact: <sip:alice@192.0.2.1>
                 Command::Accept {
                     authority: authority.unwrap(),
                     answer: answer(),
+                    fields: Fields::default(),
                 },
             );
             model.final_committed(exchange, clock.now());
@@ -11039,6 +11283,7 @@ Contact: <sip:alice@192.0.2.1>
                 exchange,
                 status(180),
                 None,
+                Fields::default(),
                 None,
                 Ok(()),
                 clock.now(),
@@ -11078,6 +11323,7 @@ Contact: <sip:alice@192.0.2.1>
                 exchange,
                 status: status(180),
                 preview: None,
+                fields: Fields::default(),
             },
         );
         model.take_effects();
@@ -11085,6 +11331,7 @@ Contact: <sip:alice@192.0.2.1>
             exchange,
             status(180),
             None,
+            Fields::default(),
             Some(operation),
             Ok(()),
             clock.now(),
@@ -11242,7 +11489,11 @@ Contact: <sip:alice@192.0.2.1>
             .exchange;
         let accept = run(
             &mut model,
-            Command::Accept { authority: held, answer: answer() },
+            Command::Accept {
+                authority: held,
+                answer: answer(),
+                fields: Fields::default(),
+            },
         );
         assert_eq!(finals_for(&model.take_effects(), exchange), [200]);
 
@@ -11367,6 +11618,7 @@ Contact: <sip:alice@192.0.2.1>
             exchange: ExchangeKey,
             status: StatusCode,
             preview: Option<Description>,
+            fields: Fields,
             operation: Option<OperationId>,
         },
         Invite(AttemptKey),
@@ -11546,11 +11798,16 @@ Contact: <sip:{host}@192.0.2.9>
                     exchange,
                     status,
                     preview,
+                    fields,
                     operation,
                     ..
-                } => {
-                    Owed::Provisional { exchange, status, preview, operation }
-                }
+                } => Owed::Provisional {
+                    exchange,
+                    status,
+                    preview,
+                    fields,
+                    operation,
+                },
                 Effect::StartInvite { attempt } => {
                     if self.model.take_invite(attempt).is_none() {
                         return;
@@ -11641,14 +11898,21 @@ Contact: <sip:{host}@192.0.2.9>
                 Owed::Final(exchange) => {
                     model.final_refused(exchange, choice % 2 == 0);
                 }
-                Owed::Provisional { exchange, status, preview, operation } => {
+                Owed::Provisional {
+                    exchange,
+                    status,
+                    preview,
+                    fields,
+                    operation,
+                } => {
                     let result = if well {
                         Ok(())
                     } else {
                         Err(Error::AlreadyFinalized)
                     };
                     model.provisional_done(
-                        exchange, status, preview, operation, result, now,
+                        exchange, status, preview, fields, operation, result,
+                        now,
                     );
                 }
                 Owed::Invite(attempt) if well => model.invite_started(attempt),
@@ -11774,10 +12038,12 @@ Contact: <sip:{host}@192.0.2.9>
                         0 | 1 => self.command(Command::Accept {
                             authority,
                             answer: answer(),
+                            fields: Fields::default(),
                         }),
                         2 => self.command(Command::Reject {
                             authority,
                             status: status(486),
+                            fields: Fields::default(),
                         }),
                         3 => {
                             self.authorities.push(authority);
@@ -11785,6 +12051,7 @@ Contact: <sip:{host}@192.0.2.9>
                                 exchange,
                                 status: status(180),
                                 preview: (a % 2 == 0).then(answer),
+                                fields: Fields::default(),
                             });
                         }
                         _ => self.model.abandon(authority.exchange),

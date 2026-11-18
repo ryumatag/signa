@@ -295,6 +295,8 @@ pub(crate) enum Place {
     Party,
     /// A Contact that forms a dialog, or a Route or Record-Route value.
     Dialog,
+    /// The Contact of a redirection, where to send the request again.
+    Redirect,
 }
 
 impl Place {
@@ -307,6 +309,7 @@ impl Place {
                 &[b"method", b"maddr", b"ttl", b"transport", b"lr"]
             }
             Place::Dialog => &[b"method", b"ttl"],
+            Place::Redirect => &[b"method", b"lr"],
         };
         !refused.contains(&name)
     }
@@ -320,9 +323,11 @@ pub(crate) fn allowed_in(uri: &str, place: Place) -> bool {
         return false;
     };
     let port = place == Place::Party && parsed.port().is_some();
+    let headers =
+        place != Place::Redirect && parsed.headers().next().is_some();
 
     !port
-        && parsed.headers().next().is_none()
+        && !headers
         && parsed.parameters().all(|parameter| {
             place.allows(&parameter.name().decode().to_ascii_lowercase())
         })
