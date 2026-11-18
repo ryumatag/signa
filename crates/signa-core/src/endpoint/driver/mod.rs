@@ -67,10 +67,10 @@ use crate::{
         builder::{Config, Reception},
         client::{
             Admitted, CancelError, CancelHandle, CancelOutcome,
-            ClientTransactionNumber, Delivery, Intent, Observation, Reserved,
+            ClientTransactionNumber, ClientWrite, Delivery, Intent, Reserved,
             Starting, Target,
         },
-        datagram::{Port, Received, Unwritten},
+        datagram::{ClientSubmit, Port, Received, Unwritten},
         error::{Busy, Error},
         observe::{self, Note, Tap, WriteOrigin, WriteRef},
         path::{ReceiveInfo, retain, transient},
@@ -84,6 +84,7 @@ use crate::{
             self, IncomingEvent, ReceivedRequest, ServerRequest,
             ServerTransactionId, SubmitError,
         },
+        settle::{Ending, Settle, Tally},
         shutdown::{self, ShutdownOutcome},
         table::{Id, Table},
         timer::{Key, TimerQueue},
@@ -206,16 +207,12 @@ struct ServerEntry {
 }
 
 impl Drop for ServerEntry {
+    /// Ends the machine of a transaction that never terminated, which only
+    /// the endpoint's teardown drops. One that terminated was finished
+    /// already, see `Driver::settle_server`.
     fn drop(&mut self) {
         if let Some(shared) = &self.shared {
-            shared.work.finish();
-            shared.observation.send_modify(|state| {
-                if state.end.is_none()
-                    && !shared.terminated.load(Ordering::Acquire)
-                {
-                    state.end = Some(server::End::EndpointClosed);
-                }
-            });
+            shared.close();
         }
     }
 }
@@ -310,6 +307,17 @@ struct ClientEntry {
     /// keeps it after a 2xx, until Timer M.
     respond: Option<Responder>,
     permit: Permit,
+    /// The transaction's settlement, which its machine ends as the entry
+    /// leaves the table, see `Driver::settle_client`.
+    settle: Arc<Settle>,
+}
+
+impl Drop for ClientEntry {
+    /// Ends the settlement of a machine that never terminated, which only
+    /// the endpoint's teardown drops.
+    fn drop(&mut self) {
+        self.settle.end_machine(true);
+    }
 }
 
 impl ClientEntry {
@@ -442,8 +450,8 @@ enum Pending {
     Request(Request<Bytes>, Admitted, Permit),
     /// A non-2xx ACK whose INVITE connection had closed. It goes to the
     /// INVITE's next hop (RFC 3261 section 17.1.1.3), not to where the final
-    /// response came from.
-    Ack(Bytes, Option<WriteRef>),
+    /// response came from. It counts in its INVITE's settlement from here.
+    Ack(Bytes, Option<WriteRef>, Id, ClientWrite),
     /// A CANCEL whose INVITE connection had closed.
     Cancel(CancelStart),
     /// A request sent once, which gets its Via when the connection is open.
@@ -472,7 +480,7 @@ impl Pending {
     /// The write this holds, if an observer recorded its start.
     fn write(&self) -> Option<WriteRef> {
         match self {
-            Pending::Ack(_, write)
+            Pending::Ack(_, write, ..)
             | Pending::Response(_, _, write)
             | Pending::OneShot(_, _, write)
             | Pending::Server(_, _, _, write) => *write,
@@ -750,9 +758,12 @@ pub(super) struct Driver {
     reply_admission: Admission,
     reply_bytes: Budget,
     writes: Vec<(tcp::Receipt, Completion)>,
-    /// Client request writes whose failure ends their transaction. The
-    /// observation keeps a late receipt away from a reused table slot.
-    client_writes: Vec<(ClientReceipt, Id, Observation)>,
+    /// Client writes whose outcome is not known yet, each counted in its
+    /// transaction's settlement until it is. A request's failure ends its
+    /// transaction, which the `ClientWrite` tells apart from a reused table
+    /// slot. Writes wait here only while the UDP backend or a TCP connection
+    /// holds them, so the write limits bound this list.
+    client_writes: Vec<(ClientReceipt, Id, ClientWrite)>,
     client_write_cursor: usize,
     /// From the `Endpoint`, `ClientControl`, `Responder` and `ReplyRoute`
     /// handles. The driver ends when they are all gone.
@@ -1182,20 +1193,25 @@ impl Driver {
         while index < self.client_writes.len() && inspected < 32 {
             inspected += 1;
             if let Poll::Ready(result) = self.client_writes[index].0.poll(cx) {
-                let (_, id, observation) =
-                    self.client_writes.swap_remove(index);
+                let (_, id, write) = self.client_writes.swap_remove(index);
                 // Only a request that did not go out ends its transaction
-                // (RFC 3261 sections 17.1.1.2 and 17.1.2.2). One whose outcome
-                // is unknown may have reached the peer, so the transaction
-                // goes on, retransmitting over UDP, until a response or its
-                // timeout ends it.
-                let WriteOutcome::NotWritten(error) = result else { continue };
-                let current = self
-                    .clients
-                    .get(id)
-                    .and_then(|entry| entry.respond.as_ref())
-                    .is_some_and(|delivery| observation.matches(delivery));
-                if current {
+                // (RFC 3261 sections 17.1.1.2 and 17.1.2.2), and only while
+                // its stream is open, which `respond` says. An INVITE in
+                // Accepted keeps its state, see `fail_client`. One whose
+                // outcome is unknown may have reached the peer, so the
+                // transaction goes on, retransmitting over UDP, until a
+                // response or its timeout ends it. A failed ACK is lost as
+                // UDP would lose it, and the server's retransmissions cover
+                // it.
+                let fails = write.is_request()
+                    && self.clients.get(id).is_some_and(|entry| {
+                        entry.respond.is_some()
+                            && write.belongs_to(&entry.settle)
+                    });
+                write.end(&result);
+                if let (true, WriteOutcome::NotWritten(error)) =
+                    (fails, result)
+                {
                     self.fail_client(id, error);
                 }
             } else {
@@ -1527,30 +1543,16 @@ impl Driver {
         let note =
             self.note(WriteOrigin::RequestRetransmission { transaction });
         let (udp, tap) = (self.udp.as_mut(), self.tap.as_ref());
-        // Without room for another receipt the retransmission goes out
-        // unobserved. Its failure would be one lost datagram, which the next
-        // retransmission or the transaction timeout covers.
-        let result = if self.client_writes.len()
-            < self.config.max_client_transactions
-        {
-            send_client(udp, tap, &entry.link, request.clone(), false, note)
-        } else {
-            let request = request.clone();
-            send_on(udp, tap, &entry.link, request, false, note).map(|()| None)
-        };
-        match result {
-            Ok(receipt) => {
-                if let (Some(receipt), Some(delivery)) =
-                    (receipt, &entry.respond)
-                {
-                    self.client_writes.push((
-                        receipt,
-                        id,
-                        delivery.observation(),
-                    ));
-                }
-                None
-            }
+        let sent =
+            send_client(udp, tap, &entry.link, request.clone(), false, note);
+        match track_client(
+            &mut self.client_writes,
+            id,
+            &entry.settle,
+            sent,
+            true,
+        ) {
+            Ok(()) => None,
             // A full local write queue is not a transport failure. Skip this
             // retransmission as if UDP had lost it, and keep the transaction.
             Err(Unwritten::Busy(_)) => None,
@@ -1604,6 +1606,7 @@ impl Driver {
             let connection =
                 entry.link.writer.as_ref().map(tcp::Writer::connection_id);
             let mut entry = self.clients.remove(id).expect("found above");
+            entry.settle.end_machine(false);
             // An INVITE that received a 2xx ends its stream at Timer M,
             // without an error. Every other end delivered its outcome first.
             if let ClientMachine::Invite(invite) = &mut entry.tx {
@@ -1813,7 +1816,15 @@ impl Driver {
                 drop(permit);
                 admitted.fail(Error::busy(Busy::Connections));
             }
-            Pending::Response(..) | Pending::Ack(..) => {}
+            Pending::Response(..) => {}
+            // A route the endpoint has no room for loses the ACK, as a
+            // failed connection does.
+            Pending::Ack(_, _, _, write) => {
+                write.end(&WriteOutcome::NotWritten(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "no room for a connection to the next hop",
+                )));
+            }
             // Server output reserves its route and connection before commit
             // and never passes through `send_over_tcp`. Refusing it here
             // would be a rejection, not a transport failure.
@@ -1884,10 +1895,19 @@ impl Driver {
             }
             // A lost ACK over TCP is like one lost over UDP. The server
             // retransmits its final response until Timer H.
-            Pending::Ack(bytes, write) => {
-                let _ = tcp_resume(self.tap.as_ref(), write, |hook| {
-                    writer.send_hooked(bytes.clone(), hook)
-                });
+            Pending::Ack(bytes, write, id, tracked) => {
+                match tcp_resume(self.tap.as_ref(), write, |hook| {
+                    writer.submit_hooked(bytes.clone(), hook)
+                }) {
+                    Ok(receipt) => self.client_writes.push((
+                        ClientReceipt::Tcp(receipt),
+                        id,
+                        tracked,
+                    )),
+                    Err(error) => tracked.end(&WriteOutcome::NotWritten(
+                        io::Error::new(io::ErrorKind::BrokenPipe, error),
+                    )),
+                }
             }
             Pending::Cancel(start) => {
                 let link = Link { flow, writer: Some(writer), path: None };
@@ -2247,12 +2267,6 @@ impl Driver {
             return;
         }
 
-        if self.client_writes.len() >= self.config.max_client_transactions {
-            drop(permit);
-            respond.send(Err(Error::busy(Busy::Client)));
-            return;
-        }
-
         // The machine copies what it keeps before anything is sent. `start`
         // checked what an INVITE's machine reads, and the Via is the
         // endpoint's own.
@@ -2293,7 +2307,9 @@ impl Driver {
         let transaction = ClientTransactionNumber::of(self.clients.next_id());
         let note = self.note(WriteOrigin::Request { transaction });
         let tap = self.tap.as_ref();
-        let receipt = match send_client(
+        // A request that does not go out is refused, so it starts no
+        // transaction and its failure counts in no settlement.
+        let sent = match send_client(
             self.udp.as_mut(),
             tap,
             &link,
@@ -2301,7 +2317,7 @@ impl Driver {
             true,
             note,
         ) {
-            Ok(receipt) => receipt,
+            Ok(sent) => sent,
             Err(unwritten) => {
                 drop((tx, permit));
                 let _ = accepted.send(Err(match unwritten {
@@ -2313,7 +2329,9 @@ impl Driver {
         };
 
         let delivery = observing.delivery();
-        let observation = delivery.observation();
+        // The settlement is made with the transaction, not with its stream,
+        // which an INVITE also reserves for a CANCEL that may never start.
+        let settle = Arc::new(Settle::new());
         let flow = link.flow;
         if let Some(writer) = &link.writer {
             *self
@@ -2321,13 +2339,18 @@ impl Driver {
                 .entry(writer.connection_id())
                 .or_default() += 1;
         }
-        let entry = ClientEntry { tx, link, respond: Some(delivery), permit };
+        let entry = ClientEntry {
+            tx,
+            link,
+            respond: Some(delivery),
+            permit,
+            settle: settle.clone(),
+        };
         let deadline = entry.deadline();
         let id = self.clients.insert(key, entry);
         debug_assert_eq!(ClientTransactionNumber::of(id), transaction);
-        if let Some(receipt) = receipt {
-            self.client_writes.push((receipt, id, observation));
-        }
+        let _ =
+            track_client(&mut self.client_writes, id, &settle, Ok(sent), true);
         if let Some(at) = deadline {
             self.timers.push(at, Key::Client(id));
         }
@@ -2339,6 +2362,7 @@ impl Driver {
             flow,
             cancel,
             transaction,
+            settle,
         )));
     }
 
@@ -2383,7 +2407,12 @@ impl Driver {
                             admitted.fail(Error::transport(err));
                         }
                         // See `send_reply` and `Driver::send_ack`.
-                        Pending::Response(..) | Pending::Ack(..) => {}
+                        Pending::Response(..) => {}
+                        Pending::Ack(_, _, _, write) => {
+                            write.end(&WriteOutcome::NotWritten(
+                                io::Error::new(source.kind(), source.clone()),
+                            ));
+                        }
                         Pending::Cancel(start) => {
                             if let Some(done) = start.done {
                                 let _ = done.send(Err(
@@ -2873,8 +2902,7 @@ impl Driver {
             accepted: AtomicBool::new(false),
             abandoned: AtomicBool::new(false),
             observation,
-            transport: AtomicUsize::new(0),
-            terminated: AtomicBool::new(false),
+            tally: Tally::new(),
         });
         self.servers.get_mut(id).expect("new transaction").shared =
             Some(shared.clone());
@@ -3432,8 +3460,19 @@ impl ClientReceipt {
     }
 }
 
-/// Sends a client request and returns a receipt when its write is queued.
-/// A full TCP queue is [`Unwritten::Busy`].
+/// How a client write that went to the transport stands.
+enum ClientSent {
+    /// It ended as it was offered, written or with its outcome unknown.
+    Done(WriteOutcome),
+    /// It waits for the backend or the connection.
+    Waiting(ClientReceipt),
+}
+
+/// Sends a write of a client transaction and returns how it stands. A write
+/// that did not go out is an error, a full TCP queue [`Unwritten::Busy`].
+///
+/// A later write, such as a retransmission, an ACK or a CANCEL, may use the
+/// room that an `initial` request leaves for transaction output.
 fn send_client(
     udp: Option<&mut Port>,
     tap: Option<&Tap>,
@@ -3441,18 +3480,60 @@ fn send_client(
     bytes: Bytes,
     initial: bool,
     note: Note,
-) -> Result<Option<ClientReceipt>, Unwritten> {
+) -> Result<ClientSent, Unwritten> {
     if let Some(writer) = &link.writer {
         tcp_write(tap, link.flow, note, &bytes, |hook| {
-            writer.submit_request(bytes.clone(), hook)
+            if initial {
+                writer.submit_request(bytes.clone(), hook)
+            } else {
+                writer.submit_hooked(bytes.clone(), hook)
+            }
         })
-        .map(|receipt| Some(ClientReceipt::Tcp(receipt)))
+        .map(|receipt| ClientSent::Waiting(ClientReceipt::Tcp(receipt)))
         .map_err(tcp_unwritten)
     } else {
         udp.expect("UDP link has a socket")
             .submit_client(bytes, link, initial, note)
-            .map(|receipt| receipt.map(ClientReceipt::Udp))
+            .map(|submitted| match submitted {
+                ClientSubmit::Done(outcome) => ClientSent::Done(outcome),
+                ClientSubmit::Waiting(receipt) => {
+                    ClientSent::Waiting(ClientReceipt::Udp(receipt))
+                }
+            })
     }
+}
+
+/// Counts a write of the client transaction in entry `id` in its
+/// settlement `settle`, as `sent` says it stands. The write is a
+/// request or a retransmission of it with `request`, a non-2xx ACK without.
+///
+/// A write that waits joins `client_writes` until its outcome is known. One
+/// that did not go out counts as not written, and is handed back for the
+/// caller to act on. One that the endpoint's limits refused is no write, and
+/// counts nothing. Every write of a client transaction takes this way, so
+/// that its settlement misses none.
+fn track_client(
+    client_writes: &mut Vec<(ClientReceipt, Id, ClientWrite)>,
+    id: Id,
+    settle: &Arc<Settle>,
+    sent: Result<ClientSent, Unwritten>,
+    request: bool,
+) -> Result<(), Unwritten> {
+    match sent {
+        Ok(ClientSent::Done(outcome)) => {
+            settle.tally.record(Ending::from(&outcome));
+        }
+        Ok(ClientSent::Waiting(receipt)) => {
+            let write = ClientWrite::new(settle, request);
+            client_writes.push((receipt, id, write));
+        }
+        Err(Unwritten::Failed(error)) => {
+            settle.tally.record(Ending::NotWritten);
+            return Err(Unwritten::Failed(error));
+        }
+        Err(busy @ Unwritten::Busy(_)) => return Err(busy),
+    }
+    Ok(())
 }
 
 /// Over TCP a full write queue is an error here. The connection is in trouble,
@@ -4181,8 +4262,7 @@ mod tests {
             accepted: AtomicBool::new(false),
             abandoned: AtomicBool::new(false),
             observation,
-            transport: AtomicUsize::new(0),
-            terminated: AtomicBool::new(false),
+            tally: Tally::new(),
         });
         let reply = route_response(&envelope.request);
         let operation =
@@ -4813,8 +4893,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_retransmission_without_receipt_capacity_keeps_the_transaction()
-    {
+    async fn a_retransmission_goes_out_while_an_earlier_write_waits() {
         let (mut driver, commands, _local) = reply_driver_with(Config {
             timers: Timers::builder()
                 .t1(Duration::from_millis(10))
@@ -4842,16 +4921,12 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        // A receipt that never resolves takes the only observation slot.
+        // A write whose receipt never resolves.
         let (id, entry) = driver.clients.iter().next().unwrap();
-        let observation = entry.respond.as_ref().unwrap().observation();
+        let write = ClientWrite::new(&entry.settle, true);
         let (_never, receipt) = oneshot::channel();
         driver.client_writes.clear();
-        driver.client_writes.push((
-            ClientReceipt::Udp(receipt),
-            id,
-            observation,
-        ));
+        driver.client_writes.push((ClientReceipt::Udp(receipt), id, write));
         sleep(Duration::from_millis(20)).await;
         driver.on_timer(Key::Client(id));
         flush(&mut driver).await;

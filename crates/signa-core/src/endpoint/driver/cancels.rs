@@ -19,7 +19,7 @@ use tokio::sync::oneshot;
 use super::{
     Arrival, Cancel, CancelStart, ClientEntry, ClientMachine, Driver, Key,
     Link, Pending, SERVICE_UNAVAILABLE, ServerMachine, identity_bytes, now,
-    send_client, send_on,
+    send_client, track_client,
 };
 use crate::{
     endpoint::{
@@ -33,6 +33,7 @@ use crate::{
         observe::WriteOrigin,
         path::{ReceiveInfo, retain},
         server::{self, IncomingCancel, IncomingEvent},
+        settle::Settle,
         table::Id,
     },
     message::{header::VIA, request::Request},
@@ -144,28 +145,21 @@ impl Driver {
         let bytes = request.to_bytes();
         drop(request);
 
-        // The reservation covers the table entry. The receipt list is bounded
-        // as for retransmissions, and the write may use the headroom that new
-        // requests leave for transaction output.
+        // The reservation covers the table entry, and the write may use the
+        // headroom that new requests leave for transaction output.
         // The CANCEL's transaction is numbered by the table entry it gets
         // below, which nothing between here and there changes.
         let transaction = ClientTransactionNumber::of(self.clients.next_id());
         let note = self.note(WriteOrigin::Request { transaction });
         let (udp, tap) = (self.udp.as_mut(), self.tap.as_ref());
-        let sent = if self.client_writes.len()
-            < self.config.max_client_transactions
-        {
-            send_client(udp, tap, &link, bytes.clone(), false, note)
-        } else {
-            send_on(udp, tap, &link, bytes.clone(), false, note).map(|()| None)
-        };
+        let sent = send_client(udp, tap, &link, bytes.clone(), false, note);
         let now = now();
         let timers = self.config.timers;
         let reliable = link.flow.transport.is_reliable();
         let tx = ClientTransaction::new(bytes, reliable, &timers, now);
         let Reserved { permit, observation } = reserved;
         let delivery = observation.delivery();
-        let observed = delivery.observation();
+        let settle = Arc::new(Settle::new());
         let flow = link.flow;
         if let Some(writer) = &link.writer {
             *self
@@ -178,6 +172,7 @@ impl Driver {
             link,
             respond: Some(delivery),
             permit,
+            settle: settle.clone(),
         };
         let deadline = entry.deadline();
         debug_assert!(self.clients.find(&key).is_none(), "one CANCEL");
@@ -188,11 +183,9 @@ impl Driver {
         }
         self.unanswered += 1;
 
-        match sent {
-            Ok(Some(receipt)) => {
-                self.client_writes.push((receipt, id, observed))
-            }
-            Ok(None) => {}
+        let writes = &mut self.client_writes;
+        match track_client(writes, id, &settle, sent, true) {
+            Ok(()) => {}
             Err(error) => {
                 let entry = self.clients.get_mut(id).expect("just inserted");
                 entry.tx.end_on_transport_error();
@@ -211,7 +204,8 @@ impl Driver {
         // RFC 3261 section 9.1. The INVITE stops waiting 64 T1 from now.
         self.start_cancel_deadline(invite, &intent, now);
 
-        let transaction = observation.finish(via, flow, None, transaction);
+        let transaction =
+            observation.finish(via, flow, None, transaction, settle);
         if let Some(done) = done {
             let _ = done.send(Ok(CancelOutcome::Sent(transaction)));
         }

@@ -16,6 +16,8 @@ module is its side of the boundary, as owned events, handles and operations:
   responses, and [`ServerEvents`], which observes what becomes of them.
 * [`Endpoint::start`] returns a [`ClientTransaction`], which splits into a
   [`ClientControl`], which can cancel an INVITE, and its [`Responses`].
+* Each transaction gives a [`Settlement`], which resolves once its machine
+  and every write it made have finished.
 * [`Endpoint::send_request`], [`Endpoint::forward_response`] and
   [`ReplyRoute::send`] send one message without a transaction.
 * [`Endpoint::shutdown`] drains the endpoint, and a [`WorkGuard`] holds the
@@ -64,7 +66,7 @@ end of one does not imply the end of another.
 | Lifetime | Owner | Ends when | The TU sees it through |
 | --- | --- | --- | --- |
 | Transport submission | The transport | The local write succeeds or fails | A one-shot send's future, [`ServerEvent::TransportFailure`], [`Error::is_transport`] |
-| SIP transaction | The driver | Its machine reaches Terminated on its timers | [`ServerEvent::Terminated`] |
+| SIP transaction | The driver | Its machine reaches Terminated on its timers, and its writes end | [`ServerEvent::Terminated`] for the machine, [`Settlement`] for both |
 | TU work | The application | The application is done with it | Nothing, unless it holds a [`WorkGuard`] |
 | Dialog or call | A layer above signa | Its own policy, such as a BYE | Nothing in signa |
 
@@ -93,6 +95,13 @@ In particular:
   unacknowledged.
 * **A handler returning does not end its transaction.** The transaction ends
   on its timers, whether its handles are still held or not.
+* **The end of observation is not the end of the work.** [`Responses`] ends
+  at the final, or at Timer M after a 2xx, while the machine stays to absorb
+  retransmissions and acknowledge a non-2xx, and a write can still be out.
+  [`ServerEvent::Terminated`] marks the machine, and a write of the final can
+  fail after it. A [`Settlement`] resolves after both, counts how each write
+  ended whether or not anyone observed it, and says when the endpoint stopped
+  first.
 * **A graceful shutdown is not a dialog teardown.**
   [`ShutdownOutcome::Drained`] means that signa's transactions, writes and
   connects, and every [`WorkGuard`], finished before the deadline. It sends
@@ -122,5 +131,6 @@ In particular:
 [`Target`]: endpoint::Target
 [`WorkGuard`]: endpoint::WorkGuard
 [`ShutdownOutcome::Drained`]: endpoint::ShutdownOutcome::Drained
+[`Settlement`]: endpoint::Settlement
 [`Error::is_timeout`]: endpoint::Error::is_timeout
 [`Error::is_transport`]: endpoint::Error::is_transport

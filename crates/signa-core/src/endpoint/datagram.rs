@@ -147,6 +147,15 @@ enum Started {
     Waiting(WriteId),
 }
 
+/// How a client write stands once the port has it.
+pub(super) enum ClientSubmit {
+    /// The backend took it and reported it at once, written or with its
+    /// outcome unknown.
+    Done(WriteOutcome),
+    /// It waits, and the receipt learns how it ends.
+    Waiting(oneshot::Receiver<WriteOutcome>),
+}
+
 /// Why a write the driver started did not go out.
 ///
 /// The driver tells a full limit of its own from a failure by the variant,
@@ -440,27 +449,31 @@ impl Port {
         }
     }
 
-    /// Sends a client request, returning a receipt when its outcome is not
-    /// known yet. Only a request that did not go out is an error.
+    /// Sends a write of a client transaction, returning a receipt when its
+    /// outcome is not known yet. Only a write that did not go out is an
+    /// error.
     pub(super) fn submit_client(
         &mut self,
         bytes: Bytes,
         link: &Link,
         initial: bool,
         note: Note,
-    ) -> Result<Option<oneshot::Receiver<WriteOutcome>>, Unwritten> {
+    ) -> Result<ClientSubmit, Unwritten> {
         let limits = if initial {
             crate::transport::budget::request_limits(self.limits)
         } else {
             self.limits
         };
         match self.start(bytes, link, limits, note) {
-            Started::Done(outcome) => failure(outcome).map(|()| None),
+            Started::Done(WriteOutcome::NotWritten(error)) => {
+                Err(Unwritten::Failed(error))
+            }
+            Started::Done(outcome) => Ok(ClientSubmit::Done(outcome)),
             Started::Busy(error) => Err(Unwritten::Busy(error)),
             Started::Waiting(id) => {
                 let (done, receipt) = oneshot::channel();
                 self.attach(id, Outcome::Client(done));
-                Ok(Some(receipt))
+                Ok(ClientSubmit::Waiting(receipt))
             }
         }
     }
@@ -1312,16 +1325,28 @@ mod tests {
         assert!(port.is_idle());
     }
 
+    /// The receipt of a client write that waits.
+    fn waiting(
+        submitted: Result<ClientSubmit, Unwritten>,
+    ) -> oneshot::Receiver<WriteOutcome> {
+        match submitted {
+            Ok(ClientSubmit::Waiting(receipt)) => receipt,
+            _ => panic!("a waiting write"),
+        }
+    }
+
     #[tokio::test]
     async fn queued_client_write_failure_reaches_its_receipt() {
         let script = Script::default();
         let mut port = port(&script, Limits::default());
         script.mode(Mode::Hold);
 
-        let receipt = port
-            .submit_client(Bytes::from_static(b"request"), &LINK, true, NOTE)
-            .unwrap()
-            .unwrap();
+        let receipt = waiting(port.submit_client(
+            Bytes::from_static(b"request"),
+            &LINK,
+            true,
+            NOTE,
+        ));
         script.mode(Mode::Accept);
         flush(&mut port);
         let id = script.accepted()[0];
@@ -1347,10 +1372,12 @@ mod tests {
         let script = Script::default();
         let mut port = port(&script, Limits::default());
         script.mode(Mode::Accept);
-        let receipt = port
-            .submit_client(Bytes::from_static(b"request"), &LINK, true, NOTE)
-            .unwrap()
-            .unwrap();
+        let receipt = waiting(port.submit_client(
+            Bytes::from_static(b"request"),
+            &LINK,
+            true,
+            NOTE,
+        ));
         let id = script.accepted()[0];
 
         script.complete(
@@ -1372,11 +1399,14 @@ mod tests {
         let script = Script::default();
         let mut port = port(&script, Limits::default());
 
-        let receipt = port
+        let submitted = port
             .submit_client(Bytes::from_static(b"request"), &LINK, true, NOTE)
             .unwrap();
 
-        assert!(receipt.is_none());
+        assert!(matches!(
+            submitted,
+            ClientSubmit::Done(WriteOutcome::Written)
+        ));
     }
 
     #[tokio::test]
@@ -1465,24 +1495,25 @@ mod tests {
         let script = Script::default();
         let mut port = port(&script, Limits::default());
         script.mode(Mode::Accept);
-        let accepted = port
-            .submit_client(Bytes::from_static(b"accepted"), &LINK, false, NOTE)
-            .unwrap()
-            .unwrap();
-        let unreported = port
-            .submit_client(
-                Bytes::from_static(b"unreported"),
-                &LINK,
-                false,
-                NOTE,
-            )
-            .unwrap()
-            .unwrap();
+        let accepted = waiting(port.submit_client(
+            Bytes::from_static(b"accepted"),
+            &LINK,
+            false,
+            NOTE,
+        ));
+        let unreported = waiting(port.submit_client(
+            Bytes::from_static(b"unreported"),
+            &LINK,
+            false,
+            NOTE,
+        ));
         script.mode(Mode::Hold);
-        let held = port
-            .submit_client(Bytes::from_static(b"held"), &LINK, false, NOTE)
-            .unwrap()
-            .unwrap();
+        let held = waiting(port.submit_client(
+            Bytes::from_static(b"held"),
+            &LINK,
+            false,
+            NOTE,
+        ));
         script.0.lock().unwrap().on_close = vec![(
             script.accepted()[0],
             WriteOutcome::NotWritten(io::Error::new(

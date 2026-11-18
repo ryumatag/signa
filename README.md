@@ -88,6 +88,8 @@ API:
   and `ServerEvents`, which reports write failures and termination.
 * `Endpoint::start` sends a request to an explicit `Target` and returns a
   `ClientControl`, which can cancel an INVITE, and a `Responses` stream.
+* Each transaction gives a `Settlement`, which resolves once its machine has
+  terminated and its writes have ended, and counts how they ended.
 * `Endpoint::prepare` measures a request with its Via before anything is
   sent, so the TU can pick TCP for one too large for UDP, and
   `Endpoint::start_prepared` sends it. `Endpoint::prepare_path` makes a

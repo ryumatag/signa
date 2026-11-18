@@ -22,7 +22,11 @@ use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use super::{
-    driver::Command, path::ReceiveInfo, reply::ReplyRoute, table::Id,
+    driver::Command,
+    path::ReceiveInfo,
+    reply::ReplyRoute,
+    settle::{Ending, Settled, Settlement, Tally},
+    table::Id,
 };
 use crate::{
     message::{Method, Request, Response},
@@ -324,6 +328,13 @@ impl ServerTransaction {
     /// Separates response submission from transaction observation.
     pub fn into_parts(self) -> (Responder, ServerEvents) {
         (self.responder, self.events)
+    }
+
+    /// Returns a [`Settlement`] that resolves once the machine has terminated
+    /// and every write of this transaction has ended.
+    /// See [`ServerEvents::settlement`].
+    pub fn settlement(&self) -> Settlement {
+        self.events.settlement()
     }
 }
 
@@ -727,6 +738,8 @@ pub(super) struct Observation {
     pub(super) problem: Option<Problem>,
     pub(super) operation: Option<ResponseId>,
     pub(super) end: Option<End>,
+    /// Set once, by whoever settles the transaction's [`Tally`].
+    pub(super) settled: Option<Settled>,
 }
 
 /// Observes one server transaction's write failures, refused output and
@@ -748,6 +761,24 @@ impl ServerEvents {
     /// Returns the identity of the observed server transaction.
     pub fn id(&self) -> ServerTransactionId {
         self.id
+    }
+
+    /// Returns a [`Settlement`] that resolves once the machine has
+    /// terminated and every write of this transaction has ended.
+    ///
+    /// This stream ends then too, unless the endpoint stops first. The
+    /// settlement counts every write where the stream coalesces failures,
+    /// and it needs no reader. It counts each response, the automatic 100,
+    /// every retransmission of a cached response and signa's 500. An INVITE
+    /// that sent a 2xx settles after Timer L, and a non-INVITE over UDP
+    /// after Timer J.
+    ///
+    /// Only the observation gives a settlement, here or through
+    /// [`ServerTransaction::settlement`]. The [`Responder`] does not, since
+    /// an unobserved transaction lets go of what a settlement needs once its
+    /// final response is accepted.
+    pub fn settlement(&self) -> Settlement {
+        Settlement::server(self.receiver.clone())
     }
 
     /// Receives the next event, or `None` once the stream ends.
@@ -867,8 +898,8 @@ pub(super) struct Shared {
     pub(super) accepted: AtomicBool,
     pub(super) abandoned: AtomicBool,
     pub(super) observation: watch::Sender<Observation>,
-    pub(super) transport: AtomicUsize,
-    pub(super) terminated: AtomicBool,
+    /// The machine and the writes in progress, see [`Settlement`].
+    pub(super) tally: Tally,
 }
 
 impl Shared {
@@ -895,42 +926,72 @@ impl Shared {
         }
     }
 
+    /// Ends the machine at Terminated. The caller then removes the entry.
     pub(super) fn finish(&self) {
         self.work.finish();
-        self.terminated.store(true, Ordering::Release);
-        if self.observation.receiver_count() != 0 {
-            let drained = self.transport.load(Ordering::Acquire) == 0;
-            self.observation.send_modify(|state| {
-                state.terminated = true;
-                if drained && state.end.is_none() {
-                    state.end = Some(End::Terminated);
-                }
-            });
+        // Every settlement holds a receiver, so with none nobody waits. The
+        // machine ends under the observation's lock, after `terminated`, so
+        // a write that settles the transaction meanwhile cannot end the
+        // stream before it.
+        if self.observation.receiver_count() == 0 {
+            self.tally.end_machine(false);
+            return;
+        }
+        self.observation.send_modify(|state| {
+            state.terminated = true;
+            if self.tally.end_machine(false) {
+                self.publish(state);
+            }
+        });
+    }
+
+    /// Ends the machine of an entry that the endpoint's teardown drops
+    /// before it terminated. Its observation ends with the endpoint closed.
+    pub(super) fn close(&self) {
+        self.work.finish();
+        // An entry removed after `finish` has nothing to add.
+        if self.tally.is_terminated() {
+            return;
+        }
+        self.observation.send_modify(|state| {
+            if state.end.is_none() {
+                state.end = Some(End::EndpointClosed);
+            }
+            if self.tally.end_machine(true) {
+                self.publish(state);
+            }
+        });
+    }
+
+    /// Ends a write that [`Shared::write`] counted, as `ending` says.
+    fn end_write(&self, ending: Ending) {
+        if self.tally.end(ending) && self.observation.receiver_count() != 0 {
+            self.observation.send_modify(|state| self.publish(state));
         }
     }
 
-    fn end_if_drained(&self) {
-        if self.observation.receiver_count() != 0
-            && self.terminated.load(Ordering::Acquire)
-            && self.transport.load(Ordering::Acquire) == 0
-        {
-            self.observation.send_modify(|state| {
-                if state.end.is_none() {
-                    state.end = Some(End::Terminated);
-                }
+    /// Publishes the settlement in `state`, which ends observation unless
+    /// it ended already, as the settlement says.
+    fn publish(&self, state: &mut Observation) {
+        let settled = self.tally.settled();
+        if state.end.is_none() {
+            state.end = Some(match settled {
+                Some(settled) if !settled.is_drained() => End::EndpointClosed,
+                _ => End::Terminated,
             });
         }
+        state.settled = settled;
     }
 
     pub(super) fn write(
         self: &Arc<Shared>,
         operation: Option<ResponseId>,
     ) -> WriteObservation {
-        self.transport.fetch_add(1, Ordering::Relaxed);
+        self.tally.start();
         WriteObservation {
             shared: self.clone(),
             operation,
-            completed: false,
+            ending: None,
             fallback: None,
         }
     }
@@ -945,7 +1006,8 @@ impl Drop for Shared {
 pub(super) struct WriteObservation {
     shared: Arc<Shared>,
     operation: Option<ResponseId>,
-    completed: bool,
+    /// How the write ended, once it has.
+    ending: Option<Ending>,
     fallback: Option<Arc<super::driver::ConnectionCounters>>,
 }
 
@@ -959,6 +1021,7 @@ impl WriteObservation {
     }
 
     pub(super) fn complete(mut self, outcome: WriteOutcome) {
+        self.ending = Some(Ending::from(&outcome));
         match outcome {
             WriteOutcome::Written => {}
             WriteOutcome::NotWritten(error) => {
@@ -977,7 +1040,6 @@ impl WriteObservation {
                 );
             }
         }
-        self.completed = true;
     }
 
     /// Ends a committed write that local capacity refused before any byte
@@ -987,13 +1049,13 @@ impl WriteObservation {
             super::driver::increment(&counters.dropped);
         }
         self.shared.problem(self.operation, Problem::Rejected);
-        self.completed = true;
+        self.ending = Some(Ending::NotWritten);
     }
 }
 
 impl Drop for WriteObservation {
     fn drop(&mut self) {
-        if !self.completed {
+        let ending = self.ending.unwrap_or_else(|| {
             if let Some(counters) = &self.fallback {
                 super::driver::increment(&counters.dropped);
             }
@@ -1004,9 +1066,9 @@ impl Drop for WriteObservation {
                     state.end = Some(End::EndpointClosed);
                 }
             });
-        }
-        self.shared.transport.fetch_sub(1, Ordering::Release);
-        self.shared.end_if_drained();
+            Ending::Abandoned
+        });
+        self.shared.end_write(ending);
     }
 }
 
@@ -1683,8 +1745,7 @@ mod tests {
             accepted: AtomicBool::new(false),
             abandoned: AtomicBool::new(false),
             observation,
-            transport: AtomicUsize::new(0),
-            terminated: AtomicBool::new(false),
+            tally: Tally::new(),
         });
         let events = ServerEvents {
             id: ServerTransactionId(1),

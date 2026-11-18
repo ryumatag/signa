@@ -23,6 +23,7 @@ share. The other modules hold the tests:
 * `arrival`: what each received message keeps of how it arrived.
 * `observe`: an endpoint's observer.
 * `port`: ports that several endpoints share.
+* `settle`: when a transaction settles, and how its writes ended.
 */
 
 mod address;
@@ -33,6 +34,7 @@ mod failure;
 mod observe;
 mod path;
 mod port;
+mod settle;
 mod shutdown;
 mod wire;
 

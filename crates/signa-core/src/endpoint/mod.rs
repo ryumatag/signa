@@ -125,6 +125,14 @@ ends once its accepted writes finish. Dropping the observer has no protocol
 effect. A responder drop is ordered after the submissions it already queued,
 and a queued submission may still run after its waiting future is dropped.
 
+A [`Settlement`], from [`ServerTransaction::settlement`] or
+[`ClientTransaction::settlement`], resolves once the transaction's machine has
+terminated and every write it started has ended. It counts each write by how
+it ended, where the observations coalesce failures or stop at an overflow,
+and its [`Settled`] says whether the endpoint stopped first. It is apart from
+the end of [`Responses`] and from [`ServerEvent::Terminated`], and a layer
+above can keep what it needs for a transaction until then.
+
 # Shared ports
 
 An endpoint built with [`Builder::bind_on`] has no socket of its own. It is
@@ -290,6 +298,7 @@ pub use self::{
         ServerEvent, ServerEvents, ServerRequest, ServerTransaction,
         ServerTransactionId, SubmitError,
     },
+    settle::{Settled, Settlement},
     shutdown::{Shutdown, ShutdownOutcome, WorkGuard},
 };
 
@@ -307,6 +316,7 @@ mod reply;
 mod routing;
 mod send;
 mod server;
+mod settle;
 mod shutdown;
 mod table;
 mod timer;
@@ -315,8 +325,9 @@ mod timer;
 ///
 /// The endpoint runs while an `Endpoint`, [`ClientControl`], [`Responder`],
 /// [`ReplyRoute`], [`WorkGuard`] or [`Shutdown`] exists, and while a one-shot
-/// reply is in flight. [`ServerEvents`] and [`Incoming`] do not keep it
-/// running, and dropping `Incoming` starts an immediate shutdown. When the
+/// reply is in flight. [`ServerEvents`], [`Responses`], a [`Settlement`] and
+/// [`Incoming`] do not keep it running, and dropping `Incoming` starts an
+/// immediate shutdown. When the
 /// last of those handles drops, the driver stops, closes its sockets and drops
 /// its transactions, and its TCP connections and UDP socket or
 /// [backend](Builder::udp_io) get five seconds to write what is already
@@ -4028,6 +4039,7 @@ mod tests {
         remote.send(&raw("OPTIONS", &via, None)).await;
         let ServerRequest { request, transaction, .. } =
             server_request(&mut incoming).await;
+        let settlement = transaction.settlement();
         let (responder, mut events) = transaction.into_parts();
         drop(remote);
         // Let the endpoint see the close.
@@ -4064,6 +4076,50 @@ mod tests {
             }
         }
         assert!(failed && terminated);
+        let settled = settlement.get().expect("the stream ended at it");
+        assert!(settled.is_drained());
+        assert_eq!((settled.written(), settled.not_written()), (0, 2));
+    }
+
+    // A transaction settles once its machine has ended and its writes with
+    // it: at the final over TCP, after Timer J or K over UDP.
+    #[tokio::test]
+    async fn transactions_settle_on_both_transports() {
+        for transport in [Transport::Udp, Transport::Tcp] {
+            let (endpoint, mut incoming) = invite_endpoint(short_timers());
+            let (mut remote, via) = uac(transport, &endpoint, "settle").await;
+            remote.send(&raw("OPTIONS", &via, None)).await;
+            let ServerRequest { request: received, transaction, .. } =
+                server_request(&mut incoming).await;
+            let settlement = transaction.settlement();
+            let (responder, _) = transaction.into_parts();
+            responder.respond(reply(&received, 200, "a")).await.unwrap();
+
+            let settled = timeout(Duration::from_secs(2), settlement.wait())
+                .await
+                .unwrap();
+            assert!(settled.is_drained(), "{transport:?}");
+            assert!(settled.written() >= 1, "{transport:?}");
+            assert_eq!(settled.not_written(), 0, "{transport:?}");
+
+            let far = Far::new().await;
+            let target = far.target(transport);
+            let options = endpoint.start(request("OPTIONS"), target);
+            let options = options.await.unwrap();
+            let settlement = options.settlement();
+            let (_control, mut responses) = options.into_parts();
+            let mut remote = far.remote(transport, &endpoint).await;
+            let sent = into_request(remote.next().await.unwrap());
+            remote.send(&reply(&sent, 200, "b")).await;
+            assert_eq!(next(&mut responses).await.status(), StatusCode::OK);
+
+            let settled = timeout(Duration::from_secs(2), settlement.wait())
+                .await
+                .unwrap();
+            assert!(settled.is_drained(), "{transport:?}");
+            assert!(settled.written() >= 1, "{transport:?}");
+            assert_eq!(settled.not_written(), 0, "{transport:?}");
+        }
     }
 
     // RFC 3261 section 17. No ACK gets a response. One that matches no
@@ -4481,11 +4537,10 @@ mod tests {
         let (endpoint, _incoming) = invite_endpoint(short_timers());
         let far = Far::new().await;
         let target = far.target(Transport::Tcp);
-        let (control, mut responses) = endpoint
-            .start(invite(), target.clone())
-            .await
-            .unwrap()
-            .into_parts();
+        let transaction =
+            endpoint.start(invite(), target.clone()).await.unwrap();
+        let settlement = transaction.settlement();
+        let (control, mut responses) = transaction.into_parts();
         let (connection, _) = far.tcp.accept().await.unwrap();
         let mut first = Stream::new(connection);
         let sent = into_request(first.next().await);
@@ -4514,6 +4569,41 @@ mod tests {
         assert_eq!(ack.headers().get(VIA), Some(control.via()));
         assert_eq!(ack.headers().get(TO), busy.headers().get(TO));
         assert!(callback.within(Duration::from_millis(100)).await.is_none());
+        // The INVITE ended at the final over TCP, and settles once the ACK
+        // that waited for a connection is written.
+        let settled = timeout(Duration::from_secs(1), settlement.wait());
+        let settled = settled.await.unwrap();
+        assert!(settled.is_drained());
+        assert_eq!((settled.written(), settled.not_written()), (2, 0));
+    }
+
+    // An ACK that waits for a connection its target refuses is lost, as one
+    // over UDP would be. It counts as not written in the INVITE's
+    // settlement, which still drains.
+    #[tokio::test]
+    async fn a_tcp_ack_whose_connection_is_refused_counts_as_not_written() {
+        // Windows may retry SYNs before reporting connection refusal.
+        const REFUSED: Duration = Duration::from_secs(10);
+        let (endpoint, _incoming) = invite_endpoint(short_timers());
+        let far = Far::new().await;
+        let target = far.target(Transport::Tcp);
+        let transaction = endpoint.start(invite(), target).await.unwrap();
+        let settlement = transaction.settlement();
+        let (_control, mut responses) = transaction.into_parts();
+        let (connection, _) = far.tcp.accept().await.unwrap();
+        let mut first = Stream::new(connection);
+        let sent = into_request(first.next().await);
+        drop((first, far));
+
+        let listener = endpoint.tcp_addr().unwrap();
+        let mut callback =
+            Stream::new(TcpStream::connect(listener).await.unwrap());
+        callback.send(&reply(&sent, 486, "a")).await;
+        assert_eq!(next(&mut responses).await.status().as_u16(), 486);
+
+        let settled = timeout(REFUSED, settlement.wait()).await.unwrap();
+        assert!(settled.is_drained());
+        assert_eq!((settled.written(), settled.not_written()), (1, 1));
     }
 
     // A CANCEL whose INVITE connection has closed goes to the INVITE's

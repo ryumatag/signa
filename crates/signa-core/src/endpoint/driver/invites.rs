@@ -20,13 +20,14 @@ use std::time::Instant;
 use bytes::Bytes;
 
 use super::{
-    Arrival, Cancel, ClientEntry, ClientMachine, Driver, Link, Pending,
-    ServerMachine, has_identity, increment, send_on, tcp_write,
+    Arrival, Cancel, ClientEntry, ClientMachine, ClientReceipt, Driver, Link,
+    Pending, ServerMachine, has_identity, increment, send_client, tcp_write,
+    track_client,
 };
 use crate::{
     endpoint::{
         admission::request_bytes,
-        client::ClientTransactionNumber,
+        client::{ClientTransactionNumber, ClientWrite},
         datagram::Unwritten,
         error::Error,
         observe::WriteOrigin,
@@ -57,7 +58,7 @@ impl Driver {
     ) {
         let timers = self.config.timers;
         let entry = self.clients.get_mut(id).expect("a live client entry");
-        let ClientEntry { tx, link, respond, permit } = entry;
+        let ClientEntry { tx, link, respond, permit, .. } = entry;
         let ClientMachine::Invite(invite) = tx else {
             unreachable!("an INVITE entry")
         };
@@ -196,6 +197,10 @@ impl Driver {
     /// listener ([RFC 3261 section 18.2.2]), is replaced by a new one to the
     /// INVITE's target. The address the final came from is never a target.
     ///
+    /// Each ACK counts in the INVITE's settlement. A UDP write that fails at
+    /// once also ends Completed, as below. A failure reported later only
+    /// counts, since the machine may have moved on by then.
+    ///
     /// [RFC 3261 section 17.1.1.3]: https://www.rfc-editor.org/rfc/rfc3261.html#section-17.1.1.3
     /// [RFC 3261 section 18.2.2]: https://www.rfc-editor.org/rfc/rfc3261.html#section-18.2.2
     fn send_ack(&mut self, id: Id, link: &Link, ack: Bytes) {
@@ -203,27 +208,48 @@ impl Driver {
             transaction: ClientTransactionNumber::of(id),
         });
         let tap = self.tap.as_ref();
+        let settle =
+            self.clients.get(id).expect("a live client entry").settle.clone();
         let error = match &link.writer {
             Some(writer) => {
-                let reconnect = writer.is_closed()
-                    || matches!(
-                        tcp_write(tap, link.flow, note, &ack, |hook| {
-                            writer.send_hooked(ack.clone(), hook)
-                        }),
-                        Err(tcp::SendError::Closed)
-                    );
-                if reconnect {
+                let queued = (!writer.is_closed()).then(|| {
+                    tcp_write(tap, link.flow, note, &ack, |hook| {
+                        writer.submit_hooked(ack.clone(), hook)
+                    })
+                });
+                match queued {
+                    Some(Ok(receipt)) => {
+                        let write = ClientWrite::new(&settle, false);
+                        let receipt = ClientReceipt::Tcp(receipt);
+                        self.client_writes.push((receipt, id, write));
+                    }
+                    // A full queue is the endpoint's own limit, which loses
+                    // the ACK as UDP would, before it is a write.
+                    Some(Err(tcp::SendError::Full)) => {}
                     // A refused or failed connection loses this ACK as UDP
                     // would. A reliable INVITE has already ended, and the
                     // server's Timer H covers it.
-                    let remote = link.flow.remote;
-                    let write = self.park(remote, note, &ack);
-                    self.send_over_tcp(remote, Pending::Ack(ack, write));
+                    Some(Err(tcp::SendError::Closed)) | None => {
+                        let remote = link.flow.remote;
+                        let write = self.park(remote, note, &ack);
+                        let tracked = ClientWrite::new(&settle, false);
+                        let pending = Pending::Ack(ack, write, id, tracked);
+                        self.send_over_tcp(remote, pending);
+                    }
                 }
                 None
             }
             None => {
-                match send_on(self.udp.as_mut(), tap, link, ack, false, note) {
+                let sent = send_client(
+                    self.udp.as_mut(),
+                    tap,
+                    link,
+                    ack,
+                    false,
+                    note,
+                );
+                let writes = &mut self.client_writes;
+                match track_client(writes, id, &settle, sent, false) {
                     Err(Unwritten::Failed(error)) => Some(error),
                     Ok(()) | Err(Unwritten::Busy(_)) => None,
                 }

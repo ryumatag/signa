@@ -10,7 +10,7 @@ use std::{
     io,
     net::SocketAddr,
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll, Waker},
@@ -27,6 +27,7 @@ use super::{
     path::{ReceiveInfo, SendPath, transient_len},
     routing::Link,
     server::ReceivedResponse,
+    settle::{Ending, Settle, Settlement},
     table::Id,
 };
 use crate::{
@@ -43,6 +44,7 @@ use crate::{
     transport::{
         Flow, Limits, Transport,
         budget::{Budget, Permit},
+        datagram::WriteOutcome,
     },
 };
 
@@ -162,6 +164,12 @@ impl ClientTransaction {
     pub fn into_parts(self) -> (ClientControl, Responses) {
         (self.control, self.responses)
     }
+
+    /// Returns a [`Settlement`] that resolves once the machine has
+    /// terminated and every write of this transaction has ended.
+    pub fn settlement(&self) -> Settlement {
+        self.control.settlement()
+    }
 }
 
 /// The number an endpoint's observation records name a client transaction
@@ -197,6 +205,7 @@ pub struct ClientControl {
     flow: Flow,
     cancel: Option<CancelHandle>,
     commands: mpsc::UnboundedSender<Command>,
+    settle: Arc<Settle>,
 }
 
 impl ClientControl {
@@ -224,6 +233,17 @@ impl ClientControl {
     /// The actual transport flow, including the selected local address.
     pub fn flow(&self) -> Flow {
         self.flow
+    }
+
+    /// Returns a [`Settlement`] that resolves once the machine has
+    /// terminated and every write of this transaction has ended.
+    ///
+    /// That is later than the end of [`Responses`]. A non-INVITE stays for
+    /// Timer K after its final over UDP, a non-2xx INVITE for Timer D, and
+    /// an INVITE that got a 2xx until Timer M. The settlement counts the
+    /// request, its retransmissions and the ACKs of a non-2xx.
+    pub fn settlement(&self) -> Settlement {
+        Settlement::client(self.settle.clone())
     }
 
     /// Asks the driver to cancel this INVITE, and waits for the outcome.
@@ -612,10 +632,6 @@ impl Delivery {
         self.update(|state| state.ended = true);
     }
 
-    pub(super) fn observation(&self) -> Observation {
-        Observation(Arc::downgrade(&self.0))
-    }
-
     /// Queues `response`, which arrived as `arrival` says, or ends the
     /// stream with an overflow if it does not fit.
     ///
@@ -724,13 +740,48 @@ impl Drop for Delivery {
     }
 }
 
-/// A weak identity of a [`Delivery`]. A write receipt that completes after
-/// its transaction ended cannot match the delivery of a reused table slot.
-pub(super) struct Observation(Weak<Mutex<State>>);
+/// A write of a client transaction in progress, counted in its settlement
+/// until it ends.
+///
+/// Dropping it before [`ClientWrite::end`] counts the write as abandoned,
+/// which is what the endpoint's teardown does to the writes it still has.
+pub(super) struct ClientWrite {
+    settle: Arc<Settle>,
+    request: bool,
+    ended: bool,
+}
 
-impl Observation {
-    pub(super) fn matches(&self, delivery: &Delivery) -> bool {
-        self.0.ptr_eq(&Arc::downgrade(&delivery.0))
+impl ClientWrite {
+    /// Starts counting a write of the transaction that `settle` belongs to,
+    /// a request or a retransmission of it with `request`, an ACK without.
+    pub(super) fn new(settle: &Arc<Settle>, request: bool) -> ClientWrite {
+        settle.tally.start();
+        ClientWrite { settle: settle.clone(), request, ended: false }
+    }
+
+    /// Whether this is a write of the transaction that `settle` belongs to.
+    /// A write that ends after its transaction cannot be taken for one of a
+    /// new transaction in the same table slot.
+    pub(super) fn belongs_to(&self, settle: &Arc<Settle>) -> bool {
+        Arc::ptr_eq(&self.settle, settle)
+    }
+
+    /// Whether this writes the request, whose failure ends the transaction.
+    pub(super) fn is_request(&self) -> bool {
+        self.request
+    }
+
+    pub(super) fn end(mut self, outcome: &WriteOutcome) {
+        self.ended = true;
+        self.settle.end(Ending::from(outcome));
+    }
+}
+
+impl Drop for ClientWrite {
+    fn drop(&mut self) {
+        if !self.ended {
+            self.settle.end(Ending::Abandoned);
+        }
     }
 }
 
@@ -912,14 +963,15 @@ impl Observing {
         Delivery(self.responses.shared.clone())
     }
 
-    /// The caller's transaction once the driver has installed it. `cancel`
-    /// is set for an INVITE.
+    /// The caller's transaction once the driver has installed it, with the
+    /// `settle` its entry shares. `cancel` is set for an INVITE.
     pub(super) fn finish(
         self,
         via: HeaderValue,
         flow: Flow,
         cancel: Option<CancelHandle>,
         number: ClientTransactionNumber,
+        settle: Arc<Settle>,
     ) -> ClientTransaction {
         let handle = self
             .responses
@@ -937,6 +989,7 @@ impl Observing {
                 flow,
                 cancel,
                 commands: self.commands,
+                settle,
             },
             responses: self.responses,
         }
