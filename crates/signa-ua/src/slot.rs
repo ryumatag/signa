@@ -58,6 +58,16 @@ impl<T> Hash for Key<T> {
     }
 }
 
+// Only the runtime's tests need keys without a table.
+#[cfg(all(test, feature = "tokio"))]
+impl<T> Key<T> {
+    /// A key of the first generation of slot `index`, for tests that need
+    /// keys without a table.
+    pub(crate) const fn of(index: u32) -> Key<T> {
+        Key { index, generation: 0, record: PhantomData }
+    }
+}
+
 impl<T> fmt::Debug for Key<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}v{}", self.index, self.generation)

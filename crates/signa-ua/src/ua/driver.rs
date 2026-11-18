@@ -78,8 +78,9 @@ use signa_core::{
     endpoint::{
         Branch, CancelError, CancelOutcome, ClientControl, ClientTransaction,
         Endpoint, Error as CoreError, Incoming, IncomingCancel, IncomingEvent,
-        ReceivedRequest, ReceivedResponse, ReplyRoute, Responder, Responses,
-        ServerRequest, ServerTransactionId, Shutdown,
+        ReceivedRequest, ReceivedResponse, ReplyError, ReplyRoute, Responder,
+        Responses, ServerRequest, ServerTransactionId,
+        Settlement as CoreSettlement, Shutdown,
         ShutdownOutcome as CoreOutcome, SubmitError, Target, ViaMode,
         WorkGuard,
     },
@@ -100,10 +101,11 @@ use tokio::{
 };
 
 use super::{
-    AttemptId, AttemptSnapshot, Command, Config, Event, IncomingInvite,
-    InviteId, Negotiate, Offer, Query, Resolve, ResolveError, Session,
-    SessionSnapshot, Shared, ShutdownMode, ShutdownOutcome, ShutdownReport,
-    ShutdownRequest,
+    AttemptId, AttemptSnapshot, Command, Completed, Config, Event,
+    IncomingInvite, InviteAttempt, InviteId, Negotiate, Offer, Query, Resolve,
+    ResolveError, Session, SessionId, SessionSnapshot, Shared, ShutdownMode,
+    ShutdownOutcome, ShutdownReport, ShutdownRequest,
+    settle::{Trackers, Write},
 };
 use crate::{
     capability,
@@ -111,7 +113,8 @@ use crate::{
     header,
     invite::{Arrival, AttemptKey, CancelResult, ExchangeKey, UsageKey},
     model::{
-        self, ByeStarted, Effect, InDialog, Model, Random, Refusal, Released,
+        self, ByeStarted, Effect, InDialog, Model, Owner, Random, Refusal,
+        Released,
     },
     negotiation::{Body, Description},
     operation::{Completion, OperationId},
@@ -219,11 +222,11 @@ pub(super) struct Driver<R, N> {
     /// longest interval before the next copy is due anyway.
     resend_timeout: Duration,
     /// The sends that wait for one of `jobs`.
-    sends: Sends<Job>,
+    sends: Sends<Work>,
     /// The replies that run.
     replies: JoinSet<Done>,
     /// The replies that wait for one of `replies`.
-    waiting: Waiting<Job>,
+    waiting: Waiting<Work>,
     readers: JoinSet<()>,
     response_sender: mpsc::Sender<Queued>,
     responses: mpsc::Receiver<Queued>,
@@ -261,6 +264,12 @@ pub(super) struct Driver<R, N> {
     /// The place in the event queue set aside for the last event of each
     /// attempt, [`Event::AttemptEnded`].
     endings: HashMap<AttemptKey, mpsc::OwnedPermit<Event>>,
+    /// The work under way for each session, attempt and incoming INVITE,
+    /// until it settles. See [`super::settle`].
+    trackers: Trackers,
+    /// The owner of each job, answer and watcher that runs for one, whose
+    /// hold it releases when it ends.
+    held: HashMap<task::Id, Owner>,
     /// Calls of [`super::UaHandle::shutdown`], merged.
     requests: watch::Receiver<ShutdownRequest>,
     /// Where the report of the stop goes.
@@ -310,6 +319,9 @@ struct Ack {
     /// meanwhile is answered by that job, so that copies do not pile up
     /// behind a busy endpoint or a peer that does not read.
     sending: bool,
+    /// What the ACK is for, the session of its 2xx or the attempt of a
+    /// cleanup, as it was when the ACK was built.
+    owner: Option<Owner>,
 }
 
 /// An answer for the ACK of a 2xx, to prepare.
@@ -319,13 +331,21 @@ struct Answer {
     /// When the answer is due. It counts from when the 2xx asked for it,
     /// so that the time in the backlog counts too.
     due: Instant,
+    /// What the answer is for, whose hold it has.
+    owner: Option<Owner>,
 }
 
 struct Waiter {
-    reply: oneshot::Sender<Result<Completion, Error>>,
+    reply: oneshot::Sender<Result<Completed, Error>>,
     /// The operation's place, which the handle took. It is held, not read,
     /// and dropping the waiter gives it back.
     _permit: OwnedSemaphorePermit,
+}
+
+/// A job in a backlog, with the owner whose hold it has, if any.
+struct Work {
+    job: Job,
+    owner: Option<Owner>,
 }
 
 /// Work that awaits, run as a task.
@@ -462,6 +482,12 @@ impl<T> Waiting<T> {
         !self.records.is_empty()
     }
 
+    /// Returns every reply that waits, for the driver's checks.
+    #[cfg(debug_assertions)]
+    fn iter(&self) -> impl Iterator<Item = &T> {
+        self.control.iter().chain(&self.records).chain(&self.ordinary)
+    }
+
     /// Takes the reply to start next, if any waits.
     fn next(&mut self) -> Option<T> {
         let others = !self.control.is_empty() || !self.records.is_empty();
@@ -519,6 +545,12 @@ impl<T> Sends<T> {
         self.others.is_empty() && self.teardown.is_empty()
     }
 
+    /// Returns every send that waits, for the driver's checks.
+    #[cfg(debug_assertions)]
+    fn iter(&self) -> impl Iterator<Item = &T> {
+        self.others.iter().chain(&self.teardown)
+    }
+
     /// Takes the send to start next, if any waits.
     fn next(&mut self) -> Option<T> {
         if !self.teardown.is_empty()
@@ -553,8 +585,11 @@ enum Done {
         replay: ReplayKey,
         answer: Option<Description>,
     },
+    /// A copy of a 2xx went to the endpoint, with how its write ended, or
+    /// `None` if the endpoint took no write for it.
     Resent {
         exchange: ExchangeKey,
+        write: Option<Write>,
     },
     Nothing,
     Started {
@@ -566,9 +601,11 @@ enum Done {
         exchange: ExchangeKey,
         result: Result<ClientTransaction, Error>,
     },
-    /// The BYE of a cleanup went to the endpoint, or could not.
+    /// The BYE of a cleanup went to the endpoint, with its transaction's
+    /// settlement, or could not.
     Byed {
         replay: ReplayKey,
+        settlement: Option<CoreSettlement>,
     },
     /// The BYE of a session went to the endpoint, or could not.
     SessionByeStarted {
@@ -580,17 +617,24 @@ enum Done {
         bye: ByeStarted,
         result: Result<(), Error>,
     },
-    /// What the endpoint did with a CANCEL it was asked for.
+    /// What the endpoint did with a CANCEL it was asked for, with the
+    /// CANCEL's settlement if it sent one.
     Cancelled {
         operation: Option<OperationId>,
         result: Result<CancelResult, Error>,
+        settlement: Option<CoreSettlement>,
     },
-    /// `target` is where the ACK went, if it resolved, and `written`
-    /// whether the endpoint wrote it in time.
+    /// The CANCEL of a re-INVITE whose session ended, with its settlement if
+    /// the endpoint sent one.
+    ReinviteCancelled {
+        settlement: Option<CoreSettlement>,
+    },
+    /// `target` is where the ACK went, if it resolved, and `write` how the
+    /// endpoint's write of it ended, or `None` if none was made.
     Acked {
         replay: ReplayKey,
         target: Option<Target>,
-        written: bool,
+        write: Option<Write>,
     },
 }
 
@@ -659,6 +703,8 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             acks: HashMap::new(),
             waiters: HashMap::new(),
             endings: HashMap::new(),
+            trackers: Trackers::default(),
+            held: HashMap::new(),
             requests,
             reports,
             mode: None,
@@ -746,6 +792,11 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
                     }
                 }
                 Some(_) = self.readers.join_next(), if !self.readers.is_empty() => {}
+                Some(settled) = self.trackers.next_settled(),
+                    if self.trackers.has_settlers() =>
+                {
+                    self.trackers.on_settled(settled);
+                }
                 // Notifications were dropped, and the count waits for room,
                 // so that the application learns of the loss even if nothing
                 // else happens.
@@ -855,6 +906,10 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
     /// these count, since none of them is work the UA owes: the count of
     /// lost notifications, the events nobody received, and the commands not
     /// taken yet, which [`Driver::stop`] ends.
+    ///
+    /// Nor do the settlements the trackers wait for. What is left of them
+    /// then is the endpoint's, the transactions it keeps to Timer J, K or
+    /// L, which its own drain waits for, and they settle as it drains.
     fn is_drained(&self) -> bool {
         self.model.is_idle()
             && self.jobs.is_empty()
@@ -915,6 +970,12 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             "a task outlives the stop",
         );
         self.fallbacks.clear();
+        self.held.clear();
+        // The endpoint has stopped, after its teardown settled every
+        // transaction it had, so each of these ends at once.
+        while let Some(settled) = self.trackers.next_settled().await {
+            self.trackers.on_settled(settled);
+        }
 
         // A command still queued after a drain finds the UA closed and idle,
         // so it ends as it would have in the loop, with nothing sent. Short
@@ -945,7 +1006,10 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             assert_eq!(left, model::Left::default());
             assert_eq!(untaken, 0);
             assert!(self.is_drained(), "a drain left work behind");
+            assert_eq!(self.trackers.len(), 0, "a drain left work unsettled");
         }
+        // What did not settle by now, the UA let go of.
+        self.trackers.clear();
         let tally = self.model.tally();
         let report = ShutdownReport {
             outcome,
@@ -984,23 +1048,60 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             + self.answers.len()
             + self.watchers.len();
         assert_eq!(self.fallbacks.len(), tasks);
+        assert!(self.held.keys().all(|id| self.fallbacks.contains_key(id)));
+
+        // Each owner holds exactly what is under way for it, so that it
+        // settles once all of it ends, and not before.
+        let mut holds = self.trackers.waits();
+        let queued = self.sends.iter().chain(self.waiting.iter());
+        let answers = self.answer_backlog.iter().map(|answer| answer.owner);
+        for owner in queued
+            .map(|work| work.owner)
+            .chain(answers)
+            .flatten()
+            .chain(self.held.values().copied())
+        {
+            *holds.entry(owner).or_default() += 1;
+        }
+        for (owner, count) in self.trackers.holds() {
+            let model = usize::from(self.model.holds_owner(owner));
+            let expected = holds.remove(&owner).unwrap_or(0) + model;
+            assert_eq!(count, expected, "{owner:?}");
+        }
+        assert!(holds.is_empty(), "holds of no tracker: {holds:?}");
+        for &attempt in self.clients.keys().chain(self.endings.keys()) {
+            assert!(self.trackers.tracks(Owner::Attempt(attempt)));
+        }
     }
 
     /// Takes what a job or watcher reported, or what it would have if it
-    /// had not panicked.
+    /// had not panicked, then releases its owner's hold. The report goes
+    /// first, since the record it changes may hold the owner too.
     fn on_joined(
         &mut self,
         joined: Result<(task::Id, Done), task::JoinError>,
     ) {
-        let done = match joined {
+        let (id, done) = match joined {
             Ok((id, done)) => {
                 self.fallbacks.remove(&id);
-                Some(done)
+                (id, Some(done))
             }
-            Err(error) => self.fallbacks.remove(&error.id()),
+            Err(error) => (error.id(), self.fallbacks.remove(&error.id())),
         };
+        let owner = self.held.remove(&id);
         if let Some(done) = done {
-            self.on_done(done);
+            self.on_done(done, owner);
+        }
+        if let Some(owner) = owner {
+            self.trackers.release(owner);
+        }
+    }
+
+    /// Returns the handle of a session, with its settlement.
+    fn session(&self, usage: UsageKey) -> Session {
+        Session {
+            id: SessionId { ua: self.shared.id, usage },
+            settlement: self.trackers.settlement(Owner::Usage(usage)),
         }
     }
 
@@ -1048,6 +1149,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
     /// [`Lane`].
     fn on_cancel(&mut self, cancel: IncomingCancel) {
         let IncomingCancel { request, transaction, target, .. } = cancel;
+        let settlement = transaction.settlement();
         let (responder, _events) = transaction.into_parts();
         let lane = if self.server_ids.contains_key(&target) {
             Lane::Control
@@ -1058,11 +1160,13 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             return;
         }
 
-        let tag = self
-            .server_ids
-            .get(&target)
-            .copied()
-            .and_then(|exchange| self.model.receive_cancel(exchange));
+        // The CANCEL's transaction is part of the INVITE's work. One that
+        // matched nothing of the UA's is the endpoint's alone, and its
+        // settlement goes, so that the endpoint lets go of it at the 200.
+        let exchange = self.server_ids.get(&target).copied();
+        self.trackers.settle_on(exchange.map(Owner::Exchange), settlement);
+        let tag =
+            exchange.and_then(|exchange| self.model.receive_cancel(exchange));
         let mut response = Response::reply_to(&request).status(StatusCode::OK);
         if let Some(tag) = tag {
             response = response.to_tag(tag);
@@ -1089,7 +1193,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         }
         if let Ok(response) = response.body(Bytes::new()) {
             let job = Job::Reply { route: reply, response };
-            self.waiting.answer(job, Lane::Ordinary);
+            self.waiting.answer(Work { job, owner: None }, Lane::Ordinary);
         }
     }
 
@@ -1101,6 +1205,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         // holds the exchange. Until then I drop them. Dropping them has no
         // protocol effect in signa-core, and the 2xx's retransmissions cover
         // a failed first write.
+        let settlement = transaction.settlement();
         let (responder, _events) = transaction.into_parts();
         let responder = Arc::new(responder);
 
@@ -1125,10 +1230,8 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             }
         };
         let exchange = authority.exchange();
-        let session = self
-            .model
-            .reinvite_session(exchange)
-            .map(|usage| Session::new(self.shared.id, usage));
+        let usage = self.model.reinvite_session(exchange);
+        let session = usage.map(|usage| self.session(usage));
         let id = responder.id();
         self.server_ids.insert(id, exchange);
         let (request, size) = compact(request);
@@ -1148,6 +1251,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             self.abandon_sender.clone().try_reserve_owned(),
         ) {
             (Ok(bytes), Ok(mut places), Ok(abandon)) => {
+                self.trackers.track_exchange(exchange, usage, settlement);
                 let bytes = Arc::new(bytes);
                 self.servers.insert(
                     exchange,
@@ -1172,6 +1276,9 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
                     authority: Some(authority),
                     abandon: Some(abandon),
                     shared: self.shared.clone(),
+                    settlement: self
+                        .trackers
+                        .settlement(Owner::Exchange(exchange)),
                 };
                 place.send(if reinvite {
                     Event::Reinvite(invite)
@@ -1180,6 +1287,13 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
                 });
             }
             _ => {
+                // An initial INVITE the application never sees has no
+                // settlement anyone could ask for, so it is not tracked,
+                // which costs a flood of them nothing more. A re-INVITE is
+                // its session's work all the same.
+                if usage.is_some() {
+                    self.trackers.track_exchange(exchange, usage, settlement);
+                }
                 // The 503 is built from the INVITE, which stays until the
                 // endpoint has the 503. Its bytes are not counted for that
                 // while, which the INVITEs of the model bound in number.
@@ -1233,6 +1347,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         // context goes now.
         let arrival = Arrival { id: received.id(), flow: received.flow() };
         drop(received);
+        let settlement = transaction.settlement();
         let (responder, _events) = transaction.into_parts();
         let responder = Arc::new(responder);
         let lane = if *request.method() == Method::BYE
@@ -1279,9 +1394,16 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
 
         if in_dialog {
             let taken = self.model.receive_request(&request, arrival);
+            // A BYE the UA takes is part of the work of what it ends, which
+            // holds it before the end is carried out. The transaction of any
+            // other request is the endpoint's alone, and its settlement goes
+            // here, so that the endpoint lets go of it at its final.
+            if let Ok(InDialog::Bye(owner)) = taken {
+                self.trackers.settle_on(Some(owner), settlement);
+            }
             self.settle(None);
             match taken {
-                Ok(InDialog::Bye) => {
+                Ok(InDialog::Bye(_)) => {
                     let ok =
                         Response::reply_to(&request).status(StatusCode::OK);
                     self.answer(responder, ok, lane);
@@ -1369,7 +1491,8 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         let Ok(response) = response.body(Bytes::new()) else {
             return;
         };
-        self.waiting.answer(Job::Refuse { responder, response }, lane);
+        let job = Job::Refuse { responder, response };
+        self.waiting.answer(Work { job, owner: None }, lane);
     }
 
     /// Says whether `lane` takes another answer. Each holds up to the job
@@ -1405,7 +1528,6 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
                 let _ = reply.send(snapshot);
             }
             Command::AttemptSnapshot { attempt, reply } => {
-                let ua = self.shared.id;
                 let snapshot =
                     self.model.attempt_state(attempt).map(|state| {
                         AttemptSnapshot {
@@ -1415,7 +1537,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
                             sessions: state
                                 .sessions
                                 .into_iter()
-                                .map(|usage| Session::new(ua, usage))
+                                .map(|usage| self.session(usage))
                                 .collect(),
                         }
                     });
@@ -1425,7 +1547,8 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         self.settle(None);
     }
 
-    fn on_done(&mut self, done: Done) {
+    /// Takes what a job or watcher of `owner` reported.
+    fn on_done(&mut self, done: Done, owner: Option<Owner>) {
         let mut attempt = None;
         match done {
             Done::Final { exchange, result, sent } => match result {
@@ -1458,7 +1581,10 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             Done::Answered { replay, answer } => {
                 self.model.answer_prepared(replay, answer);
             }
-            Done::Resent { exchange } => {
+            Done::Resent { exchange, write } => {
+                if let (Some(owner), Some(write)) = (owner, write) {
+                    self.trackers.wrote(owner, write);
+                }
                 if let Some(server) = self.servers.get_mut(&exchange) {
                     server.resending = false;
                 }
@@ -1468,6 +1594,9 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
                 attempt = Some(key);
                 match result {
                     Ok(transaction) => {
+                        let owner = Some(Owner::Attempt(key));
+                        self.trackers
+                            .settle_on(owner, transaction.settlement());
                         let (control, responses) = transaction.into_parts();
                         self.clients.insert(key, Arc::new(control));
                         self.read(Client::Attempt(key), responses);
@@ -1477,7 +1606,9 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
                 }
             }
             Done::Reinvited { exchange, result } => match result {
+                // The job took its session's hold when it was queued.
                 Ok(transaction) => {
+                    self.trackers.settle_on(owner, transaction.settlement());
                     let (control, responses) = transaction.into_parts();
                     self.reinvites.insert(exchange, control);
                     self.read(Client::Reinvite(exchange), responses);
@@ -1487,27 +1618,48 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
                     self.model.reinvite_started(exchange, Err(error), now());
                 }
             },
-            Done::Byed { replay } => self.model.bye_done(replay),
+            Done::Byed { replay, settlement } => {
+                if let Some(settlement) = settlement {
+                    self.trackers.settle_on(owner, settlement);
+                }
+                self.model.bye_done(replay);
+            }
             Done::SessionByeStarted { usage, result } => {
                 let (responses, result) = match result {
                     Ok(transaction) => {
+                        let owner = Some(Owner::Usage(usage));
+                        self.trackers
+                            .settle_on(owner, transaction.settlement());
                         let (_control, responses) = transaction.into_parts();
                         (Some(responses), Ok(()))
                     }
                     Err(error) => (None, Err(error)),
                 };
+                // The release of the session the BYE's start may cause is an
+                // effect, which comes after the watcher took its hold.
                 let started = self.model.bye_started(usage, result);
                 if let (Some(bye), Some(responses)) = (started, responses) {
-                    self.watch_bye(bye, responses);
+                    self.watch_bye(usage, bye, responses);
                 }
             }
             Done::ByeAnswered { bye, result } => {
                 self.model.bye_answered(bye, result);
             }
-            Done::Cancelled { operation, result } => {
+            Done::Cancelled { operation, result, settlement } => {
+                if let Some(settlement) = settlement {
+                    self.trackers.settle_on(owner, settlement);
+                }
                 self.model.cancel_done(operation, result);
             }
-            Done::Acked { replay, target, written } => {
+            Done::ReinviteCancelled { settlement } => {
+                if let Some(settlement) = settlement {
+                    self.trackers.settle_on(owner, settlement);
+                }
+            }
+            Done::Acked { replay, target, write } => {
+                if let (Some(owner), Some(write)) = (owner, write) {
+                    self.trackers.wrote(owner, write);
+                }
                 // The replay context and its ACK may have gone while the job
                 // ran, and nothing is left to record then.
                 if let Some(ack) = self.acks.get_mut(&replay) {
@@ -1516,6 +1668,7 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
                         ack.target = target;
                     }
                 }
+                let written = write == Some(Write::Written);
                 self.model.ack_written(replay, written);
             }
         }
@@ -1704,7 +1857,10 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
                 self.prepare_answer(replay, offer, usage);
             }
             Effect::Resend2xx { exchange } => self.resend_2xx(exchange),
-            Effect::StartInvite { attempt } => self.start_invite(attempt),
+            Effect::StartInvite { attempt } => {
+                self.trackers.track(Owner::Attempt(attempt));
+                self.start_invite(attempt);
+            }
             Effect::StartReinvite { exchange } => {
                 self.start_reinvite(exchange)
             }
@@ -1717,6 +1873,15 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             }
             Effect::CancelReinvite { exchange } => {
                 self.cancel_reinvite(exchange);
+            }
+            // A session waits for what formed it. It takes the counts of an
+            // incoming INVITE, whose writes were all its own, and only
+            // whether an attempt drained, whose writes its forks share.
+            Effect::UsageFormed { usage, from } => {
+                let owner = Owner::Usage(usage);
+                self.trackers.track(owner);
+                let inherit = matches!(from, Owner::Exchange(_));
+                self.trackers.depend(owner, from, inherit);
             }
             Effect::Notify(event) => self.notify(event, attempt),
             Effect::OperationEnded { operation } => self.deliver(operation),
@@ -1736,21 +1901,29 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
                         degraded,
                         sessions: sessions
                             .into_iter()
-                            .map(|usage| Session::new(ua, usage))
+                            .map(|usage| self.session(usage))
                             .collect(),
                     });
                 }
             }
             Effect::Released(Released::Attempt(attempt)) => {
                 self.endings.remove(&attempt);
+                self.trackers.release(Owner::Attempt(attempt));
             }
             Effect::Released(Released::Exchange(exchange)) => {
                 if let Some(server) = self.servers.remove(&exchange) {
                     self.server_ids.remove(&server.id);
                 }
+                // A re-INVITE this UA sent is its session's, not an owner.
+                if self.trackers.tracks(Owner::Exchange(exchange)) {
+                    self.trackers.release(Owner::Exchange(exchange));
+                }
             }
             Effect::Released(Released::Replay(replay)) => {
                 self.acks.remove(&replay);
+            }
+            Effect::Released(Released::Usage(usage)) => {
+                self.trackers.release(Owner::Usage(usage));
             }
         }
     }
@@ -1784,11 +1957,14 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         let response = with_description(response, body);
 
         match response {
-            Ok(response) => self.waiting.record(Job::Final {
-                exchange,
-                responder: server.responder.clone(),
-                response,
-            }),
+            Ok(response) => {
+                let job = Job::Final {
+                    exchange,
+                    responder: server.responder.clone(),
+                    response,
+                };
+                self.record(job, Owner::Exchange(exchange));
+            }
             Err(_) => self.model.final_refused(exchange, false),
         }
     }
@@ -1825,13 +2001,16 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         );
 
         match response {
-            Ok(response) => self.waiting.record(Job::Provisional {
-                exchange,
-                operation,
-                preview,
-                responder: server.responder.clone(),
-                response,
-            }),
+            Ok(response) => {
+                let job = Job::Provisional {
+                    exchange,
+                    operation,
+                    preview,
+                    responder: server.responder.clone(),
+                    response,
+                };
+                self.record(job, Owner::Exchange(exchange));
+            }
             Err(_) => self.model.provisional_done(
                 exchange,
                 status,
@@ -1858,12 +2037,31 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         }
 
         server.resending = true;
-        self.waiting.record(Job::Resend {
+        let job = Job::Resend {
             exchange,
             route: server.responder.reply_route(),
             response: response.clone(),
             timeout: self.resend_timeout,
-        });
+        };
+        self.record(job, Owner::Exchange(exchange));
+    }
+
+    /// Queues a reply of a record of `owner`, which holds the owner until
+    /// it ends.
+    fn record(&mut self, job: Job, owner: Owner) {
+        let owner = self.trackers.hold(owner);
+        self.waiting.record(Work { job, owner });
+    }
+
+    /// Queues a send for `owner`, if any, which holds the owner until it
+    /// ends, behind the other sends if `teardown`.
+    fn send(&mut self, job: Job, owner: Option<Owner>, teardown: bool) {
+        let owner = owner.and_then(|owner| self.trackers.hold(owner));
+        if teardown {
+            self.sends.teardown(Work { job, owner });
+        } else {
+            self.sends.push(Work { job, owner });
+        }
     }
 
     fn start_invite(&mut self, attempt: AttemptKey) {
@@ -1897,7 +2095,8 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         }
         let request = planned.request;
         let query = query(planned.next_hop, &request);
-        self.sends.push(Job::Start { attempt, request, query });
+        let job = Job::Start { attempt, request, query };
+        self.send(job, Some(Owner::Attempt(attempt)), false);
     }
 
     /// Sends a re-INVITE, built from its dialog (RFC 3261 section 14.1),
@@ -1935,7 +2134,9 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             *request.body_mut() = offer.body().clone();
         }
         let query = query(outgoing.target.next_hop, &request);
-        self.sends.push(Job::Reinvite { exchange, request, query });
+        let owner = self.model.reinvite_usage(exchange).map(Owner::Usage);
+        let job = Job::Reinvite { exchange, request, query };
+        self.send(job, owner, false);
     }
 
     /// Builds the ACK of a 2xx from its dialog and sends it. The ACK is kept
@@ -1964,16 +2165,25 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             *request.body_mut() = answer.body().clone();
         }
         let next_hop = outgoing.target.next_hop;
-        self.sends.push(Job::Ack {
+        let owner = self.model.replay_owner(replay);
+        let job = Job::Ack {
             replay,
             request: request.clone(),
             route: AckRoute::Resolve(query(next_hop.clone(), &request)),
             branch: branch.clone(),
             timeout: self.resend_timeout,
-        });
+        };
+        self.send(job, owner, false);
         self.acks.insert(
             replay,
-            Ack { request, branch, next_hop, target: None, sending: true },
+            Ack {
+                request,
+                branch,
+                next_hop,
+                target: None,
+                sending: true,
+                owner,
+            },
         );
     }
 
@@ -1999,13 +2209,15 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             }
         };
         ack.sending = true;
-        self.sends.push(Job::Ack {
+        let owner = ack.owner;
+        let job = Job::Ack {
             replay,
             request: ack.request.clone(),
             route,
             branch: ack.branch.clone(),
             timeout: self.resend_timeout,
-        });
+        };
+        self.send(job, owner, false);
     }
 
     /// Has the [`Negotiate`] prepare the answer to the offer of a 2xx, for
@@ -2023,10 +2235,14 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             return;
         }
 
-        let ua = self.shared.id;
-        let session = usage.map(|usage| Session::new(ua, usage));
+        let session = usage.map(|usage| self.session(usage));
+        let owner = self
+            .model
+            .replay_owner(replay)
+            .and_then(|owner| self.trackers.hold(owner));
         self.answer_backlog.push_back(Answer {
             replay,
+            owner,
             offer: Offer { description: offer, session },
             // A timeout too long to add to the clock sets an answer no
             // deadline it could reach.
@@ -2044,9 +2260,12 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             if answer.due > now {
                 break;
             }
-            let replay = answer.replay;
+            let (replay, owner) = (answer.replay, answer.owner);
             self.answer_backlog.pop_front();
             self.model.answer_prepared(replay, None);
+            if let Some(owner) = owner {
+                self.trackers.release(owner);
+            }
         }
         self.settle(None);
     }
@@ -2068,7 +2287,8 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
 
         let request = outgoing.request.map(|()| Bytes::new());
         let query = query(outgoing.target.next_hop, &request);
-        self.sends.push(Job::Bye { replay, request, query });
+        let owner = self.model.replay_owner(replay);
+        self.send(Job::Bye { replay, request, query }, owner, false);
     }
 
     /// Sends the BYE that ends a session, in a client transaction of its own
@@ -2090,17 +2310,19 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         let request = outgoing.request.map(|()| Bytes::new());
         let query = query(outgoing.target.next_hop, &request);
         let job = Job::SessionBye { usage, request, query };
-        if self.model.is_teardown(usage) {
-            self.sends.teardown(job);
-        } else {
-            self.sends.push(job);
-        }
+        let teardown = self.model.is_teardown(usage);
+        self.send(job, Some(Owner::Usage(usage)), teardown);
     }
 
     /// Reads the response to the BYE of a session, until its final or the
     /// end of its transaction, and reports it. A provisional changes
     /// nothing, and a non-2xx brings nothing back (RFC 3261 section 15.1.1).
-    fn watch_bye(&mut self, bye: ByeStarted, mut responses: Responses) {
+    fn watch_bye(
+        &mut self,
+        usage: UsageKey,
+        bye: ByeStarted,
+        mut responses: Responses,
+    ) {
         let fallback = Done::ByeAnswered { bye, result: Err(Error::Internal) };
         let handle = self.watchers.spawn(async move {
             let result = loop {
@@ -2120,6 +2342,15 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             Done::ByeAnswered { bye, result }
         });
         self.fallbacks.insert(handle.id(), fallback);
+        self.hold_task(handle.id(), Some(Owner::Usage(usage)));
+    }
+
+    /// Has a task that runs for `owner`, if any, hold it until it ends.
+    fn hold_task(&mut self, task: task::Id, owner: Option<Owner>) {
+        if let Some(owner) = owner.and_then(|owner| self.trackers.hold(owner))
+        {
+            self.held.insert(task, owner);
+        }
     }
 
     /// Asks the endpoint to cancel the INVITE of an attempt, which it does
@@ -2142,11 +2373,18 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             return;
         };
 
-        let fallback =
-            Done::Cancelled { operation, result: Err(Error::Internal) };
+        let fallback = Done::Cancelled {
+            operation,
+            result: Err(Error::Internal),
+            settlement: None,
+        };
         let handle = self.watchers.spawn(async move {
+            let mut settlement = None;
             let result = match control.cancel().await {
-                Ok(CancelOutcome::Sent(_cancel)) => Ok(CancelResult::Sent),
+                Ok(CancelOutcome::Sent(cancel)) => {
+                    settlement = Some(cancel.settlement());
+                    Ok(CancelResult::Sent)
+                }
                 Ok(_) => Ok(CancelResult::NotNeeded),
                 // The model asks once per attempt, so another request is
                 // not the UA's.
@@ -2159,9 +2397,10 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
                 Err(CancelError::Transport(_)) => Err(Error::TransportFailure),
                 Err(_) => Err(Error::DriverStopped),
             };
-            Done::Cancelled { operation, result }
+            Done::Cancelled { operation, result, settlement }
         });
         self.fallbacks.insert(handle.id(), fallback);
+        self.hold_task(handle.id(), Some(Owner::Attempt(attempt)));
     }
 
     /// Asks the endpoint to cancel a re-INVITE whose session ended, as
@@ -2182,10 +2421,16 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         let handle = self.watchers.spawn(async move {
             // The CANCEL's own transaction is left to the endpoint, as for
             // an attempt.
-            let _ = control.cancel().await;
-            Done::Nothing
+            let settlement = match control.cancel().await {
+                Ok(CancelOutcome::Sent(cancel)) => Some(cancel.settlement()),
+                _ => None,
+            };
+            Done::ReinviteCancelled { settlement }
         });
-        self.fallbacks.insert(handle.id(), Done::Nothing);
+        let fallback = Done::ReinviteCancelled { settlement: None };
+        self.fallbacks.insert(handle.id(), fallback);
+        let owner = self.model.reinvite_usage(exchange).map(Owner::Usage);
+        self.hold_task(handle.id(), owner);
     }
 
     /// Makes a fresh branch, with the magic cookie and 64 random bits.
@@ -2206,27 +2451,27 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         let event = match event {
             model::Event::EarlyDialog { usage, .. } => match attempt {
                 Some(attempt) => {
-                    Event::Early { attempt, session: Session::new(ua, usage) }
+                    Event::Early { attempt, session: self.session(usage) }
                 }
                 None => return,
             },
             model::Event::DialogConfirmed { usage, .. } => {
-                Event::Confirmed { attempt, session: Session::new(ua, usage) }
+                Event::Confirmed { attempt, session: self.session(usage) }
             }
             model::Event::NegotiationCompleted { usage } => {
-                Event::Negotiated { session: Session::new(ua, usage) }
+                Event::Negotiated { session: self.session(usage) }
             }
             model::Event::NegotiationFailed { usage } => {
-                Event::NegotiationFailed { session: Session::new(ua, usage) }
+                Event::NegotiationFailed { session: self.session(usage) }
             }
             model::Event::AnswerChanged { usage } => {
-                Event::AnswerChanged { session: Session::new(ua, usage) }
+                Event::AnswerChanged { session: self.session(usage) }
             }
             model::Event::AckTimeout { usage } => {
-                Event::AckTimeout { session: Session::new(ua, usage) }
+                Event::AckTimeout { session: self.session(usage) }
             }
             model::Event::UsageEnded { usage, reason } => {
-                Event::Ended { session: Session::new(ua, usage), reason }
+                Event::Ended { session: self.session(usage), reason }
             }
             model::Event::AttemptFailed { attempt, error } => {
                 Event::Failed { attempt: AttemptId { ua, attempt }, error }
@@ -2286,20 +2531,39 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             return;
         };
 
-        if let Some(outcome) = self.model.take_outcome(operation) {
-            let _ = waiter.reply.send(outcome);
-        }
+        let Some(outcome) = self.model.take_outcome(operation) else {
+            return;
+        };
+        let ua = self.shared.id;
+        let outcome = outcome.map(|completion| match completion {
+            Completion::Attempt(attempt) => {
+                Completed::Attempt(InviteAttempt {
+                    id: AttemptId { ua, attempt },
+                    settlement: self
+                        .trackers
+                        .settlement(Owner::Attempt(attempt)),
+                })
+            }
+            Completion::Session(usage) => {
+                Completed::Session(self.session(usage))
+            }
+            Completion::Cancel(result) => Completed::Cancel(result),
+            Completion::Done => Completed::Done,
+        });
+        let _ = waiter.reply.send(outcome);
     }
 
     /// Spawns jobs from the backlogs while there is room.
     fn start_jobs(&mut self) {
-        while self.answers.len() < self.max_answers {
-            let Some(Answer { replay, offer, due }) =
+        // A UA without a negotiator queues no answer, see
+        // `Driver::prepare_answer`.
+        while let Some(negotiator) = self.negotiator.clone() {
+            if self.answers.len() >= self.max_answers {
+                break;
+            }
+            let Some(Answer { replay, offer, due, owner }) =
                 self.answer_backlog.pop_front()
             else {
-                break;
-            };
-            let Some(negotiator) = self.negotiator.clone() else {
                 break;
             };
             // An answer that does not come by the time it is due is none,
@@ -2315,6 +2579,10 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
             // One that panics has none either.
             self.fallbacks
                 .insert(handle.id(), Done::Answered { replay, answer: None });
+            // The answer took its owner's hold when it was queued.
+            if let Some(owner) = owner {
+                self.held.insert(handle.id(), owner);
+            }
         }
 
         while self.jobs.len() < self.max_jobs {
@@ -2339,11 +2607,13 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
     /// result, so it has no fallback, and the UA's drain does not wait for
     /// it. The endpoint's does, since the request's transaction waits for
     /// its answer.
-    fn spawn(&mut self, job: Job, reply: bool) {
+    fn spawn(&mut self, work: Work, reply: bool) {
+        let Work { job, owner } = work;
         let endpoint = self.endpoint.clone();
         let resolver = self.resolver.clone();
         let timeout = self.resolve_timeout;
         if matches!(job, Job::Refuse { .. } | Job::Reply { .. }) {
+            debug_assert!(owner.is_none());
             self.answering.spawn(job.run(endpoint, resolver, timeout));
             return;
         }
@@ -2353,6 +2623,10 @@ impl<R: Resolve, N: Negotiate> Driver<R, N> {
         let handle =
             if reply { self.replies.spawn(run) } else { self.jobs.spawn(run) };
         self.fallbacks.insert(handle.id(), fallback);
+        // The job took its owner's hold when it was queued.
+        if let Some(owner) = owner {
+            self.held.insert(handle.id(), owner);
+        }
     }
 }
 
@@ -2390,7 +2664,7 @@ impl Job {
                 result: Err(Error::Internal),
             },
             Job::Resend { exchange, .. } => {
-                Done::Resent { exchange: *exchange }
+                Done::Resent { exchange: *exchange, write: None }
             }
             Job::Refuse { .. } => Done::Nothing,
             Job::Start { attempt, .. } => Done::Started {
@@ -2401,7 +2675,9 @@ impl Job {
                 exchange: *exchange,
                 result: Err(Error::Internal),
             },
-            Job::Bye { replay, .. } => Done::Byed { replay: *replay },
+            Job::Bye { replay, .. } => {
+                Done::Byed { replay: *replay, settlement: None }
+            }
             Job::SessionBye { usage, .. } => Done::SessionByeStarted {
                 usage: *usage,
                 result: Err(Error::Internal),
@@ -2413,7 +2689,7 @@ impl Job {
                     AckRoute::Resend(target) => Some(target.clone()),
                     AckRoute::Resolve(_) => None,
                 },
-                written: false,
+                write: None,
             },
         }
     }
@@ -2471,9 +2747,20 @@ impl Job {
             // place. Giving up after the endpoint queued the copy withdraws
             // nothing, and giving up before costs nothing.
             Job::Resend { exchange, route, response, timeout } => {
-                let _ =
+                let sent =
                     tokio::time::timeout(timeout, route.send(response)).await;
-                Done::Resent { exchange }
+                let write = match sent {
+                    Ok(Ok(())) => Some(Write::Written),
+                    Ok(Err(ReplyError::Transport(_))) => {
+                        Some(Write::NotWritten)
+                    }
+                    Ok(Err(ReplyError::OutcomeUnknown(_))) | Err(_) => {
+                        Some(Write::Unknown)
+                    }
+                    // The endpoint refused it before any write.
+                    Ok(Err(_)) => None,
+                };
+                Done::Resent { exchange, write }
             }
             Job::Refuse { responder, response } => {
                 let _ = responder.respond(response).await;
@@ -2505,11 +2792,14 @@ impl Job {
             // endpoint could not take is not tried again, so that a dialog
             // the UA never kept costs no more than this one try.
             Job::Bye { replay, request, query } => {
+                let mut settlement = None;
                 if let Ok(target) = resolve(&*resolver, &query, timeout).await
                 {
-                    let _ = endpoint.start(request, target).await;
+                    if let Ok(bye) = endpoint.start(request, target).await {
+                        settlement = Some(bye.settlement());
+                    }
                 }
-                Done::Byed { replay }
+                Done::Byed { replay, settlement }
             }
             // The core takes the BYE in a client transaction of its own, which
             // ends the session (RFC 3261 section 15.1.1). A BYE it could not
@@ -2542,11 +2832,7 @@ impl Job {
                     }
                 };
                 let Some(target) = target else {
-                    return Done::Acked {
-                        replay,
-                        target: None,
-                        written: false,
-                    };
+                    return Done::Acked { replay, target: None, write: None };
                 };
 
                 let via = ViaMode::Branch(branch);
@@ -2555,8 +2841,19 @@ impl Job {
                     endpoint.send_request(request, target.clone(), via),
                 )
                 .await;
-                let written = matches!(sent, Ok(Ok(_)));
-                Done::Acked { replay, target: Some(target), written }
+                let write = match sent {
+                    Ok(Ok(_)) => Some(Write::Written),
+                    Ok(Err(error)) if error.is_transport() => {
+                        Some(Write::NotWritten)
+                    }
+                    Ok(Err(error)) if error.is_outcome_unknown() => {
+                        Some(Write::Unknown)
+                    }
+                    Err(_) => Some(Write::Unknown),
+                    // The endpoint refused it before any write.
+                    Ok(Err(_)) => None,
+                };
+                Done::Acked { replay, target: Some(target), write }
             }
         }
     }

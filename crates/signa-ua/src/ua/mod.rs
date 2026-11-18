@@ -6,6 +6,7 @@ is in `driver`.
 use std::{
     error, fmt,
     future::Future,
+    hash::{Hash, Hasher},
     marker::PhantomData,
     pin::Pin,
     sync::{
@@ -27,6 +28,7 @@ use tokio::{
     time::Instant,
 };
 
+pub use self::settle::{Settled, Settlement};
 pub use crate::{
     error::{Error, WireEffect},
     invite::{AttemptResult, CancelResult, EndReason},
@@ -38,12 +40,12 @@ use crate::{
     invite::{AttemptKey, ExchangeKey, UsageKey, UsagePhase},
     model::{self, Authority, Limits, UsageState},
     negotiation::Negotiation,
-    operation::Completion,
     routing::{Place, allowed_in},
     timer,
 };
 
 mod driver;
+mod settle;
 
 /// Resolves the next hop of a request to a transport and socket address.
 ///
@@ -605,6 +607,16 @@ pub struct Ua {
 /// of an operation comes through its [`Operation`], and the state of a session
 /// through [`UaHandle::snapshot`].
 ///
+/// # Settling
+///
+/// The end of a session or an INVITE is not the end of its work. A BYE has a
+/// transaction of its own, an INVITE this UA sent can get the 2xx of another
+/// fork until Timer M, and a 2xx goes again until its ACK. The settlements of
+/// [`Session::settlement`], [`InviteAttempt::settlement`] and
+/// [`IncomingInvite::settlement`] resolve once all of that has ended, apart
+/// from the events, so that a full queue loses none of them. Each counts the
+/// writes of its work and says whether it all ended before the UA stopped.
+///
 /// # Shutting down
 ///
 /// [`UaHandle::shutdown`] stops the UA in two phases. The UA stops taking new
@@ -722,7 +734,7 @@ struct ShutdownRequest {
 enum Command {
     Operation {
         command: model::Command,
-        reply: oneshot::Sender<Result<Completion, Error>>,
+        reply: oneshot::Sender<Result<Completed, Error>>,
         permit: OwnedSemaphorePermit,
     },
     Snapshot {
@@ -791,7 +803,7 @@ impl Shared {
             reply,
             permit,
         });
-        Ok(Operation { receiver, ua: self.id, kind: PhantomData })
+        Ok(Operation { receiver, kind: PhantomData })
     }
 }
 
@@ -1403,10 +1415,18 @@ impl<T> error::Error for SubmitError<T> {}
 /// The operation goes on to its outcome, which nobody reads then.
 #[must_use = "an operation goes on without its future, but its outcome is lost"]
 pub struct Operation<T> {
-    receiver: oneshot::Receiver<Result<Completion, Error>>,
-    /// The UA that runs it, for the handle it completes with.
-    ua: UaId,
+    receiver: oneshot::Receiver<Result<Completed, Error>>,
     kind: PhantomData<fn() -> T>,
+}
+
+/// What an operation completes with, as the driver hands it over, with the
+/// handles it made.
+#[derive(Debug)]
+enum Completed {
+    Attempt(InviteAttempt),
+    Session(Session),
+    Cancel(CancelResult),
+    Done,
 }
 
 impl<T> fmt::Debug for Operation<T> {
@@ -1419,7 +1439,7 @@ impl<T> Operation<T> {
     fn poll_completion(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<Completion, Error>> {
+    ) -> Poll<Result<Completed, Error>> {
         Pin::new(&mut self.receiver)
             .poll(cx)
             .map(|outcome| outcome.unwrap_or(Err(Error::DriverStopped)))
@@ -1433,11 +1453,8 @@ impl Future for Operation<InviteAttempt> {
         mut self: Pin<&mut Operation<InviteAttempt>>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<InviteAttempt, Error>> {
-        let ua = self.ua;
         self.poll_completion(cx).map(|outcome| match outcome? {
-            Completion::Attempt(attempt) => {
-                Ok(InviteAttempt { id: AttemptId { ua, attempt } })
-            }
+            Completed::Attempt(attempt) => Ok(attempt),
             _ => unreachable!("an INVITE completes with its attempt"),
         })
     }
@@ -1450,9 +1467,8 @@ impl Future for Operation<Session> {
         mut self: Pin<&mut Operation<Session>>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Session, Error>> {
-        let ua = self.ua;
         self.poll_completion(cx).map(|outcome| match outcome? {
-            Completion::Session(usage) => Ok(Session::new(ua, usage)),
+            Completed::Session(session) => Ok(session),
             _ => unreachable!("an accept completes with its session"),
         })
     }
@@ -1466,7 +1482,7 @@ impl Future for Operation<CancelResult> {
         cx: &mut Context<'_>,
     ) -> Poll<Result<CancelResult, Error>> {
         self.poll_completion(cx).map(|outcome| match outcome? {
-            Completion::Cancel(result) => Ok(result),
+            Completed::Cancel(result) => Ok(result),
             _ => unreachable!("a cancel completes with what it did"),
         })
     }
@@ -1575,7 +1591,9 @@ pub enum Event {
         session: Session,
     },
     /// A session ended. Its snapshot keeps why for a while, see
-    /// [`UaHandle::snapshot`].
+    /// [`UaHandle::snapshot`]. Its protocol work can go on for a while, such
+    /// as its BYE's transaction, and [`Session::settlement`] says when it is
+    /// done.
     #[non_exhaustive]
     Ended {
         /// The session.
@@ -1609,7 +1627,8 @@ pub enum Event {
     /// An INVITE this UA sent can get no more responses, and this is what it
     /// came to. It is the last event of the attempt, and it is never dropped
     /// for a full queue, since the UA set its place aside when it sent the
-    /// INVITE.
+    /// INVITE. [`InviteAttempt::settlement`] says when the work of the
+    /// INVITE is done, which can be later.
     #[non_exhaustive]
     AttemptEnded {
         /// The INVITE.
@@ -1704,6 +1723,7 @@ pub struct IncomingInvite {
     /// dropping this always reaches the driver.
     abandon: Option<mpsc::OwnedPermit<ExchangeKey>>,
     shared: Arc<Shared>,
+    settlement: Settlement,
 }
 
 impl fmt::Debug for IncomingInvite {
@@ -1742,6 +1762,20 @@ impl IncomingInvite {
     /// not look inside it.
     pub fn offer(&self) -> Option<&Description> {
         self.offer.as_deref()
+    }
+
+    /// Returns the settlement of the INVITE, which resolves once the protocol
+    /// work for it has ended: its transaction until it settles in
+    /// signa-core, a CANCEL of it and a BYE in its early dialog that the UA
+    /// took, and the copies of its 2xx until the ACK or the deadline for
+    /// one.
+    ///
+    /// A rejected INVITE settles once its transaction has taken the ACK of
+    /// the rejection, or given up on it. Take the settlement before deciding,
+    /// since a decision consumes this. The session an accept forms waits for
+    /// it too, see [`Session::settlement`].
+    pub fn settlement(&self) -> Settlement {
+        self.settlement.clone()
     }
 
     /// Returns the INVITE's identity, which [`Event::Cancelled`] names.
@@ -2016,20 +2050,71 @@ pub struct SessionId {
 /// An INVITE session, the INVITE usage of one dialog.
 ///
 /// It is a handle. The UA keeps the session's state, and dropping this sends
-/// no BYE. [`UaHandle::try_terminate`] does.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+/// no BYE. [`UaHandle::try_terminate`] does. Two handles are equal when they
+/// name the same session.
+#[derive(Clone)]
 pub struct Session {
     id: SessionId,
+    settlement: Settlement,
 }
 
 impl Session {
-    fn new(ua: UaId, usage: UsageKey) -> Session {
-        Session { id: SessionId { ua, usage } }
-    }
-
     /// Returns the session's identity.
     pub fn id(&self) -> SessionId {
         self.id
+    }
+
+    /// Returns the settlement of the session, which resolves once the
+    /// protocol work of its INVITE usage has ended.
+    ///
+    /// [`Event::Ended`] says that the session ended, which is when its BYE
+    /// went or came. Its work goes on after that, and the settlement waits
+    /// for it:
+    ///
+    /// * the transactions of signa-core's for the dialog, each until it
+    ///   settles: the INVITE that formed it, each re-INVITE and its CANCEL,
+    ///   and each BYE, either way,
+    /// * the copies of each 2xx and each ACK, until no more can be asked
+    ///   for, and the answer for an ACK that the [`Negotiate`] prepares,
+    /// * the INVITE this UA sent that formed the session, until no other
+    ///   fork can answer it, or the INVITE it accepted, until the endpoint
+    ///   lets go of it.
+    ///
+    /// So a session that ended with a BYE settles after the BYE's
+    /// transaction ends, and one that this UA called settles no earlier
+    /// than its INVITE, 64 T1 after its first 2xx (Timer M of RFC 6026). The
+    /// counts of [`Settled`] are of the session's own writes and those of
+    /// the INVITE it accepted. Those of an INVITE it sent are the attempt's,
+    /// which its forks share, and [`InviteAttempt::settlement`] counts them.
+    ///
+    /// Other requests in the dialog, and requests the UA refuses before it
+    /// takes them, such as one that finds no room, are the endpoint's
+    /// alone. It settles whether or not the application reads events or
+    /// keeps this handle, and the resources an application holds for the
+    /// session, such as its media, are for the application to free.
+    pub fn settlement(&self) -> Settlement {
+        self.settlement.clone()
+    }
+}
+
+// The settlement changes over time, so it stays out of what a log shows.
+impl fmt::Debug for Session {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Session").field("id", &self.id).finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for Session {
+    fn eq(&self, other: &Session) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for Session {}
+
+impl Hash for Session {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
     }
 }
 
@@ -2044,16 +2129,54 @@ pub struct AttemptId {
 /// endpoint stops delivering them.
 ///
 /// Dropping it sends no CANCEL. The UA still acknowledges every 2xx.
-/// [`UaHandle::try_cancel`] and [`UaHandle::try_abandon`] send one.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+/// [`UaHandle::try_cancel`] and [`UaHandle::try_abandon`] send one. Two
+/// handles are equal when they name the same attempt.
+#[derive(Clone)]
 pub struct InviteAttempt {
     id: AttemptId,
+    settlement: Settlement,
 }
 
 impl InviteAttempt {
     /// Returns the attempt's identity.
     pub fn id(&self) -> AttemptId {
         self.id
+    }
+
+    /// Returns the settlement of the attempt, which resolves once every
+    /// piece of protocol work of the INVITE has ended.
+    ///
+    /// That is the INVITE's transaction and the CANCEL's, until each
+    /// settles in signa-core, and the ACK and BYE of each 2xx the UA did not
+    /// keep as a session, such as a fork beyond [`Config::max_forks`] or one
+    /// that came after [`UaHandle::try_abandon`]. It comes after
+    /// [`Event::AttemptEnded`], whether a 2xx came or not, and an attempt
+    /// that formed no session is done then. The sessions it formed settle
+    /// on their own, after it.
+    pub fn settlement(&self) -> Settlement {
+        self.settlement.clone()
+    }
+}
+
+impl fmt::Debug for InviteAttempt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InviteAttempt")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for InviteAttempt {
+    fn eq(&self, other: &InviteAttempt) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for InviteAttempt {}
+
+impl Hash for InviteAttempt {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
     }
 }
 

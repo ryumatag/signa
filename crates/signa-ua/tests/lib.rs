@@ -16,6 +16,7 @@ mod limits;
 mod reinvite;
 mod routing;
 mod runtime;
+mod settlement;
 mod shutdown;
 mod support;
 mod tower;

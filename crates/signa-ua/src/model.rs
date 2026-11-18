@@ -297,6 +297,11 @@ pub(crate) enum Effect {
         /// they formed.
         sessions: Vec<UsageKey>,
     },
+    /// A usage formed, from the responses to an attempt or the 2xx of an
+    /// incoming exchange, which `from` names. It comes before anything else
+    /// about the usage, so that the runtime can track its work from the
+    /// start.
+    UsageFormed { usage: UsageKey, from: Owner },
     /// Tell the application.
     Notify(Event),
     /// Hand the outcome of an operation to its waiter, if it still has one.
@@ -308,10 +313,29 @@ pub(crate) enum Effect {
 /// A record the model has reclaimed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Released {
-    /// An attempt whose INVITE never reached the core.
+    /// An attempt, once its record and the cleanups of the 2xx it did not
+    /// keep are gone.
     Attempt(AttemptKey),
     Exchange(ExchangeKey),
     Replay(ReplayKey),
+    /// A usage that ended, once no record of it is left: its BYE on the way
+    /// and its Mortal dialog, the replay contexts of its 2xx, and the
+    /// exchanges of its re-INVITEs either way.
+    Usage(UsageKey),
+}
+
+/// What the protocol work of the UA belongs to, which settles as one: an
+/// attempt, an incoming INVITE exchange or a usage.
+///
+/// The model says when its own records of each are gone, with
+/// [`Effect::Released`]. The runtime adds what it keeps apart, such as the
+/// jobs and the core's transactions, and reports the settlement once all of
+/// it has ended.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum Owner {
+    Attempt(AttemptKey),
+    Exchange(ExchangeKey),
+    Usage(UsageKey),
 }
 
 /// How an incoming request relates to this user agent's dialogs.
@@ -503,8 +527,11 @@ pub(crate) enum Event {
 /// How the UA takes a request in a dialog other than INVITE, ACK and CANCEL.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InDialog {
-    /// A BYE the UA took. It gets a 200 (RFC 3261 section 15.1.2).
-    Bye,
+    /// A BYE the UA took. It gets a 200 (RFC 3261 section 15.1.2). It names
+    /// what it ended, or would have: the usage of its dialog, which may have
+    /// ended already with this user agent's BYE, or the incoming exchange of
+    /// an early dialog.
+    Bye(Owner),
     /// A request that changes nothing in the dialog, which RFC 3261 section
     /// 12.2.2 has answered as one outside it.
     Other,
@@ -589,6 +616,14 @@ pub(crate) struct Model<R> {
     /// The BYEs on their way to the core, by the usage they end. Each usage
     /// has one at most, so the usage table bounds them.
     byes: HashMap<UsageKey, SendingBye>,
+    /// The usage each Mortal dialog belonged to, so that a BYE that crosses
+    /// this user agent's names it, and the usage is released only with the
+    /// dialog. The dialog table bounds it.
+    mortal: HashMap<DialogKey, UsageKey>,
+    /// The usages that ended and the attempts whose record went, with how
+    /// many records of theirs are left, see [`Model::release`]. The usage
+    /// and attempt tables bound it with the records that are left.
+    settling: HashMap<Owner, usize>,
     /// Why each of the last usages to end ended, the oldest first, so that a
     /// snapshot can say it after the notification was lost. At most
     /// `limits.usages` are kept.
@@ -646,6 +681,8 @@ impl<R: Random> Model<R> {
             merge_index: HashMap::new(),
             early_index: HashMap::new(),
             byes: HashMap::new(),
+            mortal: HashMap::new(),
+            settling: HashMap::new(),
             ended: VecDeque::new(),
             reinvites: 0,
             timers: TimerQueue::default(),
@@ -1524,6 +1561,12 @@ impl<R: Random> Model<R> {
             Scope::Outgoing | Scope::Reinvite(_) => {}
         }
         self.effects.push(Effect::Released(Released::Exchange(key)));
+        if let Scope::Incoming {
+            kind: Received::Reinvite { usage, .. }, ..
+        } = exchange.scope
+        {
+            self.release(Owner::Usage(usage));
+        }
     }
 
     /// Has a usage let go of the INVITE exchange it held open, once that
@@ -1725,6 +1768,7 @@ impl<R: Random> Model<R> {
             ReplayContext::new(replay.clone(), Source::Exchange(key), usage);
         let context = self.replays.insert_reserved(context);
         self.replay_index.insert(replay, context);
+        self.counted(context);
         self.let_go(usage, key);
         let Some(record) = self.usages.get_mut(usage) else {
             self.replays.get_mut(context).expect("just made").usage_ended();
@@ -1926,10 +1970,11 @@ impl<R: Random> Model<R> {
 
         if let Some(&key) = self.dialog_index.get(&id) {
             if self.is_mortal(key) {
-                return if bye {
-                    Ok(InDialog::Bye)
-                } else {
-                    Err(Refusal::NoDialog)
+                return match self.mortal.get(&key) {
+                    Some(&usage) if bye => {
+                        Ok(InDialog::Bye(Owner::Usage(usage)))
+                    }
+                    _ => Err(Refusal::NoDialog),
                 };
             }
             // A dialog that is not Mortal is in the table with its usage,
@@ -1948,7 +1993,7 @@ impl<R: Random> Model<R> {
             }
 
             self.end_usage(usage, arrival.remote_bye());
-            return Ok(InDialog::Bye);
+            return Ok(InDialog::Bye(Owner::Usage(usage)));
         }
 
         let Some(&key) = self.early_index.get(&id) else {
@@ -1970,7 +2015,7 @@ impl<R: Random> Model<R> {
         dialog.remote_request(cseq).map_err(out_of_order)?;
         if bye {
             self.withdraw(key, Withdrawal::Bye { arrival });
-            return Ok(InDialog::Bye);
+            return Ok(InDialog::Bye(Owner::Exchange(key)));
         }
         Ok(InDialog::Other)
     }
@@ -2371,7 +2416,7 @@ impl<R: Random> Model<R> {
         };
 
         self.exchanges.remove(record.exchange);
-        self.effects.push(Effect::Released(Released::Attempt(attempt)));
+        self.begin_settling(Owner::Attempt(attempt));
         if let Some(operation) = record.operation {
             self.complete(operation, Err(error));
         }
@@ -2742,6 +2787,8 @@ impl<R: Random> Model<R> {
         let attempt = self.attempts.get_mut(key).expect("checked above");
         attempt.forks.push(usage);
 
+        let from = Owner::Attempt(key);
+        self.effects.push(Effect::UsageFormed { usage, from });
         self.effects
             .push(Effect::Notify(Event::EarlyDialog { dialog, usage }));
         Ok(())
@@ -2964,6 +3011,7 @@ impl<R: Random> Model<R> {
         );
         let key = self.replays.insert_reserved(context);
         self.replay_index.insert(replay, key);
+        self.counted(key);
 
         self.effects
             .push(Effect::Notify(Event::DialogConfirmed { dialog, usage }));
@@ -3092,6 +3140,7 @@ impl<R: Random> Model<R> {
 
         self.cleanups += 1;
         self.replay_index.insert(replay, key);
+        self.counted(key);
         let late = self
             .attempts
             .get(attempt)
@@ -3272,6 +3321,8 @@ impl<R: Random> Model<R> {
             degraded: attempt.degraded,
             sessions,
         });
+        // Released after its end, whose place the runtime frees with it.
+        self.begin_settling(Owner::Attempt(key));
     }
 }
 
@@ -3530,6 +3581,7 @@ impl<R: Random> Model<R> {
         }
         let context = self.replays.insert_reserved(context);
         self.replay_index.insert(replay, context);
+        self.counted(context);
         self.let_go(usage, key);
         if let Some(operation) = operation {
             self.operations.advance(operation, Stage::Answered);
@@ -3835,12 +3887,14 @@ impl<R: Random> Model<R> {
             return;
         };
         self.reinvites -= 1;
+        let mut usage = None;
         if let Scope::Reinvite(sent) = exchange.scope {
             if sent.reserved {
                 self.replays.release();
             }
             self.let_go(sent.usage, key);
             debug_assert!(sent.operation.is_none(), "completed before");
+            usage = Some(sent.usage);
         }
 
         let replays: Vec<ReplayKey> = self
@@ -3854,6 +3908,9 @@ impl<R: Random> Model<R> {
             self.reclaim_replay(replay);
         }
         self.effects.push(Effect::Released(Released::Exchange(key)));
+        if let Some(usage) = usage {
+            self.release(Owner::Usage(usage));
+        }
     }
 
     /// Hands a dialog that leaves the dialog table to whatever still needs
@@ -3896,6 +3953,28 @@ impl<R: Random> Model<R> {
         if let Some(sent) = pending {
             sent.kept = Some(Box::new(dialog));
         }
+    }
+}
+
+/// Returns what a replay context belongs to: the usage of its 2xx, or for a
+/// cleanup the attempt whose 2xx it ends. A cleanup comes only from an
+/// attempt.
+fn replay_owner(replay: &ReplayContext) -> Option<Owner> {
+    match (replay.usage, replay.source) {
+        (Some(usage), _) => Some(Owner::Usage(usage)),
+        (None, Source::Attempt(attempt)) => Some(Owner::Attempt(attempt)),
+        (None, Source::Exchange(_) | Source::Reinvite(_)) => None,
+    }
+}
+
+/// Returns the usage of an exchange of a re-INVITE, either way.
+fn exchange_usage(exchange: &InviteExchange) -> Option<UsageKey> {
+    match &exchange.scope {
+        Scope::Incoming { kind: Received::Reinvite { usage, .. }, .. } => {
+            Some(*usage)
+        }
+        Scope::Reinvite(sent) => Some(sent.usage),
+        Scope::Incoming { .. } | Scope::Outgoing => None,
     }
 }
 
@@ -3945,6 +4024,7 @@ impl<R: Random> Model<R> {
         if mortal {
             if let Some(dialog) = self.dialogs.get_mut(usage.dialog) {
                 dialog.terminate();
+                self.mortal.insert(usage.dialog, key);
             }
         } else if let Some(dialog) = self.dialogs.remove(usage.dialog) {
             self.dialog_index.remove(dialog.id());
@@ -4026,6 +4106,7 @@ impl<R: Random> Model<R> {
         });
         self.effects
             .push(Effect::Notify(Event::UsageEnded { usage: key, reason }));
+        self.begin_settling(Owner::Usage(key));
     }
 
     /// Ends a usage with a BYE, for `operation` if the application asked.
@@ -4193,6 +4274,11 @@ impl<R: Random> Model<R> {
         result: Result<(), Error>,
     ) -> Option<ByeStarted> {
         let bye = self.byes.remove(&key)?;
+        // A usage the peer's BYE ended meanwhile counted this BYE among its
+        // records.
+        if self.usages.get(key).is_none() {
+            self.release(Owner::Usage(key));
+        }
 
         match result {
             Ok(()) => {
@@ -4289,6 +4375,9 @@ impl<R: Random> Model<R> {
             // An ACK may still need it, as for a re-INVITE that crossed the
             // BYE (RFC 5407 section 3.2.3).
             self.hand_on(dialog);
+            if let Some(usage) = self.mortal.remove(&bye.dialog) {
+                self.release(Owner::Usage(usage));
+            }
         }
     }
 
@@ -4340,6 +4429,14 @@ impl<R: Random> Model<R> {
         let key = self.replays.insert_reserved(context);
         self.replay_index.insert(replay, key);
 
+        // A re-INVITE forms no usage, so its source does not come here.
+        let from = match source {
+            Source::Attempt(attempt) => Owner::Attempt(attempt),
+            Source::Exchange(exchange) | Source::Reinvite(exchange) => {
+                Owner::Exchange(exchange)
+            }
+        };
+        self.effects.push(Effect::UsageFormed { usage, from });
         self.effects
             .push(Effect::Notify(Event::DialogConfirmed { dialog, usage }));
         (key, usage)
@@ -4357,6 +4454,9 @@ impl<R: Random> Model<R> {
             }
             self.replay_index.remove(&replay.id);
             self.effects.push(Effect::Released(Released::Replay(key)));
+            if let Some(owner) = replay_owner(&replay) {
+                self.release(owner);
+            }
         }
     }
 }
@@ -4381,6 +4481,117 @@ impl<R> Model<R> {
             && self.replays.len() == 0
             && self.byes.is_empty()
             && self.timers.next().is_none()
+    }
+
+    /// Starts to count down the records left of a usage that ended or an
+    /// attempt whose record went, and releases it if there are none. This
+    /// is the one scan of the tables for it. Each record of it that goes
+    /// later calls [`Model::release`], and each that comes, as the replay
+    /// context of a re-INVITE's late 2xx, [`Model::counted`].
+    fn begin_settling(&mut self, owner: Owner) {
+        match self.records(owner) {
+            0 => self.released(owner),
+            left => {
+                self.settling.insert(owner, left);
+            }
+        }
+    }
+
+    /// Counts down a record of `owner` that went, if it settles, and
+    /// releases it with the last one.
+    fn release(&mut self, owner: Owner) {
+        let Some(left) = self.settling.get_mut(&owner) else {
+            return;
+        };
+        debug_assert!(*left > 0, "{owner:?}");
+        *left = left.saturating_sub(1);
+        if *left == 0 {
+            self.settling.remove(&owner);
+            self.released(owner);
+        }
+    }
+
+    /// Counts a replay context that came for an owner that settles.
+    fn counted(&mut self, key: ReplayKey) {
+        let owner = self.replays.get(key).and_then(replay_owner);
+        if let Some(left) =
+            owner.and_then(|owner| self.settling.get_mut(&owner))
+        {
+            *left += 1;
+        }
+    }
+
+    fn released(&mut self, owner: Owner) {
+        self.effects.push(Effect::Released(match owner {
+            Owner::Attempt(key) => Released::Attempt(key),
+            Owner::Usage(key) => Released::Usage(key),
+            Owner::Exchange(key) => Released::Exchange(key),
+        }));
+    }
+
+    /// Counts the records of `owner` left, other than its own record.
+    ///
+    /// A usage keeps its BYE on the way and its Mortal dialog, the replay
+    /// contexts of its 2xx, and the exchange of each re-INVITE of its dialog,
+    /// either way. An attempt keeps the cleanups of the 2xx it did not keep.
+    /// The replay context of a 2xx it kept is its usage's. An exchange has
+    /// no records but its own, and is released with it.
+    fn records(&self, owner: Owner) -> usize {
+        let replays = || {
+            self.replays
+                .iter()
+                .filter(|(_, replay)| replay_owner(replay) == Some(owner))
+                .count()
+        };
+        match owner {
+            Owner::Usage(key) => {
+                usize::from(self.byes.contains_key(&key))
+                    + self
+                        .mortal
+                        .values()
+                        .filter(|&&usage| usage == key)
+                        .count()
+                    + replays()
+                    + self
+                        .exchanges
+                        .iter()
+                        .filter(|(_, exchange)| {
+                            exchange_usage(exchange) == Some(key)
+                        })
+                        .count()
+            }
+            Owner::Attempt(_) => replays(),
+            Owner::Exchange(_) => 0,
+        }
+    }
+
+    /// Returns what a replay context belongs to, for the runtime's jobs on
+    /// its behalf.
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    pub(crate) fn replay_owner(&self, key: ReplayKey) -> Option<Owner> {
+        self.replays.get(key).and_then(replay_owner)
+    }
+
+    /// Returns the usage of a re-INVITE this user agent sent.
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    pub(crate) fn reinvite_usage(&self, key: ExchangeKey) -> Option<UsageKey> {
+        match &self.exchanges.get(key)?.scope {
+            Scope::Reinvite(sent) => Some(sent.usage),
+            _ => None,
+        }
+    }
+
+    /// Says whether the model has yet to release `owner`, for the runtime's
+    /// checks.
+    #[cfg(debug_assertions)]
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
+    pub(crate) fn holds_owner(&self, owner: Owner) -> bool {
+        let live = match owner {
+            Owner::Usage(key) => self.usages.get(key).is_some(),
+            Owner::Attempt(key) => self.attempts.get(key).is_some(),
+            Owner::Exchange(key) => self.exchanges.get(key).is_some(),
+        };
+        live || self.settling.contains_key(&owner)
     }
 
     /// Says whether an exchange is still kept, for the runtime's checks.
@@ -4584,6 +4795,8 @@ impl<R: Random> Model<R> {
         self.merge_index.clear();
         self.early_index.clear();
         self.byes.clear();
+        self.mortal.clear();
+        self.settling.clear();
         self.reinvites = 0;
         self.timers = TimerQueue::default();
         #[cfg(test)]
@@ -4763,6 +4976,28 @@ mod tests {
                 })
                 .count();
             assert_eq!(self.dialogs.len(), self.usages.len() + mortal);
+            // Each Mortal dialog names its usage, which has ended.
+            assert_eq!(self.mortal.len(), mortal);
+            for (&dialog, &usage) in &self.mortal {
+                let phase = self.dialogs.get(dialog).map(Dialog::phase);
+                assert_eq!(phase, Some(DialogPhase::Terminated));
+                assert!(self.usages.get(usage).is_none());
+            }
+            // What settles still has a record, or it would have been
+            // released, and has ended.
+            for (&owner, &left) in &self.settling {
+                assert!(left > 0, "{owner:?} was not released");
+                assert_eq!(left, self.records(owner), "{owner:?}");
+                match owner {
+                    Owner::Usage(key) => {
+                        assert!(self.usages.get(key).is_none());
+                    }
+                    Owner::Attempt(key) => {
+                        assert!(self.attempts.get(key).is_none());
+                    }
+                    Owner::Exchange(_) => panic!("an exchange settles alone"),
+                }
+            }
             for (_, dialog) in self.dialogs.iter() {
                 assert!(self.dialog_index.contains_key(dialog.id()));
             }
@@ -5351,6 +5586,7 @@ mod tests {
             model.take_effects(),
             [
                 Effect::Released(Released::Replay(replay_key)),
+                Effect::Released(Released::Usage(usage)),
                 Effect::AttemptEnded {
                     attempt,
                     result: AttemptResult::Answered,
@@ -5358,6 +5594,7 @@ mod tests {
                     degraded: false,
                     sessions: vec![],
                 },
+                Effect::Released(Released::Attempt(attempt)),
             ],
         );
         assert!(!model.has_replay(replay_key));
@@ -5366,6 +5603,58 @@ mod tests {
             Err(Error::StaleDecision),
         );
         assert!(model.take_effects().is_empty());
+    }
+
+    /// A UAC ends its session with a BYE before Timer M. The usage ends at
+    /// once, but it is released only once its last record goes: the Mortal
+    /// dialog with the BYE's response, and the replay context of its 2xx
+    /// with the attempt's response collection, since another copy of the 2xx
+    /// still needs its ACK until then. The attempt is released after its
+    /// end, each once.
+    #[test]
+    fn a_usage_is_released_with_its_last_record() {
+        let mut model = model(limits());
+        let attempt = model.start_attempt(&request(INVITE), true).unwrap();
+        model.receive_2xx(attempt, &callee(), Some(answer())).unwrap();
+        let effects = model.take_effects();
+        let (_, usage) = confirmed(&effects);
+        let formed =
+            Effect::UsageFormed { usage, from: Owner::Attempt(attempt) };
+        assert_eq!(effects.first(), Some(&formed));
+        let replay = model.replay(&effects).id.clone();
+        let replay = model.replay_index[&replay];
+        model.ack_written(replay, true);
+
+        run(&mut model, Command::Terminate { usage });
+        model.take_effects();
+        let bye = model.bye_started(usage, Ok(())).unwrap();
+        let effects = model.take_effects();
+        assert!(effects.contains(&Effect::Notify(Event::UsageEnded {
+            usage,
+            reason: EndReason::LocalBye,
+        })));
+        assert!(!effects.contains(&Effect::Released(Released::Usage(usage))));
+
+        model.bye_answered(bye, Ok(()));
+        model.check();
+        let effects = model.take_effects();
+        assert!(!effects.contains(&Effect::Released(Released::Usage(usage))));
+        assert_eq!(model.replay_owner(replay), Some(Owner::Usage(usage)));
+
+        model.response_collection_finished(attempt);
+        model.check();
+        let effects = model.take_effects();
+        let released =
+            |effect: &&Effect| matches!(effect, Effect::Released(_));
+        assert_eq!(
+            effects.iter().filter(released).collect::<Vec<_>>(),
+            [
+                &Effect::Released(Released::Replay(replay)),
+                &Effect::Released(Released::Usage(usage)),
+                &Effect::Released(Released::Attempt(attempt)),
+            ],
+        );
+        assert!(model.settling.is_empty() && model.mortal.is_empty());
     }
 
     /// The application accepts and stops waiting before the command runs.
@@ -5685,7 +5974,10 @@ mod tests {
             .receive_provisional(attempt, &ringing("sip:bob@192.0.2.4"), None)
             .unwrap();
         let (dialog, usage) = match model.take_effects()[..] {
-            [Effect::Notify(Event::EarlyDialog { dialog, usage })] => {
+            [
+                Effect::UsageFormed { usage: formed, from },
+                Effect::Notify(Event::EarlyDialog { dialog, usage }),
+            ] if formed == usage && from == Owner::Attempt(attempt) => {
                 (dialog, usage)
             }
             ref other => panic!("no early dialog: {other:?}"),
@@ -5963,7 +6255,10 @@ mod tests {
         let ringing = reply("180 Ringing", "early", "sip:bob@192.0.2.4", "");
         model.receive_provisional(attempt, &ringing, None).unwrap();
         let usage = match model.take_effects()[..] {
-            [Effect::Notify(Event::EarlyDialog { usage, .. })] => usage,
+            [
+                Effect::UsageFormed { usage: formed, from },
+                Effect::Notify(Event::EarlyDialog { usage, .. }),
+            ] if formed == usage && from == Owner::Attempt(attempt) => usage,
             ref other => panic!("no early dialog: {other:?}"),
         };
         let busy = StatusCode::from_u16(486).unwrap();
@@ -7298,14 +7593,17 @@ mod tests {
         let effects = model.take_effects();
         assert!(!model.has_replay(replay) && !model.has_replay(cleanup));
         assert_eq!(
-            effects.last(),
-            Some(&Effect::AttemptEnded {
-                attempt,
-                result: AttemptResult::Answered,
-                complete: false,
-                degraded: false,
-                sessions: vec![],
-            }),
+            effects[effects.len() - 2..],
+            [
+                Effect::AttemptEnded {
+                    attempt,
+                    result: AttemptResult::Answered,
+                    complete: false,
+                    degraded: false,
+                    sessions: vec![],
+                },
+                Effect::Released(Released::Attempt(attempt)),
+            ],
         );
 
         // A cleanup whose ACK has not had its try when the responses end
@@ -7462,14 +7760,17 @@ mod tests {
         model.check();
         let effects = model.take_effects();
         assert_eq!(
-            effects.last(),
-            Some(&Effect::AttemptEnded {
-                attempt,
-                result: AttemptResult::Answered,
-                complete: false,
-                degraded: true,
-                sessions: sessions.clone(),
-            }),
+            effects[effects.len() - 2..],
+            [
+                Effect::AttemptEnded {
+                    attempt,
+                    result: AttemptResult::Answered,
+                    complete: false,
+                    degraded: true,
+                    sessions: sessions.clone(),
+                },
+                Effect::Released(Released::Attempt(attempt)),
+            ],
         );
         assert_eq!((model.replays.len(), model.cleanups), (0, 0));
     }
@@ -7783,7 +8084,7 @@ Contact: <sip:bob@192.0.2.4>
         let taken =
             model.receive_request(&from_caller("BYE", 314160), arrival());
         model.check();
-        assert_eq!(taken, Ok(InDialog::Bye));
+        assert!(matches!(taken, Ok(InDialog::Bye(_))));
         assert_eq!(statuses(&model.take_effects()), [487]);
         assert!(model.exchanges.get(authority.exchange).is_some());
 
@@ -7798,7 +8099,7 @@ Contact: <sip:bob@192.0.2.4>
         assert_eq!(lower, Err(Refusal::OutOfOrder));
         let taken =
             model.receive_request(&from_caller("BYE", 314160), arrival());
-        assert_eq!(taken, Ok(InDialog::Bye));
+        assert!(matches!(taken, Ok(InDialog::Bye(_))));
         model.final_committed(exchange, clock.now());
         model.check();
 
@@ -7837,7 +8138,7 @@ Contact: <sip:bob@192.0.2.4>
 
         assert_eq!(options, Ok(InDialog::Other));
         assert_eq!(stale, Err(Refusal::OutOfOrder));
-        assert_eq!(taken, Ok(InDialog::Bye));
+        assert!(matches!(taken, Ok(InDialog::Bye(_))));
         let reason = arrival().remote_bye();
         assert_eq!(
             notices(&model.take_effects()),
@@ -7941,7 +8242,10 @@ Contact: <sip:bob@192.0.2.4>
         let ringing = reply("180 Ringing", "early", "sip:bob@192.0.2.4", "");
         model.receive_provisional(attempt, &ringing, None).unwrap();
         let early = match model.take_effects()[..] {
-            [Effect::Notify(Event::EarlyDialog { usage, .. })] => usage,
+            [
+                Effect::UsageFormed { usage: formed, from },
+                Effect::Notify(Event::EarlyDialog { usage, .. }),
+            ] if formed == usage && from == Owner::Attempt(attempt) => usage,
             ref other => panic!("no early dialog: {other:?}"),
         };
 
@@ -8080,7 +8384,10 @@ Contact: <sip:bob@192.0.2.4>
         let ringing = reply("180 Ringing", "early", "sip:bob@192.0.2.4", "");
         model.receive_provisional(attempt, &ringing, None).unwrap();
         let early = match model.take_effects()[..] {
-            [Effect::Notify(Event::EarlyDialog { usage, .. })] => usage,
+            [
+                Effect::UsageFormed { usage: formed, from },
+                Effect::Notify(Event::EarlyDialog { usage, .. }),
+            ] if formed == usage && from == Owner::Attempt(attempt) => usage,
             ref other => panic!("no early dialog: {other:?}"),
         };
 
@@ -8145,7 +8452,7 @@ Contact: <sip:bob@192.0.2.4>
         );
         let again = run(&mut model, Command::Terminate { usage: session });
         model.check();
-        assert_eq!(bye, Ok(InDialog::Bye));
+        assert!(matches!(bye, Ok(InDialog::Bye(_))));
         assert_eq!(info, Err(Refusal::NoDialog));
         assert_eq!(reinvite.unwrap_err(), Refusal::NoDialog);
         assert_eq!(
@@ -8166,7 +8473,7 @@ Contact: <sip:bob@192.0.2.4>
         model.take_effects();
         let bye =
             model.receive_request(&from_callee("BYE", "callee", 7), arrival());
-        assert_eq!(bye, Ok(InDialog::Bye));
+        assert!(matches!(bye, Ok(InDialog::Bye(_))));
         let started = model.bye_started(session, Ok(())).unwrap();
         let gone = Error::RemoteFailure(StatusCode::from_u16(481).unwrap());
         model.bye_answered(started, Err(gone));
@@ -8323,7 +8630,10 @@ Contact: <sip:bob@192.0.2.4>
         let ringing = reply("180 Ringing", "early", "sip:bob@192.0.2.4", "");
         model.receive_provisional(attempt, &ringing, None).unwrap();
         let early = match model.take_effects()[..] {
-            [Effect::Notify(Event::EarlyDialog { usage, .. })] => usage,
+            [
+                Effect::UsageFormed { usage: formed, from },
+                Effect::Notify(Event::EarlyDialog { usage, .. }),
+            ] if formed == usage && from == Owner::Attempt(attempt) => usage,
             ref other => panic!("no early dialog: {other:?}"),
         };
         run(&mut model, Command::Terminate { usage: early });
@@ -9703,7 +10013,7 @@ CSeq: {cseq} INVITE
             model.receive_request(&from_caller("BYE", 314161), arrival());
         model.check();
 
-        assert_eq!(taken, Ok(InDialog::Bye));
+        assert!(matches!(taken, Ok(InDialog::Bye(_))));
         let effects = model.take_effects();
         assert_eq!(statuses(&effects), [487]);
         let ended: Vec<_> = notices(&effects)
@@ -9771,7 +10081,10 @@ CSeq: {cseq} INVITE
         let (operation, exchange, cseq) =
             reinvited(&mut model, usage, Some(answer()), clock.now());
         let bye = from_callee("BYE", "callee", 1);
-        assert_eq!(model.receive_request(&bye, arrival()), Ok(InDialog::Bye));
+        assert!(matches!(
+            model.receive_request(&bye, arrival()),
+            Ok(InDialog::Bye(_)),
+        ));
         model.check();
         assert_eq!(model.dialogs.len(), 0);
         assert_eq!(outcome(&model, operation), Some(Err(Error::SessionEnded)));
@@ -9829,7 +10142,10 @@ CSeq: {cseq} INVITE
         let exchange = started(&model.take_effects());
         model.take_reinvite(exchange).unwrap();
         let bye = from_callee("BYE", "callee", 1);
-        assert_eq!(model.receive_request(&bye, arrival()), Ok(InDialog::Bye));
+        assert!(matches!(
+            model.receive_request(&bye, arrival()),
+            Ok(InDialog::Bye(_)),
+        ));
         model.check();
         assert!(cancels(&model.take_effects()).is_empty());
         model.reinvite_started(exchange, Ok(()), clock.now());
@@ -9842,7 +10158,10 @@ CSeq: {cseq} INVITE
         run(&mut model, Command::Reinvite { usage, offer: Some(answer()) });
         let exchange = started(&model.take_effects());
         model.take_reinvite(exchange).unwrap();
-        assert_eq!(model.receive_request(&bye, arrival()), Ok(InDialog::Bye));
+        assert!(matches!(
+            model.receive_request(&bye, arrival()),
+            Ok(InDialog::Bye(_)),
+        ));
         model.reinvite_started(exchange, Err(Error::Unroutable), clock.now());
         model.check();
         assert!(cancels(&model.take_effects()).is_empty());
@@ -9865,7 +10184,10 @@ CSeq: {cseq} INVITE
             None,
             clock.now(),
         );
-        assert_eq!(model.receive_request(&bye, arrival()), Ok(InDialog::Bye));
+        assert!(matches!(
+            model.receive_request(&bye, arrival()),
+            Ok(InDialog::Bye(_)),
+        ));
         model.check();
         assert!(cancels(&model.take_effects()).is_empty());
     }
@@ -10182,7 +10504,10 @@ Contact: <sip:alice@192.0.2.1>
         run(&mut model, Command::Accept { authority, answer: answer() });
         model.take_effects();
         let bye = from_callee("BYE", "callee", 4);
-        assert_eq!(model.receive_request(&bye, arrival()), Ok(InDialog::Bye));
+        assert!(matches!(
+            model.receive_request(&bye, arrival()),
+            Ok(InDialog::Bye(_)),
+        ));
         model.final_committed(exchange, clock.now());
         model.check();
         let effects = model.take_effects();
@@ -10511,10 +10836,10 @@ Contact: <sip:alice@192.0.2.1>
                 model.bye_started(usage, Ok(())).unwrap();
             } else {
                 let bye = from_callee("BYE", "callee", 1);
-                assert_eq!(
+                assert!(matches!(
                     model.receive_request(&bye, arrival()),
-                    Ok(InDialog::Bye)
-                );
+                    Ok(InDialog::Bye(_)),
+                ));
             }
             model.take_effects();
 
@@ -11085,6 +11410,10 @@ Contact: <sip:alice@192.0.2.1>
         /// How many BYEs of sessions went while a 2xx of the session still
         /// waited for the peer's ACK.
         early_byes: usize,
+        /// The usages that formed and the attempts that started, until the
+        /// model releases them, so that each is released once and none is
+        /// left behind.
+        owners: std::collections::HashSet<Owner>,
     }
 
     /// A request a peer sends in the dialog `id` names, as this user agent
@@ -11157,6 +11486,7 @@ Contact: <sip:{host}@192.0.2.9>
                 finals: Vec::new(),
                 refusals: Vec::new(),
                 early_byes: 0,
+                owners: std::collections::HashSet::new(),
             }
         }
 
@@ -11176,6 +11506,20 @@ Contact: <sip:{host}@192.0.2.9>
 
         fn apply(&mut self, effect: Effect) {
             match &effect {
+                Effect::UsageFormed { usage, .. } => {
+                    assert!(self.owners.insert(Owner::Usage(*usage)));
+                }
+                Effect::StartInvite { attempt } => {
+                    assert!(self.owners.insert(Owner::Attempt(*attempt)));
+                }
+                Effect::Released(Released::Usage(usage)) => {
+                    let owner = Owner::Usage(*usage);
+                    assert!(self.owners.remove(&owner), "{owner:?} twice");
+                }
+                Effect::Released(Released::Attempt(attempt)) => {
+                    let owner = Owner::Attempt(*attempt);
+                    assert!(self.owners.remove(&owner), "{owner:?} twice");
+                }
                 Effect::Notify(Event::UsageEnded { usage, reason }) => {
                     self.ended.push((*usage, *reason));
                 }
@@ -11252,6 +11596,7 @@ Contact: <sip:{host}@192.0.2.9>
                 | Effect::ResendAck { .. }
                 | Effect::CancelReinvite { .. }
                 | Effect::AttemptEnded { .. }
+                | Effect::UsageFormed { .. }
                 | Effect::Notify(_)
                 | Effect::Released(_) => return,
             };
@@ -11735,6 +12080,19 @@ Contact: <sip:{host}@192.0.2.9>
                 "a Mortal dialog"
             );
             assert!(model.byes.is_empty());
+            // What is left of the usages and attempts is the usages still
+            // up, so every one that ended was released.
+            for owner in &self.owners {
+                match owner {
+                    Owner::Usage(usage) => {
+                        assert!(
+                            model.usages.get(*usage).is_some(),
+                            "{owner:?}"
+                        );
+                    }
+                    _ => panic!("{owner:?} was not released"),
+                }
+            }
             let mut ended: Vec<UsageKey> =
                 self.ended.iter().map(|&(usage, _)| usage).collect();
             ended.sort();

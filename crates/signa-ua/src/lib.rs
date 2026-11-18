@@ -51,6 +51,11 @@ submitting, events, shutting down and dropping work. In short:
   [`Event::Lagged`] reports the count once there is room. The end of each
   attempt has a place set aside, and the outcome of each operation comes
   through its [`Operation`], so a full queue loses neither.
+* A [`Session`], an [`InviteAttempt`] and an [`IncomingInvite`] each have a
+  [`Settlement`], which resolves once the protocol work for it has ended,
+  such as the BYE's transaction after the session ended, or the INVITE's
+  until Timer M. Wait for it before freeing what the application
+  keeps for a call, such as the routing of its packets.
 * [`UaHandle::shutdown`] stops the UA gracefully. Dropping the [`UaDriver`] is
   a forced stop.
 * [`Config`] sets the limits of the UA's tables, queues and jobs, each with
@@ -119,9 +124,9 @@ pub use self::ua::{
     InvalidContact, InviteAttempt, InviteId, InvitePlan, Negotiate,
     NegotiationState, NoNegotiator, Offer, Operation, Query, ReinvitePlan,
     Resolve, ResolveError, Session, SessionId, SessionPhase, SessionSnapshot,
-    ShutdownMode, ShutdownOutcome, ShutdownReport, StaticResolver,
-    SubmitError, Ua, UaDriver, UaEvents, UaHandle, UaShutdown, WireEffect,
-    attach,
+    Settled, Settlement, ShutdownMode, ShutdownOutcome, ShutdownReport,
+    StaticResolver, SubmitError, Ua, UaDriver, UaEvents, UaHandle, UaShutdown,
+    WireEffect, attach,
 };
 
 // The private state model. `dialog` knows nothing of `invite`, so other

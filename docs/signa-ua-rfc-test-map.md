@@ -32,7 +32,7 @@ Type is where the evidence runs. Paths are in `crates/signa-ua/`:
 * unit: a test of one module's functions, inline in that module.
 * build: the compiler checks it on every build.
 * doctest: an example in the rustdoc that `cargo test` compiles, here one
-  that must fail to compile.
+  that must fail to compile, or one that only has to compile.
 * fuzz: a cargo-fuzz target in `fuzz/` at the repository root, on the entry
   points of the unstable `__fuzz` feature. It runs by hand, not in CI.
 * interop: the UA against SIPp, an independent implementation, which
@@ -336,6 +336,31 @@ report.
 | The deadline | design | The endpoint stops at once, then the UA ends every task and lets go of its records, with nothing sent. Each operation still running, or submitted and not yet taken, fails with `DriverStopped`, and the report counts the sessions, INVITEs and operations left. A command still queued after a drain ends as it would have before, with nothing sent. | `all_operation_waiters_get_terminal_result` (`tests/shutdown/deadline.rs`), `deadline_expired_is_not_reported_as_drained` (`tests/shutdown/deadline.rs`), `the_deadline_leaves_no_operation_without_an_outcome` | model, loopback | UDP, TCP | covered |
 | The endpoint stopping first | design | Another handle of the endpoint that stops it ends the UA with `EndpointLost`, as the deadline does. While the UA has work, a session up included, it holds a work guard, so a shutdown of the endpoint alone waits for its deadline. | `an_endpoint_stopped_elsewhere_is_reported_as_lost` (`tests/shutdown/deadline.rs`) | loopback | UDP | covered |
 | The drain is complete | design | The UA counts as drained only once the model holds no record, timer or operation, no job, answer, watcher or reader runs, no send, reply or answer waits, and the driver keeps nothing for a record. That is one test in the driver, which builds with debug assertions check against the model's tables while the UA shuts down. Any order of inputs drains once everything settles. | `any_shutdown_drains_once_everything_settles`, `drained_has_no_live_tasks_timers_or_post_return_writes` (`tests/shutdown/deadline.rs`) | model, loopback | UDP | covered |
+
+## Settlement (design)
+
+A session, an attempt and an incoming INVITE each settle once every piece
+of protocol work for them has ended: the transactions of signa-core's for
+them, until each settles there, the copies of a 2xx and the ACKs, the jobs
+and answers of the UA, and the INVITE that formed a session. Settlement is
+apart from the end of a session and from the events. That a session waits
+for what formed it, and which writes each counts, is signa-ua policy.
+Unless a row says otherwise, the loopback tests are in
+`tests/settlement.rs`.
+
+| Requirement | Basis | Expected behavior | Evidence | Type | Scope | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| A caller's session | [6026 §8.4](https://www.rfc-editor.org/rfc/rfc6026.html#section-8.4), design | A session this UA called that ends with its BYE before Timer M settles no earlier than its INVITE, 64 T1 after the 2xx, since a fork's 2xx still needs an ACK until then. The session counts the ACK and the BYE, the attempt the INVITE. | `a_session_ended_before_timer_m_settles_after_its_invite`, `a_usage_is_released_with_its_last_record` | model, loopback | UDP, TCP | covered |
+| A callee's session | [6026 §8.7](https://www.rfc-editor.org/rfc/rfc6026.html#section-8.7), [3261 §17.2.2](https://www.rfc-editor.org/rfc/rfc3261.html#section-17.2.2), design | A session the peer's BYE ends settles once the INVITE it accepted has, at Timer L, and the BYE's transaction, at Timer J over UDP. It counts the writes of both. | `a_callees_session_waits_for_its_invite_after_the_peers_bye`, `the_peers_bye_holds_its_session_to_timer_j` | loopback | UDP, TCP | covered |
+| An attempt without a session | [3261 §9.1](https://www.rfc-editor.org/rfc/rfc3261.html#section-9.1), design | An attempt that forms no session settles with its INVITE's transaction and its CANCEL's, and counts the writes of both, the endpoint's ACK of the error response among them. | `a_cancelled_attempt_settles_with_its_cancel` | loopback | TCP | covered |
+| The cleanups of an attempt | [3261 §13.2.2.4](https://www.rfc-editor.org/rfc/rfc3261.html#section-13.2.2.4), design | The ACK and the BYE of a 2xx the UA does not keep as a session, such as a fork beyond `max_forks`, are the attempt's, and it settles once the BYE's transaction has. | `an_attempt_counts_the_cleanup_of_a_fork` | loopback | TCP | covered |
+| A rejected INVITE | [3261 §17.2.1](https://www.rfc-editor.org/rfc/rfc3261.html#section-17.2.1), design | An incoming INVITE the application rejects settles once the ACK of the rejection ends its transaction, with the 100 and the rejection as its writes. | `a_rejected_invite_settles_with_its_ack` | loopback | TCP | covered |
+| A late failure | [3261 §15.1.1](https://www.rfc-editor.org/rfc/rfc3261.html#section-15.1.1), design | A BYE without an answer ends its session at once and fails at Timer F. The session settles only then, drained, with each retransmission of the BYE counted. | `a_late_failure_settles_the_session_after_its_end` | loopback | UDP | covered |
+| Waiters and handles | design | A settlement resolves whether or not anything waits for it or keeps a handle, and each clone sees the same result. Dropping a wait changes nothing. An incoming INVITE settles with its transaction and that of a CANCEL of it. | `a_settlement_needs_no_waiter_and_no_handle` | loopback | TCP | covered |
+| The legs of a call | design | An application waits for the settlements of several sessions at once, as one that frees the routing of a call's packets once both its legs settle, through the public API alone. | `wait` (`src/ua/settle.rs`) | doctest | - | covered |
+| A stop | design | A shutdown that drains leaves every settlement drained, and each has settled by the report. Work left at a shutdown's deadline, or when the driver is dropped, settles as not drained once the UA stops. | `a_drained_shutdown_settles_everything_drained`, `work_left_at_the_deadline_settles_undrained`, `a_dropped_driver_settles_what_it_had_undrained`, `a_stop_settles_what_is_left_undrained` (`ua/settle.rs`) | unit, loopback | UDP, TCP | covered |
+| Re-INVITEs | [3261 §9.1](https://www.rfc-editor.org/rfc/rfc3261.html#section-9.1), design | A session waits for each re-INVITE of its dialog either way, and for the CANCEL the UA sends for its own when the session ends. | `a_termination_cancels_a_ringing_reinvite_and_drains` (`tests/shutdown/terminate.rs`) | loopback | TCP | partial: the driver's checks show that the session holds them, and no test waits for its settlement |
+| Each released once | design | The model releases each usage and attempt once its last record goes, exactly once, in any order of inputs, and counts the records it waits for rather than look for them. An owner settles with its last hold and what it waits for, exactly once, in any order of holds and releases. Builds with debug assertions check, while the UA shuts down, that each settlement holds exactly what is under way for it. | `a_usage_is_released_with_its_last_record`, `any_order_of_inputs_keeps_the_tables_consistent`, `any_shutdown_drains_once_everything_settles`, `an_owner_settles_with_its_last_hold` (`ua/settle.rs`) | unit, model | - | covered |
 
 ## Tower adapter (design)
 
